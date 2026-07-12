@@ -235,6 +235,16 @@ impl<'a> BlockSearch<'a> {
     }
 
     /// Returns the block header of the block being searched.
+    /// The part the searched block belongs to (Go `bs.bsw.p`).
+    pub fn part(&self) -> &Part<'a> {
+        self.p
+    }
+
+    /// The search options for this block search (Go `bs.bsw.so`).
+    pub fn search_options(&self) -> &PartitionSearchOptions<'a> {
+        self.pso
+    }
+
     pub fn block_header(&self) -> &BlockHeader {
         &self.bh
     }

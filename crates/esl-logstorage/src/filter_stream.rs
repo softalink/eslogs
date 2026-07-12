@@ -2,8 +2,9 @@
 //!
 //! `FilterStream` is the filter for `{}` aka `_stream:{...}`.
 
-use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
@@ -12,12 +13,10 @@ use crate::bitmap::Bitmap;
 use crate::block_result::{BlockResult, ColRef};
 use crate::block_search::BlockSearch;
 use crate::filter::Filter;
-use crate::indexdb::Indexdb;
 use crate::prefix_filter;
 use crate::rows::{Field, get_field_value_by_name};
 use crate::stream_filter::StreamFilter;
 use crate::stream_id::StreamID;
-use crate::tenant_id::TenantID;
 use crate::values_encoder::ValueType;
 
 /// `FilterStream` is the filter for `{}` aka `_stream:{...}`.
@@ -25,42 +24,54 @@ pub(crate) struct FilterStream {
     /// The stream filter to apply.
     f: StreamFilter,
 
-    /// The list of tenantIDs to search for streamIDs.
+    /// Matching streamIDs per partition indexdb, resolved lazily during the
+    /// search.
     ///
-    /// PORT NOTE: Go assigns this struct field directly just before the search
-    /// (`storage_search.go`, unported). The port keeps it a `pub(crate)` field
-    /// so the future search setup can populate it the same way.
-    pub(crate) tenant_ids: Vec<TenantID>,
-
-    /// The indexdb to search for streamIDs.
-    ///
-    /// PORT NOTE: Go stores `*indexdb`, assigned just before the search. The
-    /// port holds the shared `Arc<Indexdb>` (indexdb is shared via `Arc`), set
-    /// by the future search setup.
-    pub(crate) idb: Option<Arc<Indexdb>>,
-
-    stream_ids: OnceLock<HashSet<StreamID>>,
+    /// PORT NOTE: Go's `initStreamFilters` (storage_search.go) copies the
+    /// filter tree once per partition, binding `tenantIDs` + that partition's
+    /// `*indexdb` to each `filterStream`. The Rust filter tree is shared
+    /// immutably across partitions and workers, so the binding is inverted:
+    /// [`Filter::apply_to_block_search`] reaches the partition's indexdb via
+    /// the block search (`bs.p -> partition -> idb`) and the tenantIDs via
+    /// `bs.pso`, and this per-idb cache plays the role of Go's per-partition
+    /// filter copies (the cache lives only as long as the query's filter
+    /// tree; entries are keyed by indexdb identity, which is pinned by the
+    /// partition references held for the whole search).
+    stream_ids_by_idb: Mutex<HashMap<usize, Arc<HashSet<StreamID>>>>,
 }
 
 pub(crate) fn new_filter_stream(f: StreamFilter) -> FilterStream {
     FilterStream {
         f,
-        tenant_ids: Vec::new(),
-        idb: None,
-        stream_ids: OnceLock::new(),
+        stream_ids_by_idb: Mutex::new(HashMap::new()),
     }
 }
 
 impl FilterStream {
-    fn get_stream_ids(&self) -> &HashSet<StreamID> {
-        self.stream_ids.get_or_init(|| {
-            let idb = self
-                .idb
-                .as_ref()
-                .expect("BUG: filterStream.idb must be set before search");
-            let stream_ids = idb.search_stream_ids(&self.tenant_ids, &self.f);
-            stream_ids.into_iter().collect()
-        })
+    /// Resolves (and caches) the streamIDs matching the filter in the
+    /// partition the searched block belongs to (Go `getStreamIDs`, with the
+    /// per-partition binding done lazily — see the struct PORT NOTE).
+    fn get_stream_ids_for_search(&self, bs: &BlockSearch<'_>) -> Arc<HashSet<StreamID>> {
+        let pt = bs
+            .part()
+            .pt
+            .as_ref()
+            .expect("BUG: searched part must belong to a partition")
+            .upgrade()
+            .expect("BUG: partition closed while a search references its parts");
+        let idb = &pt.idb;
+        let key = Arc::as_ptr(idb) as usize;
+        let mut cache = self.stream_ids_by_idb.lock().unwrap();
+        if let Some(ids) = cache.get(&key) {
+            return Arc::clone(ids);
+        }
+        let ids: Arc<HashSet<StreamID>> = Arc::new(
+            idb.search_stream_ids(&bs.search_options().tenant_ids, &self.f)
+                .into_iter()
+                .collect(),
+        );
+        cache.insert(key, Arc::clone(&ids));
+        ids
     }
 
     fn match_column_by_stream_name(
@@ -133,7 +144,7 @@ impl Filter for FilterStream {
         if self.f.is_empty() {
             return;
         }
-        let stream_ids = self.get_stream_ids();
+        let stream_ids = self.get_stream_ids_for_search(bs);
         let sid = bs.block_header().stream_id;
         if !stream_ids.contains(&sid) {
             bm.reset_bits();

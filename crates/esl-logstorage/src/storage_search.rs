@@ -521,9 +521,14 @@ fn get_search_options<'q>(tenant_ids: &[TenantID], q: &'q Query) -> StorageSearc
 
 /// Go `partition.getSearchOptions`.
 ///
-/// PORT NOTE: Go resolves stream filters against the partition's indexdb
-/// (`idb.searchStreamIDs` / `initStreamFilters`). Stream filtering is deferred,
-/// so this always searches by tenantIDs with the filter unchanged.
+/// PORT NOTE: Go pre-resolves stream filters here per partition
+/// (`initStreamFilters` copies the filter tree binding `idb` + tenantIDs).
+/// The port resolves them lazily inside `FilterStream` instead (per-idb
+/// cache, see filter_stream.rs), so the shared filter passes through
+/// unchanged. Go's `getCommonStreamFilter` block-scheduling pre-filter
+/// (`sso.streamFilter` -> `pso.stream_ids`) remains unported — matching is
+/// done per block header in `FilterStream::apply_to_block_search`, which
+/// prunes before any column reads.
 fn partition_search_options<'f>(sso: &StorageSearchOptions<'f>) -> PartitionSearchOptions<'f> {
     PartitionSearchOptions {
         tenant_ids: sso.tenant_ids.clone(),
@@ -1470,14 +1475,11 @@ mod tests {
             assert_eq!(results, results_expected, "field_names-with-filter");
         }
 
-        // field_names-some
-        //
-        // PORT NOTE: the Go subtest filters with `_stream:{instance=~"host-1:.+"}`;
-        // `filterStream` execution needs the deferred `initStreamFilters` idb
-        // wiring (see the module PORT NOTES), so an equivalent exact filter on
-        // the `instance` stream field is used (same 385 matching rows).
+        // field_names-some (Go filters with `_stream:{instance=~"host-1:.+"}`;
+        // stream-filter execution resolves streamIDs against each partition's
+        // indexdb — see filter_stream.rs).
         {
-            let q = parse("instance:='host-1:234'");
+            let q = parse(r#"_stream:{instance=~"host-1:.+"}"#);
             let results = s
                 .get_field_names(&all_tenant_ids, &q, "")
                 .expect("get_field_names");

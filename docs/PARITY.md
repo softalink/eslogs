@@ -77,8 +77,10 @@ Tracked at file/subsystem granularity once porting starts:
 Cross-cutting deferrals (PORT-NOTEd at each site): no TLS stack anywhere
 (flags parse, fail with clear errors), no metrics registry (counters are
 plain atomics; /metrics serves the storage series), context cancellation
-dropped, `_stream:{...}` execution needs the deferred initStreamFilters idb
-wiring, net_query_runner (cluster query splitting) stubbed for single-node.
+dropped, net_query_runner (cluster query splitting) stubbed for single-node.
+`_stream:{...}` execution is fully wired (lazy per-partition streamID
+resolution in filter_stream.rs); Go's getCommonStreamFilter block-scheduling
+pre-filter remains an unported optimization.
 
 ## Benchmark gate
 

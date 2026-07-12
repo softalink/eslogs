@@ -1350,11 +1350,15 @@ mod tests {
             3
         );
 
-        // PORT NOTE: an extra_stream_filters *execution* case (Go filters by
-        // `{host="node-2"}`) cannot run here: the engine's filterStream needs
-        // the deferred `initStreamFilters` idb wiring (storage_search.rs PORT
-        // NOTE) and panics at search time. The arg parsing/composition path is
-        // covered by test_parse_extra_stream_filters_success.
+        // extra_stream_filters execution: Go filters by `{host="node-2"}`.
+        assert_eq!(
+            count_rows(&format!(
+                "/select/logsql/query?query={}&extra_stream_filters={}",
+                encode("*"),
+                encode(r#"{host="node-2"}"#)
+            )),
+            3
+        );
 
         // limit trims the result set.
         assert_eq!(
