@@ -1,0 +1,92 @@
+# EsLogs CI: lint + full test suites on Linux and native Windows (MSVC is a
+# first-class, benchmarked target), an end-to-end smoke against a live
+# server, and the upstream-port coverage gate.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
+
+  # The port treats Windows/MSVC as first-class: the whole suite runs
+  # natively, not just a cross-check.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
+
+  # Boot the real server, generate real traffic with eslogsgenerator, and
+  # verify ingestion + the query surface end to end.
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: build server + generator
+        run: cargo build --release -p es-logs -p eslogsgenerator
+      - name: end-to-end smoke
+        run: |
+          set -euo pipefail
+          ./target/release/es-logs \
+            -storageDataPath="$RUNNER_TEMP/data" \
+            -httpListenAddr=127.0.0.1:9428 -retentionPeriod=10y \
+            > "$RUNNER_TEMP/server.log" 2>&1 &
+          for i in $(seq 1 40); do
+            curl -sf -o /dev/null http://127.0.0.1:9428/health && break; sleep 0.5
+          done
+          ./target/release/eslogsgenerator -addr=http://127.0.0.1:9428/insert/jsonline \
+            -start=-1h -end=0s -activeStreams=4 -totalStreams=4 -logsPerStream=500
+          curl -sf -o /dev/null http://127.0.0.1:9428/internal/force_flush
+          B=http://127.0.0.1:9428/select/logsql
+          rows=$(curl -sf "$B/query" --data-urlencode 'query=* | stats count() rows' | grep -o '"rows":"[0-9]*"' | grep -o '[0-9]*')
+          echo "ingested rows: $rows"
+          test "$rows" -gt 0
+          curl -sf "$B/field_names" --data-urlencode 'query=*' | grep -q '"_msg"'
+          curl -sf "$B/streams" --data-urlencode 'query=*' | grep -q 'values'
+          curl -sf "$B/hits" --data-urlencode 'query=*' --data-urlencode 'step=5m' | grep -q 'hits'
+          curl -sf "$B/query" --data-urlencode 'query=*' --data-urlencode 'limit=5' --data-urlencode 'format=csv' | head -1 | grep -q ','
+          curl -sf -o /dev/null http://127.0.0.1:9428/select/esmui/
+          echo "e2e smoke OK"
+
+  # Every in-scope upstream Go file at the pinned release must be mapped to a
+  # Rust owner or ignored with a reason (docs/UPSTREAM_SYNC.md).
+  upstream-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clone upstream at pinned tag
+        run: |
+          tag=$(grep '^tag' UPSTREAM.lock | awk '{print $3}')
+          git clone --depth 1 --branch "$tag" \
+            https://github.com/VictoriaMetrics/VictoriaLogs "$RUNNER_TEMP/upstream"
+      - name: coverage gate
+        run: ESLOGS_UPSTREAM="$RUNNER_TEMP/upstream" python3 scripts/upstream_sync.py check

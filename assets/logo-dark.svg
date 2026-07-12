@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 150" role="img" aria-label="eslogs — No garbage. Just logs.">
+  <!-- eslogs mark: a stack of timber logs seen end-on (log storage, literally).
+       Growth rings double as data rings; the bolt is the query engine. -->
+  <g transform="translate(14,8)">
+    <!-- bottom-left log -->
+    <circle cx="40" cy="92" r="27" fill="#FBBF24" stroke="#9A3412" stroke-width="5"/>
+    <circle cx="41.5" cy="93" r="16.5" fill="none" stroke="#D97706" stroke-width="2.6"/>
+    <circle cx="42.5" cy="94" r="8" fill="none" stroke="#D97706" stroke-width="2.6"/>
+    <circle cx="43" cy="94.5" r="2.6" fill="#B45309"/>
+    <!-- bottom-right log -->
+    <circle cx="92" cy="92" r="27" fill="#FBBF24" stroke="#9A3412" stroke-width="5"/>
+    <circle cx="90.5" cy="93" r="16.5" fill="none" stroke="#D97706" stroke-width="2.6"/>
+    <circle cx="89.5" cy="94" r="8" fill="none" stroke="#D97706" stroke-width="2.6"/>
+    <circle cx="89" cy="94.5" r="2.6" fill="#B45309"/>
+    <!-- top log, carrying the bolt -->
+    <circle cx="66" cy="47" r="27" fill="#FCD34D" stroke="#9A3412" stroke-width="5"/>
+    <circle cx="66" cy="47" r="17.5" fill="none" stroke="#D97706" stroke-width="2.6"/>
+    <path d="M70.5 33 L55 50.5 L64 50.5 L60.5 62 L77 43.5 L67.5 43.5 Z" fill="#7C2D12"/>
+    <!-- motion dashes: ingest streaming in -->
+    <line x1="-8" y1="38" x2="18" y2="38" stroke="#EA580C" stroke-width="5" stroke-linecap="round" opacity="0.85"/>
+    <line x1="-14" y1="52" x2="6"  y2="52" stroke="#F59E0B" stroke-width="5" stroke-linecap="round" opacity="0.6"/>
+  </g>
+  <!-- wordmark -->
+  <text x="168" y="82" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+        font-size="60" font-weight="800" letter-spacing="-1.5" fill="#F8FAFC">
+    <tspan fill="#EA580C">es</tspan>logs
+  </text>
+  <!-- tagline -->
+  <text x="171" y="116" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+        font-size="21" font-weight="600" letter-spacing="2.5" fill="#FBBF24">NO GARBAGE. JUST LOGS.</text>
+</svg>

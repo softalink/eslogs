@@ -1,0 +1,116 @@
+# EsLogs release pipeline: on a version tag, run the full gate, build the
+# four product binaries for Linux and Windows, package with checksums, and
+# publish a GitHub Release.
+#
+# NOTE: release binaries are built for generic x86-64 so they run anywhere.
+# Benchmark-grade builds additionally use `-C target-cpu=...` + PGO — see
+# "Reproducing" in README.md; those are machine-specific by nature and are
+# not shipped as release artifacts.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINS: es-logs eslagent eslogscli eslogsgenerator
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: version consistency (tag == crate version == upstream pin)
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_v=$(sed -n '/\[workspace.package\]/,/^\[/p' Cargo.toml | grep -m1 '^version' | cut -d'"' -f2)
+          lock_v=$(grep '^tag' UPSTREAM.lock | awk '{print $3}' | sed 's/^v//')
+          echo "tag=$tag cargo=$cargo_v upstream-pin=$lock_v"
+          test "$tag" = "$cargo_v"
+          test "$cargo_v" = "$lock_v"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  build:
+    needs: gate
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: build release binaries
+        run: cargo build --release -p es-logs -p esl-agent -p eslogscli -p eslogsgenerator
+      - name: package (tar.gz + sha256, Linux)
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="eslogs-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          for b in $BINS; do cp "target/release/$b" "dist/$name/"; done
+          cp LICENSE NOTICE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - name: package (zip + sha256, Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "eslogs-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          foreach ($b in $env:BINS -split " ") {
+            Copy-Item "target/release/$b.exe" "dist/$name/"
+          }
+          Copy-Item LICENSE,NOTICE,README.md "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          $h = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$h  $name.zip" | Set-Content -NoNewline "dist/$name.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz*
+            dist/*.zip*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo "EsLogs ${GITHUB_REF_NAME}"
+            echo
+            echo "Upstream pin ($(grep '^tag' UPSTREAM.lock | awk '{print $3}')):"
+            sed 's/^/    /' UPSTREAM.lock
+            echo
+            echo "Binaries: es-logs (server), eslagent (log shipper),"
+            echo "eslogscli (interactive LogsQL client), eslogsgenerator."
+            echo "Benchmark standing: see bench/BASELINE.md."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "EsLogs $GITHUB_REF_NAME" \
+            --notes-file notes.md --verify-tag

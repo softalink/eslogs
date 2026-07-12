@@ -1,0 +1,47 @@
+# Weekly watch for new upstream VictoriaLogs releases. When one exists, a
+# sync report (file-level work plan mapped to the Rust sources) is generated
+# and filed as an issue. See docs/UPSTREAM_SYNC.md.
+name: upstream-watch
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clone upstream (full history for tag ancestry)
+        run: |
+          git clone --filter=blob:none \
+            https://github.com/VictoriaMetrics/VictoriaLogs "$RUNNER_TEMP/upstream"
+      - name: generate sync report
+        id: report
+        run: |
+          set -euo pipefail
+          out=$(ESLOGS_UPSTREAM="$RUNNER_TEMP/upstream" \
+                python3 scripts/upstream_sync.py report --no-fetch)
+          echo "$out"
+          report=$(echo "$out" | sed -n 's/^wrote //p' | tail -1)
+          echo "report=$report" >> "$GITHUB_OUTPUT"
+      - name: file issue for new release
+        if: steps.report.outputs.report != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          report="${{ steps.report.outputs.report }}"
+          tag=$(basename "$report" .md | sed 's/^REPORT-//')
+          title="upstream sync: $tag"
+          if gh issue list --state open --search "in:title \"$title\"" \
+              --json title --jq '.[].title' | grep -qx "$title"; then
+            echo "issue already open for $tag"; exit 0
+          fi
+          gh issue create --title "$title" --body-file "$report" \
+            --label upstream-sync || gh issue create --title "$title" --body-file "$report"

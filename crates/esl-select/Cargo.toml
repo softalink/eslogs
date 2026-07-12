@@ -1,0 +1,12 @@
+[package]
+name = "esl-select"
+description = "Port of EsLogs app/eslselect: LogsQL query endpoints and UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+esl-common.workspace = true
+esl-logstorage.workspace = true
+esl-storage = { path = "../esl-storage" }

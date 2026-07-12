@@ -1,0 +1,39 @@
+# Upstream Go paths deliberately NOT covered by the Rust port.
+# Consumed by scripts/upstream_sync.py (fnmatch glob per line).
+# Every entry needs a reason; new upstream files land in `report` as
+# UNMAPPED unless matched here.
+
+# -- Prometheus metrics registry: the port keeps counters as plain atomics
+#    and writes the /metrics series directly (see esl-storage PORT NOTEs).
+vendor/github.com/VictoriaMetrics/metrics/*
+
+# -- MetricsQL: unused by the logs product (vendored transitively upstream).
+vendor/github.com/VictoriaMetrics/metricsql/*
+
+# -- VictoriaMetrics helper libs the port intentionally skipped:
+# process self-metrics for the metrics registry (not ported)
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/appmetrics/*
+# mmap-backed block cache: superseded by the port's zero-copy mmap reads
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/blockcache/*
+# http response buffering pool: the ported httpserver buffers responses itself
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/bufferedwriter/*
+# graphite/influx ingest servers: not part of the logs product surface
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver/*
+# io helpers only used by unported packages
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/ioutil/*
+# TLS/proxy-protocol listener wrappers: no TLS stack in the port (PORT NOTEs)
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil/*
+# Prometheus remote-write protobufs: metrics-only
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb/*
+# pushmetrics: metrics registry push, not ported
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/pushmetrics/*
+# instant-snapshot HTTP helper for VM storage: logs snapshots are served by
+# the ported esl-storage handlers directly
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/snapshot/*
+# trivial WaitGroup wrapper: std sync primitives used instead
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/syncwg/*
+# vmalert proxy: not part of the logs product
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/vmalertproxy/*
+# ingest write concurrency limiter: dropped by the port (see vl-insert
+# PORT NOTEs; ingestion is bounded by the worker pool instead)
+vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter/*

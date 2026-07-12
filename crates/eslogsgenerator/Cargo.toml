@@ -1,0 +1,12 @@
+[package]
+name = "eslogsgenerator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "eslogsgenerator"
+path = "src/main.rs"
+
+[dependencies]
+esl-common = { path = "../esl-common" }

@@ -1,0 +1,22 @@
+[package]
+name = "esl-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "esl_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "eslagent"
+path = "src/main.rs"
+
+[dependencies]
+esl-common = { path = "../esl-common" }
+esl-logstorage.workspace = true
+esl-insert = { path = "../esl-insert" }
+esl-storage = { path = "../esl-storage" }
+# cespare/xxhash/v2 equivalent for the remotewrite persistent-queue path hash
+# (same crate/version esl-logstorage and esl-storage use).
+xxhash-rust = { version = "0.8", features = ["xxh64"] }

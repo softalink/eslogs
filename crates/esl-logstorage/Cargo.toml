@@ -1,0 +1,16 @@
+[package]
+name = "esl-logstorage"
+description = "Port of EsLogs lib/logstorage: storage engine and LogsQL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+esl-common.workspace = true
+# cespare/xxhash/v2 equivalent (upstream hashes must match on-disk/bloom formats)
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+regex = "1"
+# Global work-stealing thread pool (created once) for query block-search, so
+# queries do not spawn OS threads each time (expensive on Windows vs goroutines).
+rayon = "1"

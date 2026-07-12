@@ -1,0 +1,13 @@
+#!/bin/sh
+# Every commit in this repo is co-developed by Claude: append the co-author
+# trailer (GitHub credits both the author account and Claude as developers).
+# Enable with: git config core.hooksPath .githooks
+msg_file="$1"
+source="$2"
+case "$source" in
+  merge|squash) exit 0 ;;
+esac
+trailer="Co-Authored-By: Claude <noreply@anthropic.com>"
+if ! grep -qi "^Co-Authored-By: Claude" "$msg_file"; then
+  printf '\n%s\n' "$trailer" >> "$msg_file"
+fi

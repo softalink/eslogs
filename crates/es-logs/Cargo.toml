@@ -1,0 +1,28 @@
+[package]
+name = "es-logs"
+description = "Rust port of the EsLogs single-node server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "es-logs"
+path = "src/main.rs"
+
+[dependencies]
+esl-common.workspace = true
+esl-logstorage.workspace = true
+esl-insert.workspace = true
+esl-select.workspace = true
+esl-storage.workspace = true
+
+# Global allocator (the workload is allocation-heavy; the platform default
+# malloc is a poor match). Platform-split because jemalloc doesn't build on
+# windows-msvc: jemalloc on unix (tuned decay keeps RSS low — see main.rs
+# MALLOC_CONF), mimalloc on Windows (builds cleanly on MSVC).
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+mimalloc = { version = "0.1", default-features = false }

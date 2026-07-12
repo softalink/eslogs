@@ -1,0 +1,17 @@
+# Standalone (detached from the main workspace) so it never interferes with
+# the esl-* build or the MSVC cross-checks. Dependency-free: raw HTTP/1.1 over
+# std::net with keep-alive, so it builds identically on Linux and Windows MSVC.
+[package]
+name = "esl-loadgen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "esl-loadgen"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+
+[workspace]

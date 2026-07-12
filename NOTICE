@@ -1,0 +1,13 @@
+EsLogs
+Copyright 2026 Softalink LLC
+
+This product is a derivative work of VictoriaLogs
+(https://github.com/VictoriaMetrics/VictoriaLogs, upstream reference v1.51.0),
+Copyright VictoriaMetrics, Inc., licensed under the Apache License, Version 2.0.
+
+The storage engine, LogsQL query language, application layer, agent, and
+tooling were ported from the Go sources of VictoriaLogs and its
+VictoriaMetrics library dependencies to Rust by Softalink LLC. Product names,
+binary names, HTTP headers, metric prefixes, and identifiers were rebranded
+(VictoriaLogs -> EsLogs, vl/vm prefixes -> esl/esm); references to upstream
+documentation and source URLs are retained where they remain factual.

@@ -1,0 +1,21 @@
+[package]
+name = "esl-insert"
+description = "Port of EsLogs app/eslinsert: log ingestion endpoints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+esl-common.workspace = true
+esl-logstorage.workspace = true
+# Canonical native-ingestion PROTOCOL_VERSION (netinsert), re-exported by
+# native_insert; mirrors Go where eslinsert imports app/eslstorage/netinsert.
+esl-storage.workspace = true
+# Syslog listeners' -syslog.compressMethod.* support (gzip/deflate/zstd);
+# same crates/versions esl-common already uses for HTTP body decompression.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zstd = "0.13"
+# Loki protobuf ingestion: block-mode snappy decoding of push request bodies;
+# same pure-Rust crate/version esl-common's httpserver already uses.
+snap = "1"

@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned so CI's clippy lint set matches local development exactly
+# (-D warnings would otherwise break on every new stable's new lints).
+# Upgrades are deliberate: bump the pin, fix new lints, commit together.
+channel = "1.96.1"
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+components = ["rustfmt", "clippy"]

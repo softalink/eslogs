@@ -1,0 +1,31 @@
+[package]
+name = "esl-common"
+description = "Ports of Softalink LLC lib/* support packages used by EsLogs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zstd = "0.13"
+regex = "1"
+memmap2 = "0.9"
+# httpserver request-body decompression. Pure-Rust backends so the crate
+# cross-compiles cleanly to x86_64-pc-windows-msvc (no C toolchain needed):
+#   flate2 "rust_backend" uses miniz_oxide (pure Rust) for gzip/deflate;
+#   snap is pure Rust for snappy block decoding.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+snap = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }

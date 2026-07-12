@@ -1,0 +1,35 @@
+# --- build artifacts ---
+/target
+/bench/loadgen/target
+/dist
+*.profraw
+*.profdata
+
+# --- runtime data directories (created by running the server locally) ---
+/es-logs-data
+/victoria-logs-data
+
+# --- benchmark inputs/outputs (results are recorded in bench/BASELINE.md) ---
+/bench/results
+/bench/downloads
+/bench/sample_logs
+/bench/*.json
+
+# --- Claude / AI-assistant local state: never published ---
+/.claude/
+CLAUDE.md
+CLAUDE.local.md
+.claude*
+**/.claude/
+
+# --- editor / OS junk ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# --- stray logs and scratch files ---
+*.log
+*.orig
+*.rej

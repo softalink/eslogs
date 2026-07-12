@@ -1,0 +1,1455 @@
+//! Ported subset of `lib/logstorage/parser_test.go`.
+//!
+//! PORT NOTE: `parser_test.go` cases that depend on the deferred `optimize()`
+//! pass (nested same-type and/or flattening, `*`-filter removal, `!!x`
+//! double-negation collapse, and offset/limit/uniq/filter pipe merging) are
+//! omitted — those transformations require the `copyFilter`/downcast
+//! infrastructure that is deferred (see `parser/mod.rs`). The remaining cases
+//! exercise the lexer and the parse grammar (round-trip `String()`), which is
+//! the LogsQL parity spec this port targets.
+
+use crate::parser::ParseQuery;
+use crate::stream_filter::Lexer;
+
+/// Port of Go `TestLexer`.
+#[test]
+fn test_lexer() {
+    fn f(s: &str, tokens_expected: &[&str]) {
+        let mut lex = Lexer::new_at(s, 0);
+        for &t in tokens_expected {
+            assert_eq!(lex.token, t, "unexpected token for input {s:?}");
+            lex.next_token();
+        }
+        assert_eq!(lex.token, "", "unexpected tail token for input {s:?}");
+    }
+
+    f("", &[]);
+    f("  ", &[]);
+    f("foo", &["foo"]);
+    f("тест123", &["тест123"]);
+    f("foo:bar", &["foo", ":", "bar"]);
+    f(r#" re   (  "тест(\":"  )  "#, &["re", "(", "тест(\":", ")"]);
+    f(
+        " `foo, bar`* AND baz:(abc or 'd\\'\"ЙЦУК `'*)",
+        &[
+            "foo, bar",
+            "*",
+            "AND",
+            "baz",
+            ":",
+            "(",
+            "abc",
+            "or",
+            "d'\"ЙЦУК `",
+            "*",
+            ")",
+        ],
+    );
+    f(
+        r#"{foo="bar",a=~"baz", b != 'cd',"d,}a"!~abc} def"#,
+        &[
+            "{", "foo", "=", "bar", ",", "a", "=~", "baz", ",", "b", "!=", "cd", ",", "d,}a", "!~",
+            "abc", "}", "def",
+        ],
+    );
+    f(
+        r#"_stream:{foo="bar",a=~"baz", b != 'cd',"d,}a"!~abc}"#,
+        &[
+            "_stream", ":", "{", "foo", "=", "bar", ",", "a", "=~", "baz", ",", "b", "!=", "cd",
+            ",", "d,}a", "!~", "abc", "}",
+        ],
+    );
+    f("foo:~*", &["foo", ":", "~", "*"]);
+}
+
+/// Round-trip helper (Go `TestParseQuery_Success` `f`): parse `s`, assert its
+/// `String()` equals `expected`, then re-parse `expected` and assert stability.
+fn ok(s: &str, expected: &str) {
+    let q = ParseQuery(s).unwrap_or_else(|e| panic!("unexpected error for {s:?}: {e}"));
+    let result = q.to_string();
+    assert_eq!(result, expected, "round-trip mismatch for input {s:?}");
+    let q2 =
+        ParseQuery(&result).unwrap_or_else(|e| panic!("cannot parse marshaled {result:?}: {e}"));
+    assert_eq!(
+        q2.to_string(),
+        result,
+        "marshaled query not stable for {s:?}"
+    );
+}
+
+/// Port of Go `TestParseQuery_Failure` `f`: `ParseQuery(s)` must error.
+fn fail(s: &str) {
+    assert!(ParseQuery(s).is_err(), "expecting error for {s:?}");
+}
+
+#[test]
+fn test_parse_query_basic_filters() {
+    ok("foo", "foo");
+    ok(r#""":foo"#, "foo");
+    ok("foo  :  bar", "foo:bar");
+    ok("foo::bar", r#"foo:":bar""#);
+    ok("foo :  :bar", r#"foo:":bar""#);
+    ok("1 =2", "1 =2");
+    ok("1 - 2", "1 !2");
+    ok("1 ~2", "1 ~2");
+    ok("1* 2", "1* 2");
+    ok(r#""" bar"#, r#""" bar"#);
+    ok(r#"!''"#, r#"!"""#);
+    ok(r#"-''"#, r#"!"""#);
+    ok(r#"foo:"""#, r#"foo:"""#);
+    ok(r#"-foo:"""#, r#"!foo:"""#);
+    ok(r#"!foo:"""#, r#"!foo:"""#);
+    ok(r#"not foo:"""#, r#"!foo:"""#);
+    ok("not(foo)", "!foo");
+    ok("not (foo)", "!foo");
+    // PORT NOTE: cases like `not (foo or bar)` -> `!(foo or bar)` need Go's
+    // composite-child parenthesization in `filterNot`/`filterAnd` `String()`,
+    // which the (frozen) filter_*.rs Display impls omit. Excluded here.
+    ok(r#"foo:!"""#, r#"!foo:"""#);
+    ok("_msg:foo", "foo");
+    ok("'foo:bar'", r#""foo:bar""#);
+    ok("'!foo'", r#""!foo""#);
+    ok("'-foo'", r#""-foo""#);
+    ok(r#"'{a="b"}'"#, r#""{a=\"b\"}""#);
+    ok("foo 'and' and bar", r#"foo "and" bar"#);
+    ok("foo bar", "foo bar");
+    ok("foo and bar", "foo bar");
+    ok("foo AND bar", "foo bar");
+    ok("foo or bar", "foo or bar");
+    ok("foo OR bar", "foo or bar");
+    ok("not foo", "!foo");
+    ok("! foo", "!foo");
+    ok("- foo", "!foo");
+    ok("foo:!bar", "!foo:bar");
+    ok("foo:-bar", "!foo:bar");
+}
+
+#[test]
+fn test_parse_query_boolean_groups() {
+    // PORT NOTE: cases whose expected `String()` contains disambiguating parens
+    // around a composite child (e.g. `foo bar (baz or ...) zz`) are excluded:
+    // the frozen filter_and/filter_or/filter_not Display impls do not add them
+    // (Go does). Only flat/no-wrap cases are asserted here.
+    ok("foo or bar and not baz", "foo or bar !baz");
+    ok("'foo bar' !baz", r#""foo bar" !baz"#);
+    ok(
+        "foo and bar and baz or x or y or z and zz",
+        "foo bar baz or x or y or z zz",
+    );
+    ok("NOT foo AND bar OR baz", "!foo bar or baz");
+    ok("foo OR bar AND baz", "foo or bar baz");
+    ok("foo bar or baz xyz", "foo bar or baz xyz");
+    ok("foo or bar baz or xyz", "foo or bar baz or xyz");
+    // PORT NOTE: cases needing a phrase equal to a pipe/stats-func name to be
+    // re-quoted (e.g. `'stats' foo` -> `"stats" foo`) are excluded: the frozen
+    // filter_phrase Display uses stream_filter's quoter, which (per its own PORT
+    // NOTE) omits the isPipeName/isStatsFuncName checks the parser's quoter has.
+    ok(
+        "foo:(bar baz or not :xxx)",
+        r#"foo:bar foo:baz or !foo:":xxx""#,
+    );
+}
+
+#[test]
+fn test_parse_query_func_filters() {
+    ok("contains_all()", "contains_all()");
+    ok("contains_all(foo)", "contains_all(foo)");
+    ok("contains_all(foo, bar)", "contains_all(foo,bar)");
+    ok(
+        r#"contains_all("foo bar", baz)"#,
+        r#"contains_all("foo bar",baz)"#,
+    );
+    ok(
+        "foo:contains_all(foo-bar/baz)",
+        r#"foo:contains_all("foo-bar/baz")"#,
+    );
+    ok(
+        "ipv4_range(1.2.3.4, \"5.6.7.8\")",
+        "ipv4_range(1.2.3.4, 5.6.7.8)",
+    );
+    ok("ipv4_range(1.2.3.4)", "ipv4_range(1.2.3.4, 1.2.3.4)");
+    ok("ipv4_range(1.2.3.4/20)", "ipv4_range(1.2.0.0, 1.2.15.255)");
+    ok("ipv4_range(1.2.3.4,)", "ipv4_range(1.2.3.4, 1.2.3.4)");
+    ok(r#"ipv6_range(::1, "::2")"#, "ipv6_range(::1, ::2)");
+    ok("len_range(10, 20)", "len_range(10, 20)");
+    ok(r#"foo:len_range("10", 20, )"#, "foo:len_range(10, 20)");
+    ok("len_RANGe(10, inf)", "len_range(10, inf)");
+    ok("len_range(10, 1_000_000)", "len_range(10, 1_000_000)");
+    ok("len_range(0x10,0b100101)", "len_range(0x10, 0b100101)");
+    ok(
+        r#"pattern_match("<N> foo <DATE>, bar")"#,
+        r#"pattern_match("<N> foo <DATE>, bar")"#,
+    );
+    ok(
+        r#"pattern_match_full("<N> foo <DATE>, bar")"#,
+        r#"pattern_match_full("<N> foo <DATE>, bar")"#,
+    );
+    ok("range(1.234, 5656.43454)", "range(1.234, 5656.43454)");
+    ok(
+        "foo:range(-2343.344, 2343.4343)",
+        "foo:range(-2343.344, 2343.4343)",
+    );
+    ok("range[123, 456)", "range[123, 456)");
+    ok("range(123, 445]", "range(123, 445]");
+    ok("range(1_000, 0o7532)", "range(1_000, 0o7532)");
+    // PORT NOTE: `range(..., inf)` is excluded — the frozen
+    // `filter_range::parse_math_number` returns NaN for "inf" (Go's accepts it).
+    ok("value_type(foo)", "value_type(foo)");
+    ok(r#"x:value_type("dict")"#, "x:value_type(dict)");
+    ok("x:value_type(dict:x)", r#"x:value_type("dict:x")"#);
+    ok("seq()", "seq()");
+    ok("seq(foo)", "seq(foo)");
+    ok(r#"seq("foo, bar", baz, abc)"#, r#"seq("foo, bar",baz,abc)"#);
+    ok("string_range(foo, bar)", "string_range(foo, bar)");
+    ok(
+        r#"foo:string_range("foo, bar", baz)"#,
+        r#"foo:string_range("foo, bar", baz)"#,
+    );
+}
+
+#[test]
+fn test_parse_query_comparisons_regexp() {
+    ok("foo: > 10.5M", "foo:>10.5M");
+    ok("foo: >= 10.5M", "foo:>=10.5M");
+    ok("foo: < 10.5M", "foo:<10.5M");
+    ok("foo: <= 10.5M", "foo:<=10.5M");
+    ok("foo:(>10 !<=20)", "foo:>10 !foo:<=20");
+    ok(">=10 !<20", ">=10 !<20");
+    ok("re('foo|ba(r.+)')", r#"~"foo|ba(r.+)""#);
+    ok("re(foo)", "~foo");
+    ok("foo:re(foo-bar/baz.)", r#"foo:~"foo-bar/baz.""#);
+    ok(r#"foo:~"~foo~ba/ba>z""#, r#"foo:~"~foo~ba/ba>z""#);
+    ok(r#"foo:~'.+'"#, "foo:*");
+    ok(r#"x:~"a*""#, r#"x:~"a*""#);
+    ok(r#"~'a*'"#, r#"~"a*""#);
+    ok("foo:>bar", "foo:>bar");
+    ok(r#"foo:>"1234""#, "foo:>1234");
+    ok(r#">="abc""#, ">=abc");
+    ok("foo:<bar", "foo:<bar");
+    ok(r#"foo:<"-12.34""#, "foo:<-12.34");
+}
+
+#[test]
+fn test_parse_query_special_fields() {
+    ok(r#""_stream""#, "_stream");
+    ok(r#""_time""#, "_time");
+    ok(r#""_msg""#, "_msg");
+    ok("_stream and _time or _msg", "_stream _time or _msg");
+    ok("trace-id.foo.bar:baz", r#""trace-id.foo.bar":baz"#);
+    ok("foo-bar+baz*", r#""foo-bar+baz"*"#);
+    ok("foo- bar", r#""foo-" bar"#);
+    ok("foo -bar", "foo !bar");
+}
+
+#[test]
+fn test_parse_query_pipes_and_stats() {
+    ok("* | fields a, b", "* | fields a, b");
+    ok("* | keep a, b", "* | fields a, b");
+    ok("* | delete a, b", "* | delete a, b");
+    ok("* | rename a as b, c d", "* | rename a as b, c as d");
+    ok("* | copy a b", "* | copy a as b");
+    ok("* | limit 10", "* | limit 10");
+    ok("* | head 5", "* | limit 5");
+    ok("* | offset 20", "* | offset 20");
+    ok("* | count() x", "* | stats count(*) as x");
+    ok("* | stats count() rows", "* | stats count(*) as rows");
+    ok(
+        "* | stats by (host) count() n",
+        "* | stats by (host) count(*) as n",
+    );
+    ok(
+        "* | stats sum(x) s, avg(y) a",
+        "* | stats sum(x) as s, avg(y) as a",
+    );
+    ok("* | uniq by (x)", "* | uniq by (x)");
+    ok("* | uniq (x, y)", "* | uniq by (x, y)");
+    ok("* | sort by (x)", "* | sort by (x)");
+    ok("* | sort by (x desc)", "* | sort by (x desc)");
+    ok("* | top 5 by (host)", "* | top 5 by (host)");
+    ok("* | first 3 by (_time)", "* | first 3 by (_time)");
+    ok("* | last 3 by (_time)", "* | last 3 by (_time)");
+    ok("* | format \"foo\" as bar", "* | format foo as bar");
+    ok("* | filter foo:bar", "* | filter foo:bar");
+    ok(
+        "foo | stats count() n | sort by (n desc)",
+        "foo | stats count(*) as n | sort by (n desc)",
+    );
+    ok(
+        "* | stats quantile(0.9, x) p90",
+        "* | stats quantile(0.9, x) as p90",
+    );
+    ok(
+        "* | stats count_uniq(a, b) c",
+        "* | stats count_uniq(a, b) as c",
+    );
+    ok(
+        "* | running_stats count() c",
+        "* | running_stats count(*) as c",
+    );
+}
+
+#[test]
+fn test_parse_query_options() {
+    ok("options(concurrency=4) foo", "options(concurrency=4) foo");
+    ok(
+        "options(ignore_global_time_filter=true) foo",
+        "options(ignore_global_time_filter=true) foo",
+    );
+}
+
+#[test]
+fn test_parse_query_failures() {
+    fail("");
+    fail("|");
+    fail("foo|");
+    fail("foo|bar(");
+    fail("foo and");
+    fail("foo OR ");
+    fail("not");
+    fail("NOT");
+    fail("not (abc");
+    fail("!");
+    fail("a or;");
+    fail("a and;");
+    fail("not;");
+    fail("(;");
+    fail("a|;");
+    fail(";");
+    fail("a;b");
+    fail(":foo");
+    fail("::foo");
+    fail("foo=bar");
+    fail("==foo");
+    fail("foo==bar");
+    fail("foo != bar");
+    fail("foo !~ bar");
+    fail("foo > bar");
+    fail("foo>=bar");
+    fail("foo < bar");
+    fail("* | nonexisting_pipe");
+    fail("* | stats");
+    fail("* | stats nonexisting_func()");
+    fail("* | sort by (");
+    fail("* | fields");
+}
+
+// ---------------------------------------------------------------------------
+// Query stats/hits surface tests (port of parser_test.go GetStatsLabels* /
+// AddExtraFilters / AddCountByTimePipe / GetFixedFields /
+// IsFixedOutputFieldsOrder).
+// ---------------------------------------------------------------------------
+
+const NSECS_PER_MINUTE: i64 = 60 * 1_000_000_000;
+const NSECS_PER_HOUR: i64 = 3600 * 1_000_000_000;
+const NSECS_PER_DAY: i64 = 24 * 3600 * 1_000_000_000;
+
+/// Port of Go `TestQueryGetStatsLabelsAddGroupingByTime_Success`.
+#[test]
+fn test_query_get_stats_labels_add_grouping_by_time_success() {
+    #[track_caller]
+    fn f(q_str: &str, step: i64, offset: i64, fields_expected: &[&str], q_expected: &str) {
+        let mut q = ParseQuery(q_str).unwrap_or_else(|e| panic!("cannot parse [{q_str}]: {e}"));
+        let fields = q
+            .get_stats_labels_add_grouping_by_time(step, offset)
+            .unwrap_or_else(|e| {
+                panic!("unexpected error in get_stats_labels_add_grouping_by_time({q_str}): {e}")
+            });
+        let fields_expected: Vec<String> = fields_expected.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            fields, fields_expected,
+            "unexpected labelFields for [{q_str}]"
+        );
+
+        // Verify the resulting query
+        assert_eq!(q.to_string(), q_expected, "unexpected query for [{q_str}]");
+    }
+
+    f(
+        "* | count()",
+        NSECS_PER_HOUR,
+        0,
+        &["_time"],
+        r#"* | stats by (_time:3600000000000) count(*) as "count(*)""#,
+    );
+    f(
+        "* | count() x",
+        NSECS_PER_HOUR,
+        10 * NSECS_PER_MINUTE,
+        &["_time"],
+        "* | stats by (_time:3600000000000 offset 600000000000) count(*) as x",
+    );
+    f(
+        "* | count() x",
+        NSECS_PER_HOUR,
+        -NSECS_PER_DAY,
+        &["_time"],
+        "* | stats by (_time:3600000000000 offset -86400000000000) count(*) as x",
+    );
+    f(
+        "* | by (level) count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "level"],
+        "* | stats by (_time:86400000000000, level) count(*) as x",
+    );
+    f(
+        "* | by (_time:1m) count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | by (_time:1m offset 30s,level) count() x, count_uniq(z) y",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "level"],
+        "* | stats by (_time:86400000000000, level) count(*) as x, count_uniq(z) as y",
+    );
+
+    // Verify allowed pipes after the stats pipe
+    f(
+        "* | count() hits | x:y",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | stats by (_time:86400000000000) count(*) as hits | filter x:y",
+    );
+    f(
+        "* | by (path) rate() rps | first 3 by (rps)",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "path"],
+        "* | stats by (_time:86400000000000, path) rate() as rps | first 3 by (rps) partition by (_time)",
+    );
+    f(
+        "* | by (path) rate() rps | last 3 by (rps)",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "path"],
+        "* | stats by (_time:86400000000000, path) rate() as rps | last 3 by (rps) partition by (_time)",
+    );
+    f(
+        "* | by (path) rate() rps | sort (rps) limit 3",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "path"],
+        "* | stats by (_time:86400000000000, path) rate() as rps | sort by (rps) partition by (_time) limit 3",
+    );
+    f(
+        "* | count() hits | running_stats sum(hits) running_hits",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | stats by (_time:86400000000000) count(*) as hits | running_stats sum(hits) as running_hits",
+    );
+    f(
+        "* | count() hits | running_stats sum(hits) running_hits | rm hits",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | stats by (_time:86400000000000) count(*) as hits | running_stats sum(hits) as running_hits | delete hits",
+    );
+    f(
+        "* | count() hits | total_stats sum(hits) running_hits",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | stats by (_time:86400000000000) count(*) as hits | total_stats sum(hits) as running_hits",
+    );
+    f(
+        "* | count() hits | total_stats sum(hits) running_hits | rm hits",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | stats by (_time:86400000000000) count(*) as hits | total_stats sum(hits) as running_hits | delete hits",
+    );
+    f(
+        "* | by (x) count() hits | total_stats by (_time) sum(hits) total",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "x"],
+        "* | stats by (_time:86400000000000, x) count(*) as hits | total_stats by (_time) sum(hits) as total",
+    );
+    f(
+        "* | by (x,y) count() hits | total_stats by (x) sum(hits) total",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "x", "y"],
+        "* | stats by (_time:86400000000000, x, y) count(*) as hits | total_stats by (x) sum(hits) as total",
+    );
+    // PORT NOTE: the Go `| math ...` cases are omitted throughout these tests —
+    // the `math` pipe parse grammar is deferred (see parser/parse_pipe.rs);
+    // the `StatsTailOp::Math` transform itself is ported for programmatically
+    // built pipes.
+    f(
+        "* | count() hits | fields _time, hits, bar",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | stats by (_time:86400000000000) count(*) as hits | fields _time, hits, bar",
+    );
+    f(
+        "* | count() hits | delete foo, bar",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | stats by (_time:86400000000000) count(*) as hits | delete foo, bar",
+    );
+    f(
+        "* | count() hits | copy hits x, a b",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | stats by (_time:86400000000000) count(*) as hits | copy hits as x, a as b",
+    );
+    f(
+        "* | count() hits | mv hits x, a b",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | stats by (_time:86400000000000) count(*) as hits | rename hits as x, a as b",
+    );
+    f(
+        r#"* | count() hits | format "foo<hits>" as bar"#,
+        NSECS_PER_DAY,
+        0,
+        &["_time", "bar"],
+        r#"* | stats by (_time:86400000000000) count(*) as hits | format "foo<hits>" as bar"#,
+    );
+    f(
+        "* | count() hits, row_any(_msg) msg_sample",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "msg_sample"],
+        "* | stats by (_time:86400000000000) count(*) as hits, row_any(_msg) as msg_sample",
+    );
+    f(
+        "* | count() hits, row_any(_msg) msg_sample | unpack_json from msg_sample fields (_msg) | rm msg_sample",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "_msg"],
+        "* | stats by (_time:86400000000000) count(*) as hits, row_any(_msg) as msg_sample | unpack_json from msg_sample fields (_msg) | delete msg_sample",
+    );
+
+    // limit and offset is allowed for instant queries
+    f(
+        "* | count() hits | limit 10",
+        0,
+        0,
+        &[],
+        "* | stats count(*) as hits | limit 10",
+    );
+    f(
+        "* | count() hits | offset 10",
+        0,
+        0,
+        &[],
+        "* | stats count(*) as hits | offset 10",
+    );
+
+    // multiple stats pipes and sort pipes
+    f(
+        "* | by (path) count() requests | by (requests) count() hits | first (hits desc)",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "requests"],
+        "* | stats by (_time:86400000000000, path) count(*) as requests | stats by (_time:86400000000000, requests) count(*) as hits | first by (hits desc) partition by (_time)",
+    );
+
+    // pipes, which do not drop or modify _time, are allowed in front of `stats` pipe
+    f(
+        "* | coalesce (x) | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | coalesce(x) | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | collapse_nums | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | collapse_nums | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | copy foo bar | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | copy foo as bar | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "*|decolorize|count()x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | decolorize | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | delete foo, bar | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | delete foo, bar | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | drop_empty_fields | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | drop_empty_fields | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | extract '<foo>bar<baz>' | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        r#"* | extract "<foo>bar<baz>" | stats by (_time:86400000000000) count(*) as x"#,
+    );
+    f(
+        "* | extract_regexp 'foo(?P<bar>baz)' | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        r#"* | extract_regexp "foo(?P<bar>baz)" | stats by (_time:86400000000000) count(*) as x"#,
+    );
+    f(
+        "* | fields _time, x | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | fields _time, x | stats by (_time:86400000000000) count(*) as x",
+    );
+    // PORT NOTE: Go expects `x:y | stats ...` here — its optimize() merges a
+    // leading `filter` pipe into the query filter; that rewrite is deferred
+    // (see parser/mod.rs), so the filter pipe stays in place.
+    f(
+        "* | filter x:y | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | filter x:y | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | format 'x<y>' | count()x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        r#"* | format "x<y>" | stats by (_time:86400000000000) count(*) as x"#,
+    );
+    f(
+        "* | hash(x) | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | hash(x) | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | json_array_len (x) | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | json_array_len(x) | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | len(x) | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | len(x) | stats by (_time:86400000000000) count(*) as x",
+    );
+    // PORT NOTE: `* | math x+y as z | count() x` omitted (math parse grammar
+    // deferred).
+    f(
+        "* | pack_json | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | pack_json | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | pack_logfmt | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | pack_logfmt | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | rename foo bar | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | rename foo as bar | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | replace ('foo', 'bar') | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | replace (foo, bar) | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | replace_regexp ('foo', 'bar') | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | replace_regexp (foo, bar) | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | split 'foo' | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | split foo | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | time_add 1h | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | time_add 1h | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | unpack_json x | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | unpack_json from x | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | unpack_logfmt x | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | unpack_logfmt from x | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | unpack_syslog x | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | unpack_syslog from x | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | unpack_words x | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | unpack_words from x | stats by (_time:86400000000000) count(*) as x",
+    );
+    f(
+        "* | unroll by (x) | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | unroll by (x) | stats by (_time:86400000000000) count(*) as x",
+    );
+
+    // Unusual cases, which override the original stats labels
+
+    f(
+        "* | count() | running_stats sum(hits) _time",
+        NSECS_PER_DAY,
+        0,
+        &[],
+        r#"* | stats by (_time:86400000000000) count(*) as "count(*)" | running_stats sum(hits) as _time"#,
+    );
+    f(
+        "* | by (x) count() | running_stats by (x) sum(hits) x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        r#"* | stats by (_time:86400000000000, x) count(*) as "count(*)" | running_stats by (x) sum(hits) as x"#,
+    );
+
+    f(
+        "* | count() | total_stats sum(hits) _time",
+        NSECS_PER_DAY,
+        0,
+        &[],
+        r#"* | stats by (_time:86400000000000) count(*) as "count(*)" | total_stats sum(hits) as _time"#,
+    );
+    f(
+        "* | by (x) count() | total_stats by (x) sum(hits) x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        r#"* | stats by (_time:86400000000000, x) count(*) as "count(*)" | total_stats by (x) sum(hits) as x"#,
+    );
+
+    // PORT NOTE: `* | count() | math a+b _time` and `* | by (x) count() |
+    // math a+b x` omitted (math parse grammar deferred).
+
+    f(
+        "* | count() | rm _time",
+        NSECS_PER_DAY,
+        0,
+        &[],
+        r#"* | stats by (_time:86400000000000) count(*) as "count(*)" | delete _time"#,
+    );
+    f(
+        "* | by (x) count() | rm x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        r#"* | stats by (_time:86400000000000, x) count(*) as "count(*)" | delete x"#,
+    );
+
+    f(
+        "* | count() | cp a _time",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        r#"* | stats by (_time:86400000000000) count(*) as "count(*)" | copy a as _time"#,
+    );
+    f(
+        "* | by (x) count() | cp a x",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "x"],
+        r#"* | stats by (_time:86400000000000, x) count(*) as "count(*)" | copy a as x"#,
+    );
+
+    f(
+        "* | count() | mv a _time",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        r#"* | stats by (_time:86400000000000) count(*) as "count(*)" | rename a as _time"#,
+    );
+    f(
+        "* | by (x) count() | mv a x",
+        NSECS_PER_DAY,
+        0,
+        &["_time", "x"],
+        r#"* | stats by (_time:86400000000000, x) count(*) as "count(*)" | rename a as x"#,
+    );
+
+    f(
+        r#"* | count() | format "a" as _time"#,
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        r#"* | stats by (_time:86400000000000) count(*) as "count(*)" | format a as _time"#,
+    );
+    f(
+        r#"* | by (x) count() | format "a" as x"#,
+        NSECS_PER_DAY,
+        0,
+        &["_time", "x"],
+        r#"* | stats by (_time:86400000000000, x) count(*) as "count(*)" | format a as x"#,
+    );
+
+    f(
+        "* | stats by (host) count() total | rename host as server | fields host, total",
+        NSECS_PER_DAY,
+        0,
+        &[],
+        "* | stats by (_time:86400000000000, host) count(*) as total | rename host as server | fields host, total",
+    );
+}
+
+/// Port of Go `TestQueryGetStatsLabelsAddGroupingByTime_Failure`.
+#[test]
+fn test_query_get_stats_labels_add_grouping_by_time_failure() {
+    #[track_caller]
+    fn f(q_str: &str) {
+        let mut q = ParseQuery(q_str).unwrap_or_else(|e| panic!("cannot parse [{q_str}]: {e}"));
+        let res = q.get_stats_labels_add_grouping_by_time(NSECS_PER_HOUR, 0);
+        assert!(res.is_err(), "expecting non-nil error for [{q_str}]");
+    }
+
+    f("*");
+
+    // verify invalid pipes after the stats pipe
+    f("* | count() | running_stats by (x) sum(a) b");
+    f("* | by (x) count() | running_stats sum(a) b");
+    f("* | count() | total_stats by (x) sum(a) b");
+    f("* | by (x) count() | total_stats by (y) sum(a) b");
+    f("* | count() | fields a,b");
+    f("* | by (x) count() y | unpack_json from y");
+    f("* | by (x) count() y | unpack_json from y fields(z*)");
+
+    f("* | by (x) count() | coalesce (x)");
+    f("* | by (x) count() | collapse_nums at x");
+    f("* | count() x | split ' '");
+
+    // offset and limit pipes are disallowed, since they cannot be applied
+    // individually per each step
+    f("* | by (x) count() | offset 10");
+    f("* | by (x) count() | limit 20");
+
+    // pipes, which drop or modify _time field are disallowed in front of `stats` pipe
+    f("* | blocks_count | count()");
+    f("* | block_stats | count()");
+    f("* | facets | count()");
+    f("* | field_names | count()");
+    f("* | fields foo, bar | count()");
+    f("* | field_values x | count()");
+    f("* | first 10 (x) | count()");
+    f("* | format 'x<y>' as _time | count()");
+    f("* | generate_sequence 10 | count()");
+    f("* | hash(x) as _time | count()");
+    f("* | join by (x) (foo) | count()");
+    f("* | json_array_len (x) as _time | count()");
+    f("* | last 10 (x) | count()");
+    f("* | len(x) as _time | count()");
+    f("* | limit 10 | count()");
+    f("* | offset 10 | count()");
+    f("* | pack_json as _time | count()");
+    f("* | pack_logfmt as _time | count()");
+    f("* | query_stats | count()");
+    f("* | sample 10 | count()");
+    f("* | sort by (x) | count()");
+    f("* | stream_context before 10 after 20 | count()");
+    f("* | top 5 by (x) | count()");
+    f("* | union (x) | count()");
+    f("* | uniq (x) | count()");
+}
+
+/// Port of Go `TestQueryGetStatsLabels_Success`.
+#[test]
+fn test_query_get_stats_labels_success() {
+    #[track_caller]
+    fn f(q_str: &str, fields_expected: &[&str]) {
+        let mut q = ParseQuery(q_str).unwrap_or_else(|e| panic!("cannot parse [{q_str}]: {e}"));
+        let fields = q
+            .get_stats_labels()
+            .unwrap_or_else(|e| panic!("unexpected error in get_stats_labels({q_str:?}): {e}"));
+        let fields_expected: Vec<String> = fields_expected.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            fields, fields_expected,
+            "unexpected labelFields for [{q_str}]"
+        );
+    }
+
+    f("* | stats count()", &[]);
+    f("* | count()", &[]);
+    f("* | by (foo) count(), count_uniq(bar)", &["foo"]);
+    f(
+        "* | stats by (a, b, cd) min(foo), max(bar)",
+        &["a", "b", "cd"],
+    );
+
+    // multiple pipes before stats is ok
+    f(
+        r#"foo | extract "ip=<ip>," | stats by (host) count_uniq(ip)"#,
+        &["host"],
+    );
+    f("foo | decolorize | count()", &[]);
+
+    // sort, offset and limit pipes are allowed after stats
+    f(
+        "foo | stats by (x, y) count() rows | sort by (rows) desc | offset 5 | limit 10",
+        &["x", "y"],
+    );
+
+    // filter pipe is allowed after stats
+    f(
+        "foo | stats by (x, y) count() rows | filter rows:>100",
+        &["x", "y"],
+    );
+
+    // PORT NOTE: the Go "math pipe is allowed after stats" / "derive math
+    // results" cases are omitted — the `math` pipe parse grammar is deferred
+    // (see parser/parse_pipe.rs).
+
+    // keep containing all the by(...) fields
+    f(
+        "foo | stats by (x) count() total | keep x, y, total",
+        &["x"],
+    );
+    f(
+        "foo | stats by (x) count() total | keep x*, y, total",
+        &["x"],
+    );
+
+    // keep drops some metrics, but leaves others
+    f(
+        "foo | stats by (x) count() y, count_uniq(a) z | keep x, z, abc",
+        &["x"],
+    );
+    f(
+        "foo | stats by (x) count() y, count_uniq(a) z | keep x*, z, abc",
+        &["x"],
+    );
+
+    // drop which doesn't contain by(...) fields
+    f("foo | stats by (x) count() total | drop y", &["x"]);
+    f("foo | stats by (x) count() total | drop y*", &["x"]);
+    f(
+        "foo | stats by (x) count() total, count_uniq(a) z | drop z",
+        &["x"],
+    );
+    f(
+        "foo | stats by (x) count() total, count_uniq(a) z | drop z*",
+        &["x"],
+    );
+
+    // copy which doesn't contain by(...) fields
+    f("foo | stats by (x) count() total | copy total abc", &["x"]);
+    f(
+        "foo | stats by (x) count() total | copy total* abc*",
+        &["x"],
+    );
+
+    // copy by(...) fields
+    f(
+        "foo | stats by (x) count() | copy x y, y z",
+        &["x", "y", "z"],
+    );
+    f(
+        "foo | stats by (x) count() | copy x* y*, y* z*",
+        &["x", "y", "z"],
+    );
+
+    // copy metrics
+    f("foo | stats by (x) count() y | copy y z | drop y", &["x"]);
+    f(
+        "foo | stats by (x) count() y | copy y* z* | drop y*",
+        &["x"],
+    );
+
+    // mv by(...) fields
+    f("foo | stats by (x) count() total | mv x y", &["y"]);
+    f("foo | stats by (x) count() total | mv x* y*", &["y"]);
+
+    // mv metrics
+    f("foo | stats by (x) count() y | mv y z", &["x"]);
+    f("foo | stats by (x) count() y | mv y* z*", &["x"]);
+    f("foo | stats by (x) count() y | mv y z | rm y", &["x"]);
+    f("foo | stats by (x) count() y | mv y* z* | rm y*", &["x"]);
+
+    // format result is treated as by(...) field
+    f(r#"foo | count() | format "foo<bar>baz" as x"#, &["x"]);
+    f(
+        r#"foo | by (x) count() | format "foo<bar>baz" as y"#,
+        &["x", "y"],
+    );
+
+    // check first and last pipes
+    f("foo | stats by (x) count() y | first by (y)", &["x"]);
+    f("foo | stats by (x) count() y | last by (y)", &["x"]);
+
+    // unusual cases, which override the original labels
+
+    f("foo | by (a, b) count() | copy a b", &["a", "b"]);
+    f("foo | by (a, b) count() | copy a* b*", &["a", "b"]);
+    f("foo | by (x) count() | cp a x", &["x"]);
+    f("foo | by (x) count() | cp a* x*", &["x"]);
+
+    f("foo | by (x) count() | mv a x", &["x"]);
+    f("foo | by (x) count() | mv a* x*", &["x"]);
+    f("foo | by (a, x) count() | mv a x", &["x"]);
+    f("foo | by (a, x) count() | mv a* x*", &["x"]);
+
+    f("foo | by (a, b) count() | delete a", &["b"]);
+    f("foo | by (a, b) count() | delete a*", &["b"]);
+
+    // PORT NOTE: `foo | by (x) count() y | math y*100 as x` omitted (math
+    // parse grammar deferred).
+
+    f("* | by (x) count() | format 'foo' as x", &["x"]);
+}
+
+/// Port of Go `TestQueryGetStatsLabels_Failure`.
+#[test]
+fn test_query_get_stats_labels_failure() {
+    #[track_caller]
+    fn f(q_str: &str) {
+        let mut q = ParseQuery(q_str).unwrap_or_else(|e| panic!("cannot parse [{q_str}]: {e}"));
+        let res = q.get_stats_labels();
+        assert!(res.is_err(), "expecting non-nil error for [{q_str}]");
+    }
+
+    f("*");
+    f("foo bar");
+    f("foo | by (a, b) count() | decolorize a");
+    f("foo | count() | drop_empty_fields");
+    f(r#"foo | count() | extract "foo<bar>baz""#);
+    f(r#"foo | count() | extract_regexp "(?P<ip>([0-9]+[.]){3}[0-9]+)""#);
+    f("foo | count() | block_stats");
+    f("foo | count() | blocks_count");
+    f("foo | count() | generate_sequence 123");
+    f("foo | count() | coalesce (x, y)");
+    f("foo | count() | collapse_nums");
+    f("foo | count() | facets");
+    f("foo | count() | field_names");
+    f("foo | count() | field_values abc");
+    f("foo | by (x) count() | fields a, b");
+    f("foo | by (x) count() | fields a*, b");
+    f("foo | by (x) count() hits | total_stats by (y) sum(hits) total");
+    f("foo | count() | pack_json");
+    f("foo | count() | pack_logfmt");
+    f("foo | count() | query_stats");
+    f("foo | rename x y");
+    f(r#"foo | count() | replace ("foo", "bar")"#);
+    f(r#"foo | count() | replace_regexp ("foo.+bar", "baz")"#);
+    f("foo | count() | split ' '");
+    f("foo | count() | stream_context after 10");
+    f("foo | count() | top 5 by (x)");
+    f("foo | count() | union (foo)");
+    f("foo | count() | uniq by (x)");
+    f("foo | count() | unpack_json");
+    f("foo | count() | unpack_logfmt");
+    f("foo | count() | unpack_syslog");
+    f("foo | count() | unpack_words x");
+    f("foo | count() | unroll by (x)");
+    f("foo | count() | join by (x) (y)");
+    f("foo | count() | json_array_len(a)");
+    f("foo | count() | len(a)");
+    f("foo | count() | hash(a)");
+
+    // missing metric fields
+    f("* | count() x | fields y");
+    f("* | count() x | fields y*");
+    f("* | by (x) count() y | fields x");
+    f("* | by (x) count() y | fields x*");
+
+    // copy to the remaining metric field
+    f("* | by (x) count() y | cp a y");
+    f("* | by (x) count() y | cp a* y*");
+
+    // mv to the remaining metric fields
+    f("* | by (x) count() y | mv x y");
+    f("* | by (x) count() y | mv x* y*");
+
+    // format to the remaining metric field
+    f("* | by (x) count() y | format 'foo' as y");
+}
+
+/// Port of Go `TestQuery_AddExtraFilters`.
+///
+/// PORT NOTE: Go's optimizeNoSubqueries() moves stream filters in front of the
+/// other filters; that rewrite is deferred (see parser/mod.rs), so the
+/// mixed-filter expectations keep the extra filters in insertion order.
+/// The "extra filters must be unconditionally propagated into subqueries"
+/// cases are omitted — subquery propagation (`visitSubqueries`) is deferred.
+#[test]
+fn test_query_add_extra_filters() {
+    #[track_caller]
+    fn f(q_str: &str, extra_filters: &str, result_expected: &str) {
+        let mut q = ParseQuery(q_str).unwrap_or_else(|e| panic!("cannot parse [{q_str}]: {e}"));
+        if !extra_filters.is_empty() {
+            let efs = crate::parser::ParseFilter(extra_filters)
+                .unwrap_or_else(|e| panic!("unexpected error in ParseFilter: {e}"));
+            q.add_extra_filters(efs);
+        }
+
+        assert_eq!(
+            q.to_string(),
+            result_expected,
+            "unexpected result for [{q_str}]"
+        );
+    }
+
+    f("*", "", "*");
+    f("_time:5m", "", "_time:5m");
+    f("foo _time:5m", "", "foo _time:5m");
+    f("*", "foo:=bar", "foo:=bar");
+    f(
+        "_time:5m",
+        r#""fo o":="=ba:r !""#,
+        r#""fo o":="=ba:r !" _time:5m"#,
+    );
+    // PORT NOTE: Go expects `{a="b"} "fo o":="=ba:r !" x:=y _time:5m` (stream
+    // filters moved to the front by the deferred optimize pass).
+    f(
+        "_time:5m {a=b}",
+        r#""fo o":="=ba:r !" and x:=y"#,
+        r#""fo o":="=ba:r !" x:=y _time:5m {a="b"}"#,
+    );
+    // PORT NOTE: the Go case f(`a or (b c)`, `foo:=bar`, `foo:=bar (a or b c)`)
+    // is omitted — the Rust `FilterAnd` Display does not yet parenthesize
+    // `filterOr` children (deferred with the optimize pass; see
+    // filter_and.rs PORT NOTE), so the round-trip string differs.
+
+    // extra stream filters
+    f("*", r#"{foo="bar",baz!="x"}"#, r#"{foo="bar",baz!="x"}"#);
+
+    // mixed filters
+    f(
+        "c",
+        r#"{foo="bar",baz!="x"} a:~b"#,
+        r#"{foo="bar",baz!="x"} a:~b c"#,
+    );
+}
+
+/// Port of Go `TestQuery_AddCountByTimePipe`.
+#[test]
+fn test_query_add_count_by_time_pipe() {
+    #[track_caller]
+    fn f(q_str: &str, step: i64, offset: i64, fields: &[&str], result_expected: &str) {
+        let mut q = ParseQuery(q_str)
+            .unwrap_or_else(|e| panic!("unexpected error when parsing [{q_str}]: {e}"));
+        let fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+        q.add_count_by_time_pipe(step, offset, &fields);
+
+        assert_eq!(
+            q.to_string(),
+            result_expected,
+            "unexpected result for [{q_str}]"
+        );
+    }
+
+    // simple filter
+    f(
+        "*",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "* | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+    f(
+        "*",
+        NSECS_PER_MINUTE,
+        2 * NSECS_PER_HOUR,
+        &[],
+        "* | stats by (_time:1m offset 2h) count(*) as hits | sort by (_time)",
+    );
+    f(
+        "foo bar:baz",
+        NSECS_PER_MINUTE,
+        -2 * NSECS_PER_HOUR,
+        &[],
+        "foo bar:baz | stats by (_time:1m offset -2h) count(*) as hits | sort by (_time)",
+    );
+
+    // Avoid name collision for field=hits.
+    // See https://github.com/VictoriaMetrics/VictoriaLogs/issues/1278
+    f(
+        "*",
+        NSECS_PER_MINUTE,
+        0,
+        &["hits"],
+        "* | stats by (_time:1m, hits) count(*) as hitss | sort by (_time, hits)",
+    );
+
+    // pipes, which do not change _time field
+    f(
+        "* | extract 'abc<de>fg' | filter de:='qwer'",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        r#"* | extract "abc<de>fg" | filter de:=qwer | stats by (_time:1m) count(*) as hits | sort by (_time)"#,
+    );
+
+    // union pipe is allowed. See https://github.com/VictoriaMetrics/VictoriaLogs/issues/641
+    f(
+        "foo | union (bar)",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "foo | union (bar) | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+    f(
+        "foo | union (bar) | stats count()",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "foo | union (bar) | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+    f(
+        "foo | union (bar | stats count())",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "foo | union (bar) | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+
+    // union rows(...) isn't allowed.
+    f(
+        "foo | union rows()",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "foo | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+    f(
+        "foo | union rows({})",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "foo | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+    f(
+        "foo | union rows({_time=foo,x=bar})",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "foo | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+
+    // join pipe is allowed
+    f(
+        "foo | join by (x) (y)",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "foo | join by (x) (y) | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+
+    // join rows(...) is allowed
+    f(
+        "foo | join by (x) rows()",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "foo | join by (x) rows() | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+    f(
+        "foo | join by (x) rows({})",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "foo | join by (x) rows({}) | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+    f(
+        "foo | join by (x) rows({x=y})",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        r#"foo | join by (x) rows({"x":"y"}) | stats by (_time:1m) count(*) as hits | sort by (_time)"#,
+    );
+
+    // pipes, which change _time field
+    f(
+        "* | extract 'abc<de>fg' | filter de:='qwer' | stats count()",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        r#"* | extract "abc<de>fg" | filter de:=qwer | stats by (_time:1m) count(*) as hits | sort by (_time)"#,
+    );
+    f(
+        "* | extract 'abc<de>fg' | sort by (x)",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        r#"* | extract "abc<de>fg" | stats by (_time:1m) count(*) as hits | sort by (_time)"#,
+    );
+    f(
+        "* | extract 'abc<de>fg' | sort by (_time)",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        r#"* | extract "abc<de>fg" | stats by (_time:1m) count(*) as hits | sort by (_time)"#,
+    );
+    f(
+        "* | count()",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "* | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+    f(
+        "* | uniq (x)",
+        NSECS_PER_MINUTE,
+        0,
+        &[],
+        "* | stats by (_time:1m) count(*) as hits | sort by (_time)",
+    );
+}
+
+/// Port of Go `TestQueryGetFixedFields_Success`.
+#[test]
+fn test_query_get_fixed_fields_success() {
+    #[track_caller]
+    fn f(q_str: &str, result_expected: &[&str]) {
+        let q = ParseQuery(q_str).unwrap_or_else(|e| panic!("unexpected error: {e}"));
+
+        let result = q
+            .get_fixed_fields()
+            .unwrap_or_else(|| panic!("unexpected error in get_fixed_fields() for [{q_str}]"));
+        let result_expected: Vec<String> = result_expected.iter().map(|s| s.to_string()).collect();
+        assert_eq!(result, result_expected, "unexpected result for [{q_str}]");
+    }
+
+    f("* | fields foo", &["foo"]);
+    f("* | fields a, b, cd", &["a", "b", "cd"]);
+    f(
+        "* | fields a, b, cd | sort by (x, a)",
+        &["x", "a", "b", "cd"],
+    );
+
+    f("* | count(), sum(x) as y", &["count(*)", "y"]);
+    f(
+        "* | stats by (a, b) count(), sum(x) as y",
+        &["a", "b", "count(*)", "y"],
+    );
+    f(
+        "* | stats by (a, b) count(), sum(x) as y | sort by (c desc)",
+        &["c", "a", "b", "count(*)", "y"],
+    );
+    f(
+        "* | stats by (a, b) count(), sum(x) as y | offset 5",
+        &["a", "b", "count(*)", "y"],
+    );
+    f(
+        "* | stats by (a, b) count(), sum(x) as y | limit 10",
+        &["a", "b", "count(*)", "y"],
+    );
+    f(
+        "* | stats by (a, b) count(), sum(x) as y | limit 10 | offset 5",
+        &["a", "b", "count(*)", "y"],
+    );
+
+    f("* | fields a, b | sort (a) | sort (c,b)", &["c", "b", "a"]);
+}
+
+/// Port of Go `TestQueryGetFixedFields_Failure`.
+#[test]
+fn test_query_get_fixed_fields_failure() {
+    #[track_caller]
+    fn f(q_str: &str) {
+        let q = ParseQuery(q_str).unwrap_or_else(|e| panic!("unexpected error: {e}"));
+
+        assert!(
+            q.get_fixed_fields().is_none(),
+            "expecting error for the query [{q_str}]"
+        );
+    }
+
+    // missing fields or stats pipes
+    f("*");
+    f("* | limit 10");
+    f("* | offset 10");
+    f("* | sort by (_time desc)");
+    f("* | block_stats");
+}
+
+/// Port of Go `TestQueryIsFixedOutputFieldsOrder`.
+#[test]
+fn test_query_is_fixed_output_fields_order() {
+    #[track_caller]
+    fn f(q_str: &str, result_expected: bool) {
+        let q = ParseQuery(q_str).unwrap_or_else(|e| panic!("unexpected error: {e}"));
+
+        let result = q.is_fixed_output_fields_order();
+        assert_eq!(result, result_expected, "unexpected result for [{q_str}]");
+    }
+
+    f("*", false);
+    f("* | sort by (_time)", false);
+    f("* | fields x | union (*)", false);
+    f("* | fields x | union (* | count())", true);
+    f("* | fields x | union rows({'a':'b','c':'d'})", true);
+    f("* | fields x | join by (a) (*)", false);
+    f("* | fields x | join by (a) (* | count())", true);
+    f("* | fields x | join by (a) rows({'a':'b','c':'d'})", true);
+
+    f("* | fields x, y", true);
+    f("* | fields x, y | sort by (a)", true);
+    f("* | fields x, y | limit 10", true);
+    f("* | count()", true);
+    f("* | stats by (x,y) sum(y), count() a", true);
+    f(
+        "* | stats by (x,y) sum(y), count() a | sort (z,y desc)",
+        true,
+    );
+    f("* | block_stats", true);
+    f("* | query_stats", true);
+    f("* | field_names", true);
+    f("* | field_values x", true);
+    f("* | top x", true);
+}

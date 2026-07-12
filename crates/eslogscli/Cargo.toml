@@ -1,0 +1,13 @@
+[package]
+name = "eslogscli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "eslogscli"
+path = "src/main.rs"
+
+[dependencies]
+esl-common = { path = "../esl-common" }
+esl-logstorage = { path = "../esl-logstorage" }

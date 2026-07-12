@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/esl-common",
+    "crates/esl-logstorage",
+    "crates/esl-insert",
+    "crates/esl-select",
+    "crates/esl-storage",
+    "crates/es-logs",
+    "crates/eslogscli",
+    "crates/eslogsgenerator",
+    "crates/esl-agent",
+]
+
+[workspace.package]
+# Follows the pinned upstream release (UPSTREAM.lock); updated by
+# `scripts/upstream_sync.py bump` and enforced by its `check`.
+version = "1.51.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.96"
+
+[workspace.dependencies]
+esl-common = { path = "crates/esl-common" }
+esl-logstorage = { path = "crates/esl-logstorage" }
+esl-insert = { path = "crates/esl-insert" }
+esl-select = { path = "crates/esl-select" }
+esl-storage = { path = "crates/esl-storage" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+# Release performance plus debug symbols, for perf/flamegraph work.
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = true
