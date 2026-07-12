@@ -2136,9 +2136,13 @@ mod tests {
             c.conn.send_close_notify();
             c.flush().unwrap();
             let _ = c.sock.shutdown(Shutdown::Write);
+            // Keep the client socket alive until the rows are ingested:
+            // dropping it here would close the fd, and on Windows the
+            // resulting RST discards data still queued in the server's
+            // receive buffer (Linux delivers queued data before the reset),
+            // making the worker lose the not-yet-read frames.
+            wait_for_rows(&s, 2);
         }
-
-        wait_for_rows(&s, 2);
 
         stop.stop();
         // The shutdown wakeup arrives as plain TCP; the deferred handshake
