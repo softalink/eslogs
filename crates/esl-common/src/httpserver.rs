@@ -177,10 +177,10 @@ static TLS_MIN_VERSION: Flag<ArrayString> = Flag::new(
 #[derive(Clone)]
 struct TlsConn {
     tls: Arc<Mutex<TlsServerStream>>,
-    /// Raw-socket dup used for socket options (read timeouts apply to the
-    /// shared underlying socket) and for disconnect probes. Byte-level reads
-    /// on it would observe encrypted TLS records; it is only ever used for
-    /// sockopts and EOF/error probes.
+    /// Raw-socket dup used only for disconnect probes (non-blocking peek/read
+    /// of the raw byte stream). Byte-level reads on it would observe encrypted
+    /// TLS records; it is only ever used for EOF/error probes. Socket options
+    /// must NOT be set through it — see [`ConnReader::set_read_timeout`].
     sock: Arc<TcpStream>,
 }
 
@@ -193,13 +193,20 @@ enum ConnReader {
 }
 
 impl ConnReader {
-    /// Applies a read timeout to the underlying socket. For TLS this goes to
-    /// the raw-socket dup; `SO_RCVTIMEO` lives on the shared socket, so the
-    /// session's blocking reads observe it.
+    /// Applies a read timeout to the exact socket handle reads run on.
+    ///
+    /// PORT NOTE (Windows): for TLS the timeout must be set on the session's
+    /// own handle (`StreamOwned.sock`), not the raw-socket dup. On unix the
+    /// two `try_clone` handles share `SO_RCVTIMEO` via the file description,
+    /// but on Windows duplicated socket handles do not share it — a timeout
+    /// set on the dup never fires for reads on the original, which left the
+    /// session stuck on the 10s handshake timeout and stalled graceful
+    /// shutdown (stop-flag polls woke every 10s instead of every IDLE_POLL).
+    /// The mutex lock is uncontended (worker-thread only), same as `read`.
     fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match self {
             ConnReader::Plain(s) => s.set_read_timeout(dur),
-            ConnReader::Tls(c) => c.sock.set_read_timeout(dur),
+            ConnReader::Tls(c) => c.tls.lock().unwrap().sock.set_read_timeout(dur),
         }
     }
 }
