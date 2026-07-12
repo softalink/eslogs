@@ -41,3 +41,8 @@ vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/vmalertproxy/*
 # ingest write concurrency limiter: dropped by the port (see vl-insert
 # PORT NOTEs; ingestion is bounded by the worker pool instead)
 vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter/*
+
+# -- vmui frontend dev server: a tiny Go static-file server used only when
+#    developing the web UI locally. The product embeds the prebuilt vmui
+#    assets (esl-select/assets/esmui); there is nothing to port.
+app/vmui/packages/vmui/web/main.go
