@@ -16,6 +16,19 @@ memmap2 = "0.9"
 #   snap is pure Rust for snappy block decoding.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 snap = "1"
+# TLS stack (tlsutil): rustls with the `ring` crypto provider so the workspace
+# cross-compiles to x86_64-pc-windows-msvc from Linux via clang-cl (no
+# cmake/NASM, unlike aws-lc-rs). webpki-roots supplies default trust anchors
+# (Go uses the system cert pool; see PORT NOTE in tlsutil.rs);
+# rustls-pemfile parses PEM cert/key files.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+webpki-roots = "1"
+
+[dev-dependencies]
+# Self-signed certificate generation for tlsutil tests (dev-only; does not
+# affect the cross-compile target closure).
+rcgen = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

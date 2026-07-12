@@ -106,9 +106,14 @@ tests, ported alongside the code — pass across the workspace.
   the embedded esmui web UI, the `eslagent` log shipper (file tailing, k8s
   collector, remote write with a persistent disk queue — wire-compatible with
   Go), and the `eslogscli`/`eslogsgenerator` tools.
-- Out of scope / PORT-NOTEd: TLS (flags parse but fail with clear errors),
-  cluster-mode query fan-out (netinsert/netselect are ported; the query
-  splitter is single-node-stubbed), the Prometheus metrics registry.
+- TLS is supported end to end (rustls with the `ring` provider — keeps the
+  MSVC cross-build clean): https for `-storageNode.tls*`, `-remoteWrite.tls*`,
+  the Kubernetes collector and `eslogscli -tls*`, plus `-syslog.tls*` server
+  TLS. Exception: the HTTP server's `-tls*` serving flags are not ported
+  (PORT NOTE in httpserver); terminate TLS in front if needed.
+- Out of scope / PORT-NOTEd: cluster-mode query fan-out (netinsert/netselect
+  are ported; the query splitter is single-node-stubbed), the Prometheus
+  metrics registry.
 
 ### Quick start
 
@@ -314,7 +319,7 @@ upstream tests green, benchmark goal met on Linux and Windows.
    LogsQL parser and ingest paths, wider corpus/benchmark matrix (high-cardinality
    streams, multi-day retention, concurrent query load).
 2. Feature completion: remaining select endpoints (`hits`, `field_names`,
-   `field_values`), OTLP/journald/DataDog ingestion, TLS/auth, byte-compatible
+   `field_values`), OTLP/journald/DataDog ingestion, auth, byte-compatible
    `indexdb` (mergeset port) so existing Go data directories open in place.
 3. Upstream tracking beyond v1.51.0 and an upstreamable benchmark suite.
 

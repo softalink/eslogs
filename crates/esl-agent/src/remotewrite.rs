@@ -14,8 +14,9 @@
 //! `httputil.NewTransport`) is replaced by `esl_storage::http_client` (the
 //! house std-TCP client; one connection per request, no keep-alive). As a
 //! result:
-//!   * `https` remote write URLs and the `-remoteWrite.tls*` flags are not
-//!     supported — init fails with a clear error when they are used;
+//!   * `https` remote write URLs are supported through the rustls-based
+//!     client in `esl_common::tlsutil`, configured per URL from the
+//!     `-remoteWrite.tls*` flags;
 //!   * `-remoteWrite.proxyURL` and the `-remoteWrite.oauth2.*` flags are not
 //!     supported — init fails with a clear error when they are set;
 //!   * Go's one-shot retry on `io.EOF` (stale keep-alive connection) is
@@ -40,6 +41,7 @@ use esl_common::flagutil::{
 };
 use esl_common::fs as vlfs;
 use esl_common::timeutil::{BackoffTimer, add_jitter_to_duration};
+use esl_common::tlsutil::TLSConfig;
 use esl_common::{
     cgroup, errorf, fasttime, fatalf, flagutil, infof, logger, memory, panicf, warnf,
 };
@@ -144,8 +146,11 @@ static PROXY_URL: Flag<ArrayString> = Flag::new(
     ArrayString::default,
 );
 
-// PORT NOTE: -remoteWrite.tlsHandshakeTimeout is not ported: it only matters
-// for the (unsupported) TLS transport.
+// PORT NOTE: -remoteWrite.tlsHandshakeTimeout is not ported as a SEPARATE
+// timeout: Go sets it on the shared keep-alive transport (default 20s), while
+// the house client opens one connection per request, so
+// -remoteWrite.sendTimeout bounds the whole attempt
+// (TCP connect + TLS handshake + request/response).
 
 static TLS_INSECURE_SKIP_VERIFY: Flag<ArrayBool> = Flag::new(
     "remoteWrite.tlsInsecureSkipVerify",
@@ -220,7 +225,7 @@ static BEARER_TOKEN_FILE: Flag<ArrayString> = Flag::new(
 );
 
 // PORT NOTE: the -remoteWrite.oauth2.* flags are registered for CLI
-// compatibility, but OAuth2 is not supported by this port (no TLS/token
+// compatibility, but OAuth2 is not supported by this port (no OAuth2 token
 // endpoint client); init fails with a clear error when they are set.
 static OAUTH2_CLIENT_ID: Flag<ArrayString> = Flag::new(
     "remoteWrite.oauth2.clientID",
@@ -522,13 +527,7 @@ fn new_remote_write_ctx(
     ));
 
     match remote_write_url.scheme.as_str() {
-        "http" => {}
-        // PORT NOTE: Go supports https; the std-TCP house client has no TLS.
-        "https" => {
-            fatalf!(
-                "https -remoteWrite.url is not supported by this port (no TLS client): {sanitized_url}"
-            );
-        }
+        "http" | "https" => {}
         scheme => {
             fatalf!(
                 "unsupported scheme: {scheme} for remoteWriteURL: {sanitized_url}, want `http`, `https`"
@@ -623,10 +622,13 @@ impl RemoteUrl {
         })
     }
 
-    /// The TCP address to dial (`host:port`, default port filled in).
+    /// The TCP address to dial (`host:port`, default port filled in from the
+    /// scheme like Go's net/http: 443 for https, 80 otherwise).
     fn addr(&self) -> String {
         if self.host.contains(':') {
             self.host.clone()
+        } else if self.scheme == "https" {
+            format!("{}:443", self.host)
         } else {
             format!("{}:80", self.host)
         }
@@ -694,7 +696,8 @@ fn new_http_client(
     sanitized_url: &str,
     fq: Arc<FastQueue>,
 ) -> Arc<Client> {
-    let (auth_cfg, headers) = match get_auth_config(arg_idx) {
+    let is_tls = remote_write_url.scheme == "https";
+    let (auth_cfg, headers) = match get_auth_config(arg_idx, is_tls) {
         Ok(v) => v,
         Err(err) => {
             fatalf!(
@@ -810,6 +813,7 @@ impl Client {
         headers.extend(self.headers.iter().cloned());
         do_request_with_timeout(
             &self.remote_write_url.addr(),
+            self.auth_cfg.tls(),
             "POST",
             &self.remote_write_url.path_and_query(),
             &headers,
@@ -902,7 +906,18 @@ fn log_block_rejected(block: &[u8], sanitized_url: &str, resp: &HttpResponse) {
 /// Builds the promauth-equivalent config for the given -remoteWrite.url index.
 ///
 /// Returns the auth config plus the parsed -remoteWrite.headers entries.
-fn get_auth_config(arg_idx: usize) -> Result<(AuthConfig, Vec<(String, String)>), String> {
+///
+/// PORT NOTE: Go's getAuthConfig always builds a `promauth.TLSConfig` from the
+/// `-remoteWrite.tls*` flags and lets the `net/http` transport apply it to
+/// https connections only; the port takes the scheme decision as `is_tls` and
+/// materializes `Options.tls_config` only for https URLs (see
+/// `esl_storage::http_client::Options`). The rustls client config is then
+/// built eagerly by `Options::new_config`, so broken TLS files fail at init
+/// instead of on the first request (Go loads them lazily at dial time).
+fn get_auth_config(
+    arg_idx: usize,
+    is_tls: bool,
+) -> Result<(AuthConfig, Vec<(String, String)>), String> {
     let headers_value = HEADERS.get().get_optional_arg(arg_idx);
     let mut hdrs = Vec::new();
     if !headers_value.is_empty() {
@@ -934,7 +949,7 @@ fn get_auth_config(arg_idx: usize) -> Result<(AuthConfig, Vec<(String, String)>)
     let token_file = BEARER_TOKEN_FILE.get().get_optional_arg(arg_idx);
 
     // PORT NOTE: OAuth2 is not supported by this port; fail clearly like the
-    // TLS/proxy cases instead of silently ignoring credentials.
+    // proxy case instead of silently ignoring credentials.
     let client_secret = OAUTH2_CLIENT_SECRET.get().get_optional_arg(arg_idx);
     let client_secret_file = OAUTH2_CLIENT_SECRET_FILE.get().get_optional_arg(arg_idx);
     let client_id = OAUTH2_CLIENT_ID.get().get_optional_arg(arg_idx);
@@ -942,22 +957,24 @@ fn get_auth_config(arg_idx: usize) -> Result<(AuthConfig, Vec<(String, String)>)
         return Err("-remoteWrite.oauth2.* flags are not supported by this port".to_string());
     }
 
-    // PORT NOTE: TLS is not supported by this port (no TLS client); reject
-    // the TLS flags instead of silently ignoring them.
-    if !TLS_CERT_FILE.get().get_optional_arg(arg_idx).is_empty()
-        || !TLS_KEY_FILE.get().get_optional_arg(arg_idx).is_empty()
-        || !TLS_CA_FILE.get().get_optional_arg(arg_idx).is_empty()
-        || !TLS_SERVER_NAME.get().get_optional_arg(arg_idx).is_empty()
-        || TLS_INSECURE_SKIP_VERIFY.get().get_optional_arg(arg_idx)
-    {
-        return Err("-remoteWrite.tls* flags are not supported by this port".to_string());
-    }
+    let tls_config = if is_tls {
+        Some(TLSConfig {
+            ca_file: TLS_CA_FILE.get().get_optional_arg(arg_idx).to_string(),
+            cert_file: TLS_CERT_FILE.get().get_optional_arg(arg_idx).to_string(),
+            key_file: TLS_KEY_FILE.get().get_optional_arg(arg_idx).to_string(),
+            server_name: TLS_SERVER_NAME.get().get_optional_arg(arg_idx).to_string(),
+            insecure_skip_verify: TLS_INSECURE_SKIP_VERIFY.get().get_optional_arg(arg_idx),
+            ..Default::default()
+        })
+    } else {
+        None
+    };
 
     let opts = Options {
         basic_auth,
         bearer_token: token.to_string(),
         bearer_token_file: token_file.to_string(),
-        needs_tls: false,
+        tls_config,
     };
     let auth_cfg = opts.new_config().map_err(|err| {
         format!("cannot populate auth config for remoteWrite idx: {arg_idx}, err: {err}")
@@ -1404,8 +1421,150 @@ mod tests {
         let u = RemoteUrl::parse("https://host:8443").unwrap();
         assert_eq!(u.scheme, "https");
         assert_eq!(u.path, "/");
+        assert_eq!(u.addr(), "host:8443");
+
+        // Default port comes from the scheme, like Go's net/http.
+        let u = RemoteUrl::parse("https://host/insert/native").unwrap();
+        assert_eq!(u.addr(), "host:443");
 
         assert!(RemoteUrl::parse("localhost:9428").is_err());
         assert!(RemoteUrl::parse("http://").is_err());
+    }
+
+    // PORT NOTE: port-only coverage. Go always builds the TLS options and the
+    // transport decides http-vs-https; the port materializes the TLS client
+    // config only for https URLs (see get_auth_config). The -remoteWrite.tls*
+    // flags are unset here, so the https config is the default one.
+    #[test]
+    fn test_get_auth_config_tls_gating() {
+        let (ac, _) = get_auth_config(0, false).unwrap();
+        assert!(ac.tls().is_none(), "http URL must not carry a TLS config");
+        let (ac, _) = get_auth_config(0, true).unwrap();
+        assert!(ac.tls().is_some(), "https URL must carry a TLS config");
+    }
+
+    /// Spawns a one-shot TLS HTTP server which reads a single full request
+    /// (headers plus Content-Length body), answers `204 No Content` and
+    /// returns the captured raw request bytes.
+    fn spawn_tls_remote_write_server()
+    -> (String, std::path::PathBuf, std::thread::JoinHandle<Vec<u8>>) {
+        let ck = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("esl-agent-remotewrite-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("cert.pem");
+        std::fs::write(&cert_path, ck.cert.pem()).unwrap();
+        let key_path = dir.join("key.pem");
+        std::fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
+        let server_cfg = esl_common::tlsutil::get_server_tls_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            "",
+            &[],
+        )
+        .unwrap();
+
+        let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = ln.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (tcp, _) = ln.accept().unwrap();
+            let mut stream = esl_common::tlsutil::server_accept(&server_cfg, tcp).unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "request truncated");
+                req.extend_from_slice(&buf[..n]);
+                if let Some(header_end) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&req[..header_end]);
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: "))
+                        .map(|v| v.trim().parse().unwrap())
+                        .unwrap_or(0);
+                    if req.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            stream.conn.send_close_notify();
+            // flush() must come after send_close_notify() and before the
+            // socket is dropped, or the peer's reads fail with Broken pipe.
+            let _ = stream.flush();
+            req
+        });
+        (addr, cert_path, handle)
+    }
+
+    // End-to-end https round trip: the client sends a block over TLS to an
+    // in-test rustls server and the raw body must arrive intact.
+    #[test]
+    fn test_https_remote_write_round_trip() {
+        let (addr, cert_path, handle) = spawn_tls_remote_write_server();
+        let remote_write_url =
+            RemoteUrl::parse(&format!("https://{addr}/insert/native?version=v1")).unwrap();
+
+        // Same Options shape that get_auth_config builds for an https URL
+        // with -remoteWrite.tlsCAFile pointing at the server certificate.
+        let opts = Options {
+            tls_config: Some(TLSConfig {
+                ca_file: cert_path.to_str().unwrap().to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let auth_cfg = opts.new_config().unwrap();
+
+        let fq_dir =
+            std::env::temp_dir().join(format!("esl-agent-remotewrite-fq-{}", std::process::id()));
+        let fq = Arc::new(FastQueue::must_open_fast_queue(
+            &fq_dir, "test", 2, 0, false,
+        ));
+
+        let c = Client {
+            sanitized_url: "1:secret-url".to_string(),
+            remote_write_url,
+            fq: Arc::clone(&fq),
+            send_timeout: Duration::from_secs(10),
+            retry_min_interval: 100_000_000,
+            retry_max_time: 1_000_000_000,
+            auth_cfg,
+            headers: vec![("My-Auth".to_string(), "foobar".to_string())],
+            rl: Mutex::new(None),
+            stop_senders: Mutex::new(Vec::new()),
+            workers: Mutex::new(Vec::new()),
+        };
+
+        let (_stop_tx, stop_rx) = sync_channel::<()>(0);
+        let block = b"remote-write-block-payload";
+        assert!(
+            c.send_block_http(block, &stop_rx, None),
+            "block must be sent successfully"
+        );
+
+        let req = handle.join().unwrap();
+        let header_end = req.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&req[..header_end]);
+        assert!(
+            head.starts_with("POST /insert/native?version=v1 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("User-Agent: eslagent\r\n"), "{head}");
+        assert!(head.contains("Content-Encoding: zstd\r\n"), "{head}");
+        assert!(head.contains("My-Auth: foobar\r\n"), "{head}");
+        assert_eq!(&req[header_end + 4..], block, "body must arrive intact");
+
+        fq.must_close();
+        std::fs::remove_dir_all(&fq_dir).ok();
     }
 }

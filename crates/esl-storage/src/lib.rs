@@ -244,11 +244,6 @@ static STORAGE_NODE_BEARER_TOKEN_FILE: Flag<ArrayString> = Flag::new(
     ArrayString::default,
 );
 
-// PORT NOTE: the -storageNode.tls* flags are declared for CLI parity, but TLS
-// connections are not supported by the ported std-TCP transport (see
-// `http_client`); setting -storageNode.tls fails at init. The tlsCAFile /
-// tlsCertFile / tlsKeyFile / tlsServerName / tlsInsecureSkipVerify values are
-// accepted and ignored.
 static STORAGE_NODE_TLS: Flag<ArrayBool> = Flag::new(
     "storageNode.tls",
     "Whether to use TLS (HTTPS) protocol for communicating with the corresponding -storageNode. \
@@ -457,15 +452,36 @@ fn new_auth_config_for_storage_node(arg_idx: usize) -> http_client::AuthConfig {
         None
     };
 
-    // Touch the accepted-but-unsupported TLS detail flags so their values are
-    // parsed/validated like in Go (see the flag-declaration PORT NOTE).
-    let _ = STORAGE_NODE_TLS_CA_FILE.get().get_optional_arg(arg_idx);
-    let _ = STORAGE_NODE_TLS_CERT_FILE.get().get_optional_arg(arg_idx);
-    let _ = STORAGE_NODE_TLS_KEY_FILE.get().get_optional_arg(arg_idx);
-    let _ = STORAGE_NODE_TLS_SERVER_NAME.get().get_optional_arg(arg_idx);
-    let _ = STORAGE_NODE_TLS_INSECURE_SKIP_VERIFY
-        .get()
-        .get_optional_arg(arg_idx);
+    // PORT NOTE: Go always fills promauth.TLSConfig and passes the
+    // -storageNode.tls toggle separately to newStorageNode; the port only
+    // materializes the TLS config when the toggle is set (it is unused
+    // otherwise) — see `http_client::Options`.
+    let tls_config = if STORAGE_NODE_TLS.get().get_optional_arg(arg_idx) {
+        Some(esl_common::tlsutil::TLSConfig {
+            ca_file: STORAGE_NODE_TLS_CA_FILE
+                .get()
+                .get_optional_arg(arg_idx)
+                .to_string(),
+            cert_file: STORAGE_NODE_TLS_CERT_FILE
+                .get()
+                .get_optional_arg(arg_idx)
+                .to_string(),
+            key_file: STORAGE_NODE_TLS_KEY_FILE
+                .get()
+                .get_optional_arg(arg_idx)
+                .to_string(),
+            server_name: STORAGE_NODE_TLS_SERVER_NAME
+                .get()
+                .get_optional_arg(arg_idx)
+                .to_string(),
+            insecure_skip_verify: STORAGE_NODE_TLS_INSECURE_SKIP_VERIFY
+                .get()
+                .get_optional_arg(arg_idx),
+            ..Default::default()
+        })
+    } else {
+        None
+    };
 
     let opts = http_client::Options {
         basic_auth,
@@ -477,7 +493,7 @@ fn new_auth_config_for_storage_node(arg_idx: usize) -> http_client::AuthConfig {
             .get()
             .get_optional_arg(arg_idx)
             .to_string(),
-        needs_tls: STORAGE_NODE_TLS.get().get_optional_arg(arg_idx),
+        tls_config,
     };
     match opts.new_config() {
         Ok(ac) => ac,
@@ -1158,7 +1174,7 @@ mod tests {
         let handle = esl_common::httpserver::serve("127.0.0.1:0", handler)
             .expect("cannot start test http server");
         let addr = handle.local_addr().to_string();
-        let resp = http_client::do_request(&addr, "GET", path_and_query, &[], None)
+        let resp = http_client::do_request(&addr, None, "GET", path_and_query, &[], None)
             .expect("request failed");
         handle.stop();
         (

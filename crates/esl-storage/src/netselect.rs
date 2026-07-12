@@ -122,8 +122,9 @@ pub struct Storage {
 }
 
 struct StorageNode {
-    /// PORT NOTE: always "http"; TLS is rejected at auth-config construction.
-    #[allow(dead_code)]
+    /// "http" or "https" (Go derives it from the `isTLS` argument, the port
+    /// from the presence of a TLS config on `ac`).
+    #[allow(dead_code, reason = "parity with Go; requests derive TLS from ac")]
     scheme: &'static str,
 
     /// addr is TCP address of the storage node to query.
@@ -154,7 +155,7 @@ pub fn new_storage(
         .iter()
         .zip(auth_cfgs)
         .map(|(addr, ac)| StorageNode {
-            scheme: "http",
+            scheme: if ac.tls().is_some() { "https" } else { "http" },
             addr: addr.clone(),
             ac,
             send_errors: AtomicU64::new(0),
@@ -481,6 +482,7 @@ impl StorageNode {
         // send the request to the storage node
         let resp: HttpResponse = match crate::http_client::do_request(
             &self.addr,
+            self.ac.tls(),
             "POST",
             path,
             &headers,

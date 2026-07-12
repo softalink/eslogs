@@ -20,3 +20,8 @@ esl-storage = { path = "../esl-storage" }
 # cespare/xxhash/v2 equivalent for the remotewrite persistent-queue path hash
 # (same crate/version esl-logstorage and esl-storage use).
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[dev-dependencies]
+# Self-signed certificate generation for the TLS tests
+# (dev-only; does not affect the cross-compile target closure).
+rcgen = "0.13"

@@ -14,3 +14,6 @@ esl-logstorage.workspace = true
 # cespare/xxhash/v2 equivalent for the netinsert stream-hash test (same crate
 # esl-logstorage uses for upstream-compatible hashes)
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+# Self-signed certificate generation for the http_client https tests
+# (dev-only; does not affect the cross-compile target closure).
+rcgen = "0.13"

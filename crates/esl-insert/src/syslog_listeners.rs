@@ -13,10 +13,14 @@
 //! [`must_init`] takes the storage handle (`insertutil.CanWriteData()` is
 //! dropped for the same reason — see `common_params.rs`).
 //!
-//! PORT NOTE: TLS (`-syslog.tls*`) is NOT ported — the workspace has no TLS
-//! crate and the upstream tests don't cover TLS. The flags are declared for
-//! CLI compatibility, but setting `-syslog.tls` for a listener is a fatal
-//! startup error. Plaintext TCP and UDP are fully supported.
+//! PORT NOTE: TLS (`-syslog.tls*`) is ported on top of
+//! `esl_common::tlsutil::get_server_tls_config` (the `netutil.GetServerTLSConfig`
+//! port). Go wraps the accepted conn with `tls.Server` inside
+//! `netutil.TCPListener.Accept`, so the handshake happens lazily on the first
+//! `Read` in the connection goroutine; the port mirrors this with
+//! [`SyslogTcpConn`], which completes the handshake on the first read in the
+//! per-connection worker. A failed handshake therefore surfaces as a
+//! `process_stream` error in the worker and never kills the accept loop.
 //!
 //! PORT NOTE: unix-socket listeners (`-syslog.listenAddr.unix`, including the
 //! `unixgram:` prefix) are only available behind `cfg(unix)`; on other
@@ -43,6 +47,7 @@ use std::time::{Duration, Instant};
 use esl_common::cgroup::available_cpus;
 use esl_common::flagutil::{ArrayBool, ArrayString, Flag};
 use esl_common::timeutil::get_local_timezone_offset_nsecs;
+use esl_common::tlsutil::{TlsServerStream, get_server_tls_config, rustls, server_accept};
 use esl_common::{errorf, fatalf, infof, panicf};
 
 use esl_logstorage::rows::Field;
@@ -96,10 +101,6 @@ static TLS_ENABLE: Flag<ArrayBool> = Flag::new(
      The corresponding -syslog.tlsCertFile and -syslog.tlsKeyFile must be set if -syslog.tls is set. See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#security",
     ArrayBool::default,
 );
-// PORT NOTE: the remaining -syslog.tls* flags are declared for CLI
-// compatibility only; they are never read because -syslog.tls is a fatal
-// startup error (TLS is not ported).
-#[allow(dead_code)]
 static TLS_CERT_FILE: Flag<ArrayString> = Flag::new(
     "syslog.tlsCertFile",
     "Path to file with TLS certificate for the corresponding -syslog.listenAddr.tcp if the corresponding -syslog.tls is set. \
@@ -107,7 +108,6 @@ static TLS_CERT_FILE: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#security",
     ArrayString::default,
 );
-#[allow(dead_code)]
 static TLS_KEY_FILE: Flag<ArrayString> = Flag::new(
     "syslog.tlsKeyFile",
     "Path to file with TLS key for the corresponding -syslog.listenAddr.tcp if the corresponding -syslog.tls is set. \
@@ -115,7 +115,6 @@ static TLS_KEY_FILE: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#security",
     ArrayString::default,
 );
-#[allow(dead_code)]
 static TLS_CIPHER_SUITES: Flag<ArrayString> = Flag::new(
     "syslog.tlsCipherSuites",
     "Optional list of TLS cipher suites for -syslog.listenAddr.tcp if -syslog.tls is set. \
@@ -123,7 +122,6 @@ static TLS_CIPHER_SUITES: Flag<ArrayString> = Flag::new(
      See also https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#security",
     ArrayString::default,
 );
-#[allow(dead_code)]
 static TLS_MIN_VERSION: Flag<String> = Flag::new(
     "syslog.tlsMinVersion",
     "The minimum TLS version to use for -syslog.listenAddr.tcp if -syslog.tls is set. \
@@ -592,17 +590,29 @@ fn run_tcp_listener<S: LogRowsStorage + 'static>(
     storage: &Arc<S>,
     stop: &Arc<StopSignal>,
 ) {
+    // Go: tlsEnable/tlsCertFile/tlsKeyFile are per-listener via
+    // GetOptionalArg(argIdx); tlsMinVersion is a scalar flag and
+    // tlsCipherSuites is passed whole (not indexed).
+    let mut tls_config: Option<Arc<rustls::ServerConfig>> = None;
     if TLS_ENABLE.get().get_optional_arg(arg_idx) {
-        // PORT NOTE: Go builds the TLS config via netutil.GetServerTLSConfig
-        // from -syslog.tlsCertFile/-syslog.tlsKeyFile/-syslog.tlsMinVersion/
-        // -syslog.tlsCipherSuites. TLS is not ported (no TLS crate in the
-        // workspace), so enabling it is a fatal startup error.
-        fatalf!(
-            "-syslog.tls is not supported by this port; cannot enable TLS for -syslog.listenAddr.tcp={addr:?}"
-        );
+        let cert_file = TLS_CERT_FILE.get().get_optional_arg(arg_idx);
+        let key_file = TLS_KEY_FILE.get().get_optional_arg(arg_idx);
+        let tls_min_version = TLS_MIN_VERSION.get();
+        let tls_cipher_suites: &[String] = TLS_CIPHER_SUITES.get();
+        match get_server_tls_config(cert_file, key_file, tls_min_version, tls_cipher_suites) {
+            Ok(tc) => tls_config = Some(tc),
+            Err(err) => {
+                fatalf!(
+                    "cannot load TLS cert from -syslog.tlsCertFile={cert_file:?}, -syslog.tlsKeyFile={key_file:?}, \
+                     -syslog.tlsMinVersion={tls_min_version:?}, -syslog.tlsCipherSuites={tls_cipher_suites:?}: {err}"
+                );
+                unreachable!()
+            }
+        }
     }
+    // Go: netutil.NewTCPListener("syslog", addr, false, tlsConfig).
     let ln = match TcpListener::bind(normalize_listen_addr(addr)) {
-        Ok(ln) => Arc::new(ln),
+        Ok(ln) => Arc::new(SyslogTcpListener { ln, tls_config }),
         Err(err) => {
             fatalf!("syslog: cannot start TCP listener at {addr}: {err}");
             unreachable!()
@@ -628,7 +638,7 @@ fn run_tcp_listener<S: LogRowsStorage + 'static>(
         }
     };
 
-    let local_addr = ln.local_addr().ok();
+    let local_addr = ln.ln.local_addr().ok();
     let done = {
         let ln = Arc::clone(&ln);
         let cfg = Arc::clone(&cfg);
@@ -642,7 +652,10 @@ fn run_tcp_listener<S: LogRowsStorage + 'static>(
     infof!("started accepting syslog messages at -syslog.listenAddr.tcp={addr:?}");
     stop.wait();
     // Wake the blocked accept() with a throwaway self-connect (house shutdown
-    // pattern; Go closes the listener instead).
+    // pattern; Go closes the listener instead). The wakeup arrives as plain
+    // TCP even when TLS is enabled; that is fine because the TLS handshake is
+    // deferred to the first read, so the accept loop hits the stop-check and
+    // exits before any TLS work happens.
     if let Some(a) = local_addr {
         let _ = TcpStream::connect(a);
     }
@@ -879,25 +892,102 @@ trait StreamConn: Read + Send + 'static {
     fn remote_addr_string(&self) -> String;
 }
 
-impl StreamListener for TcpListener {
-    type Conn = TcpStream;
-    fn accept_conn(&self) -> io::Result<TcpStream> {
-        self.accept().map(|(c, _)| c)
+/// Port of `netutil.NewTCPListener("syslog", addr, false, tlsConfig)`: a TCP
+/// listener that optionally wraps accepted connections in server-side TLS.
+///
+/// PORT NOTE: Go's `netutil.TCPListener.Accept` returns `tls.Server(conn,
+/// tlsConfig)` when TLS is enabled, which defers the handshake to the first
+/// `Read` inside the connection goroutine. The port mirrors this by returning
+/// a [`SyslogTcpConn::TlsHandshake`] and completing the handshake (via
+/// `tlsutil::server_accept`) on the first read in the per-connection worker.
+struct SyslogTcpListener {
+    ln: TcpListener,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+}
+
+impl StreamListener for SyslogTcpListener {
+    type Conn = SyslogTcpConn;
+    fn accept_conn(&self) -> io::Result<SyslogTcpConn> {
+        let (c, _) = self.ln.accept()?;
+        Ok(match &self.tls_config {
+            None => SyslogTcpConn::Plain(c),
+            Some(cfg) => SyslogTcpConn::TlsHandshake(Some(c), Arc::clone(cfg)),
+        })
     }
     fn addr_string(&self) -> String {
-        self.local_addr().map(|a| a.to_string()).unwrap_or_default()
+        self.ln
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default()
     }
 }
 
-impl StreamConn for TcpStream {
+/// A connection accepted by [`SyslogTcpListener`]: plaintext, or TLS before /
+/// after the deferred handshake (Go `tls.Conn` handshakes on first `Read`).
+enum SyslogTcpConn {
+    Plain(TcpStream),
+    /// TLS connection whose handshake has not run yet. The socket is consumed
+    /// by the handshake, hence the `Option`; `None` after a failed handshake.
+    TlsHandshake(Option<TcpStream>, Arc<rustls::ServerConfig>),
+    /// Boxed: a rustls stream is ~1KiB, dwarfing the other variants
+    /// (clippy::large_enum_variant).
+    Tls(Box<TlsServerStream>),
+}
+
+impl SyslogTcpConn {
+    /// The underlying TCP socket (used for shutdown/peer-addr regardless of
+    /// the TLS state), if it is still around.
+    fn socket(&self) -> Option<&TcpStream> {
+        match self {
+            SyslogTcpConn::Plain(c) => Some(c),
+            SyslogTcpConn::TlsHandshake(sock, _) => sock.as_ref(),
+            SyslogTcpConn::Tls(c) => Some(&c.sock),
+        }
+    }
+}
+
+impl Read for SyslogTcpConn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let SyslogTcpConn::TlsHandshake(sock, cfg) = self {
+            // Complete the deferred handshake, like Go's tls.Conn.Read. A
+            // handshake failure (e.g. a plaintext client hitting a TLS
+            // listener) surfaces as a read error handled by the caller.
+            let sock = sock
+                .take()
+                .ok_or_else(|| io::Error::other("TLS handshake already failed"))?;
+            let tls = server_accept(cfg, sock).map_err(io::Error::other)?;
+            *self = SyslogTcpConn::Tls(Box::new(tls));
+        }
+        match self {
+            SyslogTcpConn::Plain(c) => c.read(buf),
+            SyslogTcpConn::Tls(c) => c.read(buf),
+            SyslogTcpConn::TlsHandshake(..) => unreachable!(),
+        }
+    }
+}
+
+impl StreamConn for SyslogTcpConn {
     fn try_clone_conn(&self) -> io::Result<Self> {
-        self.try_clone()
+        // PORT NOTE: the clone only feeds the conn map for shutdown (Go
+        // ingestserver.ConnsMap closes the net.Conn), so it clones the raw
+        // socket as a Plain conn regardless of the TLS state.
+        let sock = self.socket().ok_or_else(|| {
+            io::Error::other("cannot clone connection after failed TLS handshake")
+        })?;
+        Ok(SyslogTcpConn::Plain(sock.try_clone()?))
     }
     fn shutdown_conn(&self) {
-        let _ = self.shutdown(Shutdown::Both);
+        // Go's cm.CloseAll(0)/c.Close() closes the socket without sending a
+        // TLS close_notify; shutting down the raw socket matches that.
+        if let Some(sock) = self.socket() {
+            let _ = sock.shutdown(Shutdown::Both);
+        }
     }
     fn remote_addr_string(&self) -> String {
-        self.peer_addr().map(|a| a.to_string()).unwrap_or_default()
+        self.socket()
+            .and_then(|s| s.peer_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -1676,6 +1766,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    use esl_common::tlsutil;
     use esl_logstorage::rows::marshal_fields_to_json;
     use esl_logstorage::storage::Storage;
 
@@ -1928,8 +2019,11 @@ mod tests {
         GLOBAL_TIMEZONE_OFFSET_SECS.store(0, Ordering::SeqCst);
         GLOBAL_CURRENT_YEAR.store(2023, Ordering::SeqCst);
 
-        let ln = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
-        let addr = ln.local_addr().unwrap();
+        let ln = Arc::new(SyslogTcpListener {
+            ln: TcpListener::bind("127.0.0.1:0").unwrap(),
+            tls_config: None,
+        });
+        let addr = ln.ln.local_addr().unwrap();
         let cfg = Arc::new(test_configs("tcp"));
         let stop = Arc::new(StopSignal::new());
 
@@ -1961,6 +2055,101 @@ mod tests {
 
         assert_eq!(rows_count(&s), 2);
         s.must_close();
+    }
+
+    // PORT NOTE: no upstream equivalent (the Go tests never exercise TLS);
+    // validates the ported netutil.TCPListener TLS wrapping end to end:
+    // deferred handshake, framing over TLS, plaintext-client handshake
+    // failure not killing the accept loop, and the plain-TCP shutdown wakeup.
+    //
+    // The companion startup-error case ("-syslog.tls without
+    // -syslog.tlsCertFile/-syslog.tlsKeyFile is fatal") is not testable
+    // in-process: fatalf! calls std::process::exit. The underlying error is
+    // covered by esl-common's tlsutil tests for get_server_tls_config.
+    #[test]
+    fn test_serve_stream_listener_tls_roundtrip() {
+        let _guard = test_lock();
+        let s = open_temp_storage("syslog-listeners-tls");
+        GLOBAL_TIMEZONE_OFFSET_SECS.store(0, Ordering::SeqCst);
+        GLOBAL_CURRENT_YEAR.store(2023, Ordering::SeqCst);
+
+        // Self-signed server cert on disk, standing in for the per-listener
+        // -syslog.tlsCertFile/-syslog.tlsKeyFile values.
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+            .unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("esl-insert-test-syslog-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_file = dir.join("cert.pem");
+        let key_file = dir.join("key.pem");
+        std::fs::write(&cert_file, ck.cert.pem()).unwrap();
+        std::fs::write(&key_file, ck.key_pair.serialize_pem()).unwrap();
+
+        let tls_config = get_server_tls_config(
+            cert_file.to_str().unwrap(),
+            key_file.to_str().unwrap(),
+            "TLS13",
+            &[],
+        )
+        .unwrap();
+
+        let ln = Arc::new(SyslogTcpListener {
+            ln: TcpListener::bind("127.0.0.1:0").unwrap(),
+            tls_config: Some(tls_config),
+        });
+        let addr = ln.ln.local_addr().unwrap();
+        let cfg = Arc::new(test_configs("tcp"));
+        let stop = Arc::new(StopSignal::new());
+
+        let done = {
+            let ln = Arc::clone(&ln);
+            let cfg = Arc::clone(&cfg);
+            let storage = Arc::clone(&s);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || serve_stream_listener(&*ln, &cfg, &storage, &stop))
+        };
+
+        {
+            // A plaintext client must fail the deferred handshake inside the
+            // connection worker without killing the accept loop; the TLS
+            // client below proves the listener is still serving.
+            let mut c = TcpStream::connect(addr).unwrap();
+            let _ = c.write_all(b"not a tls client hello\n");
+        }
+
+        {
+            // Same payloads as the plain-TCP roundtrip, over TLS.
+            let client_cfg = tlsutil::new_tls_client_config(&tlsutil::TLSConfig {
+                ca_file: cert_file.to_str().unwrap().to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            let tcp = TcpStream::connect(addr).unwrap();
+            let mut c = tlsutil::client_connect(&client_cfg, "localhost", tcp).unwrap();
+            c.write_all(
+                b"<165>1 2023-06-03T17:42:12.345Z host app 123 - - hello\n\
+                  Jun  3 12:08:33 abcd systemd: starting\n",
+            )
+            .unwrap();
+            // Send close_notify so the server sees a clean EOF, and flush it
+            // before shutting down the write half (close_notify is buffered).
+            c.conn.send_close_notify();
+            c.flush().unwrap();
+            let _ = c.sock.shutdown(Shutdown::Write);
+        }
+
+        wait_for_rows(&s, 2);
+
+        stop.stop();
+        // The shutdown wakeup arrives as plain TCP; the deferred handshake
+        // keeps the accept loop's stop-check reachable (no handshake runs in
+        // the accept loop).
+        let _ = TcpStream::connect(addr);
+        done.join().unwrap();
+
+        assert_eq!(rows_count(&s), 2);
+        s.must_close();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

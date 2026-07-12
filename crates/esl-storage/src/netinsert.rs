@@ -65,11 +65,10 @@ struct StorageShared {
 }
 
 struct StorageNode {
-    /// scheme is the http scheme to communicate with addr.
-    ///
-    /// PORT NOTE: always "http"; TLS is rejected at auth-config construction
-    /// (see `http_client`).
-    #[allow(dead_code)]
+    /// scheme is the http scheme to communicate with addr ("http" or "https";
+    /// Go derives it from the `isTLS` argument, the port from the presence of
+    /// a TLS config on `ac`).
+    #[allow(dead_code, reason = "parity with Go; requests derive TLS from ac")]
     scheme: &'static str,
 
     /// addr is TCP address of storage node to send the ingested data to.
@@ -112,8 +111,9 @@ enum SendError {
 }
 
 fn new_storage_node(shared: Arc<StorageShared>, addr: String, ac: AuthConfig) -> Arc<StorageNode> {
+    let scheme = if ac.tls().is_some() { "https" } else { "http" };
     let sn = Arc::new(StorageNode {
-        scheme: "http",
+        scheme,
         addr,
         shared,
         ac,
@@ -301,7 +301,7 @@ impl StorageNode {
             }
         }
 
-        let resp = match do_request(&self.addr, method, &req_url, &headers, body) {
+        let resp = match do_request(&self.addr, self.ac.tls(), method, &req_url, &headers, body) {
             Ok(resp) => resp,
             Err(err) => {
                 self.set_disable_temporarily();

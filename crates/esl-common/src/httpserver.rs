@@ -38,11 +38,25 @@
 //! reads are bounded by a read timeout). [`ServerHandle::stop`] sets the flag,
 //! wakes each blocked accept with a self-connect, and joins all threads.
 //!
-//! PORT NOTE: TLS, basic-auth, `authKey`, pprof, path-prefix, per-connection
+//! PORT NOTE: basic-auth, `authKey`, pprof, path-prefix, per-connection
 //! deadline jitter and Prometheus metrics from the Go source are intentionally
 //! omitted — the benchmark uses plain HTTP with no auth. Auth checks are
 //! effectively no-ops (all requests allowed). Response compression
 //! (`gzhttp`) is also omitted; responses are small.
+//!
+//! PORT NOTE (TLS): Go's `-tls`/`-tlsCertFile`/`-tlsKeyFile` serving flags are
+//! NOT ported even though the workspace now has a TLS stack
+//! (`esl_common::tlsutil`, used by the syslog listeners and all clients). This
+//! server's connection plumbing relies on three simultaneously live
+//! `TcpStream::try_clone` handles per connection — the `BufReader` read half,
+//! the `BufWriter` write half, and the `Arc<TcpStream>` handle that
+//! `ResponseWriter::flush_chunk` writes to mid-handler for `/tail` streaming
+//! (see `handle_connection`). A rustls session is a single-owner object that
+//! serializes reads and writes through one connection state machine, so
+//! layering TLS here would require redesigning the reader/writer/flush-chunk
+//! split around a shared, locked TLS stream. The flags are therefore omitted
+//! entirely rather than half-shipped; terminate TLS in front of the server if
+//! needed.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write};

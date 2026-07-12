@@ -26,7 +26,7 @@ Status of each upstream package's port. Status values:
 | lib/fs/fsutil | ported | |
 | lib/filestream | ported | |
 | lib/regexutil | ported | |
-| lib/httpserver | ported | threaded server (worker pool sized to available_cpus); no TLS/auth/pprof/metrics (PORT NOTE) |
+| lib/httpserver | ported | threaded server (worker pool sized to available_cpus); no server-side TLS (single-owner rustls session vs the tri-handle conn plumbing, PORT NOTE), no auth/pprof/metrics (PORT NOTE) |
 | lib/httputil | ported | GetRequestValue/GetArray/GetBool/GetInt/CheckURL over Request |
 | lib/netutil | todo | |
 | lib/protoparser/protoparserutil | partial | request-body decompression (gzip/deflate/zstd/snappy) + ReadLinesBlock in httpserver; rest todo |
@@ -67,17 +67,23 @@ Tracked at file/subsystem granularity once porting starts:
 |----------|-----------|--------|-------|
 | app/es-logs | es-logs | ported | binary, flags, lifecycle, syslog-listener hooks |
 | app/eslstorage | esl-storage | ported | full main (auth keys, snapshots, metrics writer), query_stats, lastnoptimization (ported+tested; deliberately NOT on the query path — engine block pruning is faster, see esl-select PORT NOTE), netinsert, netselect |
-| app/eslinsert (all) | esl-insert | ported | jsonline, elasticsearch, loki json+protobuf(+easyproto in esl-common), opentelemetry, datadog, journald, splunk, native/multitenant/internal insert, syslog TCP/UDP/unix listeners (TLS declared-but-fatal), insertutil incl. flags/testutils |
+| app/eslinsert (all) | esl-insert | ported | jsonline, elasticsearch, loki json+protobuf(+easyproto in esl-common), opentelemetry, datadog, journald, splunk, native/multitenant/internal insert, syslog TCP/UDP/unix listeners incl. TLS, insertutil incl. flags/testutils |
 | app/eslselect (all) | esl-select | ported | all 13 /select/logsql/* endpoints incl. hits/facets/stats_query(_range)/streams/stream_*/tail (chunked streaming)/query_time_range, format=csv, internalselect (server side of netselect, round-trip tested), esmui embedded byte-identical |
 | app/eslagent | esl-agent | ported | tail (rotation/fingerprints), filecollector (internal doublestar), kubernetescollector (CRI/klog parsing, kubelet watch), remotewrite + full lib/persistentqueue port; e2e wire-compat verified against Go v1.51 binary |
-| app/eslogscli | eslogscli | ported | REPL, history, output modes, pager; minimal line editor + plain-HTTP PORT NOTEs |
+| app/eslogscli | eslogscli | ported | REPL, history, output modes, pager; minimal line editor PORT NOTE; https datasource + -tls* flags supported |
 | app/eslogsgenerator | eslogsgenerator | ported | all 20 flags, e2e-verified generation |
 | app/esmui | esl-select assets | ported | prebuilt upstream assets embedded, completeness-tested |
 
-Cross-cutting deferrals (PORT-NOTEd at each site): no TLS stack anywhere
-(flags parse, fail with clear errors), no metrics registry (counters are
-plain atomics; /metrics serves the storage series), context cancellation
-dropped, net_query_runner (cluster query splitting) stubbed for single-node.
+Cross-cutting deferrals (PORT-NOTEd at each site): no metrics registry
+(counters are plain atomics; /metrics serves the storage series), context
+cancellation dropped, net_query_runner (cluster query splitting) stubbed for
+single-node. TLS is supported via `esl_common::tlsutil` (rustls/ring, MSVC
+cross-compile-clean): client side (-storageNode.tls*, -remoteWrite.tls*,
+kubernetes collector, eslogscli -tls*) and server side (-syslog.tls*); the
+one exception is httpserver's -tls serving flags, omitted with a PORT NOTE
+(single-owner rustls session vs the server's tri-handle connection plumbing).
+rustls-vs-Go gaps (PORT-NOTEd in tlsutil): no TLS 1.0/1.1, AEAD-only cipher
+suites, webpki-roots bundle instead of the system cert pool.
 `_stream:{...}` execution is fully wired (lazy per-partition streamID
 resolution in filter_stream.rs); Go's getCommonStreamFilter block-scheduling
 pre-filter remains an unported optimization.

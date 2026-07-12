@@ -10,6 +10,7 @@ use std::net::TcpStream;
 use std::time::Instant;
 
 use esl_common::flagutil::{ArrayString, Flag, Password};
+use esl_common::tlsutil::{self, TLSConfig, TlsClientConfig, TlsClientStream};
 use esl_common::{buildinfo, envflag, flagutil, fs, logger};
 
 use esl_logstorage::parser::ParseQuery;
@@ -66,9 +67,9 @@ static BEARER_TOKEN: Flag<Password> = Flag::new(
     || Password::new("bearerToken"),
 );
 
-// PORT NOTE: the Go client supports TLS via lib/promauth; this std-only port
-// has no TLS stack, so the flags are accepted for CLI compatibility but any
-// non-default value (or an https:// -datasource.url) is rejected at startup.
+// PORT NOTE: Go wires these flags through lib/promauth (promauth.TLSConfig);
+// this port builds an `esl_common::tlsutil::TLSConfig` from them in
+// `new_auth_config` and speaks TLS via rustls.
 static TLS_CA_FILE: Flag<String> = Flag::new(
     "tlsCAFile",
     "Optional path to TLS CA file to use for verifying connections to the -datasource.url. By default, system CA is used",
@@ -117,7 +118,7 @@ fn main() {
         Err(err) => fatalf(&format!("cannot parse -header command-line flag: {err}")),
     };
 
-    let auth_headers = new_auth_headers();
+    let auth_config = new_auth_config();
 
     let mut rl = Readline::new();
 
@@ -126,16 +127,17 @@ fn main() {
         DATASOURCE_URL.get()
     ));
     rl.writeln("type ? and press enter to see available commands");
-    run_readline_loop(&mut rl, &headers, &auth_headers);
+    run_readline_loop(&mut rl, &headers, &auth_config);
 }
 
-/// Extra headers passed with every request, incl. the auth header.
+/// Extra headers passed with every request, incl. the auth header and the TLS
+/// client config.
 struct RequestContext<'a> {
     headers: &'a [HeaderEntry],
-    auth_headers: &'a AuthHeaders,
+    auth_config: &'a AuthConfig,
 }
 
-fn run_readline_loop(rl: &mut Readline, headers: &[HeaderEntry], auth_headers: &AuthHeaders) {
+fn run_readline_loop(rl: &mut Readline, headers: &[HeaderEntry], auth_config: &AuthConfig) {
     let mut history_lines = match load_from_history(HISTORY_FILE.get()) {
         Ok(lines) => lines,
         Err(err) => fatalf(&format!("cannot load query history: {err}")),
@@ -146,7 +148,7 @@ fn run_readline_loop(rl: &mut Readline, headers: &[HeaderEntry], auth_headers: &
 
     let rctx = RequestContext {
         headers,
-        auth_headers,
+        auth_config,
     };
 
     let mut output_mode = OutputMode::JsonMultiline;
@@ -481,9 +483,11 @@ fn get_query_response(
 // Minimal HTTP client.
 //
 // PORT NOTE: Go uses net/http with a lib/promauth-configured transport. This
-// std-only port speaks plain HTTP/1.1 over TcpStream (one connection per
-// request, `Connection: close`), supporting Content-Length, chunked and
-// read-to-EOF response bodies. https:// URLs are rejected (no TLS stack).
+// port speaks plain HTTP/1.1 over TcpStream (one connection per request,
+// `Connection: close`), supporting Content-Length, chunked and read-to-EOF
+// response bodies. https:// URLs wrap the connection with
+// `esl_common::tlsutil` (rustls), mirroring Go's promauth.NewTLSConfig-based
+// transport.
 // ---------------------------------------------------------------------------
 
 struct HeaderEntry {
@@ -508,40 +512,47 @@ fn parse_headers(a: &[String]) -> Result<Vec<HeaderEntry>, String> {
 }
 
 /// The subset of Go's promauth.Config this port supports: a single optional
-/// `Authorization` header derived from -username/-password or -bearerToken.
-struct AuthHeaders {
+/// `Authorization` header derived from -username/-password or -bearerToken,
+/// plus the TLS client config built from the -tls* flags.
+struct AuthConfig {
     authorization: Option<String>,
+    tls: TlsClientConfig,
 }
 
-fn new_auth_headers() -> AuthHeaders {
-    if !TLS_CA_FILE.get().is_empty()
-        || !TLS_CERT_FILE.get().is_empty()
-        || !TLS_KEY_FILE.get().is_empty()
-        || !TLS_SERVER_NAME.get().is_empty()
-        || *TLS_INSECURE_SKIP_VERIFY.get()
-    {
-        fatalf(
-            "FATAL: cannot populate auth config: TLS is not supported by this port of eslogscli",
-        );
-    }
+/// Builds the request auth/TLS config from the command-line flags
+/// (Go `newAuthConfig`).
+fn new_auth_config() -> AuthConfig {
+    // Go builds the TLS config eagerly via promauth.Options.NewConfig and
+    // panics on a broken config; bad -tls* flag values are fatal here too.
+    let tls_cfg = TLSConfig {
+        ca_file: TLS_CA_FILE.get().clone(),
+        cert_file: TLS_CERT_FILE.get().clone(),
+        key_file: TLS_KEY_FILE.get().clone(),
+        server_name: TLS_SERVER_NAME.get().clone(),
+        insecure_skip_verify: *TLS_INSECURE_SKIP_VERIFY.get(),
+        ..Default::default()
+    };
+    let tls = match tlsutil::new_tls_client_config(&tls_cfg) {
+        Ok(tls) => tls,
+        Err(err) => fatalf(&format!("FATAL: cannot populate auth config: {err}")),
+    };
 
+    let authorization = new_authorization_header();
+    AuthConfig { authorization, tls }
+}
+
+fn new_authorization_header() -> Option<String> {
     let username = USERNAME.get();
     let password = PASSWORD.get().get();
     if !username.is_empty() || !password.is_empty() {
         let creds = format!("{username}:{password}");
-        return AuthHeaders {
-            authorization: Some(format!("Basic {}", base64_encode(creds.as_bytes()))),
-        };
+        return Some(format!("Basic {}", base64_encode(creds.as_bytes())));
     }
     let bearer_token = BEARER_TOKEN.get().get();
     if !bearer_token.is_empty() {
-        return AuthHeaders {
-            authorization: Some(format!("Bearer {bearer_token}")),
-        };
+        return Some(format!("Bearer {bearer_token}"));
     }
-    AuthHeaders {
-        authorization: None,
-    }
+    None
 }
 
 struct ParsedUrl {
@@ -594,14 +605,11 @@ impl HttpResponse {
 
 fn http_post(u: &str, body: &[u8], rctx: &RequestContext<'_>) -> Result<HttpResponse, String> {
     let pu = parse_url(u)?;
-    if pu.scheme != "http" {
-        return Err(format!(
-            "unsupported scheme {:?} in url {u:?}: TLS is not supported by this port of eslogscli",
-            pu.scheme
-        ));
-    }
+    let is_tls = pu.scheme == "https";
     let addr = if pu.host_port.contains(':') {
         pu.host_port.clone()
+    } else if is_tls {
+        format!("{}:443", pu.host_port)
     } else {
         format!("{}:80", pu.host_port)
     };
@@ -610,12 +618,21 @@ fn http_post(u: &str, body: &[u8], rctx: &RequestContext<'_>) -> Result<HttpResp
         TcpStream::connect(&addr).map_err(|err| format!("Post {u:?}: dial tcp {addr}: {err}"))?;
     stream.set_nodelay(true).map_err(|err| err.to_string())?;
 
+    // When the user overrode the TLS server name, use it as the `Host` header
+    // too (Go: `req.Host = ac.tlsServerName` in promauth.Config.SetHeaders).
+    let server_name = &rctx.auth_config.tls.server_name;
+    let host_header = if is_tls && !server_name.is_empty() {
+        server_name
+    } else {
+        &pu.host_port
+    };
+
     let mut req = Vec::with_capacity(body.len() + 512);
     let _ = write!(
         req,
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n",
         pu.path_and_query,
-        pu.host_port,
+        host_header,
         body.len()
     );
     for h in rctx.headers {
@@ -623,15 +640,26 @@ fn http_post(u: &str, body: &[u8], rctx: &RequestContext<'_>) -> Result<HttpResp
     }
     let _ = write!(req, "AccountID: {}\r\n", ACCOUNT_ID.get());
     let _ = write!(req, "ProjectID: {}\r\n", PROJECT_ID.get());
-    if let Some(auth) = &rctx.auth_headers.authorization {
+    if let Some(auth) = &rctx.auth_config.authorization {
         let _ = write!(req, "Authorization: {auth}\r\n");
     }
     req.extend_from_slice(b"\r\n");
     req.extend_from_slice(body);
 
-    let mut stream = stream;
+    let mut stream = if is_tls {
+        let host = host_without_port(&pu.host_port);
+        Stream::Tls(Box::new(
+            tlsutil::client_connect(&rctx.auth_config.tls, host, stream)
+                .map_err(|err| format!("Post {u:?}: {err}"))?,
+        ))
+    } else {
+        Stream::Plain(stream)
+    };
     stream
         .write_all(&req)
+        .map_err(|err| format!("cannot send request to {u:?}: {err}"))?;
+    stream
+        .flush()
         .map_err(|err| format!("cannot send request to {u:?}: {err}"))?;
 
     let mut r = BufReader::new(stream);
@@ -688,9 +716,67 @@ fn http_post(u: &str, body: &[u8], rctx: &RequestContext<'_>) -> Result<HttpResp
     })
 }
 
+/// The connection to the datasource: plain TCP or TLS over TCP.
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<TlsClientStream>),
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.read(buf),
+            // PORT NOTE: rustls reports `UnexpectedEof` when the peer closes
+            // the connection without sending TLS close_notify. The CLI reads
+            // streaming/read-to-EOF response bodies, so map it to a clean EOF
+            // (same pattern as `TolerantEofReader` in esl-storage's
+            // http_client); Go's crypto/tls + net/http tolerate the missing
+            // close_notify the same way. A truncating attacker is still
+            // detected on Content-Length/chunked-framed bodies by the framing
+            // checks.
+            Stream::Tls(s) => match s.read(buf) {
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(0),
+                other => other,
+            },
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Plain(s) => s.write(buf),
+            Stream::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// Strips the `:port` suffix from a `host:port` address (IPv6 literals keep
+/// Go's `[host]:port` bracket form); the result feeds TLS SNI/verification.
+fn host_without_port(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return &rest[..end];
+    }
+    match addr.rsplit_once(':') {
+        // An unbracketed IPv6 literal contains more colons; treat it as a
+        // bare host without port.
+        Some((host, _)) if !host.contains(':') => host,
+        _ => addr,
+    }
+}
+
 /// Streaming `Transfer-Encoding: chunked` body decoder.
 struct ChunkedReader {
-    r: BufReader<TcpStream>,
+    r: BufReader<Stream>,
     chunk_remaining: u64,
     done: bool,
 }
@@ -1010,6 +1096,243 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"user:pass"), "dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn host_without_port_forms() {
+        assert_eq!(host_without_port("example.com:9428"), "example.com");
+        assert_eq!(host_without_port("127.0.0.1:9428"), "127.0.0.1");
+        assert_eq!(host_without_port("[::1]:9428"), "::1");
+        assert_eq!(host_without_port("example.com"), "example.com");
+        assert_eq!(host_without_port("::1"), "::1");
+    }
+
+    /// Builds an [`AuthConfig`] directly from a [`TLSConfig`], bypassing the
+    /// global command-line flags.
+    fn test_auth_config(tls_cfg: &TLSConfig) -> AuthConfig {
+        AuthConfig {
+            authorization: None,
+            tls: tlsutil::new_tls_client_config(tls_cfg).unwrap(),
+        }
+    }
+
+    /// Reads one HTTP/1.1 request (headers + `Content-Length` body) from `r`.
+    fn read_request<R: Read>(r: &mut R) -> Vec<u8> {
+        let mut req = vec![0u8; 8192];
+        let mut n = 0;
+        let header_end = loop {
+            if let Some(pos) = req[..n].windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let m = r.read(&mut req[n..]).unwrap();
+            assert!(m > 0, "request truncated");
+            n += m;
+        };
+        let head = String::from_utf8_lossy(&req[..header_end]).to_string();
+        let cl: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .map_or(0, |v| v.trim().parse().unwrap());
+        while n < header_end + cl {
+            let m = r.read(&mut req[n..]).unwrap();
+            assert!(m > 0, "request body truncated");
+            n += m;
+        }
+        req.truncate(n);
+        req
+    }
+
+    /// Spawns a one-shot https server with a self-signed rcgen certificate.
+    /// It reads one request and answers with `response`; returns the server
+    /// address, the certificate PEM (usable as the client's custom CA) and a
+    /// handle yielding the captured request bytes.
+    fn spawn_https_server(
+        response: &'static [u8],
+        close_notify: bool,
+    ) -> (String, String, std::thread::JoinHandle<Vec<u8>>) {
+        static DIR_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        let ck = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .unwrap();
+        let cert_pem = ck.cert.pem();
+        // get_server_tls_config loads the pair from files.
+        let dir = std::env::temp_dir().join(format!(
+            "eslogscli-tls-test-{}-{}",
+            std::process::id(),
+            DIR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("cert.pem");
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        let key_path = dir.join("key.pem");
+        std::fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
+        let server_cfg = tlsutil::get_server_tls_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            "",
+            &[],
+        )
+        .unwrap();
+
+        let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = ln.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            let (tcp, _) = ln.accept().unwrap();
+            // A client aborting the handshake (untrusted-cert test) is fine.
+            let Ok(mut stream) = tlsutil::server_accept(&server_cfg, tcp) else {
+                return Vec::new();
+            };
+            let req = read_request(&mut stream);
+            stream.write_all(response).unwrap();
+            if close_notify {
+                stream.conn.send_close_notify();
+            }
+            // flush() after send_close_notify() BEFORE the socket is dropped;
+            // otherwise the client's reads fail with `Broken pipe`.
+            let _ = stream.flush();
+            req
+        });
+        (addr, cert_pem, handle)
+    }
+
+    #[test]
+    fn https_round_trip_with_custom_ca() {
+        // Once with a graceful TLS shutdown, once with a bare TCP close (the
+        // missing close_notify must be treated as EOF since the
+        // Content-Length framing is already satisfied).
+        for close_notify in [true, false] {
+            let (addr, ca_pem, handle) = spawn_https_server(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nresponse",
+                close_notify,
+            );
+            let ac = test_auth_config(&TLSConfig {
+                ca: ca_pem,
+                ..Default::default()
+            });
+            let rctx = RequestContext {
+                headers: &[],
+                auth_config: &ac,
+            };
+            let mut resp = http_post(
+                &format!("https://{addr}/select/logsql/query"),
+                b"query=%2A",
+                &rctx,
+            )
+            .unwrap();
+            assert_eq!(resp.status_code, 200);
+            let mut body = String::new();
+            resp.body.read_to_string(&mut body).unwrap();
+            assert_eq!(body, "response");
+
+            let req = handle.join().unwrap();
+            let head = String::from_utf8_lossy(&req);
+            assert!(
+                head.starts_with("POST /select/logsql/query HTTP/1.1\r\n"),
+                "{head}"
+            );
+            assert!(head.contains(&format!("Host: {addr}\r\n")), "{head}");
+            assert!(head.ends_with("query=%2A"), "{head}");
+        }
+    }
+
+    #[test]
+    fn https_read_to_eof_body_tolerates_missing_close_notify() {
+        // A response without Content-Length is read to EOF; the server closes
+        // the TCP connection without sending TLS close_notify, which must be
+        // treated as a clean EOF.
+        let (addr, ca_pem, handle) = spawn_https_server(
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nstreamed",
+            false,
+        );
+        let ac = test_auth_config(&TLSConfig {
+            ca: ca_pem,
+            ..Default::default()
+        });
+        let rctx = RequestContext {
+            headers: &[],
+            auth_config: &ac,
+        };
+        let mut resp = http_post(&format!("https://{addr}/query"), b"query=%2A", &rctx).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let mut body = String::new();
+        resp.body.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "streamed");
+        let _ = handle.join().unwrap();
+    }
+
+    #[test]
+    fn https_server_name_override_sets_host_header() {
+        let (addr, ca_pem, handle) = spawn_https_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            true,
+        );
+        let ac = test_auth_config(&TLSConfig {
+            ca: ca_pem,
+            server_name: "localhost".to_string(),
+            ..Default::default()
+        });
+        let rctx = RequestContext {
+            headers: &[],
+            auth_config: &ac,
+        };
+        let resp = http_post(&format!("https://{addr}/query"), b"query=%2A", &rctx).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let req = handle.join().unwrap();
+        let head = String::from_utf8_lossy(&req);
+        // Go: req.Host = ac.tlsServerName when the server name is overridden.
+        assert!(head.contains("Host: localhost\r\n"), "{head}");
+        assert!(!head.contains(&format!("Host: {addr}\r\n")), "{head}");
+    }
+
+    #[test]
+    fn https_untrusted_cert_rejected() {
+        let (addr, _ca_pem, handle) = spawn_https_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            true,
+        );
+        // Default config verifies against the bundled root CAs, which do not
+        // include the self-signed test certificate.
+        let ac = test_auth_config(&TLSConfig::default());
+        let rctx = RequestContext {
+            headers: &[],
+            auth_config: &ac,
+        };
+        let err = match http_post(&format!("https://{addr}/query"), b"query=%2A", &rctx) {
+            Ok(_) => panic!("https request with an untrusted certificate must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("handshake"), "{err}");
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn http_plain_round_trip() {
+        let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = ln.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut tcp, _) = ln.accept().unwrap();
+            let req = read_request(&mut tcp);
+            tcp.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            req
+        });
+        let ac = test_auth_config(&TLSConfig::default());
+        let rctx = RequestContext {
+            headers: &[],
+            auth_config: &ac,
+        };
+        let mut resp = http_post(&format!("http://{addr}/query"), b"query=%2A", &rctx).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let mut body = String::new();
+        resp.body.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "ok");
+        let req = handle.join().unwrap();
+        let head = String::from_utf8_lossy(&req);
+        assert!(head.starts_with("POST /query HTTP/1.1\r\n"), "{head}");
+        assert!(head.contains(&format!("Host: {addr}\r\n")), "{head}");
     }
 
     #[test]

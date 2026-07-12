@@ -8,10 +8,12 @@
 //! processor.go (+ processor_test.go, processor_timing_test.go).
 //!
 //! PORT NOTE (TLS): Go talks to the Kubernetes API server over HTTPS via
-//! `promauth` + `net/http`. The workspace has no TLS stack (see
-//! esl-storage/src/http_client.rs); client configs are parsed and validated
-//! faithfully, but any connection that requires TLS (an `https://` API server
-//! or a client-certificate config) fails at connect time with a clear message.
+//! `promauth` + `net/http`. The port speaks https via `esl_common::tlsutil`
+//! (rustls over the same blocking TCP streams): buffered requests go through
+//! `esl_storage::http_client::do_request` and the streaming watch reader runs
+//! over [`WatchConn`] (plain TCP or TLS). The TLS client config is built
+//! eagerly at config-load time, failing at startup instead of on the first
+//! request like Go's lazy `promauth` `getTLSConfigCached`.
 //!
 //! PORT NOTE (deps): Go uses `gopkg.in/yaml.v2` for kubeconfig parsing and
 //! `valyala/fastjson` for JSON. No new external dependencies are added; this
@@ -36,6 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use esl_common::flagutil::{ArrayString, Flag};
 use esl_common::logger::{LogThrottler, with_throttler};
 use esl_common::timeutil::BackoffTimer;
+use esl_common::tlsutil::{self, TLSConfig, TlsClientConfig, TlsClientStream};
 use esl_common::{errorf, fasttime, fatalf, infof, panicf, warnf};
 
 use esl_insert::common_params::DEFAULT_MSG_VALUE;
@@ -282,29 +285,19 @@ fn hostname() -> Result<String, String> {
 // client_config.go
 // ===========================================================================
 
-/// TLS part of the auth options (Go `promauth.TLSConfig` subset).
-///
-/// PORT NOTE: parsed and validated faithfully, but TLS connections are not
-/// supported by this port — see the module docs.
-#[derive(Debug, Default, Clone)]
-struct TlsConfig {
-    ca_file: String,
-    ca: String,
-    cert_file: String,
-    cert: String,
-    key_file: String,
-    key: String,
-}
-
-impl TlsConfig {
-    fn is_set(&self) -> bool {
-        !(self.ca_file.is_empty()
-            && self.ca.is_empty()
-            && self.cert_file.is_empty()
-            && self.cert.is_empty()
-            && self.key_file.is_empty()
-            && self.key.is_empty())
-    }
+/// Returns true when any TLS option is set (Go `promauth.Options` carries a
+/// nil-able `*TLSConfig` pointer instead; the port folds "no TLS options"
+/// into an all-default [`TLSConfig`]).
+fn tls_config_is_set(tc: &TLSConfig) -> bool {
+    !(tc.ca.is_empty()
+        && tc.ca_file.is_empty()
+        && tc.cert.is_empty()
+        && tc.cert_file.is_empty()
+        && tc.key.is_empty()
+        && tc.key_file.is_empty()
+        && tc.server_name.is_empty()
+        && tc.min_version.is_empty()
+        && !tc.insecure_skip_verify)
 }
 
 /// Go `promauth.Options` subset used by the kubernetes collector.
@@ -312,31 +305,43 @@ impl TlsConfig {
 struct AuthOptions {
     bearer_token: String,
     bearer_token_file: String,
-    tls_config: TlsConfig,
+    tls_config: TLSConfig,
 }
 
 impl AuthOptions {
     /// Go `promauth.Options.NewConfig` (validation subset).
+    ///
+    /// PORT NOTE: the TLS client config is built (and validated) eagerly here,
+    /// failing at startup instead of on the first request like Go's lazy
+    /// `getTLSConfigCached` — the established port pattern (see
+    /// esl-storage/src/http_client.rs `Options::new_config`).
     fn new_config(&self) -> Result<AuthConfig, String> {
         if !self.bearer_token.is_empty() && !self.bearer_token_file.is_empty() {
             return Err(
                 "both bearer_token and bearer_token_file are set; only one can be set".to_string(),
             );
         }
+        let tls = if tls_config_is_set(&self.tls_config) {
+            let cfg = tlsutil::new_tls_client_config(&self.tls_config)
+                .map_err(|err| format!("cannot initialize tls: {err}"))?;
+            Some(cfg)
+        } else {
+            None
+        };
         Ok(AuthConfig {
             bearer_token: self.bearer_token.clone(),
             bearer_token_file: self.bearer_token_file.clone(),
-            tls_config: self.tls_config.clone(),
+            tls,
         })
     }
 }
 
-/// Go `promauth.Config` subset: request auth headers + the parsed TLS config.
+/// Go `promauth.Config` subset: request auth headers + the built TLS config.
 #[derive(Debug, Default)]
 struct AuthConfig {
     bearer_token: String,
     bearer_token_file: String,
-    tls_config: TlsConfig,
+    tls: Option<TlsClientConfig>,
 }
 
 impl AuthConfig {
@@ -356,10 +361,6 @@ impl AuthConfig {
             return Ok(format!("Bearer {}", token.trim_end_matches(['\r', '\n'])));
         }
         Ok(String::new())
-    }
-
-    fn has_tls_client_config(&self) -> bool {
-        self.tls_config.is_set()
     }
 }
 
@@ -418,9 +419,9 @@ fn load_in_cluster_config() -> Result<KubeApiConfig, String> {
 
     let opts = AuthOptions {
         bearer_token_file: BEARER_TOKEN_FILE.to_string(),
-        tls_config: TlsConfig {
+        tls_config: TLSConfig {
             ca_file: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".to_string(),
-            ..TlsConfig::default()
+            ..TLSConfig::default()
         },
         ..AuthOptions::default()
     };
@@ -563,8 +564,14 @@ fn load_local_config() -> Result<KubeApiConfig, String> {
     }
 
     let raw_config = std::fs::read_to_string(&config_path).map_err(|err| err.to_string())?;
+    local_config_from_yaml(&raw_config, &config_path)
+}
 
-    let v = yaml_parse(&raw_config)
+/// Parses a kubeconfig document into a [`KubeApiConfig`] — the
+/// file-independent tail of Go `loadLocalConfig`, split out so tests can
+/// exercise kubeconfig parsing without touching `KUBECONFIG`/`HOME`.
+fn local_config_from_yaml(raw_config: &str, config_path: &str) -> Result<KubeApiConfig, String> {
+    let v = yaml_parse(raw_config)
         .map_err(|err| format!("cannot parse yaml {config_path:?}: {err}"))?;
     let cfg = KubeConfig::from_value(&v);
 
@@ -582,7 +589,7 @@ fn load_local_config() -> Result<KubeApiConfig, String> {
         ));
     };
 
-    let mut tls_cfg = TlsConfig::default();
+    let mut tls_cfg = TLSConfig::default();
 
     if !cl.certificate_authority.is_empty() {
         tls_cfg.ca_file = cl.certificate_authority.clone();
@@ -644,12 +651,15 @@ fn load_local_config() -> Result<KubeApiConfig, String> {
 /// PORT NOTE: Go holds an `http.Client` with a pooled transport; the port
 /// issues one std-TCP connection per request via
 /// `esl_storage::http_client::do_request` (the house pattern) plus a
-/// hand-rolled streaming connection for watch requests.
+/// hand-rolled streaming connection for watch requests. Both are upgraded to
+/// TLS when the API server URL uses `https://`.
 struct KubeApiClient {
     config: KubeApiConfig,
     scheme: String,
     addr: String,
     base_path: String,
+    /// `Some` when the connection must use https; see [`new_kube_api_client`].
+    tls: Option<TlsClientConfig>,
 }
 
 fn new_kube_api_client(config: KubeApiConfig) -> Result<KubeApiClient, String> {
@@ -670,11 +680,31 @@ fn new_kube_api_client(config: KubeApiConfig) -> Result<KubeApiClient, String> {
         ));
     }
     let addr = addr_with_default_port(hostport, scheme);
+
+    // PORT NOTE: Go's `http.Client` applies the promauth TLS config only to
+    // https URLs; mirror that by keying TLS off the URL scheme. An https
+    // server without explicit TLS material gets a default client config
+    // (webpki roots), built eagerly here like the rest of the TLS setup.
+    let tls = if scheme == "https" {
+        match &config.ac.tls {
+            Some(cfg) => Some(cfg.clone()),
+            None => {
+                let cfg = tlsutil::new_tls_client_config(&TLSConfig::default()).map_err(|err| {
+                    format!("cannot initialize tls for {:?}: {err}", config.server)
+                })?;
+                Some(cfg)
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(KubeApiClient {
         scheme: scheme.to_string(),
         addr,
         base_path: base_path.to_string(),
         config,
+        tls,
     })
 }
 
@@ -717,19 +747,6 @@ enum WatchError {
 }
 
 impl KubeApiClient {
-    /// Fails with a clear message when the configured API server requires TLS.
-    /// See the module PORT NOTE on TLS.
-    fn check_connect_supported(&self) -> Result<(), String> {
-        if self.scheme == "https" || self.config.ac.has_tls_client_config() {
-            return Err(format!(
-                "cannot connect to Kubernetes API server at {:?}: TLS connections are not supported by this port; \
-                 use an http:// proxy endpoint (e.g. `kubectl proxy`) for local testing",
-                self.config.server
-            ));
-        }
-        Ok(())
-    }
-
     fn request_url(&self, path_and_query: &str) -> String {
         format!("{}://{}{}", self.scheme, self.addr, path_and_query)
     }
@@ -762,8 +779,6 @@ impl KubeApiClient {
         node_name: &str,
         resource_version: &str,
     ) -> Result<PodWatchStream, String> {
-        self.check_connect_supported()?;
-
         let mut args = vec![
             ("watch".to_string(), "true".to_string()),
             // Watch pods only on the given node.
@@ -781,8 +796,9 @@ impl KubeApiClient {
         let pq = self.build_path_and_query("/api/v1/pods", &args);
         let url = self.request_url(&pq);
 
-        let (status_code, mut response) = open_streaming_get(&self.addr, &pq, &self.config.ac)
-            .map_err(|err| format!("cannot do {url:?} GET request: {err}"))?;
+        let (status_code, mut response) =
+            open_streaming_get(&self.addr, self.tls.as_ref(), &pq, &self.config.ac)
+                .map_err(|err| format!("cannot do {url:?} GET request: {err}"))?;
 
         if status_code == 410 && !resource_version.is_empty() {
             // Requested watch operation failed because the historical resourceVersion is too old.
@@ -808,8 +824,6 @@ impl KubeApiClient {
         url_path: &str,
         args: &[(String, String)],
     ) -> Result<Value, String> {
-        self.check_connect_supported()?;
-
         let pq = self.build_path_and_query(url_path, args);
         let url = self.request_url(&pq);
 
@@ -819,7 +833,7 @@ impl KubeApiClient {
             headers.push(("Authorization".to_string(), auth));
         }
 
-        let resp = do_request(&self.addr, "GET", &pq, &headers, None)
+        let resp = do_request(&self.addr, self.tls.as_ref(), "GET", &pq, &headers, None)
             .map_err(|err| format!("cannot do {url:?} GET request: {err}"))?;
 
         if resp.status_code != 200 {
@@ -891,8 +905,9 @@ fn query_escape(s: &str) -> String {
     out
 }
 
-/// Opens a streaming HTTP/1.1 GET request and returns the parsed status code
-/// plus a [`PodWatchStream`] over the (possibly chunked) response body.
+/// Opens a streaming HTTP/1.1 GET request (over plain TCP or TLS) and returns
+/// the parsed status code plus a [`PodWatchStream`] over the (possibly
+/// chunked) response body.
 ///
 /// PORT NOTE: `esl_storage::http_client::do_request` buffers whole responses;
 /// watch responses are unbounded streams, so this module carries its own
@@ -900,6 +915,7 @@ fn query_escape(s: &str) -> String {
 /// observe collector shutdown (Go cancels the request via context instead).
 fn open_streaming_get(
     addr: &str,
+    tls: Option<&TlsClientConfig>,
     path_and_query: &str,
     ac: &AuthConfig,
 ) -> Result<(u16, PodWatchStream), String> {
@@ -910,13 +926,31 @@ fn open_streaming_get(
         .map_err(|err| format!("cannot resolve {addr:?}: {err}"))?
         .next()
         .ok_or_else(|| format!("cannot resolve {addr:?}: no addresses"))?;
-    let mut stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(30))
+    let tcp = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(30))
         .map_err(|err| format!("cannot connect to {addr:?}: {err}"))?;
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-    let _ = stream.set_nodelay(true);
+    let _ = tcp.set_write_timeout(Some(Duration::from_secs(30)));
+    // Keep the read timeout long for the TLS handshake; it is lowered to 1s
+    // below so the watch read loop can observe collector shutdown.
+    let _ = tcp.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = tcp.set_nodelay(true);
 
-    let mut req = format!("GET {path_and_query} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    let mut stream = match tls {
+        None => WatchConn::Plain(tcp),
+        Some(cfg) => {
+            let host = host_without_port(addr);
+            WatchConn::Tls(Box::new(tlsutil::client_connect(cfg, host, tcp)?))
+        }
+    };
+    stream.set_read_timeout(Duration::from_secs(1));
+
+    // When the user overrode the TLS server name, use it as the `Host` header
+    // too (Go: `req.Host = ac.tlsServerName` in promauth.Config.SetHeaders).
+    let host_header = match tls {
+        Some(cfg) if !cfg.server_name.is_empty() => cfg.server_name.as_str(),
+        _ => addr,
+    };
+    let mut req =
+        format!("GET {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n");
     let auth = ac.get_auth_header()?;
     if !auth.is_empty() {
         req.push_str(&format!("Authorization: {auth}\r\n"));
@@ -924,6 +958,9 @@ fn open_streaming_get(
     req.push_str("\r\n");
     stream
         .write_all(req.as_bytes())
+        .map_err(|err| format!("cannot send request to {addr:?}: {err}"))?;
+    stream
+        .flush()
         .map_err(|err| format!("cannot send request to {addr:?}: {err}"))?;
 
     // Read the response head.
@@ -1002,6 +1039,76 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Strips the `:port` suffix from a `host:port` address (IPv6 literals keep
+/// Go's `[host]:port` bracket form); the result feeds TLS SNI/verification.
+///
+/// PORT NOTE: duplicated from esl-storage/src/http_client.rs (private there).
+fn host_without_port(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return &rest[..end];
+    }
+    match addr.rsplit_once(':') {
+        // An unbracketed IPv6 literal contains more colons; treat it as a
+        // bare host without port.
+        Some((host, _)) if !host.contains(':') => host,
+        _ => addr,
+    }
+}
+
+/// The transport under a watch stream: plain TCP or rustls-over-TCP
+/// (Go gets this polymorphism for free from `net/http`'s `resp.Body`).
+enum WatchConn {
+    Plain(TcpStream),
+    /// Boxed: `StreamOwned` embeds large rustls buffers (clippy
+    /// `large_enum_variant`).
+    Tls(Box<TlsClientStream>),
+}
+
+impl WatchConn {
+    fn set_read_timeout(&self, timeout: Duration) {
+        let sock = match self {
+            WatchConn::Plain(s) => s,
+            WatchConn::Tls(s) => &s.sock,
+        };
+        let _ = sock.set_read_timeout(Some(timeout));
+    }
+}
+
+impl Read for WatchConn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            WatchConn::Plain(s) => s.read(buf),
+            // PORT NOTE: a peer omitting TLS close_notify surfaces as
+            // `UnexpectedEof`; map it to a clean EOF. The response framing
+            // (Content-Length/chunked) is validated by [`PodWatchStream`], so
+            // truncation is still detected — same trust model as Go's
+            // net/http (see `TolerantEofReader` in esl-storage http_client).
+            WatchConn::Tls(s) => match s.read(buf) {
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+                other => other,
+            },
+        }
+    }
+}
+
+impl Write for WatchConn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            WatchConn::Plain(s) => s.write(buf),
+            WatchConn::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            WatchConn::Plain(s) => s.flush(),
+            WatchConn::Tls(s) => s.flush(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ChunkPhase {
     Size,
@@ -1012,7 +1119,7 @@ enum ChunkPhase {
 
 /// Go `podWatchStream` — a streaming reader over a watch response body.
 struct PodWatchStream {
-    stream: TcpStream,
+    stream: WatchConn,
     chunked: bool,
     /// Remaining body bytes for `Content-Length` framing (`None` = read to EOF).
     content_remaining: Option<usize>,
@@ -3834,5 +3941,299 @@ mod tests {
             r#"2025-12-15T10:34:26.948143000Z stderr F {"message":"Failed probe","probe":"metric-storage-ready","error":"no metrics to serve","severity":"ERROR","kubernetes.container_name":"test-container","kubernetes.pod_name":"test-pod","kubernetes.pod_namespace":"test-namespace"}"#,
         ];
         run_processor_lines(&input, 11);
+    }
+
+    // -----------------------------------------------------------------------
+    // TLS: kubeconfig parsing + client config build, https requests and the
+    // streaming watch reader over TLS.
+    //
+    // PORT NOTE: no upstream test file corresponds to these; Go gets TLS from
+    // net/http + promauth (covered by lib/promauth tests upstream).
+    // -----------------------------------------------------------------------
+
+    /// Minimal std base64 encoder for building kubeconfig `*-data` fields.
+    fn base64_std_encode(data: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let n = (u32::from(chunk[0]) << 16)
+                | (u32::from(chunk.get(1).copied().unwrap_or(0)) << 8)
+                | u32::from(chunk.get(2).copied().unwrap_or(0));
+            out.push(TABLE[(n >> 18) as usize & 63] as char);
+            out.push(TABLE[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                TABLE[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                TABLE[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// Generates a self-signed cert for localhost/127.0.0.1 and returns
+    /// `(cert_pem, key_pem)`.
+    fn generate_test_cert() -> (String, String) {
+        let ck = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .unwrap();
+        (ck.cert.pem(), ck.key_pair.serialize_pem())
+    }
+
+    /// Creates a unique temp dir for a test and returns its path.
+    fn test_temp_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("esl-agent-k8s-tls-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn kubeconfig_yaml(cluster_fields: &str, user_fields: &str) -> String {
+        format!(
+            "current-context: ctx\n\
+             clusters:\n\
+             - name: c1\n\
+             \x20 cluster:\n\
+             \x20   server: https://127.0.0.1:6443\n\
+             {cluster_fields}\
+             contexts:\n\
+             - name: ctx\n\
+             \x20 context:\n\
+             \x20   cluster: c1\n\
+             \x20   user: u1\n\
+             users:\n\
+             - name: u1\n\
+             \x20 user:\n\
+             \x20   token: test-token\n\
+             {user_fields}"
+        )
+    }
+
+    #[test]
+    fn test_local_config_tls_inline_data() {
+        let (cert_pem, key_pem) = generate_test_cert();
+        let cluster = format!(
+            "\x20   certificate-authority-data: {}\n",
+            base64_std_encode(cert_pem.as_bytes())
+        );
+        let user = format!(
+            "\x20   client-certificate-data: {}\n\x20   client-key-data: {}\n",
+            base64_std_encode(cert_pem.as_bytes()),
+            base64_std_encode(key_pem.as_bytes())
+        );
+        let yaml = kubeconfig_yaml(&cluster, &user);
+
+        let cfg = local_config_from_yaml(&yaml, "test-kubeconfig").unwrap();
+        assert_eq!(cfg.server, "https://127.0.0.1:6443");
+        assert_eq!(cfg.ac.bearer_token, "test-token");
+        // The TLS client config is built eagerly from the inline PEM data.
+        assert!(cfg.ac.tls.is_some());
+
+        let client = new_kube_api_client(cfg).unwrap();
+        assert_eq!(client.scheme, "https");
+        assert!(client.tls.is_some());
+    }
+
+    #[test]
+    fn test_local_config_tls_files() {
+        let (cert_pem, key_pem) = generate_test_cert();
+        let dir = test_temp_dir("kubeconfig-files");
+        let ca_path = dir.join("ca.pem");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&ca_path, &cert_pem).unwrap();
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+
+        let cluster = format!(
+            "\x20   certificate-authority: {}\n",
+            ca_path.to_str().unwrap()
+        );
+        let user = format!(
+            "\x20   client-certificate: {}\n\x20   client-key: {}\n",
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap()
+        );
+        let yaml = kubeconfig_yaml(&cluster, &user);
+
+        let cfg = local_config_from_yaml(&yaml, "test-kubeconfig").unwrap();
+        assert_eq!(cfg.server, "https://127.0.0.1:6443");
+        assert!(cfg.ac.tls.is_some());
+        assert!(new_kube_api_client(cfg).unwrap().tls.is_some());
+    }
+
+    #[test]
+    fn test_local_config_tls_broken_fails_eagerly() {
+        let (cert_pem, _) = generate_test_cert();
+        // A client certificate without the matching key must fail when the
+        // auth config is built, not on the first request.
+        let user = format!(
+            "\x20   client-certificate-data: {}\n",
+            base64_std_encode(cert_pem.as_bytes())
+        );
+        let yaml = kubeconfig_yaml("", &user);
+        let Err(err) = local_config_from_yaml(&yaml, "test-kubeconfig") else {
+            panic!("expecting non-nil error");
+        };
+        assert!(err.contains("cannot initialize"), "unexpected error: {err}");
+    }
+
+    /// Spawns a one-shot https server that reads one request head and answers
+    /// with `response`, returning `(addr, ca_pem, captured-request handle)`.
+    fn spawn_tls_api_server(
+        name: &str,
+        response: Vec<u8>,
+    ) -> (String, String, std::thread::JoinHandle<Vec<u8>>) {
+        let (cert_pem, key_pem) = generate_test_cert();
+        let dir = test_temp_dir(name);
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        let server_cfg = esl_common::tlsutil::get_server_tls_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            "",
+            &[],
+        )
+        .unwrap();
+
+        let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = ln.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            let (tcp, _) = ln.accept().unwrap();
+            let mut stream = esl_common::tlsutil::server_accept(&server_cfg, tcp).unwrap();
+            let mut req = vec![0u8; 8192];
+            let mut n = 0;
+            while !req[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                let m = stream.read(&mut req[n..]).unwrap();
+                assert!(m > 0, "request truncated");
+                n += m;
+            }
+            stream.write_all(&response).unwrap();
+            stream.conn.send_close_notify();
+            // Flush after send_close_notify BEFORE the socket is shut down,
+            // or client reads fail with Broken pipe.
+            stream.flush().unwrap();
+            req.truncate(n);
+            req
+        });
+        (addr, cert_pem, handle)
+    }
+
+    #[test]
+    fn test_get_nodes_over_tls() {
+        let body = br#"{"items":[{"metadata":{"name":"node-a"}},{"metadata":{"name":"node-b"}}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (addr, ca_pem, handle) = spawn_tls_api_server("get-nodes", response);
+
+        let opts = AuthOptions {
+            bearer_token: "test-token".to_string(),
+            tls_config: TLSConfig {
+                ca: ca_pem,
+                ..TLSConfig::default()
+            },
+            ..AuthOptions::default()
+        };
+        let cfg = KubeApiConfig {
+            server: format!("https://{addr}"),
+            ac: opts.new_config().unwrap(),
+        };
+        let client = new_kube_api_client(cfg).unwrap();
+
+        let nodes = client.get_nodes().unwrap();
+        assert_eq!(nodes, vec!["node-a".to_string(), "node-b".to_string()]);
+
+        let req = String::from_utf8(handle.join().unwrap()).unwrap();
+        assert!(
+            req.starts_with("GET /api/v1/nodes HTTP/1.1\r\n"),
+            "unexpected request: {req:?}"
+        );
+        assert!(
+            req.contains("Authorization: Bearer test-token\r\n"),
+            "missing auth header: {req:?}"
+        );
+    }
+
+    #[test]
+    fn test_watch_node_pods_over_tls() {
+        let events = [
+            r#"{"type":"ADDED","object":{"metadata":{"name":"pod-1","namespace":"ns1","resourceVersion":"10"}}}"#,
+            r#"{"type":"MODIFIED","object":{"metadata":{"name":"pod-1","namespace":"ns1","resourceVersion":"11"}}}"#,
+        ];
+        // Chunked framing with one watch event line per chunk, like the
+        // Kubernetes API server streams watch responses.
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        for e in events {
+            response.extend_from_slice(format!("{:x}\r\n{e}\n\r\n", e.len() + 1).as_bytes());
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        let (addr, _ca_pem, handle) = spawn_tls_api_server("watch-pods", response);
+
+        // insecure_skip_verify must be honored (promauth semantics).
+        let opts = AuthOptions {
+            bearer_token: "test-token".to_string(),
+            tls_config: TLSConfig {
+                insecure_skip_verify: true,
+                ..TLSConfig::default()
+            },
+            ..AuthOptions::default()
+        };
+        let cfg = KubeApiConfig {
+            server: format!("https://{addr}"),
+            ac: opts.new_config().unwrap(),
+        };
+        let client = new_kube_api_client(cfg).unwrap();
+
+        let mut stream = client.watch_node_pods("node-1", "").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut got: Vec<(String, String)> = Vec::new();
+        let err = stream.read_events(&stop, |event| {
+            got.push((
+                event.event_type.clone(),
+                event
+                    .object
+                    .item("metadata")
+                    .item("resourceVersion")
+                    .str()
+                    .to_string(),
+            ));
+            Ok(())
+        });
+        assert!(matches!(err, WatchError::Eof));
+        assert_eq!(
+            got,
+            vec![
+                ("ADDED".to_string(), "10".to_string()),
+                ("MODIFIED".to_string(), "11".to_string()),
+            ]
+        );
+
+        let req = String::from_utf8(handle.join().unwrap()).unwrap();
+        assert!(
+            req.starts_with(
+                "GET /api/v1/pods?fieldSelector=spec.nodeName%3Dnode-1&watch=true HTTP/1.1\r\n"
+            ),
+            "unexpected request: {req:?}"
+        );
+        assert!(
+            req.contains("Authorization: Bearer test-token\r\n"),
+            "missing auth header: {req:?}"
+        );
     }
 }

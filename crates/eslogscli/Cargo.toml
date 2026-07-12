@@ -11,3 +11,8 @@ path = "src/main.rs"
 [dependencies]
 esl-common = { path = "../esl-common" }
 esl-logstorage = { path = "../esl-logstorage" }
+
+[dev-dependencies]
+# Self-signed certificate generation for the https datasource tests
+# (dev-only; does not affect the cross-compile target closure).
+rcgen = "0.13"

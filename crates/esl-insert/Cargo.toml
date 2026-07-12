@@ -19,3 +19,8 @@ zstd = "0.13"
 # Loki protobuf ingestion: block-mode snappy decoding of push request bodies;
 # same pure-Rust crate/version esl-common's httpserver already uses.
 snap = "1"
+
+[dev-dependencies]
+# Self-signed certificate generation for the syslog-over-TLS tests
+# (dev-only; does not affect the cross-compile target closure).
+rcgen = "0.13"
