@@ -25,7 +25,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use esl_common::flagutil::Flag;
 use esl_common::httpserver::{Request, ResponseWriter};
-use esl_common::{buildinfo, envflag, fatalf, flagutil, httpserver, infof, logger, procutil};
+use esl_common::{
+    buildinfo, envflag, fatalf, flagutil, httpserver, infof, logger, procutil, pushmetrics,
+};
 
 use esl_logstorage::storage::Storage;
 
@@ -86,6 +88,9 @@ fn main() {
     // the std flag package and adds environment-variable expansion).
     envflag::parse();
     buildinfo::init();
+    // Go registers `-pushmetrics.url` as secret in package init(), before
+    // logger.Init logs the flags; mirror that ordering here.
+    pushmetrics::init_secret_flags();
     logger::init();
 
     let listen_addr = HTTP_LISTEN_ADDR.get().clone();
@@ -119,9 +124,11 @@ fn main() {
         start_time.elapsed().as_secs_f64()
     );
 
+    pushmetrics::init();
     // Block until SIGTERM/SIGINT, then shut down gracefully.
     let sig = procutil::wait_for_sigterm();
     infof!("received signal {sig}");
+    pushmetrics::stop();
 
     infof!("gracefully shutting down webservice at {listen_addr:?}");
     let start_time = Instant::now();

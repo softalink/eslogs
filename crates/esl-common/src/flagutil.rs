@@ -17,7 +17,7 @@
 //! the raw map, unlike Go where array-valued flags append. Use comma-separated
 //! values (`-foo=a,b`) instead.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 pub mod array;
@@ -84,6 +84,51 @@ pub fn visit_set_flags(mut f: impl FnMut(&str, &str)) {
     names.sort();
     for name in names {
         f(name, &m[name]);
+    }
+}
+
+/// Registry of resolved flags: name -> canonical value string
+/// (`flag.Value.String()` in Go), populated by `Flag::get`.
+///
+/// PORT NOTE: Go's `flag` package knows every registered flag before
+/// `flag.Parse()` because registration happens in package `init()`. Rust
+/// statics are lazy and there is no life-before-main, so a `Flag` enters the
+/// registry when it is first resolved via `Flag::get`. See
+/// [`visit_all_flags`] for the resulting coverage.
+static FLAG_REGISTRY: OnceLock<Mutex<BTreeMap<&'static str, String>>> = OnceLock::new();
+
+fn flag_registry() -> &'static Mutex<BTreeMap<&'static str, String>> {
+    FLAG_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn register_flag_value(name: &'static str, value: String) {
+    flag_registry().lock().unwrap().insert(name, value);
+}
+
+/// Calls `f(name, value, is_set)` for every known flag in lexicographical
+/// order of flag names, like Go's `flag.VisitAll` (used by the `esm_flag`
+/// gauges on the `/metrics` page).
+///
+/// PORT NOTE: Go visits every registered flag. The port visits the union of
+/// (a) flags resolved via `Flag::get` (canonical value strings, including
+/// default values) and (b) flags set on the command line but never resolved
+/// (raw command-line strings). Declared flags that are neither set nor read
+/// by the program are absent.
+pub fn visit_all_flags(mut f: impl FnMut(&str, &str, bool)) {
+    // Snapshot the union before invoking `f`, so `f` may resolve further
+    // flags (which locks the registry) without deadlocking.
+    let mut all: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    for (name, value) in flag_registry().lock().unwrap().iter() {
+        all.insert(name.to_string(), (value.clone(), raw(name).is_some()));
+    }
+    if let Some(m) = RAW_FLAGS.get() {
+        for (name, value) in m {
+            all.entry(name.clone())
+                .or_insert_with(|| (value.clone(), true));
+        }
+    }
+    for (name, (value, is_set)) in &all {
+        f(name, value, *is_set);
     }
 }
 
@@ -189,37 +234,48 @@ impl<T: FlagValue> Flag<T> {
 
     /// Returns the parsed flag value (or the default when unset). Panics with
     /// the same wording as Go's flag package on an unparsable value.
+    ///
+    /// The resolved value also enters the global flag registry used by
+    /// [`visit_all_flags`] (Go registers flags in package `init()` instead;
+    /// see the registry PORT NOTE).
     pub fn get(&self) -> &T {
-        self.cell.get_or_init(|| match raw(self.name) {
-            Some(s) => match T::parse_flag(s) {
-                Ok(v) => v,
-                Err(err) => {
-                    crate::panicf!("invalid value \"{s}\" for flag -{}: {err}", self.name);
-                    unreachable!()
-                }
-            },
-            // Port of `lib/envflag`: when `-envflag.enable` is set via
-            // `envflag::parse`, flags not set on the command line are read
-            // from the corresponding environment variable.
-            None => match crate::envflag::lookup_flag_env(self.name) {
-                Some((value, env_name)) => match T::parse_flag(&value) {
+        self.cell.get_or_init(|| {
+            let v = match raw(self.name) {
+                Some(s) => match T::parse_flag(s) {
                     Ok(v) => v,
                     Err(err) => {
-                        crate::panicf!(
-                            "cannot set flag {} to {value:?}, which is read from env var {env_name:?}: {err}",
-                            self.name
-                        );
+                        crate::panicf!("invalid value \"{s}\" for flag -{}: {err}", self.name);
                         unreachable!()
                     }
                 },
-                None => (self.default)(),
-            },
+                // Port of `lib/envflag`: when `-envflag.enable` is set via
+                // `envflag::parse`, flags not set on the command line are read
+                // from the corresponding environment variable.
+                None => match crate::envflag::lookup_flag_env(self.name) {
+                    Some((value, env_name)) => match T::parse_flag(&value) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            crate::panicf!(
+                                "cannot set flag {} to {value:?}, which is read from env var {env_name:?}: {err}",
+                                self.name
+                            );
+                            unreachable!()
+                        }
+                    },
+                    None => (self.default)(),
+                },
+            };
+            register_flag_value(self.name, v.to_string());
+            v
         })
     }
 }
 
 /// Conversion from a raw flag string, mirroring Go's `strconv`/`flag` parsing.
-pub trait FlagValue: Sized + 'static {
+///
+/// The `Display` bound mirrors Go's `flag.Value.String()`: it produces the
+/// canonical value string used by the flag registry ([`visit_all_flags`]).
+pub trait FlagValue: Sized + std::fmt::Display + 'static {
     fn parse_flag(s: &str) -> Result<Self, String>;
 }
 
@@ -275,6 +331,31 @@ mod tests {
         assert_eq!(raw("boolFlag"), Some("true"));
         assert_eq!(raw("c"), Some("3"));
         assert_eq!(raw("ignored"), None);
+
+        // visit_all_flags covers explicitly set flags even when they were
+        // never resolved via `Flag::get` (raw values, is_set=true).
+        let mut seen = None;
+        visit_all_flags(|name, value, is_set| {
+            if name == "b" {
+                seen = Some((value.to_string(), is_set));
+            }
+        });
+        assert_eq!(seen, Some(("two".to_string(), true)));
+    }
+
+    #[test]
+    fn test_visit_all_flags_registered_default() {
+        static REG_DEFAULT: Flag<i64> = Flag::new("visitAllRegisteredFlag", "", || 7);
+        assert_eq!(*REG_DEFAULT.get(), 7);
+        // A resolved flag shows up with its canonical value and is_set=false
+        // (it was not passed on the command line).
+        let mut seen = None;
+        visit_all_flags(|name, value, is_set| {
+            if name == "visitAllRegisteredFlag" {
+                seen = Some((value.to_string(), is_set));
+            }
+        });
+        assert_eq!(seen, Some(("7".to_string(), false)));
     }
 
     #[test]

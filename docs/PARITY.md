@@ -19,17 +19,18 @@ Status of each upstream package's port. Status values:
 | lib/memory | ported | |
 | lib/cgroup | ported | Linux-only behavior; no-op on Windows |
 | lib/logger | ported | |
-| lib/flagutil | ported | |
+| lib/flagutil | ported | incl. flag registry for /flags + esm_flag gauges (registration at first Flag::get; PORT NOTE on coverage) |
 | lib/envflag | ported | |
 | lib/buildinfo | ported | |
 | lib/fs | ported | cross-platform file ops |
 | lib/fs/fsutil | ported | |
 | lib/filestream | ported | |
 | lib/regexutil | ported | |
-| lib/httpserver | ported | threaded server (worker pool sized to available_cpus); no server-side TLS (single-owner rustls session vs the tri-handle conn plumbing, PORT NOTE), no auth/pprof (PORT NOTE); /metrics serves the full registry via lib/appmetrics + esm_http_* request metrics |
+| lib/httpserver | ported | threaded server (worker pool sized to available_cpus); server-side TLS via -tls/-tlsCertFile/-tlsKeyFile/-tlsMinVersion/-tlsCipherSuites (rustls session shared behind a mutex on TLS conns; plain-TCP path keeps its lock-free tri-handle plumbing — see the module docs); no auth/pprof (PORT NOTE); /metrics serves the full registry via lib/appmetrics + esm_http_* request metrics; /flags serves the Go-format flag dump (secrets redacted) |
 | lib/httputil | ported | GetRequestValue/GetArray/GetBool/GetInt/CheckURL over Request |
-| github.com/VictoriaMetrics/metrics | ported | esl-common/src/metrics.rs: Set + default set, Counter, FloatCounter, Gauge, Histogram (vmrange buckets), Summary (incl. inline valyala/histogram+fastrand), validator, WritePrometheus, process metrics (linux /proc + windows); push.go / prometheus_histogram.go / go_metrics.go unported (ignore list) |
-| lib/appmetrics | ported | esl-common/src/appmetrics.rs: /metrics payload (registry + process + esm_app_*/esm_os_info); flag export + -metrics.exposeMetadata flag PORT-NOTEd |
+| github.com/VictoriaMetrics/metrics | ported | esl-common/src/metrics.rs: Set + default set, Counter, FloatCounter, Gauge, Histogram (vmrange buckets), Summary (incl. inline valyala/histogram+fastrand), validator, WritePrometheus, process metrics (linux /proc + windows, incl. PSI process_pressure_*), push.go (metrics/push.rs: periodic push, extra labels, gzip, metrics_push_* self-metrics); prometheus_histogram.go / go_metrics.go unported (ignore list) |
+| lib/appmetrics | ported | esl-common/src/appmetrics.rs: /metrics payload (registry + process + esm_app_*/esm_os_info); esm_flag{name,value,is_set} gauges + -metrics.exposeMetadata flag wired |
+| lib/pushmetrics | ported | esl-common/src/pushmetrics.rs: -pushmetrics.url/.interval/.extraLabel/.header/.disableCompression, Init/Stop wired in es-logs + esl-agent mains; InitWith/StopAndPush unported (vmctl/vmbackup-only, PORT NOTE) |
 | lib/netutil | todo | |
 | lib/protoparser/protoparserutil | partial | request-body decompression (gzip/deflate/zstd/snappy) + ReadLinesBlock in httpserver; rest todo |
 | lib/writeconcurrencylimiter | todo | |
@@ -77,7 +78,12 @@ Tracked at file/subsystem granularity once porting starts:
 | app/esmui | esl-select assets | ported | prebuilt upstream assets embedded, completeness-tested |
 
 Cross-cutting deferrals (PORT-NOTEd at each site):
-net_query_runner (cluster query splitting) stubbed for single-node. Context
+net_query_runner (cluster query splitting) is PORTED (2026-07-12):
+`Pipe::split_to_remote_and_local` across all 51 pipe impls,
+`PipeStatsMode` remote/local/proxy (export_state/import_state wire),
+`NetQueryRunner` + eager subquery init, wired into netselect
+`Storage::run_query` (2-node stats-merge e2e in esl-select internalselect
+tests). Context
 cancellation is ported (2026-07-12): a global disconnect-watcher thread
 (esl_common::disconnect_watcher, peek-based socket probing) stands in for
 Go's request ctx; `Storage::run_query_with_cancel` and the `Get*` query
@@ -91,9 +97,9 @@ the storage writer set, per-query-stats vmrange histograms and process
 metrics; remaining unwired families (vm_filestream_*, vm_fs_*, vm_gorutines
 and other Go-runtime series) are PORT-NOTEd at their sites. TLS is supported via `esl_common::tlsutil` (rustls/ring, MSVC
 cross-compile-clean): client side (-storageNode.tls*, -remoteWrite.tls*,
-kubernetes collector, eslogscli -tls*) and server side (-syslog.tls*); the
-one exception is httpserver's -tls serving flags, omitted with a PORT NOTE
-(single-owner rustls session vs the server's tri-handle connection plumbing).
+kubernetes collector, eslogscli -tls*) and server side (-syslog.tls* and
+httpserver's -tls/-tlsCertFile/-tlsKeyFile/-tlsMinVersion/-tlsCipherSuites
+serving flags for both es-logs and eslagent).
 rustls-vs-Go gaps (PORT-NOTEd in tlsutil): no TLS 1.0/1.1, AEAD-only cipher
 suites, webpki-roots bundle instead of the system cert pool.
 `_stream:{...}` execution is fully wired (lazy per-partition streamID
@@ -112,21 +118,27 @@ pre-filter remains an unported optimization.
 
 ## Architectural decisions
 
-- **indexdb / mergeset (2026-07-07):** EsLogs' `indexdb` sits on
-  Softalink LLC `lib/mergeset` (~4500 LOC LSM engine). We did NOT port
-  mergeset; instead `indexdb/mergeset.rs` is an API-compatible internal
-  sorted-items store (in-memory sorted store persisted to a single
-  length-prefixed `items.bin`, with lower-bound seek cursor matching
-  mergeset's Seek/NextItem/FirstItemWithPrefix). The indexdb *item byte
-  encoding* (nsPrefix+tenantID+tag/streamID) is defined in indexdb.go and is
-  preserved exactly, so query semantics match upstream. **Implication:** the
-  on-disk `indexdb/` directory is NOT byte-compatible with upstream mergeset
-  parts. This is acceptable because the logs-benchmark runs each server on a
-  fresh data dir. RISK to revisit in Layer 7 optimization: the store keeps the
-  index in RAM and flushes as one blob — fine while stream cardinality is low
-  vs log volume, but if the disk-usage or RSS metric proves sensitive, port
-  real mergeset. All other formats (streamID, stream-tags canonical, tag
-  encoding, cache keys) remain byte-identical to upstream.
+- **indexdb / mergeset (2026-07-07, superseded 2026-07-12):** EsLogs'
+  `indexdb` sits on Softalink LLC `lib/mergeset` (~4500 LOC LSM
+  engine). The port initially used an API-compatible internal sorted-items
+  store instead (single length-prefixed `items.bin`), which preserved query
+  semantics but not the on-disk format. That store has been replaced by a
+  faithful port of `lib/mergeset` (`indexdb/mergeset/`): part layout
+  (`metaindex.bin`/`index.bin`/`items.bin`/`lens.bin` + `metadata.json` per
+  part, `parts.json` listing), block encodings (commonPrefix block headers,
+  plain + zstd items/lens encodings), rawItems shards → in-memory parts →
+  file parts with background merges, and the `PrepareBlockCallback` merge
+  hook. **Implication:** the on-disk `indexdb/` directory IS now
+  byte-compatible with upstream — an existing Go `-storageDataPath` opens in
+  place, and both cross directions are verified live against the Go reference
+  binary (Go-written indexdb read by Rust; Rust-written parts read back by
+  Go; see the `#[ignore]`d `test_go_indexdb_cross_compat` in
+  `indexdb/mod.rs`). Deliberate divergences, PORT-NOTEd in
+  `indexdb/mergeset/`: no global block caches (Storage-level caches cover
+  the hot paths), `Arc<PartWrapper>` instead of the manual refCount, no
+  read-only mode, object pools omitted. All other formats (streamID,
+  stream-tags canonical, tag encoding, cache keys) remain byte-identical to
+  upstream.
 
 ## Layer 3 integration seams (to wire before/with Layer 4)
 
@@ -212,9 +224,13 @@ INGESTION fully wired → 4/5 benchmark metrics don't need this; only query late
   rendered-text subqueries (`InValues::q_text`, `FilterStreamID::q_text`,
   `PipeJoin`/`PipeUnion::query_text`) and are resolved before the search by
   `storage_search::init_subqueries` (Go `initSubqueries`/`initFilterInValues`/
-  `initJoinMaps`/`initUnionQueries`). Still deferred: `visitSubqueries`-based
-  propagation (`AddTimeFilter`/`AddExtraFilters`/`optimize` do not descend into
-  subqueries), `stream_context` runQuery wiring (`initStreamContextPipes`) and
-  the eager cluster mode (`initSubqueries(..., eagerExecute=true)` with
-  `net_query_runner`).
+  `initJoinMaps`/`initUnionQueries`). The eager cluster mode
+  (Go `initSubqueries(..., eagerExecute=true)`) is ported in
+  `net_query_runner::init_subqueries_net`, with a PORT NOTE divergence:
+  local-half `union` subqueries are also resolved eagerly (inlined as
+  `union rows(...)`) instead of Go's lazy flush-time wiring, because the
+  runner borrows the caller's run-net-query callback. Still deferred:
+  `visitSubqueries`-based propagation (`AddTimeFilter`/`AddExtraFilters`/
+  `optimize` do not descend into subqueries) and `stream_context` runQuery
+  wiring (`initStreamContextPipes`).
 - filter_and/not Display omit parens; filter_phrase Display incomplete quoter.

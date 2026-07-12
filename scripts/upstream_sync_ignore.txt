@@ -5,9 +5,8 @@
 
 # -- Prometheus metrics registry: ported to esl-common/src/metrics.rs (+
 #    submodules); the files below are the deliberately-unported remainder.
-# push-mode metrics delivery: the port serves /metrics for scraping only
-vendor/github.com/VictoriaMetrics/metrics/push.go
-# le-bucket Prometheus histograms: nothing in the EsLogs port uses them
+# le-bucket Prometheus histograms: no consumer at the pinned tag (only the
+# Set constructor plumbing in set.go references the type)
 vendor/github.com/VictoriaMetrics/metrics/prometheus_histogram.go
 # Go-runtime metrics (go_*): no Go runtime in the Rust port
 vendor/github.com/VictoriaMetrics/metrics/go_metrics.go
@@ -32,8 +31,6 @@ vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/ioutil/*
 vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil/*
 # Prometheus remote-write protobufs: metrics-only
 vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb/*
-# pushmetrics: metrics registry push, not ported
-vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/pushmetrics/*
 # instant-snapshot HTTP helper for VM storage: logs snapshots are served by
 # the ported esl-storage handlers directly
 vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/snapshot/*

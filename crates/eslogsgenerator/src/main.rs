@@ -577,6 +577,23 @@ impl FlagValue for DurationFlag {
     }
 }
 
+impl fmt::Display for DurationFlag {
+    /// Canonical value string for the flag registry (the `FlagValue` trait's
+    /// `Display` bound, mirroring Go `flag.Value.String()`): the largest unit
+    /// dividing the duration evenly, matching Go `time.Duration.String()` for
+    /// the round values this tool uses (e.g. `10s`).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let n = self.nanos;
+        if n != 0 && n % 1_000_000_000 == 0 {
+            write!(f, "{}s", n / 1_000_000_000)
+        } else if n != 0 && n % 1_000_000 == 0 {
+            write!(f, "{}ms", n / 1_000_000)
+        } else {
+            write!(f, "{n}ns")
+        }
+    }
+}
+
 /// The parsed `-addr` ingestion URL with `_stream_fields=host,worker_id`
 /// injected into the query string, like Go does via `url.Values.Set`.
 ///

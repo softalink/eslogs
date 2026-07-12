@@ -31,7 +31,7 @@ pub fn validate_metric(s: &str) -> Result<(), String> {
     validate_tags(&s[..s.len() - 1])
 }
 
-fn validate_tags(mut s: &str) -> Result<(), String> {
+pub(super) fn validate_tags(mut s: &str) -> Result<(), String> {
     if s.is_empty() {
         return Ok(());
     }

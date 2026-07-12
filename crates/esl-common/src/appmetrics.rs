@@ -3,33 +3,50 @@
 //! the `/metrics` page payload composed from the metrics registry
 //! ([`crate::metrics`]), process metrics and app-level gauges.
 //!
-//! PORT NOTE: the `-metrics.exposeMetadata` flag is not ported; metadata
-//! exposition can still be toggled programmatically via
-//! [`crate::metrics::expose_metadata`] (off by default, like Go).
-//!
 //! PORT NOTE: Go exports every registered command-line flag as
-//! `flag{name=..., value=..., is_set=...}` gauges; the port's flag handling
-//! (`flagutil`) has no global flag registry to enumerate, so the flag metrics
-//! are not exposed.
+//! `flag{name=..., value=..., is_set=...}` gauges via `flag.VisitAll`; the
+//! port exports them as `esm_flag{...}` (rebranded name) through
+//! [`crate::flagutil::visit_all_flags`], which covers resolved flags plus
+//! explicitly set ones — see its PORT NOTE for the coverage difference.
 //!
 //! PORT NOTE: `vm_os_info` release detection uses `RtlGetVersion` on Windows
 //! upstream; the port reports `os="windows"` without a release to avoid
 //! depending on ntdll. On Linux the release comes from `uname(2)` like Go.
 
-use std::sync::{LazyLock, Mutex};
+use std::fmt::Write;
+use std::sync::{LazyLock, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::flagutil::Flag;
 use crate::metrics::{write_gauge_uint64, write_metadata_if_needed};
-use crate::{buildinfo, cgroup, memory, metrics};
+use crate::{buildinfo, cgroup, flagutil, memory, metrics};
+
+static EXPOSE_METADATA: Flag<bool> = Flag::new(
+    "metrics.exposeMetadata",
+    "Whether to expose TYPE and HELP metadata at the /metrics page, which is exposed at -httpListenAddr . \
+     The metadata may be needed when the /metrics page is consumed by systems, which require this information. \
+     For example, Managed Prometheus in Google Cloud - \
+     https://cloud.google.com/stackdriver/docs/managed-prometheus/troubleshooting#missing-metric-type",
+    || false,
+);
+
+static EXPOSE_METADATA_ONCE: Once = Once::new();
+
+fn init_expose_metadata() {
+    metrics::expose_metadata(*EXPOSE_METADATA.get());
+}
 
 /// Initializes the app start time used by `esm_app_start_timestamp` and
 /// `esm_app_uptime_seconds`.
 ///
 /// PORT NOTE: Go captures the start time at package init; call this early in
 /// `main` (the ported httpserver does it when a server starts) so the first
-/// `/metrics` scrape doesn't become the start time.
+/// `/metrics` scrape doesn't become the start time. It also captures the
+/// process-metrics baselines (the PSI snapshot on Linux) which Go takes at
+/// package init.
 pub fn init_start_time() {
     LazyLock::force(&START_TIME);
+    metrics::init_process_metrics();
 }
 
 static START_TIME: LazyLock<(Instant, u64)> = LazyLock::new(|| {
@@ -45,6 +62,8 @@ static START_TIME: LazyLock<(Instant, u64)> = LazyLock::new(|| {
 ///
 /// The output is cached for one second to protect against scrape storms.
 pub fn write_prometheus_metrics(w: &mut String) {
+    EXPOSE_METADATA_ONCE.call_once(init_expose_metadata);
+
     static CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
 
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -94,9 +113,25 @@ fn write_prometheus_metrics_uncached(w: &mut String) {
     write_gauge_uint64(w, "esm_app_start_timestamp", start_unix);
     write_gauge_uint64(w, "esm_app_uptime_seconds", started.elapsed().as_secs());
 
-    // PORT NOTE: Go additionally exports every command-line flag as a
-    // `flag{...}` gauge here; see the module-level PORT NOTE.
-    write_metadata_if_needed(w, "flag", "gauge");
+    // Export flags as metrics (Go iterates `flag.VisitAll`; see the
+    // module-level PORT NOTE about the `esm_flag` name and coverage).
+    write_metadata_if_needed(w, "esm_flag", "gauge");
+    flagutil::visit_all_flags(|name, value, is_set| {
+        let lname = name.to_lowercase();
+        let value = if flagutil::is_secret_flag(&lname) {
+            // Do not expose passwords and keys to prometheus.
+            "secret"
+        } else {
+            value
+        };
+        let _ = writeln!(
+            w,
+            "esm_flag{{name={}, value={}, is_set=\"{}\"}} 1",
+            flagutil::go_quote(name),
+            flagutil::go_quote(value),
+            if is_set { "true" } else { "false" }
+        );
+    });
 }
 
 fn write_os_metrics(w: &mut String) {
@@ -147,7 +182,12 @@ mod tests {
 
     #[test]
     fn test_write_prometheus_metrics() {
+        // The expose-metadata Once toggles the global metadata switch; hold
+        // the metrics registry lock so parallel metadata tests can't race it.
+        let _guard = crate::metrics::testutil::global_registry_lock();
         super::init_start_time();
+        // Resolve a flag so the esm_flag export has at least one entry.
+        let _ = *super::EXPOSE_METADATA.get();
         let mut bb = String::new();
         write_prometheus_metrics(&mut bb);
         for needle in [
@@ -157,6 +197,7 @@ mod tests {
             "esm_available_cpu_cores ",
             "esm_app_start_timestamp ",
             "esm_app_uptime_seconds ",
+            "esm_flag{name=\"metrics.exposeMetadata\", value=\"false\", is_set=\"false\"} 1",
         ] {
             assert!(bb.contains(needle), "missing {needle:?} in\n{bb}");
         }

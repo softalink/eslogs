@@ -25,6 +25,7 @@ pub mod logger;
 pub mod memory;
 pub mod metrics;
 pub mod procutil;
+pub mod pushmetrics;
 pub mod regexutil;
 pub mod slicesutil;
 pub mod stringsutil;

@@ -166,9 +166,10 @@ fn scan_single_duration(s: &str, can_be_negative: bool) -> isize {
     }
 }
 
-// Port of Go time.Duration.String(), used in the parse_duration error message
-// so the wording matches Go exactly.
-fn format_go_duration(d: i64) -> String {
+/// Port of Go `time.Duration.String()` (`d` in nanoseconds), used in the
+/// parse_duration error message and by `Flag<Duration>`-shaped flag values so
+/// the wording matches Go exactly.
+pub fn format_go_duration(d: i64) -> String {
     let neg = d < 0;
     let mut u = d.unsigned_abs();
     let mut s;

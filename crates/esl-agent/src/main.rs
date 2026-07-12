@@ -11,16 +11,14 @@
 //! support, so the flag is a single `String` here (mirroring the ported
 //! es-logs binary).
 //!
-//! PORT NOTE: `pushmetrics.Init/Stop` are not ported — the metrics registry
-//! (`esl_common::metrics`) serves `/metrics` for scraping, but the push-mode
-//! delivery (`Softalink LLC/metrics` `push.go`) is out of scope.
-
 use std::sync::Arc;
 use std::time::Instant;
 
 use esl_common::flagutil::Flag;
 use esl_common::httpserver::{Request, ResponseWriter};
-use esl_common::{buildinfo, envflag, fatalf, flagutil, httpserver, infof, logger, procutil};
+use esl_common::{
+    buildinfo, envflag, fatalf, flagutil, httpserver, infof, logger, procutil, pushmetrics,
+};
 
 use esl_agent::{filecollector, kubernetescollector, remotewrite, tail};
 
@@ -49,6 +47,9 @@ fn main() {
     envflag::parse();
     buildinfo::init();
     remotewrite::init_secret_flags();
+    // Go registers `-pushmetrics.url` as secret in package init(), before
+    // logger.Init logs the flags; mirror that ordering here.
+    pushmetrics::init_secret_flags();
     logger::init();
 
     let listen_addr = HTTP_LISTEN_ADDR.get().clone();
@@ -93,8 +94,10 @@ fn main() {
         start_time.elapsed().as_secs_f64()
     );
 
+    pushmetrics::init();
     let sig = procutil::wait_for_sigterm();
     infof!("received signal {sig}");
+    pushmetrics::stop();
 
     let start_time = Instant::now();
     infof!("gracefully shutting down webservice at {listen_addr:?}");

@@ -84,6 +84,14 @@ impl FlagValue for DurationFlag {
     }
 }
 
+// `FlagValue` requires the canonical value string for the flag registry
+// (Go `flag.Value.String()`, i.e. `time.Duration.String()` here).
+impl std::fmt::Display for DurationFlag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&timeutil::format_go_duration(self.nanos))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // file_collector.go — Init/Stop and glob processing
 // ---------------------------------------------------------------------------

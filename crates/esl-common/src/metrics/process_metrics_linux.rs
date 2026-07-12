@@ -4,10 +4,10 @@
 //! `log.Printf` default destination (stderr); the metrics package doesn't use
 //! `lib/logger` upstream either.
 //!
-//! PORT NOTE: the cgroup-v2 PSI metrics (`process_pressure_*`,
-//! `writePSIMetrics`) are not ported — they need the initial PSI snapshot
-//! captured at program start, which has no reliable equivalent without
-//! life-before-main; none of the EsLogs dashboards use them.
+//! PORT NOTE: Go captures the initial PSI snapshot (`psiMetricsStart`) at
+//! package init; Rust has no life-before-main, so the port captures it when
+//! [`init_psi_baseline`] is first called (`appmetrics::init_start_time`, i.e.
+//! at httpserver start) or lazily on the first metrics write.
 
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,6 +78,7 @@ pub(super) fn write_process_metrics(w: &mut String) {
     write_gauge_uint64(w, "process_virtual_memory_bytes", p.vsize);
     write_process_mem_metrics(w);
     write_io_metrics(w);
+    write_psi_metrics(w);
 }
 
 /// Parses the whitespace-separated `/proc/self/stat` fields following the
@@ -149,6 +150,168 @@ fn write_io_metrics(w: &mut String) {
     write_gauge_uint64(w, "process_io_write_syscalls_total", syscw);
     write_gauge_uint64(w, "process_io_storage_read_bytes_total", read_bytes);
     write_gauge_uint64(w, "process_io_storage_written_bytes_total", write_bytes);
+}
+
+/// Writes PSI total metrics for the current process to `w`
+/// (Go `writePSIMetrics`).
+///
+/// See <https://docs.kernel.org/accounting/psi.html>
+fn write_psi_metrics(w: &mut String) {
+    let Some(start) = &*PSI_METRICS_START else {
+        // Failed to initialize PSI metrics.
+        return;
+    };
+
+    let m = match get_psi_metrics() {
+        Ok(Some(m)) => m,
+        // The cgroup v2 path disappeared; nothing to expose.
+        Ok(None) => return,
+        Err(err) => {
+            eprintln!("ERROR: metrics: cannot expose PSI metrics: {err}");
+            return;
+        }
+    };
+
+    write_counter_float64(
+        w,
+        "process_pressure_cpu_waiting_seconds_total",
+        psi_total_secs(m.cpu_some.wrapping_sub(start.cpu_some)),
+    );
+    write_counter_float64(
+        w,
+        "process_pressure_cpu_stalled_seconds_total",
+        psi_total_secs(m.cpu_full.wrapping_sub(start.cpu_full)),
+    );
+
+    write_counter_float64(
+        w,
+        "process_pressure_io_waiting_seconds_total",
+        psi_total_secs(m.io_some.wrapping_sub(start.io_some)),
+    );
+    write_counter_float64(
+        w,
+        "process_pressure_io_stalled_seconds_total",
+        psi_total_secs(m.io_full.wrapping_sub(start.io_full)),
+    );
+
+    write_counter_float64(
+        w,
+        "process_pressure_memory_waiting_seconds_total",
+        psi_total_secs(m.mem_some.wrapping_sub(start.mem_some)),
+    );
+    write_counter_float64(
+        w,
+        "process_pressure_memory_stalled_seconds_total",
+        psi_total_secs(m.mem_full.wrapping_sub(start.mem_full)),
+    );
+}
+
+fn psi_total_secs(microsecs: u64) -> f64 {
+    // PSI total stats is in microseconds according to
+    // https://docs.kernel.org/accounting/psi.html . Convert it to seconds.
+    microsecs as f64 / 1e6
+}
+
+/// The initial PSI metric values on program start; needed in order to make
+/// sure the exposed PSI metrics start from zero (Go `psiMetricsStart`,
+/// captured at package init — see the module PORT NOTE).
+static PSI_METRICS_START: LazyLock<Option<PsiMetrics>> =
+    LazyLock::new(|| match get_psi_metrics() {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("INFO: metrics: disable exposing PSI metrics because of failed init: {err}");
+            None
+        }
+    });
+
+/// Captures the initial PSI snapshot (see [`PSI_METRICS_START`]).
+pub(super) fn init_psi_baseline() {
+    LazyLock::force(&PSI_METRICS_START);
+}
+
+#[derive(Default)]
+struct PsiMetrics {
+    cpu_some: u64,
+    cpu_full: u64,
+    io_some: u64,
+    io_full: u64,
+    mem_some: u64,
+    mem_full: u64,
+}
+
+/// Returns the current PSI totals, or `None` when the process doesn't run
+/// under cgroup v2 (Go `getPSIMetrics` returning `nil, nil`).
+fn get_psi_metrics() -> Result<Option<PsiMetrics>, String> {
+    let cgroup_path = get_cgroup_v2_path();
+    if cgroup_path.is_empty() {
+        // Do nothing, since PSI requires cgroup v2, and the process doesn't
+        // run under cgroup v2.
+        return Ok(None);
+    }
+
+    let (cpu_some, cpu_full) = read_psi_totals(&cgroup_path, "cpu.pressure")?;
+    let (io_some, io_full) = read_psi_totals(&cgroup_path, "io.pressure")?;
+    let (mem_some, mem_full) = read_psi_totals(&cgroup_path, "memory.pressure")?;
+
+    Ok(Some(PsiMetrics {
+        cpu_some,
+        cpu_full,
+        io_some,
+        io_full,
+        mem_some,
+        mem_full,
+    }))
+}
+
+/// Parses the `some`/`full` totals from a cgroup v2 pressure file
+/// (Go `readPSITotals`).
+fn read_psi_totals(cgroup_path: &str, stats_name: &str) -> Result<(u64, u64), String> {
+    let file_path = format!("{cgroup_path}/{stats_name}");
+    let data = std::fs::read_to_string(&file_path).map_err(|err| err.to_string())?;
+
+    let mut some = 0u64;
+    let mut full = 0u64;
+    for line in data.lines() {
+        let line = line.trim();
+        if !line.starts_with("some ") && !line.starts_with("full ") {
+            continue;
+        }
+
+        let Some((_, total)) = line.split_once("total=") else {
+            return Err(format!(
+                "cannot find total from the line {line:?} at {file_path:?}"
+            ));
+        };
+        let microsecs: u64 = total
+            .parse()
+            .map_err(|err| format!("cannot parse total={total:?} at {file_path:?}: {err}"))?;
+
+        if line.starts_with("some ") {
+            some = microsecs;
+        } else {
+            full = microsecs;
+        }
+    }
+    Ok((some, full))
+}
+
+/// Returns the cgroup v2 path for the current process, or an empty string
+/// when the process doesn't run under cgroup v2 (Go `getCgroupV2Path`).
+fn get_cgroup_v2_path() -> String {
+    let Ok(data) = std::fs::read_to_string("/proc/self/cgroup") else {
+        return String::new();
+    };
+    let Some((_, rest)) = data.split_once("::") else {
+        return String::new();
+    };
+    let path = format!("/sys/fs/cgroup{}", rest.trim());
+
+    // Drop trailing slash if it exists. This prevents from '//' in the
+    // constructed paths by the caller.
+    match path.strip_suffix('/') {
+        Some(p) => p.to_string(),
+        None => path,
+    }
 }
 
 /// The process start time as a unix timestamp.
@@ -345,6 +508,36 @@ mod tests {
         f(0, &testdata("limits"), true);
 
         let _ = std::fs::remove_dir_all(&fd_dir);
+    }
+
+    // PORT NOTE: Rust-only test; upstream has no readPSITotals test at the
+    // vendored metrics version (v1.43.2).
+    #[test]
+    fn test_read_psi_totals() {
+        let dir = std::env::temp_dir().join(format!("esl-metrics-psi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_string_lossy().to_string();
+
+        std::fs::write(
+            dir.join("cpu.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=123456\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=789\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_psi_totals(&dir_s, "cpu.pressure").unwrap(),
+            (123456, 789)
+        );
+
+        std::fs::write(dir.join("io.pressure"), "some avg10=0.00 total=x\n").unwrap();
+        assert!(super::read_psi_totals(&dir_s, "io.pressure").is_err());
+
+        std::fs::write(dir.join("memory.pressure"), "some avg10=0.00\n").unwrap();
+        assert!(super::read_psi_totals(&dir_s, "memory.pressure").is_err());
+
+        assert!(super::read_psi_totals(&dir_s, "no.such.file").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

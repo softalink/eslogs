@@ -9,12 +9,13 @@
 //! of Go's `io.Writer`; the `/metrics` handler buffers the response anyway.
 //!
 //! PORT NOTE: `WriteProcessMetrics` in Go emits `go_*` runtime metrics
-//! (`go_metrics.go`) and push-mode metrics (`push.go`); neither has a Rust
-//! equivalent (no Go runtime, no push mode ported), so [`write_process_metrics`]
-//! emits only the OS-level `process_*` series.
+//! (`go_metrics.go`) first; there is no Go runtime in the Rust port, so
+//! [`write_process_metrics`] emits only the OS-level `process_*` series plus
+//! the push-mode metrics ([`push`]).
 //!
 //! PORT NOTE: `prometheus_histogram.go` (`le`-bucket histograms) is not
-//! ported — nothing in the EsLogs port uses it.
+//! ported — at the pinned upstream tag it has no consumer (only the `Set`
+//! constructor plumbing in `set.go` references it).
 
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,7 @@ mod histogram;
 mod process_metrics_linux;
 #[cfg(windows)]
 mod process_metrics_windows;
+pub mod push;
 mod set;
 mod summary;
 mod validator;
@@ -218,14 +220,24 @@ pub fn write_prometheus(w: &mut String, expose_process_metrics: bool) {
 ///
 /// See also [`write_fd_metrics`].
 pub fn write_process_metrics(w: &mut String) {
+    // PORT NOTE: mirrors process_metrics_other.go — no OS-level process
+    // metrics on systems other than linux/windows. Go additionally emits
+    // go_* runtime metrics here (N/A for Rust).
     #[cfg(target_os = "linux")]
     process_metrics_linux::write_process_metrics(w);
     #[cfg(windows)]
     process_metrics_windows::write_process_metrics(w);
-    #[cfg(not(any(target_os = "linux", windows)))]
-    // PORT NOTE: mirrors process_metrics_other.go — no process metrics on
-    // unsupported systems.
-    let _ = w;
+    push::write_push_metrics(w);
+}
+
+/// Captures the process-metrics baselines Go takes at package init (currently
+/// the Linux PSI snapshot); called from `appmetrics::init_start_time`.
+///
+/// PORT NOTE: Rust has no life-before-main; without this call the baselines
+/// are captured lazily on the first metrics write instead.
+pub fn init_process_metrics() {
+    #[cfg(target_os = "linux")]
+    process_metrics_linux::init_psi_baseline();
 }
 
 /// Writes `process_max_fds` and `process_open_fds` metrics to `w`.

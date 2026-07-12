@@ -47,29 +47,47 @@
 //! deadline jitter. Response compression (`gzhttp`) is also omitted;
 //! responses are small.
 //!
-//! PORT NOTE (TLS): Go's `-tls`/`-tlsCertFile`/`-tlsKeyFile` serving flags are
-//! NOT ported even though the workspace now has a TLS stack
-//! (`esl_common::tlsutil`, used by the syslog listeners and all clients). This
-//! server's connection plumbing relies on three simultaneously live
-//! `TcpStream::try_clone` handles per connection — the `BufReader` read half,
-//! the `BufWriter` write half, and the `Arc<TcpStream>` handle that
-//! `ResponseWriter::flush_chunk` writes to mid-handler for `/tail` streaming
-//! (see `handle_connection`). A rustls session is a single-owner object that
-//! serializes reads and writes through one connection state machine, so
-//! layering TLS here would require redesigning the reader/writer/flush-chunk
-//! split around a shared, locked TLS stream. The flags are therefore omitted
-//! entirely rather than half-shipped; terminate TLS in front of the server if
-//! needed.
+//! ## TLS serving
+//!
+//! Go's `-tls`/`-tlsCertFile`/`-tlsKeyFile`/`-tlsMinVersion`/`-tlsCipherSuites`
+//! serving flags are ported on top of `crate::tlsutil` (rustls). The
+//! per-connection plumbing differs by transport: a plain-TCP connection holds
+//! three independent `TcpStream::try_clone` handles (the `BufReader` read
+//! half, the `BufWriter` write half, and the handle that
+//! `ResponseWriter::flush_chunk` writes to mid-handler for `/tail` streaming),
+//! while a rustls session is a single-owner state machine that serializes
+//! reads and writes, so a TLS connection instead shares one `StreamOwned`
+//! behind a mutex (uncontended — every user runs on the connection's worker
+//! thread) plus a raw-socket dup for socket options and disconnect probes; see
+//! [`TlsConn`]. The transports meet in the two-variant
+//! [`ConnReader`]/[`ConnWriter`] enums, keeping the plain-TCP hot path's
+//! direct, lock-free reads and writes (one predictable branch per buffered
+//! refill/flush, no dyn dispatch, no mutex).
+//!
+//! The TLS handshake runs only after the post-accept stop-flag check (so the
+//! plain-TCP self-connect shutdown wakeups can never wedge a worker in a
+//! handshake) and is bounded by [`TLS_HANDSHAKE_TIMEOUT`] (so a client that
+//! connects and never speaks TLS releases its worker).
+//!
+//! PORT NOTE (TLS disconnect detection): the disconnect watcher
+//! (`crate::disconnect_watcher`) and the `flush_chunk` probe operate on the
+//! *raw* socket, so on a TLS connection any bytes they observe are encrypted
+//! records. That is fine: only `Ok(0)` (EOF) or a hard error flips the
+//! disconnect flag — queued records are treated exactly like pipelined
+//! plaintext on a plain connection ("still connected"). See the PORT NOTEs at
+//! [`ResponseWriter::watch_disconnect`] and in `flush_chunk`.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::cgroup::available_cpus;
+use crate::flagutil::{ArrayBool, ArrayString, Flag};
+use crate::tlsutil::{TlsServerStream, rustls::ServerConfig};
 
 // Read/write buffer sizes tuned for the ingestion path (large POST bodies).
 const READ_BUF_SIZE: usize = 64 * 1024;
@@ -86,6 +104,12 @@ const IDLE_POLL: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 // How often the acceptor wakes to re-check the stop flag when idle.
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
+// Read timeout applied to the socket for the duration of the TLS handshake, so
+// a client that connects but never speaks TLS cannot hold a worker for long.
+// PORT NOTE: Go's net/http has no default handshake deadline; this bound is
+// needed here because a stuck handshake would pin one of the fixed pool of
+// worker threads.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Mirrors protoparserutil line-reader limits.
 const MAX_LINE_SIZE: usize = 256 * 1024;
@@ -94,6 +118,158 @@ const DEFAULT_BLOCK_SIZE: usize = 64 * 1024;
 // snappy has a default limit of ~2GB which is too high for insert requests;
 // mirror the Go 56MB cap to prevent memory-allocation attacks.
 const MAX_SNAPPY_BLOCK_SIZE: usize = 56_000_000;
+
+// ---------------------------------------------------------------------------
+// TLS serving flags (Go lib/httpserver package-level flag vars)
+// ---------------------------------------------------------------------------
+
+// Like Go, the flags live in the shared httpserver library, so every binary
+// that calls [`serve`] (es-logs, eslagent) gets them. The ported server binds
+// a single -httpListenAddr (see the PORT NOTE in the binaries), so only index
+// 0 of each array flag is consulted.
+static TLS_ENABLE: Flag<ArrayBool> = Flag::new(
+    "tls",
+    "Whether to enable TLS for incoming HTTP requests at the given -httpListenAddr (aka https). \
+     -tlsCertFile and -tlsKeyFile must be set if -tls is set. See also -mtls",
+    ArrayBool::default,
+);
+static TLS_CERT_FILE: Flag<ArrayString> = Flag::new(
+    "tlsCertFile",
+    "Path to file with TLS certificate for the corresponding -httpListenAddr if -tls is set. \
+     Prefer ECDSA certs instead of RSA certs as RSA certs are slower. \
+     The provided certificate file is automatically re-read every second, so it can be dynamically updated. \
+     See also -tlsAutocertHosts",
+    ArrayString::default,
+);
+static TLS_KEY_FILE: Flag<ArrayString> = Flag::new(
+    "tlsKeyFile",
+    "Path to file with TLS key for the corresponding -httpListenAddr if -tls is set. \
+     The provided key file is automatically re-read every second, so it can be dynamically updated. \
+     See also -tlsAutocertHosts",
+    ArrayString::default,
+);
+static TLS_CIPHER_SUITES: Flag<ArrayString> = Flag::new(
+    "tlsCipherSuites",
+    "Optional list of TLS cipher suites for incoming requests over HTTPS if -tls is set. \
+     See the list of supported cipher suites at https://pkg.go.dev/crypto/tls#pkg-constants",
+    ArrayString::default,
+);
+static TLS_MIN_VERSION: Flag<ArrayString> = Flag::new(
+    "tlsMinVersion",
+    "Optional minimum TLS version to use for the corresponding -httpListenAddr if -tls is set. \
+     Supported values: TLS10, TLS11, TLS12, TLS13",
+    ArrayString::default,
+);
+
+// ---------------------------------------------------------------------------
+// Connection transport (plain TCP vs TLS)
+// ---------------------------------------------------------------------------
+
+/// Shared handles for one TLS connection.
+///
+/// A rustls session ([`TlsServerStream`]) is a single-owner state machine
+/// that serializes reads and writes, so — unlike the plain-TCP path with its
+/// three independent `try_clone` handles — the session is shared behind a
+/// mutex between the reader half, the writer half and the mid-handler
+/// [`ResponseWriter::flush_chunk`] hook. All of them run on the connection's
+/// worker thread, so the lock is always uncontended (the disconnect watcher
+/// probes the raw socket dup, never the TLS session).
+#[derive(Clone)]
+struct TlsConn {
+    tls: Arc<Mutex<TlsServerStream>>,
+    /// Raw-socket dup used for socket options (read timeouts apply to the
+    /// shared underlying socket) and for disconnect probes. Byte-level reads
+    /// on it would observe encrypted TLS records; it is only ever used for
+    /// sockopts and EOF/error probes.
+    sock: Arc<TcpStream>,
+}
+
+/// The read half of a connection. A two-variant enum (not `dyn Read`) so the
+/// plain-TCP hot path keeps its direct, lock-free reads: one predictable
+/// branch per `BufReader` refill, no dispatch, no mutex.
+enum ConnReader {
+    Plain(TcpStream),
+    Tls(TlsConn),
+}
+
+impl ConnReader {
+    /// Applies a read timeout to the underlying socket. For TLS this goes to
+    /// the raw-socket dup; `SO_RCVTIMEO` lives on the shared socket, so the
+    /// session's blocking reads observe it.
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        match self {
+            ConnReader::Plain(s) => s.set_read_timeout(dur),
+            ConnReader::Tls(c) => c.sock.set_read_timeout(dur),
+        }
+    }
+}
+
+impl Read for ConnReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ConnReader::Plain(s) => s.read(buf),
+            ConnReader::Tls(c) => c.tls.lock().unwrap().read(buf),
+        }
+    }
+}
+
+/// The write half of a connection (see [`ConnReader`] for the design).
+enum ConnWriter {
+    Plain(TcpStream),
+    Tls(TlsConn),
+}
+
+impl Write for ConnWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            ConnWriter::Plain(s) => s.write(buf),
+            ConnWriter::Tls(c) => c.tls.lock().unwrap().write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            ConnWriter::Plain(s) => s.flush(),
+            ConnWriter::Tls(c) => c.tls.lock().unwrap().flush(),
+        }
+    }
+}
+
+/// The buffered connection reader all request parsing runs over.
+type ConnBufReader = BufReader<ConnReader>;
+
+/// Per-request handle installed on [`ResponseWriter`] for mid-handler
+/// streaming (`flush_chunk`) and disconnect watching. Cloning is a refcount
+/// bump on the underlying `Arc`s.
+#[derive(Clone)]
+enum ChunkStream {
+    Plain(Arc<TcpStream>),
+    Tls(TlsConn),
+}
+
+impl ChunkStream {
+    fn write_all(&self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            ChunkStream::Plain(s) => (&**s).write_all(buf),
+            ChunkStream::Tls(c) => c.tls.lock().unwrap().write_all(buf),
+        }
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        match self {
+            ChunkStream::Plain(s) => (&**s).flush(),
+            ChunkStream::Tls(c) => c.tls.lock().unwrap().flush(),
+        }
+    }
+
+    /// The raw socket, for the disconnect watcher and disconnect probes.
+    fn raw_sock(&self) -> &Arc<TcpStream> {
+        match self {
+            ChunkStream::Plain(s) => s,
+            ChunkStream::Tls(c) => &c.sock,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Headers
@@ -276,7 +452,7 @@ impl<'a> Request<'a> {
 /// The raw HTTP message body framing over the connection reader.
 enum Transfer<'a> {
     /// `Content-Length`-framed body: exactly N bytes.
-    Length(io::Take<&'a mut BufReader<TcpStream>>),
+    Length(io::Take<&'a mut ConnBufReader>),
     /// `Transfer-Encoding: chunked` body.
     Chunked(ChunkedReader<'a>),
     /// No body.
@@ -318,13 +494,13 @@ impl Read for Body<'_> {
 
 /// Streaming reader for `Transfer-Encoding: chunked` bodies.
 struct ChunkedReader<'a> {
-    inner: &'a mut BufReader<TcpStream>,
+    inner: &'a mut ConnBufReader,
     remaining: u64,
     done: bool,
 }
 
 impl<'a> ChunkedReader<'a> {
-    fn new(inner: &'a mut BufReader<TcpStream>) -> Self {
+    fn new(inner: &'a mut ConnBufReader) -> Self {
         ChunkedReader {
             inner,
             remaining: 0,
@@ -403,7 +579,7 @@ impl Read for ChunkedReader<'_> {
 }
 
 fn make_transfer(
-    reader: &mut BufReader<TcpStream>,
+    reader: &mut ConnBufReader,
     chunked: bool,
     content_length: Option<u64>,
 ) -> Transfer<'_> {
@@ -475,7 +651,7 @@ pub struct ResponseWriter {
     // Streaming (chunked transfer-encoding) support for flush_chunk. `stream`
     // and `stop` are installed by handle_connection; both stay `None` when the
     // ResponseWriter is constructed outside a server connection (tests).
-    stream: Option<Arc<TcpStream>>,
+    stream: Option<ChunkStream>,
     stop: Option<Arc<AtomicBool>>,
     streaming_started: bool,
 }
@@ -562,9 +738,16 @@ impl ResponseWriter {
     /// mid-handler via [`Self::flush_chunk`] must NOT use this (the watcher's
     /// non-blocking probes would race the streaming writes); `flush_chunk`
     /// already probes for disconnects itself.
+    ///
+    /// PORT NOTE (TLS): the watcher peeks the *raw* socket, so on a TLS
+    /// connection any queued bytes it observes are encrypted records (e.g. a
+    /// pipelined request). That is fine: only `peek() == Ok(0)` (EOF) or a
+    /// hard error flips the cancel flag — queued records are treated exactly
+    /// like pipelined plaintext ("still connected"), and `peek` never consumes
+    /// them, so the TLS session stays intact.
     pub fn watch_disconnect(&mut self) -> Option<crate::disconnect_watcher::CancelToken> {
-        let stream = self.stream.clone()?;
-        Some(crate::disconnect_watcher::watch(stream))
+        let sock = Arc::clone(self.stream.as_ref()?.raw_sock());
+        Some(crate::disconnect_watcher::watch(sock))
     }
 
     /// Streams the currently buffered body to the client mid-handler as an
@@ -587,11 +770,11 @@ impl ResponseWriter {
             return Err(io::Error::new(ErrorKind::Interrupted, "server is stopping"));
         }
 
-        let mut w = &*stream;
         if !self.streaming_started {
             self.streaming_started = true;
+            let mut head = Vec::with_capacity(256);
             write!(
-                w,
+                head,
                 "HTTP/1.1 {} {}\r\n",
                 self.status,
                 reason_phrase(self.status)
@@ -603,19 +786,28 @@ impl ResponseWriter {
                 {
                     continue;
                 }
-                write!(w, "{k}: {v}\r\n")?;
+                write!(head, "{k}: {v}\r\n")?;
             }
-            w.write_all(b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
+            head.extend_from_slice(b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+            stream.write_all(&head)?;
         }
 
-        // Probe for a client disconnect with a non-blocking read. The request
-        // was fully drained before the handler ran, so any readable byte here
-        // is either EOF (client gone) or a pipelined request that will never
-        // be answered anyway (a streamed response closes the connection).
-        stream.set_nonblocking(true)?;
+        // Probe for a client disconnect with a non-blocking read on the raw
+        // socket. The request was fully drained before the handler ran, so any
+        // readable byte here is either EOF (client gone) or a pipelined
+        // request that will never be answered anyway (a streamed response
+        // closes the connection).
+        //
+        // PORT NOTE (TLS): on a TLS connection the consumed byte belongs to an
+        // encrypted record (a pipelined request or a close_notify alert).
+        // Corrupting the inbound record stream is harmless for the same
+        // reason the plain-TCP read is: this connection never reads again and
+        // closes when the handler returns; only EOF/error matter here.
+        let sock = stream.raw_sock();
+        sock.set_nonblocking(true)?;
         let mut probe = [0u8; 1];
-        let probe_result = Read::read(&mut (&*stream), &mut probe);
-        stream.set_nonblocking(false)?;
+        let probe_result = Read::read(&mut (&**sock), &mut probe);
+        sock.set_nonblocking(false)?;
         let client_gone = match probe_result {
             Ok(0) => true,
             Ok(_) => false,
@@ -627,10 +819,12 @@ impl ResponseWriter {
         }
 
         if !self.body.is_empty() {
-            write!(w, "{:x}\r\n", self.body.len())?;
-            w.write_all(&self.body)?;
-            w.write_all(b"\r\n")?;
-            w.flush()?;
+            let mut chunk = Vec::with_capacity(self.body.len() + 20);
+            write!(chunk, "{:x}\r\n", self.body.len())?;
+            chunk.extend_from_slice(&self.body);
+            chunk.extend_from_slice(b"\r\n");
+            stream.write_all(&chunk)?;
+            stream.flush()?;
             self.body.clear();
         }
         Ok(())
@@ -646,14 +840,15 @@ impl ResponseWriter {
                 .stream
                 .clone()
                 .expect("BUG: streaming_started without a stream");
-            let mut sw = &*stream;
+            let mut tail = Vec::with_capacity(self.body.len() + 25);
             if !self.body.is_empty() {
-                write!(sw, "{:x}\r\n", self.body.len())?;
-                sw.write_all(&self.body)?;
-                sw.write_all(b"\r\n")?;
+                write!(tail, "{:x}\r\n", self.body.len())?;
+                tail.extend_from_slice(&self.body);
+                tail.extend_from_slice(b"\r\n");
             }
-            sw.write_all(b"0\r\n\r\n")?;
-            return sw.flush();
+            tail.extend_from_slice(b"0\r\n\r\n");
+            stream.write_all(&tail)?;
+            return stream.flush();
         }
         write!(
             w,
@@ -760,6 +955,43 @@ pub fn serve<H>(addr: &str, handler: H) -> io::Result<ServerHandle>
 where
     H: Fn(&mut Request, &mut ResponseWriter) + Send + Sync + 'static,
 {
+    // Build the TLS server config from the -tls* flags (Go does this inside
+    // Serve before netutil.NewTCPListener). Go logger.Fatalf's on a bad
+    // config; here the error is returned and the binaries fatalf on it, with
+    // the same message.
+    let tls_cfg = if TLS_ENABLE.get().get_optional_arg(0) {
+        let cert_file = TLS_CERT_FILE.get().get_optional_arg(0);
+        let key_file = TLS_KEY_FILE.get().get_optional_arg(0);
+        let min_version = TLS_MIN_VERSION.get().get_optional_arg(0);
+        let cipher_suites: &[String] = TLS_CIPHER_SUITES.get();
+        let cfg =
+            crate::tlsutil::get_server_tls_config(cert_file, key_file, min_version, cipher_suites)
+                .map_err(|err| {
+                    io::Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "cannot load TLS cert from -tlsCertFile={cert_file:?}, -tlsKeyFile={key_file:?}, -tlsMinVersion={min_version:?}, -tlsCipherSuites={cipher_suites:?}: {err}"
+                        ),
+                    )
+                })?;
+        Some(cfg)
+    } else {
+        None
+    };
+    serve_with_tls(addr, tls_cfg, handler)
+}
+
+/// [`serve`] with an explicit TLS server config (`None` = plain HTTP). Split
+/// out so tests can drive the TLS path without touching the process-global
+/// flags.
+fn serve_with_tls<H>(
+    addr: &str,
+    tls_cfg: Option<Arc<ServerConfig>>,
+    handler: H,
+) -> io::Result<ServerHandle>
+where
+    H: Fn(&mut Request, &mut ResponseWriter) + Send + Sync + 'static,
+{
     // Go's net convention: an address of the form ":9428" (or "" ) means "all
     // interfaces on that port". Rust's TcpListener::bind can't resolve a bare
     // ":port", so normalize it to "0.0.0.0:port" (and "" to "0.0.0.0:0").
@@ -797,6 +1029,7 @@ where
         let listener = Arc::clone(&listener);
         let handler = Arc::clone(&handler);
         let stop_w = Arc::clone(&stop);
+        let tls_cfg = tls_cfg.clone();
         let worker = thread::Builder::new()
             .name(format!("httpserver-worker-{i}"))
             .spawn(move || {
@@ -804,12 +1037,14 @@ where
                     match listener.accept() {
                         Ok((stream, _)) => {
                             // A shutdown self-connect also lands here; bail
-                            // before serving it.
+                            // before serving it (and before any TLS handshake,
+                            // so the plain-TCP wakeup connects can never wedge
+                            // a worker on a TLS listener).
                             if stop_w.load(Ordering::SeqCst) {
                                 break;
                             }
                             let _ = stream.set_nonblocking(false);
-                            handle_connection(stream, &*handler, &stop_w);
+                            handle_connection(stream, &*handler, &stop_w, tls_cfg.as_ref());
                         }
                         Err(_) => {
                             if stop_w.load(Ordering::SeqCst) {
@@ -832,25 +1067,85 @@ where
     })
 }
 
-fn handle_connection<H>(stream: TcpStream, handler: &H, stop: &Arc<AtomicBool>)
-where
+fn handle_connection<H>(
+    stream: TcpStream,
+    handler: &H,
+    stop: &Arc<AtomicBool>,
+    tls_cfg: Option<&Arc<ServerConfig>>,
+) where
     H: Fn(&mut Request, &mut ResponseWriter),
 {
     let _ = stream.set_nodelay(true);
 
-    let read_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    // Shared handle to the socket for ResponseWriter::flush_chunk streaming
-    // (one dup per connection; per-request installation is a refcount bump).
-    let chunk_stream = stream.try_clone().ok().map(Arc::new);
     let remote_addr = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
-    let mut reader = BufReader::with_capacity(READ_BUF_SIZE, read_stream);
-    let mut writer = BufWriter::with_capacity(WRITE_BUF_SIZE, stream);
+
+    let (conn_reader, conn_writer, chunk_stream) = match tls_cfg {
+        None => {
+            let read_stream = match stream.try_clone() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            // Shared handle to the socket for ResponseWriter::flush_chunk
+            // streaming (one dup per connection; per-request installation is a
+            // refcount bump).
+            let chunk = stream
+                .try_clone()
+                .ok()
+                .map(Arc::new)
+                .map(ChunkStream::Plain);
+            (
+                ConnReader::Plain(read_stream),
+                ConnWriter::Plain(stream),
+                chunk,
+            )
+        }
+        Some(cfg) => {
+            // Complete the TLS handshake, bounded by a read timeout so a
+            // client that connects and never speaks TLS releases this worker
+            // (wait_for_request re-arms the regular timeouts right after).
+            let _ = stream.set_read_timeout(Some(TLS_HANDSHAKE_TIMEOUT));
+            let sock = match stream.try_clone() {
+                Ok(s) => Arc::new(s),
+                Err(_) => return,
+            };
+            let tls = match crate::tlsutil::server_accept(cfg, stream) {
+                Ok(s) => s,
+                Err(err) => {
+                    // Mirror Go's tlsErrorSkipLogger: handshake failures from
+                    // peers that just disconnect (health checks, port scans)
+                    // or never speak (timeout) are not worth logging. The
+                    // os-error substrings cover the Windows spellings of
+                    // reset (10054) / would-block (10035) / timeout (10060).
+                    if !err.contains("unexpected end of file")
+                        && !err.contains("Connection reset")
+                        && !err.contains("Resource temporarily unavailable")
+                        && !err.contains("timed out")
+                        && !err.contains("os error 10054")
+                        && !err.contains("os error 10035")
+                        && !err.contains("os error 10060")
+                    {
+                        crate::warnf!("cannot complete TLS handshake with {remote_addr}: {err}");
+                    }
+                    return;
+                }
+            };
+            let conn = TlsConn {
+                tls: Arc::new(Mutex::new(tls)),
+                sock,
+            };
+            (
+                ConnReader::Tls(conn.clone()),
+                ConnWriter::Tls(conn.clone()),
+                Some(ChunkStream::Tls(conn)),
+            )
+        }
+    };
+
+    let mut reader = BufReader::with_capacity(READ_BUF_SIZE, conn_reader);
+    let mut writer = BufWriter::with_capacity(WRITE_BUF_SIZE, conn_writer);
 
     // Perf diagnostic (ESL_HTTP_TIMING=1): per-request read/handle/flush split.
     let timing = std::env::var_os("ESL_HTTP_TIMING").is_some();
@@ -880,7 +1175,7 @@ where
         let keep_alive_req = req.wants_keep_alive();
         let mut rw = ResponseWriter::new();
         if let Some(cs) = &chunk_stream {
-            rw.stream = Some(Arc::clone(cs));
+            rw.stream = Some(cs.clone());
             rw.stop = Some(Arc::clone(stop));
         }
 
@@ -915,6 +1210,15 @@ where
         if !keep_alive {
             break;
         }
+    }
+
+    // Mirror Go's crypto/tls Conn.Close(): send close_notify before dropping
+    // the session so well-behaved clients observe a clean TLS EOF instead of
+    // an unexpected-EOF error. Best-effort — the peer may already be gone.
+    if let ConnReader::Tls(c) = reader.get_ref() {
+        let mut tls = c.tls.lock().unwrap();
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
     }
 }
 
@@ -958,7 +1262,7 @@ enum WaitResult {
 /// Blocks until the next request begins arriving, polling on a short timeout so
 /// the `stop` flag is observed within `IDLE_POLL` during graceful shutdown.
 /// Gives up after `IDLE_TIMEOUT` of inactivity.
-fn wait_for_request(reader: &mut BufReader<TcpStream>, stop: &AtomicBool) -> WaitResult {
+fn wait_for_request(reader: &mut ConnBufReader, stop: &AtomicBool) -> WaitResult {
     let _ = reader.get_ref().set_read_timeout(Some(IDLE_POLL));
     let deadline = std::time::Instant::now() + IDLE_TIMEOUT;
     loop {
@@ -982,7 +1286,7 @@ fn wait_for_request(reader: &mut BufReader<TcpStream>, stop: &AtomicBool) -> Wai
 /// Reads and parses one request head, then constructs a [`Request`] whose body
 /// streams from `reader`. Returns `Ok(None)` on a clean EOF before any bytes.
 fn read_request<'a>(
-    reader: &'a mut BufReader<TcpStream>,
+    reader: &'a mut ConnBufReader,
     remote_addr: &str,
 ) -> io::Result<Option<Request<'a>>> {
     let request_line = match read_head_line(reader)? {
@@ -1061,8 +1365,8 @@ fn read_request<'a>(
 
 /// Handles built-in routes; returns true if the request was served.
 ///
-/// PORT NOTE: `/flags` returns an empty 200 — flag dumping is not ported
-/// (see `crate::appmetrics`). pprof, favicon bytes and auth are omitted.
+/// PORT NOTE: pprof, favicon bytes and auth (`-metricsAuthKey`,
+/// `-flagsAuthKey`, `-httpAuth.*`) are omitted.
 fn builtin_routes(req: &mut Request, rw: &mut ResponseWriter) -> bool {
     let path = req.path();
     if path.ends_with("/favicon.ico") {
@@ -1097,6 +1401,9 @@ fn builtin_routes(req: &mut Request, rw: &mut ResponseWriter) -> bool {
         }
         "/flags" => {
             rw.set_header("Content-Type", "text/plain; charset=utf-8");
+            let mut buf = Vec::new();
+            crate::flagutil::write_flags(&mut buf);
+            rw.write_str(&String::from_utf8_lossy(&buf));
             true
         }
         "/-/healthy" => {
@@ -1465,7 +1772,7 @@ mod tests {
         // "Wikipedia\r\n\r\nin\r\n\r\nchunks." split across chunks.
         let raw = "4\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\n\r\n";
         let stream = tcp_pair_send(raw.as_bytes());
-        let mut reader = BufReader::new(stream);
+        let mut reader = BufReader::new(ConnReader::Plain(stream));
         let mut cr = ChunkedReader::new(&mut reader);
         let mut out = Vec::new();
         cr.read_to_end(&mut out).unwrap();
@@ -1492,7 +1799,7 @@ mod tests {
         read_response(&mut reader)
     }
 
-    fn read_response(reader: &mut BufReader<TcpStream>) -> (u16, Vec<u8>) {
+    fn read_response<R: Read>(reader: &mut BufReader<R>) -> (u16, Vec<u8>) {
         let status_line = read_head_line(reader).unwrap().unwrap();
         let status: u16 = status_line.split(' ').nth(1).unwrap().parse().unwrap();
         let mut content_length = 0usize;
@@ -1735,5 +2042,297 @@ mod tests {
         let (stream, _) = listener.accept().unwrap();
         sender.join().unwrap();
         stream
+    }
+
+    // --- TLS serving ---------------------------------------------------------
+
+    use crate::tlsutil;
+
+    /// A self-signed cert/key pair for `localhost`/`127.0.0.1` written to temp
+    /// PEM files (the server-side config takes file paths, like Go).
+    struct TlsFixture {
+        cert_path: String,
+        key_path: String,
+    }
+
+    fn make_tls_fixture(tag: &str) -> TlsFixture {
+        let ck = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("esl-httpserver-tls-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("cert.pem").to_string_lossy().into_owned();
+        let key_path = dir.join("key.pem").to_string_lossy().into_owned();
+        std::fs::write(&cert_path, ck.cert.pem()).unwrap();
+        std::fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
+        TlsFixture {
+            cert_path,
+            key_path,
+        }
+    }
+
+    /// Starts the real server with TLS enabled (the same code path `serve`
+    /// takes when the -tls flags are set; only the flag lookup is bypassed —
+    /// flags are process-global and cannot be set per-test).
+    fn serve_tls<H>(fx: &TlsFixture, handler: H) -> ServerHandle
+    where
+        H: Fn(&mut Request, &mut ResponseWriter) + Send + Sync + 'static,
+    {
+        let cfg =
+            crate::tlsutil::get_server_tls_config(&fx.cert_path, &fx.key_path, "", &[]).unwrap();
+        serve_with_tls("127.0.0.1:0", Some(cfg), handler).unwrap()
+    }
+
+    /// Connects a TLS client (via tlsutil, trusting the fixture cert as CA)
+    /// and completes the handshake.
+    fn tls_connect(fx: &TlsFixture, addr: SocketAddr) -> tlsutil::TlsClientStream {
+        let cfg = tlsutil::new_tls_client_config(&tlsutil::TLSConfig {
+            ca_file: fx.cert_path.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        let tcp = TcpStream::connect(addr).unwrap();
+        tlsutil::client_connect(&cfg, "localhost", tcp).unwrap()
+    }
+
+    #[test]
+    fn test_tls_health_round_trip() {
+        let fx = make_tls_fixture("health");
+        let srv = serve_tls(&fx, |req, rw| {
+            let body = req.read_full_body().unwrap_or_default();
+            rw.write_bytes(&body);
+        });
+        let addr = srv.local_addr();
+
+        let mut s = tls_connect(&fx, addr);
+        s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        s.flush().unwrap();
+        let mut reader = BufReader::new(s);
+        let (status, body) = read_response(&mut reader);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"OK");
+        srv.stop();
+    }
+
+    #[test]
+    fn test_tls_post_body_round_trip() {
+        let fx = make_tls_fixture("post");
+        let srv = serve_tls(&fx, |req, rw| {
+            let body = req.read_full_body().unwrap_or_default();
+            rw.write_bytes(&body);
+        });
+        let addr = srv.local_addr();
+
+        let payload = b"{\"_msg\":\"hello\"}\n{\"_msg\":\"world\"}\n";
+        let raw = format!(
+            "POST /insert/jsonline HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        let mut s = tls_connect(&fx, addr);
+        s.write_all(raw.as_bytes()).unwrap();
+        s.write_all(payload).unwrap();
+        s.flush().unwrap();
+        let mut reader = BufReader::new(s);
+        let (status, body) = read_response(&mut reader);
+        assert_eq!(status, 200);
+        assert_eq!(body, payload);
+        srv.stop();
+    }
+
+    #[test]
+    fn test_tls_keep_alive_two_requests() {
+        let fx = make_tls_fixture("keepalive");
+        let srv = serve_tls(&fx, |req, rw| {
+            let body = req.read_full_body().unwrap_or_default();
+            rw.write_bytes(&body);
+        });
+        let addr = srv.local_addr();
+
+        let mut s = tls_connect(&fx, addr);
+        let mk = |body: &str| {
+            format!(
+                "POST /insert HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                body.len(),
+                body
+            )
+        };
+        s.write_all(mk("first").as_bytes()).unwrap();
+        s.write_all(mk("second").as_bytes()).unwrap();
+        s.flush().unwrap();
+
+        let mut reader = BufReader::new(s);
+        let (st1, b1) = read_response(&mut reader);
+        let (st2, b2) = read_response(&mut reader);
+        assert_eq!((st1, st2), (200, 200));
+        assert_eq!(b1, b"first");
+        assert_eq!(b2, b"second");
+        srv.stop();
+    }
+
+    #[test]
+    fn test_tls_flush_chunk_streaming_response() {
+        let fx = make_tls_fixture("stream");
+        let srv = serve_tls(&fx, |_req, rw| {
+            assert!(rw.supports_streaming());
+            rw.set_header("Content-Type", "application/x-ndjson");
+            rw.write_str("first\n");
+            rw.flush_chunk().unwrap();
+            rw.write_str("second\n");
+            rw.flush_chunk().unwrap();
+            // Left buffered: finish() must emit it as the final chunk.
+            rw.write_str("tail\n");
+        });
+        let addr = srv.local_addr();
+
+        let mut s = tls_connect(&fx, addr);
+        s.write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        s.flush().unwrap();
+        let mut raw = Vec::new();
+        // The server sends close_notify after a streamed response, so the
+        // TLS read loop terminates with a clean EOF.
+        s.read_to_end(&mut raw).unwrap();
+        let text = String::from_utf8(raw).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "head={head}");
+        assert!(head.contains("Transfer-Encoding: chunked"), "head={head}");
+        assert!(head.contains("Connection: close"), "head={head}");
+        assert_eq!(
+            body,
+            "6\r\nfirst\n\r\n7\r\nsecond\n\r\n5\r\ntail\n\r\n0\r\n\r\n"
+        );
+        srv.stop();
+    }
+
+    #[test]
+    fn test_tls_flush_chunk_detects_client_disconnect() {
+        let fx = make_tls_fixture("stream-disconnect");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let tx = std::sync::Mutex::new(tx);
+        let srv = serve_tls(&fx, move |_req, rw| {
+            loop {
+                rw.write_str("tick\n");
+                if rw.flush_chunk().is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let _ = tx.lock().unwrap().send(());
+        });
+        let addr = srv.local_addr();
+
+        {
+            let mut s = tls_connect(&fx, addr);
+            s.write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            s.flush().unwrap();
+            let mut first = [0u8; 16];
+            let n = s.read(&mut first).unwrap();
+            assert!(n > 0, "expected streamed bytes before disconnecting");
+            // Dropping the stream closes the raw connection (no close_notify).
+        }
+
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("handler must observe the client disconnect and return");
+        srv.stop();
+    }
+
+    #[test]
+    fn test_tls_disconnect_watcher_flips_on_client_close() {
+        let fx = make_tls_fixture("watcher");
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let tx = std::sync::Mutex::new(tx);
+        let srv = serve_tls(&fx, move |_req, rw| {
+            let token = rw.watch_disconnect().expect("live connection");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !token.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = tx.lock().unwrap().send(token.load(Ordering::SeqCst));
+        });
+        let addr = srv.local_addr();
+
+        {
+            let mut s = tls_connect(&fx, addr);
+            s.write_all(b"GET /watch HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            s.flush().unwrap();
+            // Give the request time to reach the handler, then disconnect
+            // abruptly: the watcher's raw-socket peek must observe the EOF.
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("handler must finish"),
+            "cancel token must flip after the TLS client disconnects"
+        );
+        srv.stop();
+    }
+
+    #[test]
+    fn test_tls_garbage_and_eof_do_not_kill_accept_loop() {
+        let fx = make_tls_fixture("garbage");
+        let srv = serve_tls(&fx, |req, rw| {
+            let body = req.read_full_body().unwrap_or_default();
+            rw.write_bytes(&body);
+        });
+        let addr = srv.local_addr();
+
+        // A plain-TCP probe that connects and immediately closes (kubernetes
+        // health-check style) must not take a worker down.
+        drop(TcpStream::connect(addr).unwrap());
+
+        // A plain-TCP client sending non-TLS bytes fails the handshake; the
+        // worker must drop the connection and keep accepting.
+        {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+            let mut buf = [0u8; 64];
+            let _ = s.read(&mut buf); // server closes (possibly after a TLS alert)
+        }
+
+        // A real TLS request still succeeds afterwards.
+        let mut s = tls_connect(&fx, addr);
+        s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        s.flush().unwrap();
+        let mut reader = BufReader::new(s);
+        let (status, body) = read_response(&mut reader);
+        assert_eq!(status, 200);
+        assert_eq!(body, b"OK");
+        srv.stop();
+    }
+
+    #[test]
+    fn test_tls_graceful_shutdown() {
+        let fx = make_tls_fixture("shutdown");
+        let srv = serve_tls(&fx, |req, rw| {
+            let body = req.read_full_body().unwrap_or_default();
+            rw.write_bytes(&body);
+        });
+        let addr = srv.local_addr();
+
+        // Park one worker on an idle keep-alive TLS connection so shutdown
+        // exercises both the wait_for_request stop check and the plain-TCP
+        // self-connect accept wakeups (which never handshake).
+        let mut s = tls_connect(&fx, addr);
+        s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+            .unwrap();
+        s.flush().unwrap();
+        let mut reader = BufReader::new(s);
+        let (status, _) = read_response(&mut reader);
+        assert_eq!(status, 200);
+
+        let t0 = std::time::Instant::now();
+        srv.stop();
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "graceful shutdown with TLS enabled must not wedge"
+        );
     }
 }
