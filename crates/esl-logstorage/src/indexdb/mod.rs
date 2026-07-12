@@ -1,8 +1,9 @@
 //! Port of EsLogs `lib/logstorage/indexdb.go`.
 //!
 //! The per-partition stream index: maps stream tags to internal stream ids and
-//! answers `_stream:{...}` filters. See [`mergeset`] for the storage-engine
-//! decision (an API-compatible internal store replaces `lib/mergeset`).
+//! answers `_stream:{...}` filters. The rows are stored in the [`mergeset`]
+//! module, a faithful port of upstream `lib/mergeset` whose on-disk format is
+//! byte-compatible with upstream indexdb directories.
 //!
 //! PORT NOTE: `allow(dead_code)` because part of the public `indexdb` surface
 //! (`search_stream_ids`, `search_tenants`, `append_stream_string`) is consumed
@@ -31,7 +32,7 @@ use crate::stream_tags::{self, get_stream_tags, must_unmarshal_stream_tags_inpla
 use crate::tenant_id::TenantID;
 use crate::u128::U128;
 
-use mergeset::{SearchError, Table, TableMetrics, TableSearch};
+use mergeset::{SearchError, Table, TableMetrics, TableSearch, must_open_table};
 
 // (tenantID:streamID) entries have this prefix.
 //
@@ -124,14 +125,14 @@ pub(crate) fn must_open_indexdb(
     let flush_cb: Box<dyn Fn() + Send + Sync> = Box::new(move || {
         gen_for_cb.fetch_add(1, Ordering::SeqCst);
     });
-    // PORT NOTE: Go stores `s.flushInterval` as a `time.Duration`; the port's
-    // Storage stores a `std::time::Duration`, so convert to i64 nanoseconds for
-    // the mergeset Table (which keeps flush intervals as i64 nanos).
-    let flush_interval = s.flush_interval.as_nanos() as i64;
-    let tb = Table::must_open(
+    // Go: mergeset.MustOpenTable(path, s.flushInterval,
+    // idb.invalidateStreamFilterCache, time.Second, mergeTagToStreamIDsRows,
+    // &isReadOnly); the read-only flag is not ported (see mergeset/table.rs).
+    let tb = must_open_table(
         path,
-        flush_interval,
+        s.flush_interval,
         Some(flush_cb),
+        std::time::Duration::from_secs(1),
         Some(merge_tag_to_stream_ids_rows),
     );
     Arc::new(Indexdb {
@@ -467,7 +468,7 @@ impl Indexdb {
             .unwrap()
             .pop()
             .unwrap_or_default();
-        is.ts.init(&self.tb);
+        is.ts.init(&self.tb, false);
         is
     }
 
@@ -1443,5 +1444,186 @@ mod tests {
         let storage_path = s.path.clone();
         s.must_close();
         esl_common::fs::must_remove_dir(&storage_path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-compatibility with the Go reference binary.
+
+    const GO_BINARY: &str = "/home/test/refs/bin/victoria-logs-go";
+
+    fn http_request(port: u16, method: &str, path: &str, body: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+            .unwrap_or_else(|err| panic!("cannot connect to 127.0.0.1:{port}: {err}"));
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        resp
+    }
+
+    fn wait_for_http(port: u16, deadline: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// Cross-compat proof, Go→Rust direction: generates a data dir with the
+    /// Go reference binary (ingesting a few streams over HTTP), stops it
+    /// cleanly, then opens the produced `indexdb` directory with the Rust
+    /// mergeset port and verifies stream searches return the Go-written
+    /// streams.
+    ///
+    /// Ignored by default: requires the Go reference binary at
+    /// /home/test/refs/bin/victoria-logs-go. Run with:
+    /// `cargo test -p esl-logstorage --lib go_indexdb_cross_compat -- --ignored`
+    #[test]
+    #[ignore = "requires the Go reference binary (see the doc comment)"]
+    fn test_go_indexdb_cross_compat() {
+        if !std::path::Path::new(GO_BINARY).exists() {
+            eprintln!("skipping: {GO_BINARY} is missing");
+            return;
+        }
+
+        let data_dir = test_dir("go-cross-compat");
+        let port: u16 = 9497;
+
+        // Start the Go reference binary on a temp -storageDataPath.
+        let mut child = std::process::Command::new(GO_BINARY)
+            .arg(format!("-storageDataPath={data_dir}"))
+            .arg(format!("-httpListenAddr=:{port}"))
+            .arg("-retentionPeriod=10y")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("cannot start the Go reference binary");
+        assert!(wait_for_http(port, std::time::Duration::from_secs(30)));
+
+        // Ingest a few streams.
+        const JOBS_COUNT: usize = 3;
+        const INSTANCES_COUNT: usize = 2;
+        let mut body = String::new();
+        for i in 0..JOBS_COUNT {
+            for j in 0..INSTANCES_COUNT {
+                body.push_str(&format!(
+                    "{{\"_msg\":\"test row {i} {j}\",\"_time\":\"2026-07-07T00:00:0{j}Z\",\"job\":\"go-job-{i}\",\"instance\":\"go-inst-{j}\"}}\n"
+                ));
+            }
+        }
+        let resp = http_request(
+            port,
+            "POST",
+            "/insert/jsonline?_stream_fields=job,instance",
+            &body,
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "unexpected ingest response: {resp}"
+        );
+        let _ = http_request(port, "GET", "/internal/force_flush", "");
+
+        // Stop the Go binary cleanly (graceful shutdown persists all parts).
+        // No libc dependency in this crate; use kill(1) for the SIGINT.
+        let kill_status = std::process::Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .expect("cannot run kill");
+        assert!(kill_status.success(), "kill -INT failed");
+        let status = child.wait().expect("cannot wait for the Go binary");
+        assert!(status.success(), "the Go binary exited with {status}");
+
+        // Locate the per-day partition indexdb written by the Go binary.
+        let partitions_dir = std::path::Path::new(&data_dir).join("partitions");
+        let partition_dir = std::fs::read_dir(&partitions_dir)
+            .expect("cannot read partitions dir")
+            .next()
+            .expect("no partitions created by the Go binary")
+            .unwrap()
+            .path();
+        let partition_name = partition_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let indexdb_path = partition_dir.join("indexdb");
+        assert!(
+            indexdb_path.join("parts.json").exists(),
+            "missing parts.json in the Go indexdb dir"
+        );
+
+        // Open the Go-written indexdb with the Rust port and search it.
+        let s = new_test_storage();
+        let idb = must_open_indexdb(indexdb_path.to_str().unwrap(), &partition_name, &s);
+
+        let tenant_id = TenantID {
+            account_id: 0,
+            project_id: 0,
+        };
+
+        // searchTenants must return the (0:0) tenant registered by Go.
+        let tenants = idb.search_tenants();
+        assert_eq!(tenants, vec![tenant_id], "unexpected tenants");
+
+        // Every ingested stream must be found via its stream filter, and its
+        // streamID must match hash128(streamTagsCanonical) like upstream.
+        for i in 0..JOBS_COUNT {
+            for j in 0..INSTANCES_COUNT {
+                let sf = must_new_test_stream_filter(&format!(
+                    "{{job=\"go-job-{i}\",instance=\"go-inst-{j}\"}}"
+                ));
+                let stream_ids = idb.search_stream_ids(&[tenant_id], &sf);
+                assert_eq!(
+                    stream_ids.len(),
+                    1,
+                    "expected exactly one Go-written stream for job {i} instance {j}"
+                );
+                let mut tags = BTreeMap::new();
+                tags.insert("job", format!("go-job-{i}"));
+                tags.insert("instance", format!("go-inst-{j}"));
+                let (expected_sid, _) = stream_id_for_tags(tenant_id, &tags);
+                assert_eq!(stream_ids[0], expected_sid, "unexpected streamID");
+                assert!(idb.has_stream_id(&expected_sid), "hasStreamID must be true");
+            }
+        }
+
+        // Per-job filters must match INSTANCES_COUNT streams.
+        for i in 0..JOBS_COUNT {
+            let sf = must_new_test_stream_filter(&format!("{{job=\"go-job-{i}\"}}"));
+            let stream_ids = idb.search_stream_ids(&[tenant_id], &sf);
+            assert_eq!(
+                stream_ids.len(),
+                INSTANCES_COUNT,
+                "unexpected streams for job {i}"
+            );
+        }
+
+        // Register one more stream with the Rust port and verify it becomes
+        // searchable next to the Go-written ones (Rust parts are written into
+        // the same dir on close; the reverse Go-opens-this-dir direction is
+        // verified live via the server binaries).
+        let mut tags = BTreeMap::new();
+        tags.insert("job", "rust-job".to_string());
+        tags.insert("instance", "rust-inst".to_string());
+        let (rust_sid, canonical) = stream_id_for_tags(tenant_id, &tags);
+        idb.must_register_stream(&rust_sid, &canonical);
+        idb.debug_flush();
+        let sf = must_new_test_stream_filter("{job=\"rust-job\"}");
+        let stream_ids = idb.search_stream_ids(&[tenant_id], &sf);
+        assert_eq!(stream_ids, vec![rust_sid], "unexpected rust-job streamIDs");
+
+        must_close_indexdb(&idb);
+        drop(idb);
+        let storage_path = s.path.clone();
+        s.must_close();
+        esl_common::fs::must_remove_dir(&storage_path);
+        esl_common::fs::must_remove_dir(&data_dir);
     }
 }
