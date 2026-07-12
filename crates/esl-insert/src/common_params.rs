@@ -13,11 +13,14 @@
 //! PORT NOTE: Go's `logMessageProcessor` runs a background goroutine
 //! (`initPeriodicFlush`) for stream-mode connections. The HTTP request handlers
 //! feed a finite body and call `close()` at the end, which flushes the tail, so
-//! the periodic-flush thread and the per-protocol `metrics` counters are
+//! the periodic-flush thread (and the `isStreamMode` constructor argument) is
 //! omitted.
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use esl_common::metrics::{Counter, Gauge, Summary};
 
 use esl_common::flagutil::Flag;
 use esl_common::httpserver::{Request, get_quoted_remote_addr};
@@ -339,7 +342,31 @@ pub struct LogMessageProcessor<'a, S: LogRowsStorage> {
     storage: &'a Arc<S>,
     cp: &'a CommonParams,
     lr: LogRows,
+
+    rows_ingested_total: Arc<Counter>,
+    bytes_ingested_total: Arc<Counter>,
+    flush_duration: Arc<Summary>,
+
+    unflushed_rows: u64,
+    unflushed_bytes: u64,
 }
+
+static ROWS_DROPPED_TOTAL_DEBUG: LazyLock<Arc<Counter>> =
+    LazyLock::new(|| esl_common::metrics::new_counter(r#"esl_rows_dropped_total{reason="debug"}"#));
+static ROWS_DROPPED_TOTAL_TOO_MANY_FIELDS: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::get_or_create_counter(
+        r#"esl_rows_dropped_total{reason="too_many_fields"}"#,
+    )
+});
+static MESSAGE_PROCESSOR_COUNT: AtomicI64 = AtomicI64::new(0);
+static MESSAGE_PROCESSOR_COUNT_GAUGE: LazyLock<Arc<Gauge>> = LazyLock::new(|| {
+    esl_common::metrics::new_gauge(
+        "esl_insert_processors_count",
+        Some(Box::new(|| {
+            MESSAGE_PROCESSOR_COUNT.load(Ordering::Relaxed) as f64
+        })),
+    )
+});
 
 impl<S: LogRowsStorage> LogMessageProcessor<'_, S> {
     /// AddRow adds a new log message with the given timestamp and fields.
@@ -347,7 +374,9 @@ impl<S: LogRowsStorage> LogMessageProcessor<'_, S> {
     /// If `stream_fields_len >= 0`, the given number of initial fields is used
     /// as log stream fields instead of the pre-configured stream fields.
     pub fn add_row(&mut self, timestamp: i64, fields: &mut [Field], stream_fields_len: isize) {
-        let _ = estimated_json_row_len(fields); // Go tracks unflushed bytes for metrics.
+        self.unflushed_rows += 1;
+        let n = estimated_json_row_len(fields);
+        self.unflushed_bytes += n as u64;
 
         let max_fields_per_line = *MAX_FIELDS_PER_LINE.get() as usize;
         if fields.len() > max_fields_per_line {
@@ -359,6 +388,7 @@ impl<S: LogRowsStorage> LogMessageProcessor<'_, S> {
                 max_fields_per_line,
                 String::from_utf8_lossy(&line)
             );
+            ROWS_DROPPED_TOTAL_TOO_MANY_FIELDS.inc();
             return;
         }
 
@@ -370,7 +400,9 @@ impl<S: LogRowsStorage> LogMessageProcessor<'_, S> {
 
     /// AddInsertRow adds r to the processor (native data ingestion protocol).
     pub fn add_insert_row(&mut self, r: &InsertRow) {
-        let _ = estimated_json_row_len(&r.fields); // Go tracks unflushed bytes for metrics.
+        self.unflushed_rows += 1;
+        let n = estimated_json_row_len(&r.fields);
+        self.unflushed_bytes += n as u64;
 
         let max_fields_per_line = *MAX_FIELDS_PER_LINE.get() as usize;
         if r.fields.len() > max_fields_per_line {
@@ -382,6 +414,7 @@ impl<S: LogRowsStorage> LogMessageProcessor<'_, S> {
                 max_fields_per_line,
                 String::from_utf8_lossy(&line)
             );
+            ROWS_DROPPED_TOTAL_TOO_MANY_FIELDS.inc();
             return;
         }
 
@@ -400,6 +433,7 @@ impl<S: LogRowsStorage> LogMessageProcessor<'_, S> {
                 self.cp.debug_remote_addr,
                 self.cp.debug_request_uri
             );
+            ROWS_DROPPED_TOTAL_DEBUG.inc();
             return;
         }
 
@@ -409,14 +443,23 @@ impl<S: LogRowsStorage> LogMessageProcessor<'_, S> {
     }
 
     fn flush(&mut self) {
+        let start = Instant::now();
         self.storage.must_add_rows(&self.lr);
         self.lr.reset_keep_settings();
+
+        self.flush_duration.update_duration(start);
+        self.rows_ingested_total.add(self.unflushed_rows);
+        self.bytes_ingested_total.add(self.unflushed_bytes);
+
+        self.unflushed_rows = 0;
+        self.unflushed_bytes = 0;
     }
 
     /// Flushes the remaining data to the storage and releases the LogRows.
     pub fn close(mut self) {
         self.flush();
         put_log_rows(self.lr);
+        MESSAGE_PROCESSOR_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -434,18 +477,41 @@ impl<S: LogRowsStorage> InsertRowProcessor for LogMessageProcessor<'_, S> {
 
 impl CommonParams {
     /// Returns a new [`LogMessageProcessor`] bound to the given storage.
+    ///
+    /// `protocol_name` labels the per-protocol ingestion metrics
+    /// (`esl_rows_ingested_total{type=...}`, ...).
     pub fn new_log_message_processor<'a, S: LogRowsStorage>(
         &'a self,
         storage: &'a Arc<S>,
+        protocol_name: &str,
     ) -> LogMessageProcessor<'a, S> {
         let sf: Vec<&str> = self.stream_fields.iter().map(String::as_str).collect();
         let ig: Vec<&str> = self.ignore_fields.iter().map(String::as_str).collect();
         let dc: Vec<&str> = self.decolorize_fields.iter().map(String::as_str).collect();
         let lr = get_log_rows(&sf, &ig, &dc, &self.extra_fields, DEFAULT_MSG_VALUE.get());
+
+        let rows_ingested_total = esl_common::metrics::get_or_create_counter(&format!(
+            "esl_rows_ingested_total{{type={protocol_name:?}}}"
+        ));
+        let bytes_ingested_total = esl_common::metrics::get_or_create_counter(&format!(
+            "esl_bytes_ingested_total{{type={protocol_name:?}}}"
+        ));
+        let flush_duration = esl_common::metrics::get_or_create_summary(&format!(
+            "esl_insert_flush_duration_seconds{{type={protocol_name:?}}}"
+        ));
+
+        MESSAGE_PROCESSOR_COUNT.fetch_add(1, Ordering::Relaxed);
+        LazyLock::force(&MESSAGE_PROCESSOR_COUNT_GAUGE);
+
         LogMessageProcessor {
             storage,
             cp: self,
             lr,
+            rows_ingested_total,
+            bytes_ingested_total,
+            flush_duration,
+            unflushed_rows: 0,
+            unflushed_bytes: 0,
         }
     }
 }

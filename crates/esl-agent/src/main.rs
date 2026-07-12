@@ -11,8 +11,9 @@
 //! support, so the flag is a single `String` here (mirroring the ported
 //! es-logs binary).
 //!
-//! PORT NOTE: `pushmetrics.Init/Stop` are not ported (no metrics crate in the
-//! workspace).
+//! PORT NOTE: `pushmetrics.Init/Stop` are not ported — the metrics registry
+//! (`esl_common::metrics`) serves `/metrics` for scraping, but the push-mode
+//! delivery (`Softalink LLC/metrics` `push.go`) is out of scope.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -141,6 +142,7 @@ fn request_handler(storage: &Arc<remotewrite::Storage>, req: &mut Request, w: &m
     if esl_insert::request_handler(storage, req, w) {
         return;
     }
+    esl_common::httpserver::unsupported_request_errors().inc();
     w.errorf(req, &format!("unsupported path requested: {path:?}"));
 }
 

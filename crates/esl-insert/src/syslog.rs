@@ -103,7 +103,7 @@ mod tests {
     fn test_process_line_lands_row() {
         let s = open_temp_storage("syslog");
         let cp = get_common_params_for_syslog(TenantID::default(), None, vec![], vec![], vec![]);
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         // RFC5424 line; use_local_timestamp=true forces the current time.
         let line = "<165>1 2023-01-01T00:00:00.000Z myhost myapp 1 - - hello world";

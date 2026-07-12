@@ -25,10 +25,10 @@
 //! through `netinsert` and the query entry points routing through `netselect`)
 //! is described in the netinsert/netselect module docs.
 //!
-//! PORT NOTE: Go registers `writeStorageMetrics` in a `metrics.Set` rendered at
-//! `/metrics`. The metrics registry is not ported (esl-common's `/metrics` is a
-//! stub), so [`write_storage_metrics`] is exposed for the future `/metrics`
-//! wiring in `es-logs` main instead.
+//! PORT NOTE: like Go, [`init_storage_metrics`] registers
+//! `write_storage_metrics` in an `esl_common::metrics::Set` rendered at
+//! `/metrics`; `es-logs` main calls it after opening the storage (Go does it
+//! inside `vlstorage.Init`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -662,6 +662,7 @@ fn process_force_merge(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
     let _ = std::thread::Builder::new()
         .name("force_merge".to_string())
         .spawn(move || {
+            active_force_merges().inc();
             infof!("forced merge for partition_prefix={partition_prefix:?} has been started");
             let start_time = Instant::now();
             storage.must_force_merge(&partition_prefix);
@@ -669,8 +670,16 @@ fn process_force_merge(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
                 "forced merge for partition_prefix={partition_prefix:?} has been successfully finished in {:.3} seconds",
                 start_time.elapsed().as_secs_f64()
             );
+            active_force_merges().dec();
         });
     true
+}
+
+/// The `esl_active_force_merges` counter (Go `activeForceMerges`).
+fn active_force_merges() -> &'static Arc<esl_common::metrics::Counter> {
+    static C: std::sync::LazyLock<Arc<esl_common::metrics::Counter>> =
+        std::sync::LazyLock::new(|| esl_common::metrics::new_counter("esl_active_force_merges"));
+    &C
 }
 
 /// Port of Go `processForceFlush`.
@@ -851,30 +860,31 @@ fn write_json_response(w: &mut ResponseWriter, response: &[String]) {
 // Metrics
 // ---------------------------------------------------------------------------
 
-// The write_* helpers mirror the `metrics` package writers used by Go
-// `writeStorageMetrics` (counters and gauges render identically in the
-// Prometheus exposition format).
+// The write_* helpers delegate to the `esl_common::metrics` exposition
+// writers used by Go `writeStorageMetrics`.
 
-fn write_gauge_uint64(w: &mut ResponseWriter, name: &str, value: u64) {
-    w.write_str(&format!("{name} {value}\n"));
-}
+use esl_common::metrics::{write_counter_uint64, write_gauge_float64, write_gauge_uint64};
 
-fn write_counter_uint64(w: &mut ResponseWriter, name: &str, value: u64) {
-    write_gauge_uint64(w, name, value);
-}
-
-fn write_gauge_float64(w: &mut ResponseWriter, name: &str, value: f64) {
-    w.write_str(&format!("{name} {value}\n"));
+/// Registers the storage metrics in a new `metrics::Set` rendered at
+/// `/metrics`, mirroring Go `vlstorage.initLocalStorage`:
+///
+/// ```go
+/// localStorageMetrics = metrics.NewSet()
+/// localStorageMetrics.RegisterMetricsWriter(func(w io.Writer) { writeStorageMetrics(w, localStorage) })
+/// metrics.RegisterSet(localStorageMetrics)
+/// ```
+pub fn init_storage_metrics(storage: &Arc<Storage>) {
+    crate::query_stats::init();
+    let storage = Arc::clone(storage);
+    let local_storage_metrics = Arc::new(esl_common::metrics::Set::new());
+    local_storage_metrics
+        .register_metrics_writer(move |w: &mut String| write_storage_metrics(&storage, w));
+    esl_common::metrics::register_set(local_storage_metrics);
 }
 
 /// Writes the storage metrics in Prometheus exposition format, mirroring Go
 /// `eslstorage.writeStorageMetrics`.
-///
-/// PORT NOTE: Go registers this writer in a `metrics.Set` rendered at
-/// `/metrics`; the port exposes it for the future `/metrics` wiring (see the
-/// module PORT NOTE). The `esl_active_force_merges` counter is omitted (its
-/// Go counterpart lives in the metrics registry, not in this writer).
-pub fn write_storage_metrics(storage: &Arc<Storage>, w: &mut ResponseWriter) {
+pub fn write_storage_metrics(storage: &Arc<Storage>, w: &mut String) {
     let mut ss = StorageStats::default();
     storage.update_stats(&mut ss);
     let ds = &ss.partition_stats.datadb_stats;
@@ -1318,7 +1328,11 @@ mod tests {
         s.debug_flush();
         let s_metrics = Arc::clone(&s);
         let (status, body) = get_with_handler(
-            move |_req, w| write_storage_metrics(&s_metrics, w),
+            move |_req, w| {
+                let mut buf = String::new();
+                write_storage_metrics(&s_metrics, &mut buf);
+                w.write_str(&buf);
+            },
             "/eslstorage/metrics",
         );
         assert_eq!(status, 200);

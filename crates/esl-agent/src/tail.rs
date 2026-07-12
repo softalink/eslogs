@@ -10,22 +10,17 @@
 //! `Sender` side is the "close" broadcast (`needs_stop` observes
 //! `TryRecvError::Disconnected`, `BackoffTimer::wait` observes
 //! `RecvTimeoutError::Disconnected`).
-//!
-//! PORT NOTE: Go exports `esl_too_long_lines_skipped_total` via
-//! `Softalink LLC/metrics`. The metrics registry isn't ported yet, so the
-//! counter is kept as a process-local `AtomicU64`, ready to be exported once
-//! `lib/metrics` lands.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, Metadata};
 use std::io::Read;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
-use std::sync::{Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use esl_common::fs::fsutil;
+use esl_common::metrics::Counter;
 use esl_common::timeutil::BackoffTimer;
 use esl_common::{cgroup, infof, panicf, warnf};
 
@@ -298,7 +293,7 @@ impl LogFile {
 
         self.tail_size += tail_end.len();
         if self.tail_size > MAX_LOG_LINE_SIZE {
-            TOO_LONG_LINES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            TOO_LONG_LINES_SKIPPED.inc();
             warnf!(
                 "log line from file {:?} with size {} bytes exceeds maximum allowed size of {} MiB",
                 self.path,
@@ -1479,7 +1474,9 @@ fn try_resolve_symlink(symlink: &str) -> String {
     }
 }
 
-static TOO_LONG_LINES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static TOO_LONG_LINES_SKIPPED: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::get_or_create_counter("esl_too_long_lines_skipped_total")
+});
 
 // ---------------------------------------------------------------------------
 // Tests: logfile_test.go, logfile_timing_test.go, tailer_test.go

@@ -6,11 +6,51 @@
 //! skeletons (see [`logsql`]). The embedded esmui web UI is out of scope and is
 //! served as a minimal placeholder.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use esl_common::buildinfo;
 use esl_common::httpserver::{Request, ResponseWriter};
+use esl_common::metrics::{Counter, Summary};
 use esl_logstorage::storage::Storage;
+
+/// Per-route `esl_http_requests_total{path=...}` counter and
+/// `esl_http_request_duration_seconds{path=...}` summary, registered once per
+/// call site like Go's package-level vars in `app/eslselect/main.go`.
+macro_rules! path_metrics {
+    ($path:literal) => {{
+        static C: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+            esl_common::metrics::new_counter(concat!(
+                "esl_http_requests_total{path=\"",
+                $path,
+                "\"}"
+            ))
+        });
+        static D: LazyLock<Arc<Summary>> = LazyLock::new(|| {
+            esl_common::metrics::new_summary(concat!(
+                "esl_http_request_duration_seconds{path=\"",
+                $path,
+                "\"}"
+            ))
+        });
+        (&C, &D)
+    }};
+}
+
+/// Per-route request counter without a duration summary (Go registers only
+/// the counter for `/select/logsql/tail` and `/select/logsql/query_time_range`).
+macro_rules! path_requests {
+    ($path:literal) => {{
+        static C: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+            esl_common::metrics::new_counter(concat!(
+                "esl_http_requests_total{path=\"",
+                $path,
+                "\"}"
+            ))
+        });
+        &C
+    }};
+}
 
 pub mod csv;
 pub mod esmui_assets;
@@ -47,54 +87,100 @@ pub fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
 
     match path.as_str() {
         "/select/logsql/query" => {
+            let (requests, duration) = path_metrics!("/select/logsql/query");
+            requests.inc();
+            let start_time = Instant::now();
             logsql::process_query_request(storage, req, w);
+            duration.update_duration(start_time);
             true
         }
         "/select/logsql/query_time_range" => {
+            path_requests!("/select/logsql/query_time_range").inc();
             logsql::process_query_time_range_request(req, w);
             true
         }
         "/select/logsql/hits" => {
+            let (requests, duration) = path_metrics!("/select/logsql/hits");
+            requests.inc();
+            let start_time = Instant::now();
             logsql::process_hits_request(storage, req, w);
+            duration.update_duration(start_time);
             true
         }
         "/select/logsql/facets" => {
+            let (requests, duration) = path_metrics!("/select/logsql/facets");
+            requests.inc();
+            let start_time = Instant::now();
             logsql_facets::process_facets_request(storage, req, w);
+            duration.update_duration(start_time);
             true
         }
         "/select/logsql/stats_query" => {
+            let (requests, duration) = path_metrics!("/select/logsql/stats_query");
+            requests.inc();
+            let start_time = Instant::now();
             logsql_stats_query::process_stats_query_request(storage, req, w);
+            duration.update_duration(start_time);
             true
         }
         "/select/logsql/stats_query_range" => {
+            let (requests, duration) = path_metrics!("/select/logsql/stats_query_range");
+            requests.inc();
+            let start_time = Instant::now();
             logsql_stats_query::process_stats_query_range_request(storage, req, w);
+            duration.update_duration(start_time);
             true
         }
         "/select/logsql/field_names" => {
+            let (requests, duration) = path_metrics!("/select/logsql/field_names");
+            requests.inc();
+            let start_time = Instant::now();
             logsql_fields::process_field_names_request(storage, req, w);
+            duration.update_duration(start_time);
             true
         }
         "/select/logsql/field_values" => {
+            let (requests, duration) = path_metrics!("/select/logsql/field_values");
+            requests.inc();
+            let start_time = Instant::now();
             logsql_fields::process_field_values_request(storage, req, w);
+            duration.update_duration(start_time);
             true
         }
         "/select/logsql/streams" => {
+            let (requests, duration) = path_metrics!("/select/logsql/streams");
+            requests.inc();
+            let start_time = Instant::now();
             logsql_streams::process_streams_request(storage, req, w);
+            duration.update_duration(start_time);
             true
         }
         "/select/logsql/stream_ids" => {
+            let (requests, duration) = path_metrics!("/select/logsql/stream_ids");
+            requests.inc();
+            let start_time = Instant::now();
             logsql_streams::process_stream_ids_request(storage, req, w);
+            duration.update_duration(start_time);
             true
         }
         "/select/logsql/stream_field_names" => {
+            let (requests, duration) = path_metrics!("/select/logsql/stream_field_names");
+            requests.inc();
+            let start_time = Instant::now();
             logsql_streams::process_stream_field_names_request(storage, req, w);
+            duration.update_duration(start_time);
             true
         }
         "/select/logsql/stream_field_values" => {
+            let (requests, duration) = path_metrics!("/select/logsql/stream_field_values");
+            requests.inc();
+            let start_time = Instant::now();
             logsql_streams::process_stream_field_values_request(storage, req, w);
+            duration.update_duration(start_time);
             true
         }
         "/select/logsql/tail" => {
+            path_requests!("/select/logsql/tail").inc();
             logsql_tail::process_live_tail_request(storage, req, w);
             true
         }

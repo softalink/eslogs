@@ -6,7 +6,7 @@
 
 pub mod zstd;
 
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex};
 
 // minCompressibleBlockSize is the minimum block size in bytes for trying compression.
 //
@@ -436,14 +436,35 @@ fn get_compress_level(items_count: usize) -> i32 {
 // compress.go
 //
 
-// PORT NOTE: the Go package increments vm_zstd_block_* metrics counters in
-// these wrappers; lib/metrics has no port yet, so the counters are omitted.
+/// The esm_zstd_block_* counters mirroring the Go package-level vars in
+/// lib/encoding/compress.go.
+struct ZstdBlockCounters {
+    compress_calls: Arc<crate::metrics::Counter>,
+    decompress_calls: Arc<crate::metrics::Counter>,
+    original_bytes: Arc<crate::metrics::Counter>,
+    compressed_bytes: Arc<crate::metrics::Counter>,
+}
+
+fn zstd_block_counters() -> &'static ZstdBlockCounters {
+    static C: LazyLock<ZstdBlockCounters> = LazyLock::new(|| ZstdBlockCounters {
+        compress_calls: crate::metrics::new_counter("esm_zstd_block_compress_calls_total"),
+        decompress_calls: crate::metrics::new_counter("esm_zstd_block_decompress_calls_total"),
+        original_bytes: crate::metrics::new_counter("esm_zstd_block_original_bytes_total"),
+        compressed_bytes: crate::metrics::new_counter("esm_zstd_block_compressed_bytes_total"),
+    });
+    &C
+}
 
 /// Appends compressed src to dst.
 ///
 /// The given compress_level is used for the compression.
 pub fn compress_zstd_level(dst: &mut Vec<u8>, src: &[u8], compress_level: i32) {
+    let c = zstd_block_counters();
+    c.compress_calls.inc();
+    c.original_bytes.add(src.len() as u64);
+    let dst_len = dst.len();
     zstd::compress_level(dst, src, compress_level);
+    c.compressed_bytes.add((dst.len() - dst_len) as u64);
 }
 
 /// Decompresses src and appends the result to dst.
@@ -451,6 +472,7 @@ pub fn compress_zstd_level(dst: &mut Vec<u8>, src: &[u8], compress_level: i32) {
 /// This function must be called only for the trusted src.
 /// Use decompress_zstd_limited for untrusted src.
 pub fn decompress_zstd(dst: &mut Vec<u8>, src: &[u8]) -> Result<(), String> {
+    zstd_block_counters().decompress_calls.inc();
     zstd::decompress(dst, src).map_err(|err| {
         format!(
             "cannot decompress zstd block with len={}: {}; block data (hex): {}",
@@ -469,6 +491,7 @@ pub fn decompress_zstd_limited(
     src: &[u8],
     max_data_size_bytes: usize,
 ) -> Result<(), String> {
+    zstd_block_counters().decompress_calls.inc();
     zstd::decompress_limited(dst, src, max_data_size_bytes).map_err(|err| {
         format!(
             "cannot decompress zstd block with len={} and maxDataSizeBytes={}: {}",

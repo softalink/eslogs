@@ -12,10 +12,12 @@
 //! `valyala/fastjson` arena. The port models JSON values with the private
 //! [`JsonValue`] enum instead.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use esl_common::easyproto;
 use esl_common::httpserver::{Request, ResponseWriter};
+use esl_common::metrics::{Counter, Summary};
 use esl_common::stringsutil::json_string;
 
 use esl_logstorage::rows::{Field, Fields, get_fields, put_fields, rename_field};
@@ -55,10 +57,28 @@ pub fn request_handler<S: LogRowsStorage>(
     }
 }
 
+static REQUESTS_PROTOBUF_TOTAL: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::new_counter(
+        r#"esl_http_requests_total{path="/insert/opentelemetry/v1/logs",format="protobuf"}"#,
+    )
+});
+static ERRORS_TOTAL: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::new_counter(
+        r#"esl_http_errors_total{path="/insert/opentelemetry/v1/logs",format="protobuf"}"#,
+    )
+});
+static REQUEST_PROTOBUF_DURATION: LazyLock<Arc<Summary>> = LazyLock::new(|| {
+    esl_common::metrics::new_summary(
+        r#"esl_http_request_duration_seconds{path="/insert/opentelemetry/v1/logs",format="protobuf"}"#,
+    )
+});
+
 fn handle_protobuf<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &mut ResponseWriter) {
-    // PORT NOTE: Go tracks requestsProtobufTotal / requestProtobufDuration /
-    // errorsTotal metrics and checks insertutil.CanWriteData(); metrics and the
-    // CanWriteData indirection are omitted in the port (see common_params.rs).
+    // PORT NOTE: Go's insertutil.CanWriteData() check is omitted in the port
+    // (see common_params.rs).
+    let start_time = Instant::now();
+    REQUESTS_PROTOBUF_TOTAL.inc();
+
     let cp = match get_common_params(req) {
         Ok(cp) => cp,
         Err(err) => {
@@ -89,16 +109,20 @@ fn handle_protobuf<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &m
     let use_default_stream_fields = cp.stream_fields.is_empty();
     let msg_fields: Vec<&str> = cp.msg_fields.iter().map(String::as_str).collect();
 
-    let mut lmp = cp.new_log_message_processor(storage);
+    let mut lmp = cp.new_log_message_processor(storage, "opentelemetry_protobuf");
     let res = push_protobuf_request(&data, &mut lmp, &msg_fields, use_default_stream_fields);
     lmp.close();
 
     if let Err(err) = res {
+        ERRORS_TOTAL.inc();
         w.errorf(
             req,
             &format!("cannot read OpenTelemetry protocol data: {err}"),
         );
+        return;
     }
+
+    REQUEST_PROTOBUF_DURATION.update_duration(start_time);
 }
 
 /// PORT NOTE: Go's `pushProtobufRequest` accepts the

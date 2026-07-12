@@ -3,7 +3,7 @@
 //! and `sortLogRows`, plus `WriteJSONRows` from `query_response.qtpl.go`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use esl_common::httpserver::{Request, ResponseWriter};
@@ -31,9 +31,28 @@ const TAIL_OFFSET_NSECS: i64 = 5_000_000_000;
 /// single query iteration runs and the buffered rows are returned as a
 /// regular response.
 ///
-/// PORT NOTE: the Go `esl_live_tailing_requests` metric is not ported (no
-/// metrics registry in this port).
+fn live_tail_requests() -> &'static Arc<esl_common::metrics::Counter> {
+    static C: LazyLock<Arc<esl_common::metrics::Counter>> =
+        LazyLock::new(|| esl_common::metrics::new_counter("esl_live_tailing_requests"));
+    &C
+}
+
+/// Minimal drop-guard mirroring Go's `defer` for the live-tail counter.
+fn scopeguard<F: FnMut()>(f: F) -> impl Drop {
+    struct Guard<F: FnMut()>(F);
+    impl<F: FnMut()> Drop for Guard<F> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+    Guard(f)
+}
+
 pub fn process_live_tail_request(storage: &Arc<Storage>, req: &Request, w: &mut ResponseWriter) {
+    // Go increments liveTailRequests and decrements it via defer, so the
+    // counter tracks the number of currently active live tails.
+    live_tail_requests().inc();
+    let _dec_on_return = scopeguard(|| live_tail_requests().dec());
     let ca = match parse_common_args_with_config(req, true) {
         Ok(ca) => ca,
         Err(e) => {

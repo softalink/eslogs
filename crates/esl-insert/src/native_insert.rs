@@ -84,7 +84,7 @@ pub fn request_handler<S: LogRowsStorage>(
         None => return,
     };
 
-    let mut lmp = cp.new_log_message_processor(storage);
+    let mut lmp = cp.new_log_message_processor(storage, "nativeinsert");
     let res = parse_data(&mut lmp, &data, cp.tenant_id);
     lmp.close();
     if let Err(err) = res {
@@ -136,7 +136,7 @@ pub fn multitenant_request_handler<S: LogRowsStorage>(
         None => return,
     };
 
-    let mut lmp = cp.new_log_message_processor(storage);
+    let mut lmp = cp.new_log_message_processor(storage, "nativemultitenant");
     let res = parse_data_multitenant(&mut lmp, &data);
     lmp.close();
     if let Err(err) = res {
@@ -332,7 +332,7 @@ mod tests {
     fn test_parse_data_roundtrip() {
         let s = open_temp_storage("native");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         let mut data = Vec::new();
         marshal_test_row(&mut data, TenantID::default(), "m1");
@@ -350,7 +350,7 @@ mod tests {
     fn test_parse_data_overrides_tenant_id() {
         let s = open_temp_storage("native-tenant");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         // The row carries tenant 1:2, while the request tenant is the default;
         // parse_data must override it with the request tenant.
@@ -373,7 +373,7 @@ mod tests {
     fn test_parse_data_multitenant_roundtrip() {
         let s = open_temp_storage("native-multitenant");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         let mut data = Vec::new();
         marshal_test_row(&mut data, TenantID::default(), "m1");
@@ -398,7 +398,7 @@ mod tests {
     fn test_parse_data_error() {
         let s = open_temp_storage("native-bad");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         let res = parse_data(&mut lmp, b"\x01\x02\x03", TenantID::default());
         assert!(res.is_err(), "expected error for truncated data");

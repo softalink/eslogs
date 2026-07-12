@@ -2,12 +2,14 @@
 //! server side of the cluster select protocol, serving `/internal/select/*`
 //! and `/internal/delete/*` for the `esl-storage` netselect client.
 //!
-//! PORT NOTE — concurrency limiter and metrics: Go wraps `requestHandler` in a
+//! PORT NOTE — concurrency limiter: Go wraps `requestHandler` in a
 //! `concurrencyLimitCh` gate sized by `-internalselect.maxConcurrentRequests`
-//! (with `Init`/`Stop` lifecycle) and tracks `esl_http_requests_total` /
-//! `esl_http_errors_total` / duration summaries. The port has no flags/metrics
-//! infrastructure in esl-select (consistent with `logsql.rs`), so the limiter
-//! and the counters are dropped; requests are served directly.
+//! (with `Init`/`Stop` lifecycle) and a `esl_concurrent_internalselect_requests_wait_duration`
+//! summary. The limiter is dropped (requests are served directly, bounded by
+//! the httpserver worker pool), so the wait-duration summary has nothing to
+//! measure and is not registered. The per-path `esl_http_requests_total` /
+//! `esl_http_errors_total` / `esl_http_request_duration_seconds` metrics are
+//! ported.
 //!
 //! PORT NOTE — `QueryContext`: Go bundles ctx cancellation, `QueryStats`,
 //! `AllowPartialResponse` and `HiddenFieldsFilters` into a
@@ -29,7 +31,10 @@
 //! mid-stream write errors (Go `errGlobal`/`sendBuf` failures) cannot occur.
 //!
 //! PORT NOTE — `UpdatePerQueryStatsMetrics` (Go `defer` in every handler)
-//! feeds per-query metrics; dropped together with the metrics infrastructure.
+//! is not called: the ported queries don't accumulate `QueryStats` (see
+//! above), so the update would only record zeros. The
+//! `esl_storage_per_query_*` histograms are still registered (at zero) by
+//! `esl_storage::query_stats::init`, matching the series Go exposes.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -91,6 +96,28 @@ pub fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
         }
     };
 
+    let start_time = Instant::now();
+    let known_path = matches!(
+        path.as_str(),
+        "/internal/select/query"
+            | "/internal/select/field_names"
+            | "/internal/select/field_values"
+            | "/internal/select/stream_field_names"
+            | "/internal/select/stream_field_values"
+            | "/internal/select/streams"
+            | "/internal/select/stream_ids"
+            | "/internal/select/tenant_ids"
+            | "/internal/delete/run_task"
+            | "/internal/delete/stop_task"
+            | "/internal/delete/active_tasks"
+    );
+    if known_path {
+        esl_common::metrics::get_or_create_counter(&format!(
+            "esl_http_requests_total{{path={path:?}}}"
+        ))
+        .inc();
+    }
+
     let result = match path.as_str() {
         "/internal/select/query" => process_query_request(storage, req, &form, w),
         "/internal/select/field_names" => process_field_names_request(storage, req, &form, w),
@@ -116,8 +143,18 @@ pub fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
     };
 
     if let Err(err) = result {
+        esl_common::metrics::get_or_create_counter(&format!(
+            "esl_http_errors_total{{path={path:?}}}"
+        ))
+        .inc();
         w.errorf(req, &err);
+        // The return is skipped intentionally in order to track the duration
+        // of failed queries.
     }
+    esl_common::metrics::get_or_create_summary(&format!(
+        "esl_http_request_duration_seconds{{path={path:?}}}"
+    ))
+    .update_duration(start_time);
     true
 }
 

@@ -10,20 +10,21 @@
 //! resolve lazily, so the tenant-id and stream-fields initialization happens on
 //! first use via `OnceLock` instead of an explicit init call.
 //!
-//! PORT NOTE: Go's `CanWriteData()` check, the `writeconcurrencylimiter`
-//! reader wrapper and the request metrics are omitted, matching the rest of
-//! the port (see `common_params.rs`). The `Content-Encoding`s Go handles via
+//! PORT NOTE: Go's `CanWriteData()` check and the `writeconcurrencylimiter`
+//! reader wrapper are omitted, matching the rest of the port (see
+//! `common_params.rs`). The `Content-Encoding`s Go handles via
 //! `protoparserutil.GetUncompressedReader` are decompressed transparently by
 //! [`Request::body_reader`] in `esl_common::httpserver`.
 
 use std::borrow::Cow;
 use std::io::Read;
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::Instant;
 
 use esl_common::errorf;
 use esl_common::flagutil::{ArrayString, Flag};
 use esl_common::httpserver::{Request, ResponseWriter, get_quoted_remote_addr};
+use esl_common::metrics::{Counter, Summary};
 
 use esl_logstorage::rows::Field;
 use esl_logstorage::stream_tags::check_stream_field_names;
@@ -160,11 +161,27 @@ pub fn request_handler<S: LogRowsStorage>(
     }
 }
 
+static REQUESTS_TOTAL: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::new_counter(r#"esl_http_requests_total{path="/insert/journald/upload"}"#)
+});
+static ERRORS_TOTAL: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::new_counter(r#"esl_http_errors_total{path="/insert/journald/upload"}"#)
+});
+static REQUEST_DURATION: LazyLock<Arc<Summary>> = LazyLock::new(|| {
+    esl_common::metrics::new_summary(
+        r#"esl_http_request_duration_seconds{path="/insert/journald/upload"}"#,
+    )
+});
+
 /// handleJournald parses Journal binary entries
 fn handle_journald<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &mut ResponseWriter) {
+    let start_time = Instant::now();
+    REQUESTS_TOTAL.inc();
+
     let cp = match get_common_params(req) {
         Ok(cp) => cp,
         Err(err) => {
+            ERRORS_TOTAL.inc();
             w.errorf(
                 req,
                 &format!("cannot parse common params from request: {err}"),
@@ -185,10 +202,11 @@ fn handle_journald<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &m
         String::new()
     };
 
-    let mut lmp = cp.new_log_message_processor(storage);
+    let mut lmp = cp.new_log_message_processor(storage, "journald");
     let res = process_stream_internal(&stream_name, req.body_reader(), &remote_ip, &mut lmp, &cp);
     lmp.close();
     if let Err(err) = res {
+        ERRORS_TOTAL.inc();
         w.errorf(req, &format!("cannot read journald protocol data: {err}"));
         return;
     }
@@ -197,6 +215,11 @@ fn handle_journald<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &m
     // algorithms list in Accept-Encoding response header in a format "<algorithm_1>[:<priority_1>][;<algorithm_2>:<priority_2>]"
     // See https://github.com/systemd/systemd/pull/34822
     w.set_header("Accept-Encoding", "zstd");
+
+    // Update REQUEST_DURATION only for successfully parsed requests.
+    // There is no need in updating it for request errors, since their timings
+    // are usually much smaller than the timing for successful request parsing.
+    REQUEST_DURATION.update_duration(start_time);
 }
 
 fn process_stream_internal(

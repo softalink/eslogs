@@ -88,7 +88,7 @@ pub fn request_handler<S: LogRowsStorage>(
             let preserve_keys: Vec<&str> =
                 cp.preserve_json_keys.iter().map(String::as_str).collect();
 
-            let mut lmp = cp.new_log_message_processor(storage);
+            let mut lmp = cp.new_log_message_processor(storage, "elasticsearch_bulk");
             let (n, res) = read_bulk_request(
                 &stream_name,
                 req.body_reader(),
@@ -327,7 +327,7 @@ mod tests {
     fn test_read_bulk_request_parses_actions_and_docs() {
         let s = open_temp_storage("esbulk");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         let body = b"{\"create\":{\"_index\":\"logs\"}}\n{\"_msg\":\"hello\",\"host\":\"a\"}\n{\"index\":{}}\n{\"_msg\":\"world\"}\n".to_vec();
         let mut cur = Cursor::new(body);
@@ -344,7 +344,7 @@ mod tests {
     fn test_read_bulk_request_rejects_bad_command() {
         let s = open_temp_storage("esbulk-bad");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         let body = b"{\"delete\":{}}\n{\"_msg\":\"x\"}\n".to_vec();
         let mut cur = Cursor::new(body);

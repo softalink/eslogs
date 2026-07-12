@@ -5,10 +5,7 @@
 //!
 //! PORT NOTE: the HTTP transport (Go `net/http` + `promauth` +
 //! `httputil.NewTransport`) is replaced by [`crate::http_client`]; see the PORT
-//! NOTES there. The `metrics` counters/gauges
-//! (`esl_insert_remote_send_errors_total`, `esl_insert_remote_is_reachable`,
-//! `esl_insert_active_streams`) are kept as plain atomics on the structs since
-//! the metrics registry is not ported.
+//! NOTES there.
 //!
 //! PORT NOTE: Go's `pendingDataBuffers` buffered channel doubles as a buffer
 //! pool with backpressure; the port models it as a `Mutex<Vec<ByteBuffer>>` +
@@ -22,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use esl_common::bytesutil::ByteBuffer;
 use esl_common::encoding::zstd;
+use esl_common::metrics::Counter;
 use esl_common::{errorf, fasttime, warnf};
 
 use esl_logstorage::log_rows::InsertRow;
@@ -42,7 +40,7 @@ pub const PROTOCOL_VERSION: &str = "v1";
 pub struct Storage {
     sns: Vec<Arc<StorageNode>>,
 
-    srt: StreamRowsTracker,
+    srt: Arc<StreamRowsTracker>,
 
     shared: Arc<StorageShared>,
 
@@ -87,8 +85,8 @@ struct StorageNode {
     pending: Mutex<PendingData>,
 
     /// sendErrors counts failed send attempts for this storage node
-    /// (Go: `esl_insert_remote_send_errors_total{addr=...}` counter).
-    send_errors: AtomicU64,
+    /// (the `esl_insert_remote_send_errors_total{addr=...}` registry counter).
+    send_errors: Arc<Counter>,
 
     /// disabledUntil contains unix timestamp until the storageNode is disabled
     /// for data writing.
@@ -112,6 +110,7 @@ enum SendError {
 
 fn new_storage_node(shared: Arc<StorageShared>, addr: String, ac: AuthConfig) -> Arc<StorageNode> {
     let scheme = if ac.tls().is_some() { "https" } else { "http" };
+    let addr_for_metrics = addr.clone();
     let sn = Arc::new(StorageNode {
         scheme,
         addr,
@@ -121,11 +120,33 @@ fn new_storage_node(shared: Arc<StorageShared>, addr: String, ac: AuthConfig) ->
             data: ByteBuffer::default(),
             last_flush: Instant::now(),
         }),
-        send_errors: AtomicU64::new(0),
+        send_errors: esl_common::metrics::get_or_create_counter(&format!(
+            "esl_insert_remote_send_errors_total{{addr={addr_label:?}}}",
+            addr_label = addr_for_metrics
+        )),
         disabled_until: AtomicU64::new(0),
         is_reachable: AtomicBool::new(true),
     });
     sn.is_reachable.store(true, Ordering::SeqCst);
+
+    // Go registers the reachability gauge with a callback reading
+    // sn.isReachable; the gauge keeps a strong reference to the node, exactly
+    // like the Go closure does.
+    let sn_gauge = Arc::clone(&sn);
+    let _ = esl_common::metrics::get_or_create_gauge(
+        &format!(
+            "esl_insert_remote_is_reachable{{addr={addr_label:?}}}",
+            addr_label = sn.addr
+        ),
+        Some(Box::new(move || {
+            if sn_gauge.is_reachable.load(Ordering::SeqCst) {
+                1.0
+            } else {
+                0.0
+            }
+        })),
+    );
+
     sn
 }
 
@@ -248,7 +269,7 @@ impl StorageNode {
         }
 
         if self.disabled_until.load(Ordering::SeqCst) > fasttime::unix_timestamp() {
-            self.send_errors.fetch_add(1, Ordering::Relaxed);
+            self.send_errors.inc();
             return Err(SendError::TemporarilyDisabled);
         }
 
@@ -296,7 +317,7 @@ impl StorageNode {
                 }
             }
             Err(err) => {
-                self.send_errors.fetch_add(1, Ordering::Relaxed);
+                self.send_errors.inc();
                 return Err(format!("cannot set auth headers for {req_url}: {err}"));
             }
         }
@@ -337,7 +358,7 @@ impl StorageNode {
         self.disabled_until
             .store(fasttime::unix_timestamp() + 10, Ordering::SeqCst);
 
-        self.send_errors.fetch_add(1, Ordering::Relaxed);
+        self.send_errors.inc();
         self.is_reachable.store(false, Ordering::SeqCst);
     }
 }
@@ -435,9 +456,19 @@ pub fn new_storage(
         );
     }
 
+    // Active streams tracker.
+    let srt = Arc::new(new_stream_rows_tracker(addrs.len()));
+    let srt_gauge = Arc::clone(&srt);
+    let _ = esl_common::metrics::get_or_create_gauge(
+        "esl_insert_active_streams",
+        Some(Box::new(move || {
+            srt_gauge.rows_per_stream.lock().unwrap().len() as f64
+        })),
+    );
+
     Storage {
         sns,
-        srt: new_stream_rows_tracker(addrs.len()),
+        srt,
         shared,
         handles: Mutex::new(handles),
     }
@@ -446,7 +477,7 @@ pub fn new_storage(
 impl Storage {
     /// Returns the number of log streams being tracked since the Storage start
     /// (Go `getActiveStreams`; exported by the `esl_insert_active_streams`
-    /// gauge upstream).
+    /// gauge).
     pub fn get_active_streams(&self) -> usize {
         self.srt.rows_per_stream.lock().unwrap().len()
     }
@@ -486,7 +517,7 @@ impl Storage {
             .map(|sn| {
                 (
                     sn.addr.clone(),
-                    sn.send_errors.load(Ordering::Relaxed),
+                    sn.send_errors.get(),
                     sn.is_reachable.load(Ordering::SeqCst),
                 )
             })

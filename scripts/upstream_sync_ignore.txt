@@ -3,16 +3,23 @@
 # Every entry needs a reason; new upstream files land in `report` as
 # UNMAPPED unless matched here.
 
-# -- Prometheus metrics registry: the port keeps counters as plain atomics
-#    and writes the /metrics series directly (see esl-storage PORT NOTEs).
-vendor/github.com/VictoriaMetrics/metrics/*
+# -- Prometheus metrics registry: ported to esl-common/src/metrics.rs (+
+#    submodules); the files below are the deliberately-unported remainder.
+# push-mode metrics delivery: the port serves /metrics for scraping only
+vendor/github.com/VictoriaMetrics/metrics/push.go
+# le-bucket Prometheus histograms: nothing in the EsLogs port uses them
+vendor/github.com/VictoriaMetrics/metrics/prometheus_histogram.go
+# Go-runtime metrics (go_*): no Go runtime in the Rust port
+vendor/github.com/VictoriaMetrics/metrics/go_metrics.go
+# process metrics for OSes the workspace doesn't target (linux+windows only)
+vendor/github.com/VictoriaMetrics/metrics/process_metrics_darwin*
+vendor/github.com/VictoriaMetrics/metrics/process_metrics_solaris.go
+vendor/github.com/VictoriaMetrics/metrics/process_metrics_other.go
 
 # -- MetricsQL: unused by the logs product (vendored transitively upstream).
 vendor/github.com/VictoriaMetrics/metricsql/*
 
 # -- VictoriaMetrics helper libs the port intentionally skipped:
-# process self-metrics for the metrics registry (not ported)
-vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/appmetrics/*
 # mmap-backed block cache: superseded by the port's zero-copy mmap reads
 vendor/github.com/VictoriaMetrics/VictoriaMetrics/lib/blockcache/*
 # http response buffering pool: the ported httpserver buffers responses itself

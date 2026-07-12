@@ -2,6 +2,7 @@
 //! depends on. Each module mirrors one Go package; see `docs/CONVENTIONS.md`
 //! for the porting rules and `docs/PARITY.md` for status.
 
+pub mod appmetrics;
 pub mod atomicutil;
 pub mod buildinfo;
 pub mod bytesutil;
@@ -21,6 +22,7 @@ pub mod httpserver;
 pub mod httputil;
 pub mod logger;
 pub mod memory;
+pub mod metrics;
 pub mod procutil;
 pub mod regexutil;
 pub mod slicesutil;

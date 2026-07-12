@@ -47,7 +47,7 @@ pub fn request_handler<S: LogRowsStorage>(
     let msg_fields: Vec<&str> = cp.msg_fields.iter().map(String::as_str).collect();
     let preserve_keys: Vec<&str> = cp.preserve_json_keys.iter().map(String::as_str).collect();
 
-    let mut lmp = cp.new_log_message_processor(storage);
+    let mut lmp = cp.new_log_message_processor(storage, "jsonline");
     let res = process_stream_internal(
         &stream_name,
         req.body_reader(),
@@ -161,7 +161,7 @@ mod tests {
     fn test_jsonline_to_storage_roundtrip() {
         let s = open_temp_storage("jsonline");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         // No _time field, so each row defaults to the current timestamp.
         let body =
@@ -188,7 +188,7 @@ mod tests {
     fn test_jsonline_skips_blank_lines() {
         let s = open_temp_storage("jsonline-blank");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         let body = b"\n{\"_msg\":\"only\"}\n\n".to_vec();
         let mut cur = Cursor::new(body);

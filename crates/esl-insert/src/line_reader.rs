@@ -5,9 +5,18 @@
 //! like Elasticsearch bulk stay line-aligned).
 
 use std::io::Read;
+use std::sync::{Arc, LazyLock};
 
 use esl_common::flagutil::{Bytes, Flag};
+use esl_common::metrics::Counter;
 use esl_common::warnf;
+
+fn too_long_lines_skipped() -> &'static Arc<Counter> {
+    static C: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+        esl_common::metrics::get_or_create_counter("esl_too_long_lines_skipped_total")
+    });
+    &C
+}
 
 /// MaxLineSizeBytes is the maximum length of a single line for `/insert/*`
 /// handlers (Go `-insert.maxLineSizeBytes` from `insertutil/flags.go`).
@@ -125,6 +134,7 @@ impl<'a> LineReader<'a> {
                 skipped_bytes,
                 snippet
             );
+            too_long_lines_skipped().inc();
             return ok;
         }
 

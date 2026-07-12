@@ -26,8 +26,10 @@ Status of each upstream package's port. Status values:
 | lib/fs/fsutil | ported | |
 | lib/filestream | ported | |
 | lib/regexutil | ported | |
-| lib/httpserver | ported | threaded server (worker pool sized to available_cpus); no server-side TLS (single-owner rustls session vs the tri-handle conn plumbing, PORT NOTE), no auth/pprof/metrics (PORT NOTE) |
+| lib/httpserver | ported | threaded server (worker pool sized to available_cpus); no server-side TLS (single-owner rustls session vs the tri-handle conn plumbing, PORT NOTE), no auth/pprof (PORT NOTE); /metrics serves the full registry via lib/appmetrics + esm_http_* request metrics |
 | lib/httputil | ported | GetRequestValue/GetArray/GetBool/GetInt/CheckURL over Request |
+| github.com/VictoriaMetrics/metrics | ported | esl-common/src/metrics.rs: Set + default set, Counter, FloatCounter, Gauge, Histogram (vmrange buckets), Summary (incl. inline valyala/histogram+fastrand), validator, WritePrometheus, process metrics (linux /proc + windows); push.go / prometheus_histogram.go / go_metrics.go unported (ignore list) |
+| lib/appmetrics | ported | esl-common/src/appmetrics.rs: /metrics payload (registry + process + esm_app_*/esm_os_info); flag export + -metrics.exposeMetadata flag PORT-NOTEd |
 | lib/netutil | todo | |
 | lib/protoparser/protoparserutil | partial | request-body decompression (gzip/deflate/zstd/snappy) + ReadLinesBlock in httpserver; rest todo |
 | lib/writeconcurrencylimiter | todo | |
@@ -74,10 +76,13 @@ Tracked at file/subsystem granularity once porting starts:
 | app/eslogsgenerator | eslogsgenerator | ported | all 20 flags, e2e-verified generation |
 | app/esmui | esl-select assets | ported | prebuilt upstream assets embedded, completeness-tested |
 
-Cross-cutting deferrals (PORT-NOTEd at each site): no metrics registry
-(counters are plain atomics; /metrics serves the storage series), context
+Cross-cutting deferrals (PORT-NOTEd at each site): context
 cancellation dropped, net_query_runner (cluster query splitting) stubbed for
-single-node. TLS is supported via `esl_common::tlsutil` (rustls/ring, MSVC
+single-node. The metrics registry is ported (esl_common::metrics) and wired
+across the crates: /metrics serves the registry (esl_/esm_/eslagent_ series),
+the storage writer set, per-query-stats vmrange histograms and process
+metrics; remaining unwired families (vm_filestream_*, vm_fs_*, vm_gorutines
+and other Go-runtime series) are PORT-NOTEd at their sites. TLS is supported via `esl_common::tlsutil` (rustls/ring, MSVC
 cross-compile-clean): client side (-storageNode.tls*, -remoteWrite.tls*,
 kubernetes collector, eslogscli -tls*) and server side (-syslog.tls*); the
 one exception is httpserver's -tls serving flags, omitted with a PORT NOTE

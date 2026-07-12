@@ -144,7 +144,7 @@ fn handle_json<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &mut R
         .map(String::as_str)
         .collect();
 
-    let mut lmp = cp.cp.new_log_message_processor(storage);
+    let mut lmp = cp.cp.new_log_message_processor(storage, "loki_json");
     let res = parse_json_request(
         &data,
         &mut lmp,
@@ -703,7 +703,7 @@ mod tests {
     fn test_parse_json_request_lands_rows() {
         let s = open_temp_storage("loki");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         // Empty timestamp strings force the current time (avoids retention).
         let body = br#"{"streams":[{"stream":{"app":"foo","level":"info"},"values":[["","hello"],["","world"]]}]}"#;
@@ -720,7 +720,7 @@ mod tests {
     fn test_parse_json_request_missing_streams() {
         let s = open_temp_storage("loki-bad");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
         let no_fields: [&str; 0] = [];
         let res = parse_json_request(b"{}", &mut lmp, &no_fields, &no_fields, "", true, true);
         assert!(res.is_err(), "expected error for missing streams");

@@ -10,19 +10,20 @@
 //! `Content-Encoding`s Go supports are decompressed transparently by
 //! [`Request::body_reader`] in `esl_common::httpserver`.
 //!
-//! PORT NOTE: Go's `CanWriteData()` check and the `esl_http_requests_total` /
-//! `esl_http_request_duration_seconds` metrics are omitted, matching the rest
-//! of the port (see `common_params.rs`).
+//! PORT NOTE: Go's `CanWriteData()` check is omitted, matching the rest of
+//! the port (see `common_params.rs`).
 //!
 //! PORT NOTE: Go parses JSON via the vendored `valyala/fastjson`. esl-insert
 //! only depends on `esl-common`/`esl-logstorage`, so a small dependency-free
 //! JSON value parser lives in the [`json`] submodule below (same approach as
 //! `loki.rs`).
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use esl_common::flagutil::{ArrayString, Flag};
 use esl_common::httpserver::{Request, ResponseWriter};
+use esl_common::metrics::{Counter, Summary};
 
 use esl_logstorage::rows::Field;
 use esl_logstorage::stream_tags::check_stream_field_names;
@@ -65,11 +66,24 @@ pub fn request_handler<S: LogRowsStorage>(
     }
 }
 
+static V2_LOGS_REQUESTS_TOTAL: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::new_counter(
+        r#"esl_http_requests_total{path="/insert/datadog/api/v2/logs"}"#,
+    )
+});
+static V2_LOGS_REQUEST_DURATION: LazyLock<Arc<Summary>> = LazyLock::new(|| {
+    esl_common::metrics::new_summary(
+        r#"esl_http_request_duration_seconds{path="/insert/datadog/api/v2/logs"}"#,
+    )
+});
+
 fn datadog_logs_ingestion<S: LogRowsStorage>(
     storage: &Arc<S>,
     req: &mut Request,
     w: &mut ResponseWriter,
 ) {
+    let start_time = Instant::now();
+    V2_LOGS_REQUESTS_TOTAL.inc();
     w.set_header("Content-Type", "application/json");
 
     let ts_value = req.header("dd-message-timestamp").to_string();
@@ -124,7 +138,7 @@ fn datadog_logs_ingestion<S: LogRowsStorage>(
         }
     };
 
-    let mut lmp = cp.new_log_message_processor(storage);
+    let mut lmp = cp.new_log_message_processor(storage, "datadog");
     let res = read_logs_request(ts, &data, &mut lmp);
     lmp.close();
 
@@ -133,6 +147,7 @@ fn datadog_logs_ingestion<S: LogRowsStorage>(
         return;
     }
 
+    V2_LOGS_REQUEST_DURATION.update_duration(start_time);
     w.set_status(202);
     w.write_str("{}");
 }

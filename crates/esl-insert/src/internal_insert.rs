@@ -94,7 +94,7 @@ pub fn request_handler<S: LogRowsStorage>(
         return;
     }
 
-    let mut lmp = cp.new_log_message_processor(storage);
+    let mut lmp = cp.new_log_message_processor(storage, "internalinsert");
     // PORT NOTE: Go duplicates `parseData` in each package; the port reuses
     // `native_insert::parse_data_multitenant`, which is byte-for-byte the same
     // parser (rows keep their own tenantID).
@@ -145,7 +145,7 @@ mod tests {
     fn test_internal_insert_wire_roundtrip() {
         let s = open_temp_storage("internal-insert");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         let mut data = Vec::new();
         marshal_test_row(&mut data, TenantID::default(), "m1");
@@ -171,7 +171,7 @@ mod tests {
     fn test_internal_insert_rejects_garbage() {
         let s = open_temp_storage("internal-insert-bad");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         let mut data = Vec::new();
         marshal_test_row(&mut data, TenantID::default(), "m1");

@@ -93,6 +93,9 @@ fn main() {
     let start_time = Instant::now();
 
     let storage = esl_storage::init();
+    // Register the storage metrics set for /metrics (Go does this inside
+    // vlstorage.Init).
+    esl_storage::init_storage_metrics(&storage);
 
     // Go eslinsert.Init(): start the syslog TCP/UDP/unix listeners (no-op
     // unless -syslog.listenAddr.* flags are set).
@@ -179,7 +182,8 @@ fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut ResponseWr
     }
 
     // Nothing handled the request: mirror Go `httpserver` unsupported-path
-    // behavior.
+    // behavior (including the `reason="unsupported"` error counter).
+    esl_common::httpserver::unsupported_request_errors().inc();
     w.errorf(req, &format!("unsupported path requested: {path:?}"));
 }
 

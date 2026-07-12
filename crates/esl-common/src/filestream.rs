@@ -1,9 +1,10 @@
 //! Port of Softalink LLC `lib/filestream` (filestream.go, parallel.go and
 //! the filestream_linux.go / filestream_windows.go stream trackers).
 //!
-//! PORT NOTE: the `vm_filestream_*` metrics are not ported — there is no
-//! metrics crate in this workspace yet — so the stat wrappers around the
-//! underlying reads/writes are omitted.
+//! PORT NOTE: the `vm_filestream_*` metrics are not wired to the
+//! `esl_common::metrics` registry — the stat wrappers around the underlying
+//! reads/writes were dropped with the ReadCloser/WriteCloser indirection they
+//! hang off in Go, and none of the EsLogs dashboards consume these series.
 //!
 //! PORT NOTE: Go pools `bufio.Reader`/`bufio.Writer` objects via sync.Pool;
 //! the Rust port pools the raw buffers behind [`Reader`]/[`Writer`], which

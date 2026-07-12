@@ -317,26 +317,17 @@ pub fn log_at(level: Level, location: &Location<'_>, args: fmt::Arguments<'_>) {
     count_log_message(level, &location, is_printed);
 }
 
-// PORT NOTE: Go increments `vm_log_messages_total{...}` counters in
-// lib/metrics. The metrics registry isn't ported yet, so the counters are
-// kept in an in-process map with the same counter names, ready to be exported
-// once lib/metrics lands.
-static LOG_MESSAGE_COUNTERS: LazyLock<Mutex<HashMap<String, u64>>> =
-    LazyLock::new(Default::default);
-
+// Go increments `vm_log_messages_total{...}` counters in lib/metrics; the
+// port registers the same series (rebranded `esm_`) in the metrics registry.
 fn count_log_message(level: Level, location: &str, is_printed: bool) {
     let counter_name = format!(
-        "vm_log_messages_total{{app_version={}, level={}, location={}, is_printed=\"{}\"}}",
+        "esm_log_messages_total{{app_version={}, level={}, location={}, is_printed=\"{}\"}}",
         go_quote(crate::buildinfo::version()),
         go_quote(level.as_str()),
         go_quote(location),
         is_printed
     );
-    *LOG_MESSAGE_COUNTERS
-        .lock()
-        .unwrap()
-        .entry(counter_name)
-        .or_insert(0) += 1;
+    crate::metrics::get_or_create_counter(&counter_name).inc();
 }
 
 fn log_message_internal(level: Level, msg: &str, location: &str) -> bool {
@@ -953,26 +944,29 @@ mod tests {
         count_log_message(Level::Warn, "counter_test.rs:7", true);
         count_log_message(Level::Warn, "counter_test.rs:7", true);
         count_log_message(Level::Warn, "counter_test.rs:7", false);
-        let counters = LOG_MESSAGE_COUNTERS.lock().unwrap();
-        let printed: Vec<_> = counters
+        let names = crate::metrics::list_metric_names();
+        let printed: Vec<_> = names
             .iter()
-            .filter(|(name, _)| {
+            .filter(|name| {
                 name.contains("level=\"warn\"")
                     && name.contains("location=\"counter_test.rs:7\"")
                     && name.contains("is_printed=\"true\"")
             })
             .collect();
         assert_eq!(printed.len(), 1);
-        assert_eq!(*printed[0].1, 2);
-        let suppressed: Vec<_> = counters
+        assert_eq!(crate::metrics::get_or_create_counter(printed[0]).get(), 2);
+        let suppressed: Vec<_> = names
             .iter()
-            .filter(|(name, _)| {
+            .filter(|name| {
                 name.contains("location=\"counter_test.rs:7\"")
                     && name.contains("is_printed=\"false\"")
             })
             .collect();
         assert_eq!(suppressed.len(), 1);
-        assert_eq!(*suppressed[0].1, 1);
+        assert_eq!(
+            crate::metrics::get_or_create_counter(suppressed[0]).get(),
+            1
+        );
     }
 
     #[test]

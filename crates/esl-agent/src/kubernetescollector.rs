@@ -29,7 +29,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -37,6 +37,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use esl_common::flagutil::{ArrayString, Flag};
 use esl_common::logger::{LogThrottler, with_throttler};
+use esl_common::metrics::Counter;
 use esl_common::timeutil::BackoffTimer;
 use esl_common::tlsutil::{self, TLSConfig, TlsClientConfig, TlsClientStream};
 use esl_common::{errorf, fasttime, fatalf, infof, panicf, warnf};
@@ -2187,7 +2188,7 @@ impl TailProcessor for LogFileProcessor {
                     self.add_line_internal(timestamp, content.as_bytes());
                 }
                 Err(err) => {
-                    ROWS_DROPPED_TOTAL_INVALID_CRI.fetch_add(1, Ordering::Relaxed);
+                    ROWS_DROPPED_TOTAL_INVALID_CRI.inc();
                     let pod =
                         must_get_field_val_by_name(&self.common_fields, "kubernetes.pod_name");
                     let namespace =
@@ -2205,7 +2206,7 @@ impl TailProcessor for LogFileProcessor {
         let cri_line = match parse_cri_line(log_line) {
             Ok(cri_line) => cri_line,
             Err(err) => {
-                ROWS_DROPPED_TOTAL_INVALID_CRI.fetch_add(1, Ordering::Relaxed);
+                ROWS_DROPPED_TOTAL_INVALID_CRI.inc();
                 self.partial_cri_stdout.reset();
                 self.partial_cri_stderr.reset();
                 let pod = must_get_field_val_by_name(&self.common_fields, "kubernetes.pod_name");
@@ -2308,7 +2309,7 @@ impl LogFileProcessor {
             // Discard the too large log line.
             let size = state.size;
             state.reset();
-            TOO_LONG_LINES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            TOO_LONG_LINES_SKIPPED.inc();
             let pod = must_get_field_val_by_name(&self.common_fields, "kubernetes.pod_name");
             let namespace =
                 must_get_field_val_by_name(&self.common_fields, "kubernetes.pod_namespace");
@@ -2353,7 +2354,7 @@ impl LogFileProcessor {
                 parser.fields().len(),
                 String::from_utf8_lossy(&line_buf)
             );
-            ROWS_DROPPED_TOTAL_TOO_MANY_FIELDS.fetch_add(1, Ordering::Relaxed);
+            ROWS_DROPPED_TOTAL_TOO_MANY_FIELDS.inc();
             put_json_parser(parser);
             return;
         }
@@ -2388,8 +2389,8 @@ impl LogFileProcessor {
         if self.rows_ingested_local == 0 {
             return;
         }
-        ROWS_INGESTED_TOTAL.fetch_add(self.rows_ingested_local, Ordering::Relaxed);
-        BYTES_INGESTED_TOTAL.fetch_add(self.bytes_ingested_local, Ordering::Relaxed);
+        ROWS_INGESTED_TOTAL.add(self.rows_ingested_local);
+        BYTES_INGESTED_TOTAL.add(self.bytes_ingested_local);
         self.rows_ingested_local = 0;
         self.bytes_ingested_local = 0;
     }
@@ -2756,18 +2757,29 @@ fn field_index(fields: &[Field], names: &[String]) -> isize {
     -1
 }
 
-// PORT NOTE: the `metrics` registry is not ported (see esl-storage/netinsert);
-// the Go counters are plain atomics here:
-//   esl_rows_ingested_total{type="kubernetes_logs"}
-//   esl_bytes_ingested_total{type="kubernetes_logs"}
-//   esl_too_long_lines_skipped_total
-//   esl_rows_dropped_total{reason="too_many_fields"}
-//   esl_rows_dropped_total{reason="invalid_cri_line"}
-static ROWS_INGESTED_TOTAL: AtomicU64 = AtomicU64::new(0);
-static BYTES_INGESTED_TOTAL: AtomicU64 = AtomicU64::new(0);
-static TOO_LONG_LINES_SKIPPED: AtomicU64 = AtomicU64::new(0);
-static ROWS_DROPPED_TOTAL_TOO_MANY_FIELDS: AtomicU64 = AtomicU64::new(0);
-static ROWS_DROPPED_TOTAL_INVALID_CRI: AtomicU64 = AtomicU64::new(0);
+// Go package-level metric vars from `kubernetescollector/processor.go`
+// (`vl_` rebranded to `esl_`; shared families use get_or_create like Go).
+static ROWS_INGESTED_TOTAL: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::get_or_create_counter(r#"esl_rows_ingested_total{type="kubernetes_logs"}"#)
+});
+static BYTES_INGESTED_TOTAL: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::get_or_create_counter(
+        r#"esl_bytes_ingested_total{type="kubernetes_logs"}"#,
+    )
+});
+static TOO_LONG_LINES_SKIPPED: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::get_or_create_counter("esl_too_long_lines_skipped_total")
+});
+static ROWS_DROPPED_TOTAL_TOO_MANY_FIELDS: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::get_or_create_counter(
+        r#"esl_rows_dropped_total{reason="too_many_fields"}"#,
+    )
+});
+static ROWS_DROPPED_TOTAL_INVALID_CRI: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::get_or_create_counter(
+        r#"esl_rows_dropped_total{reason="invalid_cri_line"}"#,
+    )
+});
 
 /// Go `stream`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

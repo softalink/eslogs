@@ -232,7 +232,7 @@ fn handle_collector_event<S: LogRowsStorage>(
     let msg_fields: Vec<&str> = cp.msg_fields.iter().map(String::as_str).collect();
     let preserve_keys: Vec<&str> = cp.preserve_json_keys.iter().map(String::as_str).collect();
 
-    let mut lmp = cp.new_log_message_processor(storage);
+    let mut lmp = cp.new_log_message_processor(storage, "splunk");
     let res = process_event(&data, &mut lmp, &time_fields, &msg_fields, &preserve_keys);
     lmp.close();
 

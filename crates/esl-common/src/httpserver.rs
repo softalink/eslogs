@@ -38,11 +38,14 @@
 //! reads are bounded by a read timeout). [`ServerHandle::stop`] sets the flag,
 //! wakes each blocked accept with a self-connect, and joins all threads.
 //!
-//! PORT NOTE: basic-auth, `authKey`, pprof, path-prefix, per-connection
-//! deadline jitter and Prometheus metrics from the Go source are intentionally
-//! omitted — the benchmark uses plain HTTP with no auth. Auth checks are
-//! effectively no-ops (all requests allowed). Response compression
-//! (`gzhttp`) is also omitted; responses are small.
+//! PORT NOTE: basic-auth, `authKey`, pprof, path-prefix and per-connection
+//! deadline jitter from the Go source are intentionally omitted — the
+//! benchmark uses plain HTTP with no auth. Auth checks are effectively no-ops
+//! (all requests allowed), so the `wrong_basic_auth`/`wrong_auth_key` error
+//! counters and the pprof request counters have nothing to count and are not
+//! registered. `esm_http_conn_timeout_closed_conns_total` is omitted with the
+//! deadline jitter. Response compression (`gzhttp`) is also omitted;
+//! responses are small.
 //!
 //! PORT NOTE (TLS): Go's `-tls`/`-tlsCertFile`/`-tlsKeyFile` serving flags are
 //! NOT ported even though the workspace now has a TLS stack
@@ -61,8 +64,8 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -750,6 +753,10 @@ where
     } else {
         addr.to_string()
     };
+    // Capture the app start time for `esm_app_start_timestamp` /
+    // `esm_app_uptime_seconds` (Go does it at package init).
+    crate::appmetrics::init_start_time();
+
     let listener = TcpListener::bind(&bind_addr)?;
     let local_addr = listener.local_addr()?;
     // Blocking listener: accept() returns immediately when a connection arrives,
@@ -850,6 +857,8 @@ where
         } else {
             String::new()
         };
+
+        requests_total_all().inc();
 
         let keep_alive_req = req.wants_keep_alive();
         let mut rw = ResponseWriter::new();
@@ -1035,11 +1044,12 @@ fn read_request<'a>(
 
 /// Handles built-in routes; returns true if the request was served.
 ///
-/// PORT NOTE: `/metrics` and `/flags` return an empty 200 — appmetrics/flag
-/// dumping is not ported. pprof, favicon bytes and auth are omitted.
+/// PORT NOTE: `/flags` returns an empty 200 — flag dumping is not ported
+/// (see `crate::appmetrics`). pprof, favicon bytes and auth are omitted.
 fn builtin_routes(req: &mut Request, rw: &mut ResponseWriter) -> bool {
     let path = req.path();
     if path.ends_with("/favicon.ico") {
+        favicon_requests().inc();
         rw.set_header("Cache-Control", "max-age=3600");
         return true;
     }
@@ -1058,7 +1068,17 @@ fn builtin_routes(req: &mut Request, rw: &mut ResponseWriter) -> bool {
             rw.set_status(status);
             true
         }
-        "/metrics" | "/flags" => {
+        "/metrics" => {
+            metrics_requests().inc();
+            let start_time = std::time::Instant::now();
+            rw.set_header("Content-Type", "text/plain; charset=utf-8");
+            let mut body = String::new();
+            crate::appmetrics::write_prometheus_metrics(&mut body);
+            rw.write_str(&body);
+            metrics_handler_duration().update_duration(start_time);
+            true
+        }
+        "/flags" => {
             rw.set_header("Content-Type", "text/plain; charset=utf-8");
             true
         }
@@ -1076,6 +1096,48 @@ fn builtin_routes(req: &mut Request, rw: &mut ResponseWriter) -> bool {
         }
         _ => false,
     }
+}
+
+// Request metrics, mirroring the Go `lib/httpserver` package-level vars
+// (rebranded `vm_` -> `esm_`). Registered lazily on first use in the default
+// registry set.
+fn metrics_requests() -> &'static Arc<crate::metrics::Counter> {
+    static C: LazyLock<Arc<crate::metrics::Counter>> = LazyLock::new(|| {
+        crate::metrics::new_counter(r#"esm_http_requests_total{path="/metrics"}"#)
+    });
+    &C
+}
+
+fn metrics_handler_duration() -> &'static Arc<crate::metrics::Histogram> {
+    static H: LazyLock<Arc<crate::metrics::Histogram>> = LazyLock::new(|| {
+        crate::metrics::new_histogram(r#"esm_http_request_duration_seconds{path="/metrics"}"#)
+    });
+    &H
+}
+
+fn favicon_requests() -> &'static Arc<crate::metrics::Counter> {
+    static C: LazyLock<Arc<crate::metrics::Counter>> = LazyLock::new(|| {
+        crate::metrics::new_counter(r#"esm_http_requests_total{path="*/favicon.ico"}"#)
+    });
+    &C
+}
+
+fn requests_total_all() -> &'static Arc<crate::metrics::Counter> {
+    static C: LazyLock<Arc<crate::metrics::Counter>> =
+        LazyLock::new(|| crate::metrics::new_counter("esm_http_requests_all_total"));
+    &C
+}
+
+/// The `esm_http_request_errors_total{path="*", reason="unsupported"}`
+/// counter (Go `unsupportedRequestErrors`). Application request handlers
+/// increment it when they reject an unrecognized path.
+pub fn unsupported_request_errors() -> &'static Arc<crate::metrics::Counter> {
+    static C: LazyLock<Arc<crate::metrics::Counter>> = LazyLock::new(|| {
+        crate::metrics::new_counter(
+            r#"esm_http_request_errors_total{path="*", reason="unsupported"}"#,
+        )
+    });
+    &C
 }
 
 /// Enables permissive CORS on the response, mirroring Go `EnableCORS`.

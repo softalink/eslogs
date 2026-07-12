@@ -5,10 +5,6 @@
 //! ([`FastQueue`]) which prefers passing blocks through memory and falls back
 //! to the file-based queue when readers don't keep up with writers.
 //!
-//! PORT NOTE: the `vm_persistentqueue_*` metrics (counters, gauges and the
-//! read/write duration float counters) are not ported — there is no metrics
-//! crate in this workspace.
-//!
 //! PORT NOTE: Go pools block buffers via `bytesutil.ByteBufferPool`
 //! (`blockBufPool`, `headerBufPool`); the port uses plain `Vec<u8>` buffers.
 //!
@@ -19,11 +15,13 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::time::Instant;
 
 use esl_common::encoding::{marshal_uint64, unmarshal_uint64};
 use esl_common::filestream;
 use esl_common::fs as vlfs;
+use esl_common::metrics::{Counter, FloatCounter};
 use esl_common::{errorf, fasttime, infof, panicf, warnf};
 
 /// MaxBlockSize is the maximum size of the block persistent queue can work with.
@@ -75,6 +73,13 @@ struct Queue {
     writer_flushed_offset: u64,
 
     last_metainfo_flush_time: u64,
+
+    blocks_dropped: Arc<Counter>,
+    bytes_dropped: Arc<Counter>,
+    blocks_written: Arc<Counter>,
+    bytes_written: Arc<Counter>,
+    blocks_read: Arc<Counter>,
+    bytes_read: Arc<Counter>,
 }
 
 impl Queue {
@@ -215,6 +220,8 @@ impl Queue {
                         panicf!("FATAL: cannot read the oldest block {err}");
                     }
                 }
+                self.blocks_dropped.inc();
+                self.bytes_dropped.add(bb.len() as u64);
             }
             if block_size > self.max_pending_bytes {
                 // The block is too big to put it into the queue. Drop it.
@@ -227,6 +234,13 @@ impl Queue {
     }
 
     fn write_block(&mut self, block: &[u8]) -> Result<(), String> {
+        let start_time = Instant::now();
+        let res = self.write_block_internal(block);
+        write_duration_seconds().add(start_time.elapsed().as_secs_f64());
+        res
+    }
+
+    fn write_block_internal(&mut self, block: &[u8]) -> Result<(), String> {
         if self.writer_local_offset + self.max_block_size + 8 > self.chunk_file_size {
             self.next_chunk_file_for_write()
                 .map_err(|err| format!("cannot create next chunk file: {err}"))?;
@@ -250,6 +264,8 @@ impl Queue {
                 self.writer_path
             )
         })?;
+        self.blocks_written.inc();
+        self.bytes_written.add(block.len() as u64);
         self.flush_writer_metainfo_if_needed();
         Ok(())
     }
@@ -299,6 +315,13 @@ impl Queue {
     }
 
     fn read_block(&mut self, dst: &mut Vec<u8>) -> Result<(), ReadError> {
+        let start_time = Instant::now();
+        let res = self.read_block_internal(dst);
+        read_duration_seconds().add(start_time.elapsed().as_secs_f64());
+        res
+    }
+
+    fn read_block_internal(&mut self, dst: &mut Vec<u8>) -> Result<(), ReadError> {
         if self.reader_local_offset + self.max_block_size + 8 > self.chunk_file_size {
             self.next_chunk_file_for_read()
                 .map_err(|err| ReadError::Other(format!("cannot open next chunk file: {err}")))?;
@@ -352,6 +375,8 @@ impl Queue {
                 self.skip_broken_chunk_file()?;
                 continue;
             }
+            self.blocks_read.inc();
+            self.bytes_read.add(block_len);
             self.flush_reader_metainfo_if_needed();
             return Ok(());
         }
@@ -534,6 +559,29 @@ fn clean_on_error(q: &mut Queue) {
     q.flock_f = None;
 }
 
+/// The `esm_persistentqueue_<name>{path=...}` registry counter (Go
+/// `vm_persistentqueue_*`).
+fn pq_counter(name: &str, path: &Path) -> Arc<Counter> {
+    esl_common::metrics::get_or_create_counter(&format!(
+        "esm_persistentqueue_{name}{{path={:?}}}",
+        path.to_string_lossy()
+    ))
+}
+
+fn write_duration_seconds() -> &'static Arc<FloatCounter> {
+    static C: LazyLock<Arc<FloatCounter>> = LazyLock::new(|| {
+        esl_common::metrics::new_float_counter("esm_persistentqueue_write_duration_seconds_total")
+    });
+    &C
+}
+
+fn read_duration_seconds() -> &'static Arc<FloatCounter> {
+    static C: LazyLock<Arc<FloatCounter>> = LazyLock::new(|| {
+        esl_common::metrics::new_float_counter("esm_persistentqueue_read_duration_seconds_total")
+    });
+    &C
+}
+
 fn try_opening_queue(
     path: &Path,
     name: &str,
@@ -558,6 +606,12 @@ fn try_opening_queue(
         writer_local_offset: 0,
         writer_flushed_offset: 0,
         last_metainfo_flush_time: 0,
+        blocks_dropped: pq_counter("blocks_dropped_total", path),
+        bytes_dropped: pq_counter("bytes_dropped_total", path),
+        blocks_written: pq_counter("blocks_written_total", path),
+        bytes_written: pq_counter("bytes_written_total", path),
+        blocks_read: pq_counter("blocks_read_total", path),
+        bytes_read: pq_counter("bytes_read_total", path),
     };
 
     // Protect from concurrent opens.
@@ -1019,17 +1073,18 @@ impl FastQueue {
     /// in-memory buffer capacity are rejected. The in-memory queue part can be
     /// stored on disk during graceful shutdown.
     ///
-    /// PORT NOTE: the `vm_persistentqueue_bytes_pending` and
-    /// `vm_persistentqueue_free_disk_space_bytes` gauges are not ported.
+    /// PORT NOTE: returns `Arc<FastQueue>` (Go returns `*FastQueue`) so the
+    /// `esm_persistentqueue_bytes_pending` / `esm_persistentqueue_free_disk_space_bytes`
+    /// gauge callbacks can hold the queue, like the Go closures do.
     pub fn must_open_fast_queue(
         path: &Path,
         name: &str,
         max_inmemory_blocks: usize,
         max_pending_bytes: i64,
         is_pq_disabled: bool,
-    ) -> FastQueue {
+    ) -> Arc<FastQueue> {
         let pq = must_open(path, name, max_pending_bytes);
-        let fq = FastQueue {
+        let fq = Arc::new(FastQueue {
             mu: Mutex::new(FastQueueInner {
                 pq,
                 ch: VecDeque::with_capacity(max_inmemory_blocks),
@@ -1040,7 +1095,22 @@ impl FastQueue {
             }),
             cond: Condvar::new(),
             is_pq_disabled,
-        };
+        });
+
+        let path_label = path.to_string_lossy().into_owned();
+        let fq_gauge = Arc::clone(&fq);
+        let _ = esl_common::metrics::get_or_create_gauge(
+            &format!("esm_persistentqueue_bytes_pending{{path={path_label:?}}}"),
+            Some(Box::new(move || fq_gauge.get_pending_bytes() as f64)),
+        );
+        let free_space_path = path.to_path_buf();
+        let _ = esl_common::metrics::get_or_create_gauge(
+            &format!("esm_persistentqueue_free_disk_space_bytes{{path={path_label:?}}}"),
+            Some(Box::new(move || {
+                vlfs::must_get_free_space(&free_space_path) as f64
+            })),
+        );
+
         let pending_bytes = fq.get_pending_bytes();
         let persistence_status = if is_pq_disabled {
             "disabled"

@@ -9,21 +9,16 @@
 //! semantics (`**`, `*`, `?`, `[...]` classes, `{...}` alternates, escaping,
 //! `WithNoHidden`) is implemented in the internal [`doublestar`] module below.
 //!
-//! PORT NOTE: Go registers `esl_rows_ingested_total{type="file_logs"}`,
-//! `esl_bytes_ingested_total{type="file_logs"}` and
-//! `esl_rows_dropped_total{reason="too_many_fields"}` via
-//! `Softalink LLC/metrics`. The metrics registry isn't ported yet, so the
-//! counters are kept as process-local `AtomicU64`s.
 
 use std::fs::{self, File};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use esl_common::flagutil::{ArrayString, Flag, FlagValue};
+use esl_common::metrics::Counter;
 use esl_common::timeutil;
 use esl_common::{errorf, fatalf, panicf, warnf};
 
@@ -934,7 +929,7 @@ impl<S: LogRowsStorage + 'static> TailProcessor for Processor<S> {
                 parser.fields().len(),
                 String::from_utf8_lossy(&line_json)
             );
-            ROWS_DROPPED_TOTAL_TOO_MANY_FIELDS.fetch_add(1, Ordering::Relaxed);
+            ROWS_DROPPED_TOTAL_TOO_MANY_FIELDS.inc();
             put_json_parser(parser);
             return true;
         }
@@ -971,19 +966,24 @@ impl<S: LogRowsStorage> Processor<S> {
         if self.rows_ingested_local == 0 {
             return;
         }
-        ROWS_INGESTED_TOTAL.fetch_add(self.rows_ingested_local as u64, Ordering::Relaxed);
-        BYTES_INGESTED_TOTAL.fetch_add(self.bytes_ingested_local as u64, Ordering::Relaxed);
+        ROWS_INGESTED_TOTAL.add(self.rows_ingested_local as u64);
+        BYTES_INGESTED_TOTAL.add(self.bytes_ingested_local as u64);
         self.rows_ingested_local = 0;
         self.bytes_ingested_local = 0;
     }
 }
 
-// esl_rows_dropped_total{reason="too_many_fields"}
-static ROWS_DROPPED_TOTAL_TOO_MANY_FIELDS: AtomicU64 = AtomicU64::new(0);
-// esl_rows_ingested_total{type="file_logs"}
-static ROWS_INGESTED_TOTAL: AtomicU64 = AtomicU64::new(0);
-// esl_bytes_ingested_total{type="file_logs"}
-static BYTES_INGESTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static ROWS_DROPPED_TOTAL_TOO_MANY_FIELDS: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::get_or_create_counter(
+        r#"esl_rows_dropped_total{reason="too_many_fields"}"#,
+    )
+});
+static ROWS_INGESTED_TOTAL: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::get_or_create_counter(r#"esl_rows_ingested_total{type="file_logs"}"#)
+});
+static BYTES_INGESTED_TOTAL: LazyLock<Arc<Counter>> = LazyLock::new(|| {
+    esl_common::metrics::get_or_create_counter(r#"esl_bytes_ingested_total{type="file_logs"}"#)
+});
 
 static PARSED_TENANT_IDS: OnceLock<Vec<TenantID>> = OnceLock::new();
 

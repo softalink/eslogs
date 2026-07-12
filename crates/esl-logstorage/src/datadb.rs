@@ -21,10 +21,6 @@
 //! - `wgPool` (pooled `sync.WaitGroup`s for merge fan-out) →
 //!   `std::thread::scope`.
 //!
-//! PORT NOTE: the `metrics.Summary` members (`esl_merge_duration_seconds`,
-//! `esl_merge_bytes`) are dropped — there is no metrics port yet; the atomic
-//! counters consumed by [`DatadbStats`] are kept.
-//!
 //! PORT NOTE: `datadb.deleteRows` is NOT ported yet: it depends on
 //! `partitionSearchOptions`, `ddb.getPartsForTimeRange` and
 //! `part.hasMatchingRows` from the unported `storage_search.go`.
@@ -805,11 +801,15 @@ impl Datadb {
         &self,
         part_type: PartType,
         src_row_count: u64,
-        _start_time: Instant,
-        _dst_size: u64,
+        start_time: Instant,
+        dst_size: u64,
     ) {
-        // PORT NOTE: the metrics.Summary updates (merge duration/bytes) are
-        // dropped; see the module PORT NOTE.
+        // PORT NOTE: Go keeps the per-type `esl_merge_duration_seconds` /
+        // `esl_merge_bytes` summaries as datadb struct members created with
+        // GetOrCreateSummary; the port uses equivalent process-wide statics.
+        let (duration, bytes) = merge_summaries(part_type);
+        duration.update_duration(start_time);
+        bytes.update(dst_size as f64);
         match part_type {
             PartType::Inmemory => {
                 self.inmemory_merge_rows_total
@@ -2149,6 +2149,44 @@ impl Drop for ActiveMergesGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_add(-1, Ordering::SeqCst);
     }
+}
+
+/// Returns the `(esl_merge_duration_seconds, esl_merge_bytes)` summaries for
+/// the given part type (Go `datadb` members created via GetOrCreateSummary).
+fn merge_summaries(
+    part_type: PartType,
+) -> (
+    &'static std::sync::Arc<esl_common::metrics::Summary>,
+    &'static std::sync::Arc<esl_common::metrics::Summary>,
+) {
+    use std::sync::{Arc, LazyLock};
+
+    use esl_common::metrics::{Summary, get_or_create_summary};
+
+    static INMEMORY: LazyLock<(Arc<Summary>, Arc<Summary>)> = LazyLock::new(|| {
+        (
+            get_or_create_summary(r#"esl_merge_duration_seconds{type="storage/inmemory"}"#),
+            get_or_create_summary(r#"esl_merge_bytes{type="storage/inmemory"}"#),
+        )
+    });
+    static SMALL: LazyLock<(Arc<Summary>, Arc<Summary>)> = LazyLock::new(|| {
+        (
+            get_or_create_summary(r#"esl_merge_duration_seconds{type="storage/small"}"#),
+            get_or_create_summary(r#"esl_merge_bytes{type="storage/small"}"#),
+        )
+    });
+    static BIG: LazyLock<(Arc<Summary>, Arc<Summary>)> = LazyLock::new(|| {
+        (
+            get_or_create_summary(r#"esl_merge_duration_seconds{type="storage/big"}"#),
+            get_or_create_summary(r#"esl_merge_bytes{type="storage/big"}"#),
+        )
+    });
+    let pair = match part_type {
+        PartType::Inmemory => &*INMEMORY,
+        PartType::Small => &*SMALL,
+        PartType::Big => &*BIG,
+    };
+    (&pair.0, &pair.1)
 }
 
 #[cfg(test)]

@@ -27,9 +27,8 @@
 //! platforms setting the flag is a fatal startup error (Go's `net.ListenUnix`
 //! would fail there at runtime as well).
 //!
-//! PORT NOTE: the `esl_errors_total`/`esl_udp_reqests_total`/`esl_udp_errors_total`
-//! metrics and the `writeconcurrencylimiter` wrapper are not ported, matching
-//! the metrics omissions documented in `common_params.rs` and `httpserver.rs`.
+//! PORT NOTE: the `writeconcurrencylimiter` wrapper is not ported (ingestion
+//! is bounded by the worker pool instead; see the eslinsert PORT NOTEs).
 //!
 //! PORT NOTE: shutdown follows the house pattern from
 //! `esl-common/src/httpserver.rs`: an `AtomicBool`-style stop signal, blocking
@@ -39,10 +38,13 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use esl_common::metrics::Counter;
 
 use esl_common::cgroup::available_cpus;
 use esl_common::flagutil::{ArrayBool, ArrayString, Flag};
@@ -745,7 +747,7 @@ fn packet_reader_loop<C: PacketConn, S: LogRowsStorage + 'static>(
                 if stop.is_stopped() {
                     break;
                 }
-                // udpErrorsTotal metric omitted (see module PORT NOTE).
+                UDP_ERRORS_TOTAL.inc();
                 errorf!(
                     "syslog: cannot read {} data at {local_addr}: {err}",
                     cfg.typ
@@ -754,7 +756,7 @@ fn packet_reader_loop<C: PacketConn, S: LogRowsStorage + 'static>(
                 continue;
             }
         };
-        // udpRequestsTotal metric omitted (see module PORT NOTE).
+        UDP_REQUESTS_TOTAL.inc();
 
         let remote_ip = get_remote_ip(&remote_addr, cfg.use_remote_ip);
 
@@ -1083,10 +1085,10 @@ impl PacketConn for std::os::unix::net::UnixDatagram {
 /// periodic background flush for long-lived connections. The Rust
 /// `common_params` port dropped both (see its module PORT NOTEs), so rows from
 /// an idle long-lived connection become searchable when the in-memory buffer
-/// fills or the connection closes. `_protocol` is kept for signature parity —
-/// Go only uses it for the processor name and its metrics.
+/// fills or the connection closes. `protocol` labels the per-protocol
+/// ingestion metrics via the processor name, like Go.
 fn process_stream<S: LogRowsStorage + 'static>(
-    _protocol: &str,
+    protocol: &str,
     r: &mut dyn Read,
     compress_method: &str,
     use_local_timestamp: bool,
@@ -1094,7 +1096,7 @@ fn process_stream<S: LogRowsStorage + 'static>(
     cp: &CommonParams,
     storage: &Arc<S>,
 ) -> Result<(), String> {
-    let mut lmp = cp.new_log_message_processor(storage);
+    let mut lmp = cp.new_log_message_processor(storage, &format!("syslog_{protocol}"));
     let res = process_stream_internal(r, compress_method, use_local_timestamp, remote_ip, &mut lmp);
     lmp.close();
     res
@@ -1146,7 +1148,6 @@ fn process_uncompressed_stream<P: SyslogLogMessageProcessor>(
         let current_year = GLOBAL_CURRENT_YEAR.load(Ordering::SeqCst);
         let timezone_offset_secs = GLOBAL_TIMEZONE_OFFSET_SECS.load(Ordering::SeqCst);
         let line = String::from_utf8_lossy(&slr.line);
-        // errorsTotal metric omitted (see module PORT NOTE).
         process_line(
             &line,
             current_year,
@@ -1155,7 +1156,10 @@ fn process_uncompressed_stream<P: SyslogLogMessageProcessor>(
             remote_ip,
             lmp,
         )
-        .map_err(|err| format!("cannot read line #{n}: {err}"))?;
+        .map_err(|err| {
+            ERRORS_TOTAL.inc();
+            format!("cannot read line #{n}: {err}")
+        })?;
         n += 1;
     }
     slr.error()
@@ -1336,6 +1340,14 @@ fn parse_fields_list(s: &str) -> Result<Option<Vec<String>>, String> {
     p.expect_eof()?;
     Ok(Some(a))
 }
+
+static ERRORS_TOTAL: LazyLock<Arc<Counter>> =
+    LazyLock::new(|| esl_common::metrics::new_counter(r#"esl_errors_total{type="syslog"}"#));
+// The `reqests` typo is preserved from upstream (`vl_udp_reqests_total`).
+static UDP_REQUESTS_TOTAL: LazyLock<Arc<Counter>> =
+    LazyLock::new(|| esl_common::metrics::new_counter(r#"esl_udp_reqests_total{type="syslog"}"#));
+static UDP_ERRORS_TOTAL: LazyLock<Arc<Counter>> =
+    LazyLock::new(|| esl_common::metrics::new_counter(r#"esl_udp_errors_total{type="syslog"}"#));
 
 fn get_remote_ip(remote_addr: &str, use_remote_ip: bool) -> String {
     if !use_remote_ip {

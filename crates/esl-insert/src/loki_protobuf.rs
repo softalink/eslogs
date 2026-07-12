@@ -80,7 +80,7 @@ pub(crate) fn handle_protobuf<S: LogRowsStorage>(
         .map(String::as_str)
         .collect();
 
-    let mut lmp = cp.cp.new_log_message_processor(storage);
+    let mut lmp = cp.cp.new_log_message_processor(storage, "loki_protobuf");
     let res = parse_protobuf_request(
         &data,
         &mut lmp,
@@ -800,7 +800,7 @@ mod tests {
     fn test_parse_protobuf_request_lands_rows() {
         let s = open_temp_storage("loki-protobuf");
         let cp = CommonParams::empty();
-        let mut lmp = cp.new_log_message_processor(&s);
+        let mut lmp = cp.new_log_message_processor(&s, "test");
 
         // Zero timestamps force the current time (avoids retention drops).
         let pr = PushRequest {

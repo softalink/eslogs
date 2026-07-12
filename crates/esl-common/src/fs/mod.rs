@@ -2,9 +2,11 @@
 //! [`fsutil`]).
 //!
 //! PORT NOTE: metrics registration (`RegisterPathFsMetrics`, `getFsType` and
-//! the `vm_fs_*`/`vm_nfs_*`/`vm_mmapped_files` metrics) is not ported — there
-//! is no metrics crate in this workspace yet. Counters whose values appear in
-//! user-visible error messages are kept as private atomics.
+//! the `vm_fs_*`/`vm_nfs_*`/`vm_mmapped_files` metrics) is not wired to the
+//! `esl_common::metrics` registry: the equivalent disk-space series are
+//! emitted by `esl-storage`'s `write_storage_metrics`, and the remaining
+//! series are Go-runtime/NFS-workaround diagnostics. Counters whose values
+//! appear in user-visible error messages are kept as private atomics.
 //!
 //! PORT NOTE: Go panics when `File.Close()` fails; Rust closes files on drop
 //! without reporting errors, so those panics cannot be reproduced.

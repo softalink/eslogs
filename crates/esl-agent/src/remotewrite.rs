@@ -7,9 +7,6 @@
 //! per-URL [`Client`] workers which POST them to the remote EsLogs
 //! with retries and exponential backoff.
 //!
-//! PORT NOTE: the `eslagent_remotewrite_*` metrics (counters, gauges,
-//! histograms) are not ported — there is no metrics crate in this workspace.
-//!
 //! PORT NOTE: the HTTP transport (Go `net/http` + `promauth` +
 //! `httputil.NewTransport`) is replaced by `esl_storage::http_client` (the
 //! house std-TCP client; one connection per request, no keep-alive). As a
@@ -31,7 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +37,7 @@ use esl_common::flagutil::{
     ArrayBool, ArrayBytes, ArrayDuration, ArrayInt, ArrayString, Bytes, ExtendedDuration, Flag,
 };
 use esl_common::fs as vlfs;
+use esl_common::metrics::{Counter, FloatCounter, Histogram};
 use esl_common::timeutil::{BackoffTimer, add_jitter_to_duration};
 use esl_common::tlsutil::TLSConfig;
 use esl_common::{
@@ -518,13 +516,43 @@ fn new_remote_write_ctx(
         max_pending_bytes = DEFAULT_CHUNK_FILE_SIZE as i64;
     }
 
-    let fq = Arc::new(FastQueue::must_open_fast_queue(
+    let fq = FastQueue::must_open_fast_queue(
         &queue_path,
         sanitized_url,
         max_inmemory_blocks,
         max_pending_bytes,
         false,
-    ));
+    );
+    let queue_path_label = queue_path.to_string_lossy().into_owned();
+    let fq_pending = Arc::clone(&fq);
+    let _ = esl_common::metrics::get_or_create_gauge(
+        &format!(
+            "eslagent_remotewrite_pending_data_bytes{{path={queue_path_label:?}, url={sanitized_url:?}}}"
+        ),
+        Some(Box::new(move || fq_pending.get_pending_bytes() as f64)),
+    );
+    let fq_inmemory = Arc::clone(&fq);
+    let _ = esl_common::metrics::get_or_create_gauge(
+        &format!(
+            "eslagent_remotewrite_pending_inmemory_blocks{{path={queue_path_label:?}, url={sanitized_url:?}}}"
+        ),
+        Some(Box::new(move || {
+            fq_inmemory.get_inmemory_queue_len() as f64
+        })),
+    );
+    let fq_blocked = Arc::clone(&fq);
+    let _ = esl_common::metrics::get_or_create_gauge(
+        &format!(
+            "eslagent_remotewrite_queue_blocked{{path={queue_path_label:?}, url={sanitized_url:?}}}"
+        ),
+        Some(Box::new(move || {
+            if fq_blocked.is_write_blocked() {
+                1.0
+            } else {
+                0.0
+            }
+        })),
+    );
 
     match remote_write_url.scheme.as_str() {
         "http" | "https" => {}
@@ -672,6 +700,15 @@ struct Client {
 
     fq: Arc<FastQueue>,
 
+    bytes_sent: Arc<Counter>,
+    blocks_sent: Arc<Counter>,
+    request_duration: Arc<Histogram>,
+    requests_ok_count: Arc<Counter>,
+    errors_count: Arc<Counter>,
+    packets_dropped: Arc<Counter>,
+    retries_count: Arc<Counter>,
+    send_duration: Arc<FloatCounter>,
+
     send_timeout: Duration,
     /// Nanoseconds (Go time.Duration).
     retry_min_interval: i64,
@@ -721,10 +758,23 @@ fn new_http_client(
         send_timeout = Duration::from_secs(60);
     }
 
+    let m = |name: &str| format!("eslagent_remotewrite_{name}{{url={sanitized_url:?}}}");
     Arc::new(Client {
         sanitized_url: sanitized_url.to_string(),
         remote_write_url,
         fq,
+        bytes_sent: esl_common::metrics::get_or_create_counter(&m("bytes_sent_total")),
+        blocks_sent: esl_common::metrics::get_or_create_counter(&m("blocks_sent_total")),
+        request_duration: esl_common::metrics::get_or_create_histogram(&m("duration_seconds")),
+        requests_ok_count: esl_common::metrics::get_or_create_counter(&format!(
+            "eslagent_remotewrite_requests_total{{url={sanitized_url:?}, status_code=\"2XX\"}}"
+        )),
+        errors_count: esl_common::metrics::get_or_create_counter(&m("errors_total")),
+        packets_dropped: esl_common::metrics::get_or_create_counter(&m("packets_dropped_total")),
+        retries_count: esl_common::metrics::get_or_create_counter(&m("retries_count_total")),
+        send_duration: esl_common::metrics::get_or_create_float_counter(&m(
+            "send_duration_seconds_total",
+        )),
         send_timeout,
         retry_min_interval: RETRY_MIN_INTERVAL
             .get()
@@ -741,16 +791,37 @@ fn new_http_client(
 
 impl Client {
     fn init(self: &Arc<Self>, arg_idx: usize, concurrency: usize, sanitized_url: &str) {
+        let limit_reached = esl_common::metrics::get_or_create_counter(&format!(
+            "eslagent_remotewrite_rate_limit_reached_total{{url={:?}}}",
+            self.sanitized_url
+        ));
         let bytes_per_sec = RATE_LIMIT.get().get_optional_arg(arg_idx);
         let rl = if bytes_per_sec > 0 {
             infof!(
                 "applying {bytes_per_sec} bytes per second rate limit for -remoteWrite.url={sanitized_url}"
             );
-            Some(Arc::new(RateLimiter::new(bytes_per_sec)))
+            Some(Arc::new(RateLimiter::new(bytes_per_sec, limit_reached)))
         } else {
             None
         };
         *self.rl.lock().unwrap() = rl.clone();
+
+        let _ = esl_common::metrics::get_or_create_gauge(
+            &format!(
+                "eslagent_remotewrite_rate_limit{{url={:?}}}",
+                self.sanitized_url
+            ),
+            Some(Box::new(move || {
+                RATE_LIMIT.get().get_optional_arg(arg_idx) as f64
+            })),
+        );
+        let _ = esl_common::metrics::get_or_create_gauge(
+            &format!(
+                "eslagent_remotewrite_queues{{url={:?}}}",
+                self.sanitized_url
+            ),
+            Some(Box::new(|| *QUEUES.get() as f64)),
+        );
 
         let mut senders = self.stop_senders.lock().unwrap();
         let mut workers = self.workers.lock().unwrap();
@@ -790,7 +861,10 @@ impl Client {
                 // skip empty data blocks from sending
                 continue;
             }
-            if !self.send_block_http(&block, stop_rx, rl) {
+            let start_time = Instant::now();
+            let sent = self.send_block_http(&block, stop_rx, rl);
+            self.send_duration.add(start_time.elapsed().as_secs_f64());
+            if !sent {
                 // Return unsent block to the queue.
                 self.fq.must_write_block_ignore_disabled_pq(&block);
                 return;
@@ -839,9 +913,13 @@ impl Client {
         let mut retries_count = 0;
 
         loop {
-            let resp = match self.do_request(block) {
+            let start_time = Instant::now();
+            let resp = self.do_request(block);
+            self.request_duration.update_duration(start_time);
+            let resp = match resp {
                 Ok(resp) => resp,
                 Err(err) => {
+                    self.errors_count.inc();
                     remote_write_retry_logger().warnf(format_args!(
                         "couldn't send a block with size {} bytes to {:?}: {err}; re-sending the block in {}",
                         block.len(),
@@ -851,17 +929,27 @@ impl Client {
                     if !bt.wait(stop_rx) {
                         return false;
                     }
+                    self.retries_count.inc();
                     continue;
                 }
             };
 
             let status_code = resp.status_code;
             if status_code / 100 == 2 {
+                self.requests_ok_count.inc();
+                self.bytes_sent.add(block.len() as u64);
+                self.blocks_sent.inc();
                 return true;
             }
 
+            esl_common::metrics::get_or_create_counter(&format!(
+                "eslagent_remotewrite_requests_total{{url={:?}, status_code=\"{status_code}\"}}",
+                self.sanitized_url
+            ))
+            .inc();
             if status_code == 400 || status_code == 404 {
                 log_block_rejected(block, &self.sanitized_url, &resp);
+                self.packets_dropped.inc();
                 return true;
             }
             // Unexpected status code returned
@@ -882,6 +970,7 @@ impl Client {
             if !bt.wait(stop_rx) {
                 return false;
             }
+            self.retries_count.inc();
         }
     }
 }
@@ -1060,10 +1149,13 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 ///
 /// PORT NOTE: Go blocks on a pooled timer vs the stop channel; the port uses
 /// a Condvar with a deadline plus a stop flag ([`RateLimiter::stop`] replaces
-/// closing the Go stopCh). The `limitReached` counter is not ported.
+/// closing the Go stopCh).
 struct RateLimiter {
     /// The per-second limit of resources.
     per_second_limit: i64,
+
+    /// Incremented every time the limiter has to block (Go `limitReached`).
+    limit_reached: Arc<Counter>,
 
     state: Mutex<RateLimiterState>,
     cond: Condvar,
@@ -1078,9 +1170,10 @@ struct RateLimiterState {
 }
 
 impl RateLimiter {
-    fn new(per_second_limit: i64) -> RateLimiter {
+    fn new(per_second_limit: i64, limit_reached: Arc<Counter>) -> RateLimiter {
         RateLimiter {
             per_second_limit,
+            limit_reached,
             state: Mutex::new(RateLimiterState {
                 budget: 0,
                 deadline: None,
@@ -1108,6 +1201,7 @@ impl RateLimiter {
             if let Some(deadline) = st.deadline {
                 let now = Instant::now();
                 if deadline > now {
+                    self.limit_reached.inc();
                     let (guard, _) = self.cond.wait_timeout(st, deadline - now).unwrap();
                     st = guard;
                     if self.stopped.load(Ordering::Relaxed) {
@@ -1271,12 +1365,26 @@ impl WriteRequest {
         esl_common::encoding::zstd::compress_level(&mut zb, &self.pending_data, 1);
         push_block(&zb);
 
-        // PORT NOTE: the eslagent_remotewrite_block_size_{bytes,rows}
-        // histograms are not ported.
+        block_size_bytes().update(zb.len() as f64);
+        block_size_log_rows().update(self.pending_log_rows_count as f64);
 
         self.pending_data.clear();
         self.pending_log_rows_count = 0;
     }
+}
+
+fn block_size_bytes() -> &'static Arc<Histogram> {
+    static H: LazyLock<Arc<Histogram>> = LazyLock::new(|| {
+        esl_common::metrics::new_histogram("eslagent_remotewrite_block_size_bytes")
+    });
+    &H
+}
+
+fn block_size_log_rows() -> &'static Arc<Histogram> {
+    static H: LazyLock<Arc<Histogram>> = LazyLock::new(|| {
+        esl_common::metrics::new_histogram("eslagent_remotewrite_block_size_rows")
+    });
+    &H
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,14 +1635,27 @@ mod tests {
 
         let fq_dir =
             std::env::temp_dir().join(format!("esl-agent-remotewrite-fq-{}", std::process::id()));
-        let fq = Arc::new(FastQueue::must_open_fast_queue(
-            &fq_dir, "test", 2, 0, false,
-        ));
+        let fq = FastQueue::must_open_fast_queue(&fq_dir, "test", 2, 0, false);
 
+        let m = |name: &str| format!("eslagent_remotewrite_{name}{{url=\"1:secret-url\"}}");
         let c = Client {
             sanitized_url: "1:secret-url".to_string(),
             remote_write_url,
             fq: Arc::clone(&fq),
+            bytes_sent: esl_common::metrics::get_or_create_counter(&m("bytes_sent_total")),
+            blocks_sent: esl_common::metrics::get_or_create_counter(&m("blocks_sent_total")),
+            request_duration: esl_common::metrics::get_or_create_histogram(&m("duration_seconds")),
+            requests_ok_count: esl_common::metrics::get_or_create_counter(
+                "eslagent_remotewrite_requests_total{url=\"1:secret-url\", status_code=\"2XX\"}",
+            ),
+            errors_count: esl_common::metrics::get_or_create_counter(&m("errors_total")),
+            packets_dropped: esl_common::metrics::get_or_create_counter(&m(
+                "packets_dropped_total",
+            )),
+            retries_count: esl_common::metrics::get_or_create_counter(&m("retries_count_total")),
+            send_duration: esl_common::metrics::get_or_create_float_counter(&m(
+                "send_duration_seconds_total",
+            )),
             send_timeout: Duration::from_secs(10),
             retry_min_interval: 100_000_000,
             retry_max_time: 1_000_000_000,
