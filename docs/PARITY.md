@@ -76,9 +76,16 @@ Tracked at file/subsystem granularity once porting starts:
 | app/eslogsgenerator | eslogsgenerator | ported | all 20 flags, e2e-verified generation |
 | app/esmui | esl-select assets | ported | prebuilt upstream assets embedded, completeness-tested |
 
-Cross-cutting deferrals (PORT-NOTEd at each site): context
-cancellation dropped, net_query_runner (cluster query splitting) stubbed for
-single-node. The metrics registry is ported (esl_common::metrics) and wired
+Cross-cutting deferrals (PORT-NOTEd at each site):
+net_query_runner (cluster query splitting) stubbed for single-node. Context
+cancellation is ported (2026-07-12): a global disconnect-watcher thread
+(esl_common::disconnect_watcher, peek-based socket probing) stands in for
+Go's request ctx; `Storage::run_query_with_cancel` and the `Get*` query
+surface take the cancel token and return "context canceled"
+(storage_search::QUERY_CANCELED_ERROR) on abort, wired into all buffered
+/select/logsql/* handlers and /internal/select/*; /select/logsql/tail keeps
+its flush_chunk-based per-window disconnect detection (PORT NOTE at the
+site). Per-query stats accumulation from Go's QueryContext remains dropped. The metrics registry is ported (esl_common::metrics) and wired
 across the crates: /metrics serves the registry (esl_/esm_/eslagent_ series),
 the storage writer set, per-query-stats vmrange histograms and process
 metrics; remaining unwired families (vm_filestream_*, vm_fs_*, vm_gorutines

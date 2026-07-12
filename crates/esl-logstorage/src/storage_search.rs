@@ -559,6 +559,20 @@ fn sort_search(n: usize, mut f: impl FnMut(usize) -> bool) -> usize {
     lo
 }
 
+/// The error message returned by the query path when the caller-provided
+/// cancel token is set (external cancellation, e.g. the HTTP client
+/// disconnected). Mirrors Go's `context.Canceled` ("context canceled"), which
+/// `Storage.RunQuery` returns when the request context is done.
+pub const QUERY_CANCELED_ERROR: &str = "context canceled";
+
+/// Returns true when `err` denotes an externally-canceled query
+/// ([`QUERY_CANCELED_ERROR`], possibly wrapped with call-site context, like
+/// Go's `errors.Is(err, context.Canceled)`). Handlers must treat such errors
+/// as "the client is gone: do not write a response".
+pub fn is_query_canceled_error(err: &str) -> bool {
+    err.contains(QUERY_CANCELED_ERROR)
+}
+
 /// A function that consumes a result [`DataBlock`] for a given worker
 /// (Go `WriteDataBlockFunc`).
 ///
@@ -642,15 +656,25 @@ where
 /// [`DataBlock`] to `write_block_fn` (Go `Storage.RunQuery` / `runQuery`).
 ///
 /// PORT NOTE: Go takes a `*QueryContext` (context/cancellation/tenantIDs/stats);
-/// the port passes `tenant_ids` explicitly and drops context cancellation.
+/// the port passes `tenant_ids` explicitly plus an optional external `cancel`
+/// token standing in for `ctx.Done()` (per-query stats accumulation stays
+/// dropped). When `cancel` is set the block search aborts promptly and the
+/// query returns `Err(`[`QUERY_CANCELED_ERROR`]`)`, like Go returning
+/// `context.Canceled`. `cancel` is external-only: run_pipes' internal stop flag
+/// (flipped by pipes on benign early-stops such as `limit`, and on state-budget
+/// errors) stays per-run, mirroring Go's derived `context.WithCancelCause` —
+/// sharing one flag for both would poison sequential runs reusing the token
+/// (lastn/csv subqueries) and make benign `limit` stops indistinguishable from
+/// disconnects.
 pub(crate) fn run_query(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
     write_block_fn: WriteDataBlockFn,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<(), String> {
     let sink: Arc<dyn PipeProcessor> = Arc::new(BlockResultWriter { f: write_block_fn });
-    run_query_with_sink(storage, tenant_ids, q, sink)
+    run_query_with_sink(storage, tenant_ids, q, sink, cancel)
 }
 
 /// Go `Storage.runQuery`, with the terminal `writeBlock` generalized to a
@@ -662,8 +686,15 @@ fn run_query_with_sink(
     tenant_ids: &[TenantID],
     q: &Query,
     sink: Arc<dyn PipeProcessor>,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<(), String> {
-    let q_new = init_subqueries(storage, tenant_ids, q)?;
+    if let Some(c) = cancel
+        && c.load(Ordering::SeqCst)
+    {
+        return Err(QUERY_CANCELED_ERROR.to_string());
+    }
+
+    let q_new = init_subqueries(storage, tenant_ids, q, cancel)?;
     let q = q_new.as_ref().unwrap_or(q);
 
     let sso = get_search_options(tenant_ids, q);
@@ -686,7 +717,24 @@ fn run_query_with_sink(
             let skip_block = move |worker_id: usize, min_ts: i64, max_ts: i64| {
                 head_s.block_skip_check(worker_id, min_ts, max_ts)
             };
-            search_parallel(storage, workers, &sso, &qs, stop, &skip_block, &write_block);
+            search_parallel(
+                storage,
+                workers,
+                &sso,
+                &qs,
+                stop,
+                cancel.map(|c| c.as_ref()),
+                &skip_block,
+                &write_block,
+            );
+            // Returning the canceled error here (Go: the search loop returning
+            // ctx.Err()) makes run_pipes set its internal stop before flushing,
+            // so the pipe flushes bail out too where they honor it.
+            if let Some(c) = cancel
+                && c.load(Ordering::SeqCst)
+            {
+                return Err(QUERY_CANCELED_ERROR.to_string());
+            }
             Ok(())
         },
         sink,
@@ -713,12 +761,14 @@ fn run_query_with_sink(
 /// scope-local `Vec` and the scoped workers pull items via a shared cursor. The
 /// scheduling read cost (reading block headers) is the same; only the
 /// producer/consumer overlap is dropped.
+#[allow(clippy::too_many_arguments)] // mirrors Go's searchParallel parameter surface + cancel
 fn search_parallel(
     storage: &Arc<Storage>,
     workers_count: usize,
     sso: &StorageSearchOptions<'_>,
     qs: &QueryStats,
     stop: &AtomicBool,
+    cancel: Option<&AtomicBool>,
     skip_block: &(dyn Fn(usize, i64, i64) -> bool + Sync),
     write_block: &(dyn Fn(usize, &mut BlockResult) + Sync),
 ) {
@@ -780,7 +830,7 @@ fn search_parallel(
     }
 
     let process = |worker_id: usize, w: &BlockSearchWork| {
-        if stop.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) || cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
             return;
         }
         if skip_block(
@@ -858,16 +908,17 @@ impl Storage {
     /// If `filter` is non-empty, then only the field names containing the
     /// filter substring are returned.
     ///
-    /// PORT NOTE: Go takes a `*QueryContext`; the port passes `tenant_ids` and
-    /// `q` explicitly (see [`Storage::run_query`]). Go clones `q` shallowly
-    /// (sharing the filter and pipes); Rust filters/pipes are single-owner
-    /// trait objects, so the query is cloned via re-parsing
-    /// ([`Query::clone`]).
+    /// PORT NOTE: Go takes a `*QueryContext`; the port passes `tenant_ids`,
+    /// `q` and the optional external `cancel` token explicitly (see
+    /// [`Storage::run_query`]). Go clones `q` shallowly (sharing the filter
+    /// and pipes); Rust filters/pipes are single-owner trait objects, so the
+    /// query is cloned via re-parsing ([`Query::clone`]).
     pub fn get_field_names(
         self: &Arc<Storage>,
         tenant_ids: &[TenantID],
         q: &Query,
         filter: &str,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<Vec<ValueWithHits>, String> {
         let mut q_new = q.clone(q.get_timestamp());
 
@@ -886,7 +937,7 @@ impl Storage {
         let p = crate::parser::parse_pipe::must_parse_pipe(&pipe_str, q.get_timestamp());
         q_new.pipes.push(p);
 
-        self.run_values_with_hits_query(tenant_ids, &q_new)
+        self.run_values_with_hits_query(tenant_ids, &q_new, cancel)
     }
 
     /// Returns unique values with the number of hits for the given
@@ -903,6 +954,7 @@ impl Storage {
         field_name: &str,
         filter: &str,
         limit: u64,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<Vec<ValueWithHits>, String> {
         let mut q_new = q.clone(q.get_timestamp());
 
@@ -920,7 +972,7 @@ impl Storage {
         let p = crate::parser::parse_pipe::must_parse_pipe(&pipe_str, q.get_timestamp());
         q_new.pipes.push(p);
 
-        self.run_values_with_hits_query(tenant_ids, &q_new)
+        self.run_values_with_hits_query(tenant_ids, &q_new, cancel)
     }
 
     /// Returns stream field names for the results of `q`
@@ -933,8 +985,9 @@ impl Storage {
         tenant_ids: &[TenantID],
         q: &Query,
         filter: &str,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        let streams = self.get_streams(tenant_ids, q, u64::MAX)?;
+        let streams = self.get_streams(tenant_ids, q, u64::MAX, cancel)?;
 
         let mut m: HashMap<String, u64> = HashMap::new();
         for_each_stream_field(&streams, |f, hits| {
@@ -961,8 +1014,9 @@ impl Storage {
         field_name: &str,
         filter: &str,
         limit: u64,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        let streams = self.get_streams(tenant_ids, q, u64::MAX)?;
+        let streams = self.get_streams(tenant_ids, q, u64::MAX, cancel)?;
 
         let mut m: HashMap<String, u64> = HashMap::new();
         for_each_stream_field(&streams, |f, hits| {
@@ -1016,8 +1070,9 @@ impl Storage {
         tenant_ids: &[TenantID],
         q: &Query,
         limit: u64,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        self.get_field_values(tenant_ids, q, "_stream", "", limit)
+        self.get_field_values(tenant_ids, q, "_stream", "", limit, cancel)
     }
 
     /// Returns `_stream_id` field values from the results of `q`
@@ -1029,8 +1084,9 @@ impl Storage {
         tenant_ids: &[TenantID],
         q: &Query,
         limit: u64,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        self.get_field_values(tenant_ids, q, "_stream_id", "", limit)
+        self.get_field_values(tenant_ids, q, "_stream_id", "", limit, cancel)
     }
 
     /// Go `Storage.runValuesWithHitsQuery`: runs `q` (which must end with a
@@ -1039,6 +1095,7 @@ impl Storage {
         self: &Arc<Storage>,
         tenant_ids: &[TenantID],
         q: &Query,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<Vec<ValueWithHits>, String> {
         let results: Arc<std::sync::Mutex<Vec<ValueWithHits>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1070,7 +1127,7 @@ impl Storage {
             results_w.lock().unwrap().extend(values_with_hits);
         });
 
-        self.run_query(tenant_ids, q, write_block)?;
+        crate::storage_search::run_query(self, tenant_ids, q, write_block, cancel)?;
 
         let mut results = std::mem::take(&mut *results.lock().unwrap());
         crate::pipe_field_values_local::sort_values_with_hits(&mut results);
@@ -1220,6 +1277,7 @@ fn get_field_values_generic(
     tenant_ids: &[TenantID],
     q: &Query,
     field_name: &str,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<String>, String> {
     let q_holder;
     let q = if is_last_pipe_uniq(q.pipes()) {
@@ -1250,7 +1308,7 @@ fn get_field_values_generic(
         }
     });
 
-    run_query(storage, tenant_ids, q, write_block)?;
+    run_query(storage, tenant_ids, q, write_block, cancel)?;
 
     let values = std::mem::take(&mut *values.lock().unwrap());
     Ok(values)
@@ -1270,6 +1328,7 @@ fn get_rows(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<Vec<Field>>, String> {
     let max_state_size = (esl_common::memory::allowed() as f64 * 0.2) as i64;
     let state_size_budget = Arc::new(std::sync::atomic::AtomicI64::new(max_state_size));
@@ -1312,7 +1371,7 @@ fn get_rows(
         rows_w.lock().unwrap().extend(block_rows);
     });
 
-    run_query(storage, tenant_ids, q, write_block)?;
+    run_query(storage, tenant_ids, q, write_block, cancel)?;
 
     if state_size_budget.load(Ordering::SeqCst) < 0 {
         return Err(format!(
@@ -1339,6 +1398,7 @@ fn init_subqueries(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<Option<Query>, String> {
     let has_in = q.has_filter_in_with_query();
     let has_join = q.pipes().iter().any(|p| p.is_join_pipe());
@@ -1354,17 +1414,18 @@ fn init_subqueries(
         // Go `getValuesForQuery` caches subquery results in an `inValuesCache`
         // keyed by the subquery string; the cache is folded into the closure.
         let mut cache: HashMap<String, Vec<String>> = HashMap::new();
-        let mut get_field_values =
-            |q_text: &str, field_name: &str| -> Result<Vec<String>, String> {
-                if let Some(values) = cache.get(q_text) {
-                    return Ok(values.clone());
-                }
-                let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
-                    .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
-                let values = get_field_values_generic(storage, tenant_ids, &q_sub, field_name)?;
-                cache.insert(q_text.to_string(), values.clone());
-                Ok(values)
-            };
+        let mut get_field_values = |q_text: &str,
+                                    field_name: &str|
+         -> Result<Vec<String>, String> {
+            if let Some(values) = cache.get(q_text) {
+                return Ok(values.clone());
+            }
+            let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
+                .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
+            let values = get_field_values_generic(storage, tenant_ids, &q_sub, field_name, cancel)?;
+            cache.insert(q_text.to_string(), values.clone());
+            Ok(values)
+        };
         init_filter_in_values_for_query(&mut q_new, &mut get_field_values, timestamp)
             .map_err(|e| format!("cannot initialize `in` subqueries: {e}"))?;
     }
@@ -1375,7 +1436,7 @@ fn init_subqueries(
         let mut get_join_rows = |q_text: &str| -> Result<Vec<Vec<Field>>, String> {
             let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
                 .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
-            get_rows(storage, tenant_ids, &q_sub)
+            get_rows(storage, tenant_ids, &q_sub, cancel)
         };
         for p in &mut q_new.pipes {
             p.init_join_map(&mut get_join_rows)
@@ -1390,11 +1451,12 @@ fn init_subqueries(
         // Go's single-node path (`eagerExecute == false`).
         let storage_u = Arc::clone(storage);
         let tenant_ids_u: Vec<TenantID> = tenant_ids.to_vec();
+        let cancel_u: Option<Arc<AtomicBool>> = cancel.cloned();
         let run_union_query: crate::pipe::RunUnionQueryFn =
             Arc::new(move |q_text, sink| -> Result<(), String> {
                 let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
                     .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
-                run_query_with_sink(&storage_u, &tenant_ids_u, &q_sub, sink)
+                run_query_with_sink(&storage_u, &tenant_ids_u, &q_sub, sink, cancel_u.as_ref())
             });
         for p in &mut q_new.pipes {
             p.init_union_query(&run_union_query)
@@ -1716,6 +1778,96 @@ mod tests {
         esl_common::fs::must_remove_dir(&path);
     }
 
+    // -- External cancellation (client-disconnect) tests ---------------------
+
+    /// A pre-set cancel token aborts the query before any block is searched,
+    /// returning the canceled error (Go: RunQuery returning ctx.Err()).
+    #[test]
+    fn test_run_query_with_cancel_preset() {
+        let path = run_query_temp_path("cancel-preset");
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+        let all_tenant_ids = fill_run_query_fixture(&s);
+
+        let q = ParseQuery("*").expect("parse query");
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_cl = Arc::clone(&calls);
+        let write: WriteDataBlockFn = Arc::new(move |_wid, _db: &mut DataBlock| {
+            calls_cl.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = s
+            .run_query_with_cancel(&all_tenant_ids, &q, write, Some(&cancel))
+            .expect_err("a pre-set cancel token must abort the query");
+        assert_eq!(err, QUERY_CANCELED_ERROR);
+        assert!(is_query_canceled_error(&err));
+        assert!(
+            is_query_canceled_error(&format!("cannot execute query: {err}")),
+            "wrapped canceled errors must still be detected"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no block may reach the sink for a pre-canceled query"
+        );
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
+    }
+
+    /// A cancel flipped mid-query (from the write-block callback, i.e. from
+    /// inside the pipeline) aborts the search before all blocks are processed.
+    /// `concurrency=1` forces the serial block-search path, which makes the
+    /// abort point deterministic: exactly one block reaches the sink.
+    #[test]
+    fn test_run_query_with_cancel_mid_query() {
+        let path = run_query_temp_path("cancel-mid");
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+        let all_tenant_ids = fill_run_query_fixture(&s);
+
+        // Baseline: without cancel, the fixture yields many blocks.
+        let q = ParseQuery("options(concurrency=1) *").expect("parse query");
+        let total_blocks = {
+            let calls = Arc::new(AtomicU64::new(0));
+            let calls_cl = Arc::clone(&calls);
+            let write: WriteDataBlockFn = Arc::new(move |_wid, _db: &mut DataBlock| {
+                calls_cl.fetch_add(1, Ordering::SeqCst);
+            });
+            s.run_query(&all_tenant_ids, &q, write).expect("run_query");
+            calls.load(Ordering::SeqCst)
+        };
+        assert!(
+            total_blocks > 1,
+            "fixture must span multiple blocks; got {total_blocks}"
+        );
+
+        // Cancel from the first write_block call: every following block must
+        // be skipped by the per-block cancel check in search_parallel.
+        let calls = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let calls_cl = Arc::clone(&calls);
+        let cancel_cl = Arc::clone(&cancel);
+        let write: WriteDataBlockFn = Arc::new(move |_wid, _db: &mut DataBlock| {
+            calls_cl.fetch_add(1, Ordering::SeqCst);
+            cancel_cl.store(true, Ordering::SeqCst);
+        });
+        let err = s
+            .run_query_with_cancel(&all_tenant_ids, &q, write, Some(&cancel))
+            .expect_err("a mid-query cancel must surface the canceled error");
+        assert!(is_query_canceled_error(&err), "got: {err}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the serial search must abort right after the cancelling block \
+             ({total_blocks} blocks total)"
+        );
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
+    }
+
     // -- ValuesWithHits query-surface tests ----------------------------------
     //
     // Port of the `field_names-*` / `field_values-*` / `stream_field_*` /
@@ -1793,7 +1945,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_names(&all_tenant_ids, &q, "")
+                .get_field_names(&all_tenant_ids, &q, "", None)
                 .expect("get_field_names");
             let results_expected = vec![
                 vh("_msg", 1155),
@@ -1813,7 +1965,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_names(&all_tenant_ids, &q, "o")
+                .get_field_names(&all_tenant_ids, &q, "o", None)
                 .expect("get_field_names");
             let results_expected = vec![vh("job", 1155), vh("source-file", 1155)];
             assert_eq!(results, results_expected, "field_names-with-filter");
@@ -1825,7 +1977,7 @@ mod tests {
         {
             let q = parse(r#"_stream:{instance=~"host-1:.+"}"#);
             let results = s
-                .get_field_names(&all_tenant_ids, &q, "")
+                .get_field_names(&all_tenant_ids, &q, "", None)
                 .expect("get_field_names");
             let results_expected = vec![
                 vh("_msg", 385),
@@ -1845,7 +1997,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "", 0)
+                .get_field_values(&all_tenant_ids, &q, "_stream", "", 0, None)
                 .expect("get_field_values");
             let results_expected = vec![
                 vh(r#"{instance="host-0:234",job="foobar"}"#, 385),
@@ -1859,7 +2011,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "1:23", 0)
+                .get_field_values(&all_tenant_ids, &q, "_stream", "1:23", 0, None)
                 .expect("get_field_values");
             let results_expected = vec![vh(r#"{instance="host-1:234",job="foobar"}"#, 385)];
             assert_eq!(results, results_expected, "field_values-with-filter");
@@ -1869,7 +2021,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "", 3)
+                .get_field_values(&all_tenant_ids, &q, "_stream", "", 3, None)
                 .expect("get_field_values");
             let results_expected = vec![
                 vh(r#"{instance="host-0:234",job="foobar"}"#, 385),
@@ -1883,7 +2035,7 @@ mod tests {
         {
             let q = parse("instance:='host-1:234'");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "", 4)
+                .get_field_values(&all_tenant_ids, &q, "_stream", "", 4, None)
                 .expect("get_field_values");
             let results_expected = vec![vh(r#"{instance="host-1:234",job="foobar"}"#, 385)];
             assert_eq!(results, results_expected, "field_values-limit-not-reached");
@@ -1893,7 +2045,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_stream_field_names(&all_tenant_ids, &q, "")
+                .get_stream_field_names(&all_tenant_ids, &q, "", None)
                 .expect("get_stream_field_names");
             let results_expected = vec![vh("instance", 1155), vh("job", 1155)];
             assert_eq!(results, results_expected, "stream_field_names");
@@ -1903,7 +2055,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_stream_field_names(&all_tenant_ids, &q, "ob")
+                .get_stream_field_names(&all_tenant_ids, &q, "ob", None)
                 .expect("get_stream_field_names");
             let results_expected = vec![vh("job", 1155)];
             assert_eq!(results, results_expected, "stream_field_names-with-filter");
@@ -1913,7 +2065,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_stream_field_values(&all_tenant_ids, &q, "instance", "", 0)
+                .get_stream_field_values(&all_tenant_ids, &q, "instance", "", 0, None)
                 .expect("get_stream_field_values");
             let results_expected = vec![
                 vh("host-0:234", 385),
@@ -1927,7 +2079,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_stream_field_values(&all_tenant_ids, &q, "instance", "t-2", 0)
+                .get_stream_field_values(&all_tenant_ids, &q, "instance", "t-2", 0, None)
                 .expect("get_stream_field_values");
             let results_expected = vec![vh("host-2:234", 385)];
             assert_eq!(results, results_expected, "stream_field_values-with-filter");
@@ -1937,7 +2089,7 @@ mod tests {
         {
             let q = parse("*");
             let values = s
-                .get_stream_field_values(&all_tenant_ids, &q, "instance", "", 3)
+                .get_stream_field_values(&all_tenant_ids, &q, "instance", "", 3, None)
                 .expect("get_stream_field_values");
             let results_expected = vec![
                 vh("host-0:234", 385),
@@ -1950,7 +2102,9 @@ mod tests {
         // streams
         {
             let q = parse("*");
-            let results = s.get_streams(&all_tenant_ids, &q, 0).expect("get_streams");
+            let results = s
+                .get_streams(&all_tenant_ids, &q, 0, None)
+                .expect("get_streams");
             let results_expected = vec![
                 vh(r#"{instance="host-0:234",job="foobar"}"#, 385),
                 vh(r#"{instance="host-1:234",job="foobar"}"#, 385),
@@ -1963,7 +2117,7 @@ mod tests {
         {
             let q = parse("*");
             let mut results = s
-                .get_stream_ids(&all_tenant_ids, &q, 0)
+                .get_stream_ids(&all_tenant_ids, &q, 0, None)
                 .expect("get_stream_ids");
 
             // Verify the first 5 results with the smallest _stream_id value.

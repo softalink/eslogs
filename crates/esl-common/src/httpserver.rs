@@ -550,6 +550,23 @@ impl ResponseWriter {
         self.stream.is_some()
     }
 
+    /// Registers this request's connection with the global
+    /// [`crate::disconnect_watcher`] and returns a token whose flag flips when
+    /// the client disconnects, letting long-running handlers abort doomed work
+    /// (Go's `r.Context().Done()`).
+    ///
+    /// Returns `None` when no live connection is attached (direct handler
+    /// invocation in tests). The token deregisters on drop; buffered handlers
+    /// may simply let it fall out of scope — the response bytes are only
+    /// written to the socket after the handler returns. Handlers that stream
+    /// mid-handler via [`Self::flush_chunk`] must NOT use this (the watcher's
+    /// non-blocking probes would race the streaming writes); `flush_chunk`
+    /// already probes for disconnects itself.
+    pub fn watch_disconnect(&mut self) -> Option<crate::disconnect_watcher::CancelToken> {
+        let stream = self.stream.clone()?;
+        Some(crate::disconnect_watcher::watch(stream))
+    }
+
     /// Streams the currently buffered body to the client mid-handler as an
     /// HTTP/1.1 chunk (Go `http.Flusher.Flush`).
     ///

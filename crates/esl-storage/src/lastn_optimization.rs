@@ -4,14 +4,17 @@
 //!
 //! PORT NOTE: Go passes a `*logstorage.QueryContext` (query + tenantIDs +
 //! context + query stats) through every helper; the ported `Storage::run_query`
-//! surface takes `(tenant_ids, query, write_block)` explicitly and carries no
-//! context/stats, so the helpers below do the same.
+//! surface takes `(tenant_ids, query, write_block)` plus an optional external
+//! cancel token standing in for the context (no stats), so the helpers below
+//! do the same: the same `cancel` is threaded through every binary-search
+//! subquery, like Go sharing one request ctx across them.
 //!
 //! PORT NOTE: this module is not wired into esl-select yet. The wiring, mirroring
 //! Go `eslstorage.RunQuery`, is [`crate::run_query`]: esl-select should call
 //! `esl_storage::run_query(...)` instead of `Storage::run_query` so eligible
 //! queries (detected via `Query::get_last_n_results_query`) take this path.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use esl_logstorage::parser::{Query, can_apply_last_n_results_optimization};
@@ -33,8 +36,9 @@ pub fn run_optimized_last_n_results_query(
     offset: u64,
     limit: u64,
     write_block: WriteDataBlockFn,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<(), String> {
-    let rows = get_last_n_query_results(storage, tenant_ids, q, offset + limit)?;
+    let rows = get_last_n_query_results(storage, tenant_ids, q, offset + limit, cancel)?;
     if offset >= rows.len() as u64 {
         return Ok(());
     }
@@ -62,12 +66,13 @@ fn get_last_n_query_results(
     tenant_ids: &[TenantID],
     q_orig: &Query,
     limit: u64,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<LogRow>, String> {
     let timestamp = q_orig.get_timestamp();
 
     let mut q = q_orig.clone(timestamp);
     q.add_pipe_offset_limit(0, 2 * limit);
-    let rows = get_query_results(storage, tenant_ids, &q)?;
+    let rows = get_query_results(storage, tenant_ids, &q, cancel)?;
 
     if (rows.len() as u64) < 2 * limit {
         // Fast path - the requested time range contains up to 2*limit rows.
@@ -87,7 +92,7 @@ fn get_last_n_query_results(
     loop {
         let mut q = q_orig.clone_with_time_filter(timestamp, start, end - 1);
         q.add_pipe_offset_limit(0, 2 * n);
-        let rows = get_query_results(storage, tenant_ids, &q)?;
+        let rows = get_query_results(storage, tenant_ids, &q, cancel)?;
 
         if end / 2 - start / 2 <= 0 {
             // The [start ... end) time range doesn't exceed a nanosecond, e.g. it cannot be adjusted more.
@@ -103,7 +108,7 @@ fn get_last_n_query_results(
             // so search for the rows on the adjusted time range [start+(end/2-start/2) ... end).
             if !can_apply_last_n_results_optimization(start, end) {
                 // It is faster obtaining the last N logs as is on such a small time range instead of using binary search.
-                let rows = get_log_rows_last_n(storage, tenant_ids, q_orig, start, end, n)?;
+                let rows = get_log_rows_last_n(storage, tenant_ids, q_orig, start, end, n, cancel)?;
                 rows_found.extend(rows);
                 let rows_found = get_last_n_rows(rows_found, limit);
                 return Ok(rows_found);
@@ -140,12 +145,13 @@ fn get_log_rows_last_n(
     start: i64,
     end: i64,
     n: u64,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<LogRow>, String> {
     let timestamp = q_orig.get_timestamp();
     let mut q = q_orig.clone_with_time_filter(timestamp, start, end);
     q.add_pipe_sort_by_time_desc();
     q.add_pipe_offset_limit(0, n);
-    get_query_results(storage, tenant_ids, &q)
+    get_query_results(storage, tenant_ids, &q, cancel)
 }
 
 /// Port of Go `getQueryResults`.
@@ -153,6 +159,7 @@ fn get_query_results(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<Vec<LogRow>, String> {
     let rows: Arc<Mutex<Vec<LogRow>>> = Arc::new(Mutex::new(Vec::new()));
     let err_local: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -171,7 +178,7 @@ fn get_query_results(
             },
         );
 
-    let result = crate::run_query(storage, tenant_ids, q, write_block);
+    let result = crate::run_query_with_cancel(storage, tenant_ids, q, write_block, cancel);
     if let Some(err) = err_local.lock().unwrap().take() {
         return Err(err);
     }

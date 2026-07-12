@@ -555,6 +555,20 @@ pub fn run_query(
     q: &Query,
     write_block: WriteDataBlockFn,
 ) -> Result<(), String> {
+    run_query_with_cancel(storage, tenant_ids, q, write_block, None)
+}
+
+/// Like [`run_query`], but aborts early when the external `cancel` token is
+/// set, returning `esl_logstorage::storage_search::QUERY_CANCELED_ERROR`
+/// (Go: the `*QueryContext` ctx going done -> `context.Canceled`). The same
+/// token is threaded through every subquery of the last-N optimization.
+pub fn run_query_with_cancel(
+    storage: &Arc<Storage>,
+    tenant_ids: &[TenantID],
+    q: &Query,
+    write_block: WriteDataBlockFn,
+    cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), String> {
     if let Some((q_opt, offset, limit)) = q.get_last_n_results_query() {
         return lastn_optimization::run_optimized_last_n_results_query(
             storage,
@@ -563,10 +577,11 @@ pub fn run_query(
             offset,
             limit,
             write_block,
+            cancel,
         );
     }
 
-    storage.run_query(tenant_ids, q, write_block)
+    storage.run_query_with_cancel(tenant_ids, q, write_block, cancel)
 }
 
 // PORT NOTE: the Go `GetFieldNames`/`GetFieldValues`/`GetStreamFieldNames`/

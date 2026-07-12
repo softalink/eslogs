@@ -1363,8 +1363,9 @@ impl Storage {
     /// result [`DataBlock`] to `write_block_fn` (Go `Storage.RunQuery`).
     ///
     /// PORT NOTE: Go takes a `*QueryContext` carrying the tenantIDs, context and
-    /// query stats; the port passes `tenant_ids` explicitly and drops the
-    /// context (cancellation) and stats accumulation. The search spine lives in
+    /// query stats; the port passes `tenant_ids` explicitly and drops the stats
+    /// accumulation. Context cancellation is available via
+    /// [`Storage::run_query_with_cancel`]. The search spine lives in
     /// `storage_search.rs` (`run_query` / `search_parallel`).
     pub fn run_query(
         self: &Arc<Storage>,
@@ -1372,7 +1373,27 @@ impl Storage {
         q: &crate::parser::Query,
         write_block_fn: crate::storage_search::WriteDataBlockFn,
     ) -> Result<(), String> {
-        crate::storage_search::run_query(self, tenant_ids, q, write_block_fn)
+        crate::storage_search::run_query(self, tenant_ids, q, write_block_fn, None)
+    }
+
+    /// Like [`Storage::run_query`], but aborts early when `cancel` is set,
+    /// returning [`crate::storage_search::QUERY_CANCELED_ERROR`] — the port of
+    /// Go's request-context cancellation (`ctx.Done()` -> `context.Canceled`).
+    ///
+    /// `cancel` must only be set by the external caller (e.g. the HTTP
+    /// client-disconnect watcher); it is checked alongside the query's internal
+    /// per-run stop flag, mirroring Go's parent-ctx/derived-cancel split (see
+    /// the `storage_search::run_query` PORT NOTE). The same token may safely
+    /// cancel several sequential `run_query_with_cancel` calls serving one
+    /// request.
+    pub fn run_query_with_cancel(
+        self: &Arc<Storage>,
+        tenant_ids: &[TenantID],
+        q: &crate::parser::Query,
+        write_block_fn: crate::storage_search::WriteDataBlockFn,
+        cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<(), String> {
+        crate::storage_search::run_query(self, tenant_ids, q, write_block_fn, cancel)
     }
 }
 

@@ -10,6 +10,7 @@ pub mod cgroup;
 pub mod chunkedbuffer;
 pub mod contextutil;
 pub mod decimal;
+pub mod disconnect_watcher;
 pub mod easyproto;
 pub mod encoding;
 pub mod envflag;

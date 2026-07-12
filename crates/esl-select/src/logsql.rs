@@ -15,7 +15,9 @@ use esl_common::httpserver::{Request, ResponseWriter, get_quoted_remote_addr};
 use esl_common::timeutil::parse_time_at;
 use esl_logstorage::parser::{Filter, ParseFilter, Query};
 use esl_logstorage::storage::Storage;
-use esl_logstorage::storage_search::{BlockColumn, DataBlock, WriteDataBlockFn};
+use esl_logstorage::storage_search::{
+    BlockColumn, DataBlock, WriteDataBlockFn, is_query_canceled_error,
+};
 use esl_logstorage::tenant_id::{TenantID, get_tenant_id_from_request};
 use esl_logstorage::values_encoder::{
     marshal_timestamp_rfc3339_nano_string, sub_int64_no_overflow, try_parse_duration,
@@ -923,6 +925,11 @@ pub(crate) fn process_query_request(storage: &Arc<Storage>, req: &Request, w: &m
         ca.q.add_pipe_offset_limit(offset as u64, limit as u64);
     }
 
+    // Cancel the query when the client disconnects (Go: the request context;
+    // see ResponseWriter::watch_disconnect). The same token covers the csv
+    // field-name subquery and the main query, like one Go request ctx.
+    let cancel = w.watch_disconnect();
+
     // Go ProcessQueryRequest format=csv branch: resolve the csv header fields.
     let mut csv_header: Vec<u8> = Vec::new();
     if format == "csv" {
@@ -931,15 +938,24 @@ pub(crate) fn process_query_request(storage: &Arc<Storage>, req: &Request, w: &m
             None => {
                 // Slow path - detect the fields by scanning the logs for the
                 // given query.
-                let field_names = match storage.get_field_names(&ca.tenant_ids, &ca.q, "") {
+                let field_names = match storage.get_field_names(
+                    &ca.tenant_ids,
+                    &ca.q,
+                    "",
+                    cancel.as_deref(),
+                ) {
                     Ok(v) => v,
                     Err(e) => {
+                        if is_query_canceled_error(&e) {
+                            // The client disconnected: nobody to respond to.
+                            return;
+                        }
                         w.errorf(
-                            req,
-                            &format!(
-                                "cannot obtain field names for returning query results in csv format: {e}"
-                            ),
-                        );
+                                req,
+                                &format!(
+                                    "cannot obtain field names for returning query results in csv format: {e}"
+                                ),
+                            );
                         return;
                     }
                 };
@@ -1003,8 +1019,17 @@ pub(crate) fn process_query_request(storage: &Arc<Storage>, req: &Request, w: &m
     // measured end-to-end the Go dispatch is ~5x slower here (41ms vs 8ms on
     // the 500k benchmark corpus). The faithful port lives in
     // esl_storage::run_query / lastn_optimization (unit- and e2e-tested);
-    // the direct engine path is used deliberately.
-    if let Err(e) = storage.run_query(&ca.tenant_ids, &ca.q, write_fn) {
+    // the direct engine path is used deliberately. Context cancellation is
+    // ported: the disconnect-watcher token cancels the query like Go's
+    // request ctx, and a canceled query writes no response (Go stops writing
+    // to the closed conn); the buffered partial output is discarded.
+    if let Err(e) =
+        storage.run_query_with_cancel(&ca.tenant_ids, &ca.q, write_fn, cancel.as_deref())
+    {
+        if is_query_canceled_error(&e) {
+            // The client disconnected: there is nobody to respond to.
+            return;
+        }
         w.errorf(req, &format!("cannot execute query [{}]: {e}", ca.q));
         return;
     }
@@ -1396,6 +1421,55 @@ mod tests {
         );
         assert_eq!(status, 200, "body={body}");
         assert!(body.contains(r#""hasTimeFilter":true"#), "body={body}");
+
+        handle.stop();
+        storage.must_close();
+        esl_common::fs::must_remove_dir(&path);
+    }
+
+    /// E2E: connections dropped mid-request (the disconnect-watcher's cancel
+    /// path) must not wedge the server — subsequent queries on fresh
+    /// connections keep working, and the watcher stays quiesced for them.
+    #[test]
+    fn test_process_query_request_survives_dropped_connections() {
+        use std::io::Write as _;
+        use test_support::{encode, http_get, open_storage_with_rows, unique_nsec};
+
+        let base = unique_nsec();
+        let rows = [("alpha", "node-1"), ("beta", "node-1"), ("gamma", "node-2")];
+        let (storage, path) = open_storage_with_rows("query-disconnect", base, &rows);
+
+        let storage_h = std::sync::Arc::clone(&storage);
+        let handle = esl_common::httpserver::serve("127.0.0.1:0", move |req, w| match req.path() {
+            "/select/logsql/query" => process_query_request(&storage_h, req, w),
+            _ => w.errorf(req, "unexpected path"),
+        })
+        .expect("serve");
+        let addr = handle.local_addr();
+
+        // Fire a few requests and drop each connection immediately without
+        // reading the response, so the handler's watch_disconnect token can
+        // observe the disconnect (or the response write hits a dead socket —
+        // both must leave the server healthy).
+        for _ in 0..3 {
+            let mut s = std::net::TcpStream::connect(addr).expect("connect");
+            write!(
+                s,
+                "GET /select/logsql/query?query={} HTTP/1.1\r\nHost: t\r\n\r\n",
+                encode("*")
+            )
+            .expect("write request");
+            s.flush().expect("flush");
+            drop(s); // disconnect without reading
+        }
+
+        // Normal queries on fresh connections must still succeed.
+        for _ in 0..2 {
+            let (status, body) =
+                http_get(addr, &format!("/select/logsql/query?query={}", encode("*")));
+            assert_eq!(status, 200, "body={body}");
+            assert_eq!(body.lines().filter(|l| !l.is_empty()).count(), 3);
+        }
 
         handle.stop();
         storage.must_close();

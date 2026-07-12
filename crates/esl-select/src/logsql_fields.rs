@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use esl_common::httpserver::{Request, ResponseWriter};
 use esl_logstorage::storage::Storage;
-use esl_logstorage::storage_search::ValueWithHits;
+use esl_logstorage::storage_search::{ValueWithHits, is_query_canceled_error};
 
 use crate::logsql::{append_json_string, get_positive_int, parse_common_args};
 
@@ -56,18 +56,25 @@ pub fn process_field_names_request(storage: &Arc<Storage>, req: &Request, w: &mu
     // filter substring
     let filter = req.form_value("filter");
 
-    // Obtain field names for the given query
+    // Obtain field names for the given query, canceling on client disconnect
+    // (Go: the request context).
     let start_time = Instant::now();
-    let field_names = match storage.get_field_names(&ca.tenant_ids, &ca.q, filter) {
-        Ok(v) => v,
-        Err(e) => {
-            w.errorf(
-                req,
-                &format!("cannot obtain field names with filter={filter:?}: {e}"),
-            );
-            return;
-        }
-    };
+    let cancel = w.watch_disconnect();
+    let field_names =
+        match storage.get_field_names(&ca.tenant_ids, &ca.q, filter, cancel.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                if is_query_canceled_error(&e) {
+                    // The client disconnected: there is nobody to respond to.
+                    return;
+                }
+                w.errorf(
+                    req,
+                    &format!("cannot obtain field names with filter={filter:?}: {e}"),
+                );
+                return;
+            }
+        };
 
     // Write response headers
     w.set_header("Content-Type", "application/json");
@@ -109,21 +116,33 @@ pub fn process_field_values_request(storage: &Arc<Storage>, req: &Request, w: &m
         }
     };
 
-    // Obtain unique values for the given field
+    // Obtain unique values for the given field, canceling on client
+    // disconnect (Go: the request context).
     let start_time = Instant::now();
-    let values =
-        match storage.get_field_values(&ca.tenant_ids, &ca.q, field_name, filter, limit as u64) {
-            Ok(v) => v,
-            Err(e) => {
-                w.errorf(
-                    req,
-                    &format!(
-                        "cannot obtain values for field {field_name:?} with filter {filter:?}: {e}"
-                    ),
-                );
+    let cancel = w.watch_disconnect();
+    let values = match storage.get_field_values(
+        &ca.tenant_ids,
+        &ca.q,
+        field_name,
+        filter,
+        limit as u64,
+        cancel.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            if is_query_canceled_error(&e) {
+                // The client disconnected: there is nobody to respond to.
                 return;
             }
-        };
+            w.errorf(
+                req,
+                &format!(
+                    "cannot obtain values for field {field_name:?} with filter {filter:?}: {e}"
+                ),
+            );
+            return;
+        }
+    };
 
     // Write response headers
     w.set_header("Content-Type", "application/json");

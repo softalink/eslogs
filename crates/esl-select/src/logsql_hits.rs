@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use esl_common::httpserver::{Request, ResponseWriter};
 use esl_logstorage::storage::Storage;
-use esl_logstorage::storage_search::{BlockColumn, DataBlock, WriteDataBlockFn};
+use esl_logstorage::storage_search::{
+    BlockColumn, DataBlock, WriteDataBlockFn, is_query_canceled_error,
+};
 use esl_logstorage::values_encoder::try_parse_timestamp_rfc3339_nano;
 
 use crate::logsql::{
@@ -134,8 +136,15 @@ pub fn process_hits_request(storage: &Arc<Storage>, req: &Request, w: &mut Respo
         }
     });
 
-    // Execute the query
-    if let Err(e) = storage.run_query(&ca.tenant_ids, &ca.q, write_fn) {
+    // Execute the query, canceling on client disconnect (Go: request ctx).
+    let cancel = w.watch_disconnect();
+    if let Err(e) =
+        storage.run_query_with_cancel(&ca.tenant_ids, &ca.q, write_fn, cancel.as_deref())
+    {
+        if is_query_canceled_error(&e) {
+            // The client disconnected: there is nobody to respond to.
+            return;
+        }
         w.errorf(req, &format!("cannot execute query [{}]: {e}", ca.q));
         return;
     }

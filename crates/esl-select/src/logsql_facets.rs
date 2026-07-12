@@ -9,7 +9,7 @@ use std::time::Instant;
 use esl_common::httpserver::{Request, ResponseWriter};
 use esl_logstorage::parser::{ParseQueryAtTimestamp, Query};
 use esl_logstorage::storage::Storage;
-use esl_logstorage::storage_search::{DataBlock, WriteDataBlockFn};
+use esl_logstorage::storage_search::{DataBlock, WriteDataBlockFn, is_query_canceled_error};
 
 use crate::logsql::{append_json_string, get_bool, get_positive_int, parse_common_args};
 
@@ -95,8 +95,15 @@ pub fn process_facets_request(storage: &Arc<Storage>, req: &Request, w: &mut Res
         }
     });
 
-    // Execute the query
-    if let Err(e) = storage.run_query(&ca.tenant_ids, &ca.q, write_fn) {
+    // Execute the query, canceling on client disconnect (Go: request ctx).
+    let cancel = w.watch_disconnect();
+    if let Err(e) =
+        storage.run_query_with_cancel(&ca.tenant_ids, &ca.q, write_fn, cancel.as_deref())
+    {
+        if is_query_canceled_error(&e) {
+            // The client disconnected: there is nobody to respond to.
+            return;
+        }
         w.errorf(req, &format!("cannot execute query [{}]: {e}", ca.q));
         return;
     }

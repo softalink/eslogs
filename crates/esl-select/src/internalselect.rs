@@ -17,7 +17,11 @@
 //! `Storage::run_query` takes tenant_ids/query explicitly and does not
 //! accumulate `QueryStats` (see the PORT NOTE on `Storage::run_query`), so the
 //! trailing query-stats block carries zero counters plus the measured
-//! `QueryDurationNsecs`. `allow_partial_response` and `hidden_fields_filters`
+//! `QueryDurationNsecs`. Ctx cancellation IS ported: each query/Get* handler
+//! registers a disconnect-watcher token (`ResponseWriter::watch_disconnect`)
+//! that cancels the running query when the netselect client goes away, and
+//! canceled queries produce no response body (the dispatcher suppresses
+//! `errorf` for them). `allow_partial_response` and `hidden_fields_filters`
 //! are parsed and validated exactly like Go (their absence is an error) but are
 //! not consumed by the local query execution: `allow_partial_response` only
 //! affects multi-node fan-out (a client-side concern here) and
@@ -147,7 +151,12 @@ pub fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
             "esl_http_errors_total{{path={path:?}}}"
         ))
         .inc();
-        w.errorf(req, &err);
+        if esl_logstorage::storage_search::is_query_canceled_error(&err) {
+            // The client disconnected mid-query: there is nobody to respond
+            // to (Go: writes to the closed conn are dropped).
+        } else {
+            w.errorf(req, &err);
+        }
         // The return is skipped intentionally in order to track the duration
         // of failed queries.
     }
@@ -350,9 +359,13 @@ fn process_query_request(
 
     // PORT NOTE: the ported `Storage::run_query` does not accumulate
     // QueryStats (see the module docs), so the query-stats block below carries
-    // zero counters plus QueryDurationNsecs.
+    // zero counters plus QueryDurationNsecs. Context cancellation from Go's
+    // `*QueryContext` IS ported: the disconnect-watcher token below cancels
+    // the query when the netselect client goes away, like ctx.Done().
     let qs = QueryStats::default();
-    storage.run_query(&cp.tenant_ids, &cp.query, write_block)?;
+    let cancel = w.watch_disconnect();
+    storage.run_query_with_cancel(&cp.tenant_ids, &cp.query, write_block, cancel.as_deref())?;
+    drop(cancel);
 
     // Send the remaining data.
     let mut bufs = bufs.lock().unwrap();
@@ -408,9 +421,11 @@ fn process_field_names_request(
 
     let filter = form.value(req, "filter");
 
+    let cancel = w.watch_disconnect();
     let field_names = storage
-        .get_field_names(&cp.tenant_ids, &cp.query, filter)
+        .get_field_names(&cp.tenant_ids, &cp.query, filter, cancel.as_deref())
         .map_err(|err| format!("cannot obtain field names: {err}"))?;
+    drop(cancel);
 
     write_values_with_hits(
         w,
@@ -436,9 +451,18 @@ fn process_field_values_request(
 
     let limit = get_int64_from_request(req, form, "limit")?;
 
+    let cancel = w.watch_disconnect();
     let field_values = storage
-        .get_field_values(&cp.tenant_ids, &cp.query, field_name, filter, limit as u64)
+        .get_field_values(
+            &cp.tenant_ids,
+            &cp.query,
+            field_name,
+            filter,
+            limit as u64,
+            cancel.as_deref(),
+        )
         .map_err(|err| format!("cannot obtain field values: {err}"))?;
+    drop(cancel);
 
     write_values_with_hits(
         w,
@@ -461,9 +485,11 @@ fn process_stream_field_names_request(
 
     let filter = form.value(req, "filter");
 
+    let cancel = w.watch_disconnect();
     let field_names = storage
-        .get_stream_field_names(&cp.tenant_ids, &cp.query, filter)
+        .get_stream_field_names(&cp.tenant_ids, &cp.query, filter, cancel.as_deref())
         .map_err(|err| format!("cannot obtain stream field names: {err}"))?;
+    drop(cancel);
 
     write_values_with_hits(
         w,
@@ -489,9 +515,18 @@ fn process_stream_field_values_request(
 
     let limit = get_int64_from_request(req, form, "limit")?;
 
+    let cancel = w.watch_disconnect();
     let field_values = storage
-        .get_stream_field_values(&cp.tenant_ids, &cp.query, field_name, filter, limit as u64)
+        .get_stream_field_values(
+            &cp.tenant_ids,
+            &cp.query,
+            field_name,
+            filter,
+            limit as u64,
+            cancel.as_deref(),
+        )
         .map_err(|err| format!("cannot obtain stream field values: {err}"))?;
+    drop(cancel);
 
     write_values_with_hits(
         w,
@@ -514,9 +549,11 @@ fn process_streams_request(
 
     let limit = get_int64_from_request(req, form, "limit")?;
 
+    let cancel = w.watch_disconnect();
     let streams = storage
-        .get_streams(&cp.tenant_ids, &cp.query, limit as u64)
+        .get_streams(&cp.tenant_ids, &cp.query, limit as u64, cancel.as_deref())
         .map_err(|err| format!("cannot obtain streams: {err}"))?;
+    drop(cancel);
 
     write_values_with_hits(
         w,
@@ -539,9 +576,11 @@ fn process_stream_ids_request(
 
     let limit = get_int64_from_request(req, form, "limit")?;
 
+    let cancel = w.watch_disconnect();
     let stream_ids = storage
-        .get_stream_ids(&cp.tenant_ids, &cp.query, limit as u64)
+        .get_stream_ids(&cp.tenant_ids, &cp.query, limit as u64, cancel.as_deref())
         .map_err(|err| format!("cannot obtain streams: {err}"))?;
+    drop(cancel);
 
     write_values_with_hits(
         w,
