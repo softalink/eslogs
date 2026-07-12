@@ -157,6 +157,36 @@ pub trait Filter: Send + Sync {
     fn filter_time_range(&self) -> Option<(i64, i64)> {
         None
     }
+
+    /// `storage_search::get_common_stream_filter` support (Go
+    /// `getCommonStreamFilter` type-switches on `*filterStream`): a read-only
+    /// view of the [`crate::stream_filter::StreamFilter`] wrapped by a
+    /// `FilterStream`. Returns `None` for every other filter.
+    fn as_stream_filter(&self) -> Option<&crate::stream_filter::StreamFilter> {
+        None
+    }
+
+    /// `Query::optimize` support (Go `mergeFiltersStream` type-switches on
+    /// `*filterStream`): takes ownership of the
+    /// [`crate::stream_filter::StreamFilter`] wrapped by a `FilterStream`,
+    /// leaving it empty. Returns `None` for every other filter.
+    fn take_stream_filter(&mut self) -> Option<crate::stream_filter::StreamFilter> {
+        None
+    }
+
+    /// `Query::get_stream_ids` support (Go `getStreamIDsFromFilterOr`
+    /// type-switches on `*filterStreamID`): a read-only view of the streamIDs
+    /// of a `FilterStreamID`. Returns `None` for every other filter.
+    fn stream_ids(&self) -> Option<&[crate::stream_id::StreamID]> {
+        None
+    }
+
+    /// `Query::get_stream_ids` support (Go `getStreamIDsFromFilterOr`
+    /// type-switches on `*filterOr`): a read-only view of the sub-filters of a
+    /// `FilterOr` (see `and_children`).
+    fn or_children(&self) -> Option<&[Box<dyn Filter>]> {
+        None
+    }
 }
 
 /// `FieldFilter` implements filtering for log entries by a given `field_name`.
@@ -260,8 +290,9 @@ pub fn visit_filters_recursive(
 // which recurses through the `take_or_children`/`take_and_children`/
 // `take_not_child` hooks (the `copyFilterInternal` composite arms) and
 // substitutes leaves via [`Filter::init_filter_in_values`] (the copyFunc leaf
-// arm). Other copyFilter consumers (`flattenFiltersOr`, `mergeFiltersStream`,
-// time-offset shifting) remain deferred with the unported optimize() passes.
+// arm). The `flattenFiltersAnd/Or` and `mergeFiltersStream` optimize passes
+// use the same hooks (see `parser::query`); the remaining copyFilter consumer
+// (time-offset shifting) stays deferred.
 
 // PORT NOTE: upstream `filter_test.go` (TestComplexFilters) is a full
 // filter-subsystem integration test (it builds `filterAnd`/`filterOr`/

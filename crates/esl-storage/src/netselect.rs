@@ -18,14 +18,14 @@
 //!   * `HiddenFieldsFilters` does not exist in the ported query surface, so the
 //!     `hidden_fields_filters` request arg is always `null` (Go's zero value).
 //!
-//! PORT NOTE — `NetQueryRunner`: Go `Storage.RunQuery` splits the query into a
-//! remote part and local pipes via `logstorage.NewNetQueryRunner`, which is
-//! still an executable-spec stub in esl-logstorage (`net_query_runner.rs`). The
-//! ported [`Storage::run_query`] therefore sends the *full* query to every node
-//! and streams the returned blocks as-is: queries whose trailing pipes need a
-//! cross-node merge (e.g. `stats`) would return per-node partial results until
-//! `NetQueryRunner` lands. The per-node protocol implementation (`runQuery`,
-//! the block framing and the query-stats blocks) is ported faithfully.
+//! PORT NOTE — `NetQueryRunner`: like Go, [`Storage::run_query`] splits the
+//! query via `esl_logstorage::net_query_runner::new_net_query_runner` into a
+//! remote part sent to every storage node (e.g. `stats` becomes
+//! `stats_remote`, which exports serialized per-group states) and local pipes
+//! that merge the returned per-node partial results (e.g. `stats_local`,
+//! which imports those states). The per-node protocol implementation
+//! (`runQuery`, the block framing and the query-stats blocks) is ported
+//! faithfully.
 //!
 //! PORT NOTE — HTTP transport and the `esl_select_remote_send_errors_total`
 //! metric: see [`crate::http_client`] and the netinsert module note; the
@@ -38,6 +38,7 @@ use esl_common::encoding as vlencoding;
 use esl_common::encoding::zstd;
 
 use esl_logstorage::delete_task::{DeleteTask, unmarshal_delete_tasks_from_json};
+use esl_logstorage::net_query_runner::new_net_query_runner;
 use esl_logstorage::parser::{Filter, Query};
 use esl_logstorage::pipe_field_values_local::merge_values_with_hits;
 use esl_logstorage::query_stats::QueryStats;
@@ -616,11 +617,39 @@ impl Storage {
     }
 
     /// Runs the given query and calls write_block for the returned data blocks
-    /// (Go `RunQuery`).
-    ///
-    /// PORT NOTE: see the module-level `NetQueryRunner` note — the query is
-    /// currently sent to every node unsplit.
+    /// (Go `RunQuery`): the query is split via `NetQueryRunner` into a remote
+    /// part executed at every storage node and local pipes merging the
+    /// per-node partial results.
     pub fn run_query(
+        &self,
+        qs: &QueryStats,
+        tenant_ids: &[TenantID],
+        q: &Query,
+        allow_partial_response: bool,
+        write_block: WriteDataBlockFn,
+    ) -> Result<(), String> {
+        // Go passes `s.RunQuery` (the full distributed runner) so subqueries
+        // embedded in `q` are split recursively as well.
+        let run_net_query = |q_sub: &Query, wb: WriteDataBlockFn| -> Result<(), String> {
+            self.run_query(qs, tenant_ids, q_sub, allow_partial_response, wb)
+        };
+        let nqr = new_net_query_runner(q, &run_net_query, write_block)?;
+
+        // PORT NOTE: Go's local pipe workers adapt dynamically to any workerID
+        // (`atomicutil.Slice`), and the per-node responses are streamed with
+        // workerID == nodeIdx; the ported pipe processors size their shards up
+        // front, so the concurrency must cover every node index.
+        let concurrency = q.get_concurrency().max(self.sns.len());
+        nqr.run(concurrency, |_stop, q_remote, wb| {
+            // PORT NOTE: the stop token is unused — the std-TCP client cannot
+            // cancel in-flight node requests (see the module PORT NOTE).
+            self.run_query_internal(qs, tenant_ids, q_remote, allow_partial_response, wb)
+        })
+    }
+
+    /// Fans the (already split) query out to every storage node
+    /// (Go `Storage.runQuery`).
+    fn run_query_internal(
         &self,
         qs: &QueryStats,
         tenant_ids: &[TenantID],

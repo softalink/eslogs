@@ -213,6 +213,17 @@ impl Pipe for PipeSort {
         Some(crate::pipe::StatsTailOp::Keep)
     }
 
+    /// Port of Go `pipeSort.splitToRemoteAndLocal`: the remote side sorts with
+    /// `limit + offset` and no rank; the offset/rank are applied locally.
+    fn split_to_remote_and_local(&self, _timestamp: i64) -> crate::pipe::SplitPipesResult {
+        let mut p_remote = self.clone();
+        p_remote.limit += p_remote.offset;
+        p_remote.offset = 0;
+        p_remote.rank_field_name = String::new();
+
+        (Some(Box::new(p_remote)), vec![Box::new(self.clone())])
+    }
+
     fn fixed_fields_transparent(&self) -> bool {
         true
     }

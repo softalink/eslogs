@@ -28,6 +28,12 @@ pub(crate) fn new_pipe_first(ps: PipeSort) -> PipeFirst {
 }
 
 impl Pipe for PipeFirst {
+    /// Port of Go `pipeFirst.splitToRemoteAndLocal` (delegates to the wrapped
+    /// sort, so both sides run as plain `sort` pipes).
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        self.ps.split_to_remote_and_local(timestamp)
+    }
+
     fn get_offset_limit(&self) -> Option<(u64, u64)> {
         crate::pipe_sort::get_offset_limit_from_pipe_sort(&self.ps)
     }

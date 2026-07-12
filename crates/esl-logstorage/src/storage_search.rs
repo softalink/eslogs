@@ -25,14 +25,13 @@
 //! `parser::query`; `_stream` materialization is wired via
 //! `BlockSearch::get_stream_str_slow` → `partition.idb`.
 //!
-//! Correctness fallbacks kept from the Go source (each carries a local PORT
-//! NOTE):
-//! * **Time-range pruning.** `get_filter_time_range` returns the full `i64`
-//!   range (no partition/block time pruning); per-row time filtering still
-//!   happens inside the filter.
-//! * **Stream pre-filtering.** `get_stream_ids` / `getCommonStreamFilter`
-//!   return empty/None (scan all streams by tenantID), so the search always
-//!   goes through the tenantID path.
+//! **Stream pre-filtering** is ported: [`get_common_stream_filter`] extracts a
+//! top-level `{...}` filter, `partition_search_options` resolves its
+//! streamIDs against each partition's indexdb before any block is scheduled,
+//! and `Query::get_stream_ids` extracts `_stream_id:...` literal lists — both
+//! feed `pso.stream_ids`, so `schedule_by_stream_ids` binary-searches the
+//! sorted block headers and skips non-matching blocks entirely (Go
+//! `sso.streamFilter`/`sso.streamIDs` -> `pso.streamIDs`).
 //!
 //! **Subqueries** (`in(<subquery>)` filters, `join`/`union` subqueries) are
 //! ported: [`init_subqueries`] mirrors Go `initSubqueries` and runs at the top
@@ -456,14 +455,19 @@ fn are_const_values(values: &[Vec<u8>]) -> bool {
 
 /// Search options for a Storage search (Go `storageSearchOptions`).
 ///
-/// PORT NOTE: the `streamFilter`/`hiddenFieldsFilter` passes are deferred
-/// (see the module deferral notes). `filter` is borrowed from the query (the
+/// PORT NOTE: the `hiddenFieldsFilter` pass is deferred (see the module
+/// deferral notes). `filter`/`stream_filter` are borrowed from the query (the
 /// `Filter` trait has no clone hook and the query outlives the search).
 struct StorageSearchOptions<'f> {
     tenant_ids: Vec<TenantID>,
     stream_ids: Vec<StreamID>,
     min_timestamp: i64,
     max_timestamp: i64,
+    /// An optional stream filter to use for the search before applying the
+    /// filter: per partition, its matching streamIDs are resolved against the
+    /// partition indexdb so block scheduling skips non-matching blocks
+    /// entirely (Go `sso.streamFilter` -> `pso.streamIDs`).
+    stream_filter: Option<&'f crate::stream_filter::StreamFilter>,
     filter: &'f dyn crate::filter::Filter,
     fields_filter: prefix_filter::Filter,
     time_offset: i64,
@@ -498,9 +502,7 @@ fn get_search_options<'q>(tenant_ids: &[TenantID], q: &'q Query) -> StorageSearc
 
     let (min_timestamp, max_timestamp) = q.get_filter_time_range();
     let filter = q.get_final_filter();
-    // PORT NOTE: Go's getCommonStreamFilter(ff) splits a common stream filter out
-    // of the final filter; that split needs the deferred filter downcast, so the
-    // full final filter is used and no stream pre-filter is produced.
+    let stream_filter = get_common_stream_filter(filter);
     let fields_filter = q.get_needed_columns();
 
     let mut tenant_ids = tenant_ids.to_vec();
@@ -511,6 +513,7 @@ fn get_search_options<'q>(tenant_ids: &[TenantID], q: &'q Query) -> StorageSearc
         stream_ids,
         min_timestamp,
         max_timestamp,
+        stream_filter,
         filter,
         fields_filter,
         time_offset: -q.time_offset(),
@@ -522,20 +525,93 @@ fn get_search_options<'q>(tenant_ids: &[TenantID], q: &'q Query) -> StorageSearc
     }
 }
 
+/// Go `getCommonStreamFilter`: extracts the stream filter when the query's
+/// top-level filter is (or ANDs with) a single `filterStream`.
+///
+/// PORT NOTE: Go also strips the extracted `filterStream` from the returned
+/// filter (returning `(sf, remaining)`); the port borrows the query's filter
+/// (no clone hook on the `Filter` trait), so the filter tree stays intact and
+/// the extracted filter is re-checked per scheduled block by
+/// `FilterStream::apply_to_block_search` — an O(1) cached-set containment test
+/// against blocks that already passed the streamID scheduling, so results and
+/// scheduling behavior match Go. Go's bare-`filterStream` arm returns `t.f`
+/// without the `isEmpty` guard; the port guards both arms (an empty `{...}`
+/// matches all streams, so pre-filtering by it would be wrong and Go never
+/// resolves it either: `FilterStream` short-circuits empty filters).
+fn get_common_stream_filter(
+    f: &dyn crate::filter::Filter,
+) -> Option<&crate::stream_filter::StreamFilter> {
+    if let Some(children) = f.and_children() {
+        for child in children {
+            if let Some(sf) = child.as_stream_filter()
+                && !sf.is_empty()
+            {
+                return Some(sf);
+            }
+        }
+        return None;
+    }
+    f.as_stream_filter().filter(|sf| !sf.is_empty())
+}
+
+/// Go `intersectStreamIDs`.
+fn intersect_stream_ids(a: Vec<StreamID>, b: &[StreamID]) -> Vec<StreamID> {
+    let m: std::collections::HashSet<StreamID> = b.iter().copied().collect();
+    a.into_iter().filter(|sid| m.contains(sid)).collect()
+}
+
+/// Go `getStreamIDsForTenantIDs`.
+fn get_stream_ids_for_tenant_ids(
+    stream_ids: &[StreamID],
+    tenant_ids: &[TenantID],
+) -> Vec<StreamID> {
+    let m: std::collections::HashSet<TenantID> = tenant_ids.iter().copied().collect();
+    stream_ids
+        .iter()
+        .filter(|sid| m.contains(&sid.tenant_id))
+        .copied()
+        .collect()
+}
+
 /// Go `partition.getSearchOptions`.
 ///
-/// PORT NOTE: Go pre-resolves stream filters here per partition
+/// When the query carries a common stream filter (Go
+/// `sso.streamFilter`), its matching streamIDs are resolved against this
+/// partition's indexdb up front, so block scheduling
+/// (`schedule_by_stream_ids`) skips non-matching blocks entirely.
+///
+/// PORT NOTE: Go additionally pre-binds the remaining stream filters here
 /// (`initStreamFilters` copies the filter tree binding `idb` + tenantIDs).
-/// The port resolves them lazily inside `FilterStream` instead (per-idb
-/// cache, see filter_stream.rs), so the shared filter passes through
-/// unchanged. Go's `getCommonStreamFilter` block-scheduling pre-filter
-/// (`sso.streamFilter` -> `pso.stream_ids`) remains unported — matching is
-/// done per block header in `FilterStream::apply_to_block_search`, which
-/// prunes before any column reads.
-fn partition_search_options<'f>(sso: &StorageSearchOptions<'f>) -> PartitionSearchOptions<'f> {
+/// The port resolves those lazily inside `FilterStream` instead (per-idb
+/// cache, see filter_stream.rs), reading the query tenantIDs from
+/// `stream_filter_tenant_ids`.
+fn partition_search_options<'f>(
+    sso: &StorageSearchOptions<'f>,
+    pt: &crate::partition::Partition,
+) -> PartitionSearchOptions<'f> {
+    let mut tenant_ids = sso.tenant_ids.clone();
+    let mut stream_ids: Vec<StreamID>;
+
+    if let Some(sf) = sso.stream_filter {
+        stream_ids = pt.idb.search_stream_ids(&tenant_ids, sf);
+        if !sso.stream_ids.is_empty() {
+            stream_ids = intersect_stream_ids(stream_ids, &sso.stream_ids);
+        }
+        // schedule_by_stream_ids assumes sorted streamIDs (Go relies on
+        // searchStreamIDs returning them sorted).
+        stream_ids.sort_by(stream_id_cmp);
+        tenant_ids = Vec::new();
+    } else if !sso.stream_ids.is_empty() {
+        stream_ids = get_stream_ids_for_tenant_ids(&sso.stream_ids, &tenant_ids);
+        tenant_ids = Vec::new();
+    } else {
+        stream_ids = Vec::new();
+    }
+
     PartitionSearchOptions {
-        tenant_ids: sso.tenant_ids.clone(),
-        stream_ids: sso.stream_ids.clone(),
+        tenant_ids,
+        stream_ids,
+        stream_filter_tenant_ids: sso.tenant_ids.clone(),
         min_timestamp: sso.min_timestamp,
         max_timestamp: sso.max_timestamp,
         filter: sso.filter,
@@ -656,25 +732,27 @@ where
 /// [`DataBlock`] to `write_block_fn` (Go `Storage.RunQuery` / `runQuery`).
 ///
 /// PORT NOTE: Go takes a `*QueryContext` (context/cancellation/tenantIDs/stats);
-/// the port passes `tenant_ids` explicitly plus an optional external `cancel`
-/// token standing in for `ctx.Done()` (per-query stats accumulation stays
-/// dropped). When `cancel` is set the block search aborts promptly and the
-/// query returns `Err(`[`QUERY_CANCELED_ERROR`]`)`, like Go returning
-/// `context.Canceled`. `cancel` is external-only: run_pipes' internal stop flag
-/// (flipped by pipes on benign early-stops such as `limit`, and on state-budget
-/// errors) stays per-run, mirroring Go's derived `context.WithCancelCause` —
-/// sharing one flag for both would poison sequential runs reusing the token
-/// (lastn/csv subqueries) and make benign `limit` stops indistinguishable from
-/// disconnects.
+/// the port passes `tenant_ids`, the optional external `cancel` token standing
+/// in for `ctx.Done()`, and the shared per-query `qs` (Go `qctx.QueryStats`)
+/// explicitly. `qs` is `Arc`-shared because subquery closures (`union`) must
+/// hold it beyond a borrow. When `cancel` is set the block search aborts
+/// promptly and the query returns `Err(`[`QUERY_CANCELED_ERROR`]`)`, like Go
+/// returning `context.Canceled`. `cancel` is external-only: run_pipes' internal
+/// stop flag (flipped by pipes on benign early-stops such as `limit`, and on
+/// state-budget errors) stays per-run, mirroring Go's derived
+/// `context.WithCancelCause` — sharing one flag for both would poison
+/// sequential runs reusing the token (lastn/csv subqueries) and make benign
+/// `limit` stops indistinguishable from disconnects.
 pub(crate) fn run_query(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
     write_block_fn: WriteDataBlockFn,
     cancel: Option<&Arc<AtomicBool>>,
+    qs: &Arc<QueryStats>,
 ) -> Result<(), String> {
     let sink: Arc<dyn PipeProcessor> = Arc::new(BlockResultWriter { f: write_block_fn });
-    run_query_with_sink(storage, tenant_ids, q, sink, cancel)
+    run_query_with_sink(storage, tenant_ids, q, sink, cancel, qs)
 }
 
 /// Go `Storage.runQuery`, with the terminal `writeBlock` generalized to a
@@ -687,6 +765,7 @@ fn run_query_with_sink(
     q: &Query,
     sink: Arc<dyn PipeProcessor>,
     cancel: Option<&Arc<AtomicBool>>,
+    qs: &Arc<QueryStats>,
 ) -> Result<(), String> {
     if let Some(c) = cancel
         && c.load(Ordering::SeqCst)
@@ -694,11 +773,10 @@ fn run_query_with_sink(
         return Err(QUERY_CANCELED_ERROR.to_string());
     }
 
-    let q_new = init_subqueries(storage, tenant_ids, q, cancel)?;
+    let q_new = init_subqueries(storage, tenant_ids, q, cancel, qs)?;
     let q = q_new.as_ref().unwrap_or(q);
 
     let sso = get_search_options(tenant_ids, q);
-    let qs = QueryStats::default();
 
     let concurrency = q.get_concurrency().max(1);
     let workers = q
@@ -721,7 +799,7 @@ fn run_query_with_sink(
                 storage,
                 workers,
                 &sso,
-                &qs,
+                qs,
                 stop,
                 cancel.map(|c| c.as_ref()),
                 &skip_block,
@@ -784,7 +862,7 @@ fn search_parallel(
     let mut part_refs: Vec<(*const Part<'static>, usize)> = Vec::new();
     for ptw in &ptws {
         let pso_idx = psos.len();
-        psos.push(partition_search_options(sso));
+        psos.push(partition_search_options(sso, &ptw.pt));
         let pws = ptw
             .pt
             .ddb()
@@ -796,15 +874,13 @@ fn search_parallel(
     }
 
     // Schedule all block-search work (single-threaded; reads block headers).
-    // Declared here (not inside the scope) so it outlives the scoped workers.
-    let sched_qs = QueryStats::default();
     let mut works: Vec<BlockSearchWork> = Vec::new();
     for (ptr, pso_idx) in &part_refs {
         // SAFETY: `ptr` was produced by `PartWrapper::part_ptr` for a part
         // held referenced in `pws_hold` for the whole scope; its refCount is
         // > 0, so the part is not closed and its address is pinned.
         let p: &Part = unsafe { &**ptr };
-        schedule_part_search(&mut works, p, &psos[*pso_idx], &sched_qs);
+        schedule_part_search(&mut works, p, &psos[*pso_idx], qs);
     }
 
     if sso.desc_block_order {
@@ -919,6 +995,7 @@ impl Storage {
         q: &Query,
         filter: &str,
         cancel: Option<&Arc<AtomicBool>>,
+        qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
         let mut q_new = q.clone(q.get_timestamp());
 
@@ -937,7 +1014,7 @@ impl Storage {
         let p = crate::parser::parse_pipe::must_parse_pipe(&pipe_str, q.get_timestamp());
         q_new.pipes.push(p);
 
-        self.run_values_with_hits_query(tenant_ids, &q_new, cancel)
+        self.run_values_with_hits_query(tenant_ids, &q_new, cancel, qs)
     }
 
     /// Returns unique values with the number of hits for the given
@@ -947,6 +1024,7 @@ impl Storage {
     /// filter substring are returned.
     ///
     /// If `limit > 0`, then up to `limit` unique values are returned.
+    #[allow(clippy::too_many_arguments)] // mirrors Go's GetFieldValues + qctx surface
     pub fn get_field_values(
         self: &Arc<Storage>,
         tenant_ids: &[TenantID],
@@ -955,6 +1033,7 @@ impl Storage {
         filter: &str,
         limit: u64,
         cancel: Option<&Arc<AtomicBool>>,
+        qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
         let mut q_new = q.clone(q.get_timestamp());
 
@@ -972,7 +1051,7 @@ impl Storage {
         let p = crate::parser::parse_pipe::must_parse_pipe(&pipe_str, q.get_timestamp());
         q_new.pipes.push(p);
 
-        self.run_values_with_hits_query(tenant_ids, &q_new, cancel)
+        self.run_values_with_hits_query(tenant_ids, &q_new, cancel, qs)
     }
 
     /// Returns stream field names for the results of `q`
@@ -986,8 +1065,9 @@ impl Storage {
         q: &Query,
         filter: &str,
         cancel: Option<&Arc<AtomicBool>>,
+        qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        let streams = self.get_streams(tenant_ids, q, u64::MAX, cancel)?;
+        let streams = self.get_streams(tenant_ids, q, u64::MAX, cancel, qs)?;
 
         let mut m: HashMap<String, u64> = HashMap::new();
         for_each_stream_field(&streams, |f, hits| {
@@ -1007,6 +1087,7 @@ impl Storage {
     /// filter substring are returned.
     ///
     /// If `limit > 0`, then up to `limit` unique values are returned.
+    #[allow(clippy::too_many_arguments)] // mirrors Go's GetStreamFieldValues + qctx surface
     pub fn get_stream_field_values(
         self: &Arc<Storage>,
         tenant_ids: &[TenantID],
@@ -1015,8 +1096,9 @@ impl Storage {
         filter: &str,
         limit: u64,
         cancel: Option<&Arc<AtomicBool>>,
+        qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        let streams = self.get_streams(tenant_ids, q, u64::MAX, cancel)?;
+        let streams = self.get_streams(tenant_ids, q, u64::MAX, cancel, qs)?;
 
         let mut m: HashMap<String, u64> = HashMap::new();
         for_each_stream_field(&streams, |f, hits| {
@@ -1071,8 +1153,9 @@ impl Storage {
         q: &Query,
         limit: u64,
         cancel: Option<&Arc<AtomicBool>>,
+        qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        self.get_field_values(tenant_ids, q, "_stream", "", limit, cancel)
+        self.get_field_values(tenant_ids, q, "_stream", "", limit, cancel, qs)
     }
 
     /// Returns `_stream_id` field values from the results of `q`
@@ -1085,8 +1168,9 @@ impl Storage {
         q: &Query,
         limit: u64,
         cancel: Option<&Arc<AtomicBool>>,
+        qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        self.get_field_values(tenant_ids, q, "_stream_id", "", limit, cancel)
+        self.get_field_values(tenant_ids, q, "_stream_id", "", limit, cancel, qs)
     }
 
     /// Go `Storage.runValuesWithHitsQuery`: runs `q` (which must end with a
@@ -1096,6 +1180,7 @@ impl Storage {
         tenant_ids: &[TenantID],
         q: &Query,
         cancel: Option<&Arc<AtomicBool>>,
+        qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
         let results: Arc<std::sync::Mutex<Vec<ValueWithHits>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1127,7 +1212,7 @@ impl Storage {
             results_w.lock().unwrap().extend(values_with_hits);
         });
 
-        crate::storage_search::run_query(self, tenant_ids, q, write_block, cancel)?;
+        crate::storage_search::run_query(self, tenant_ids, q, write_block, cancel, qs)?;
 
         let mut results = std::mem::take(&mut *results.lock().unwrap());
         crate::pipe_field_values_local::sort_values_with_hits(&mut results);
@@ -1278,6 +1363,7 @@ fn get_field_values_generic(
     q: &Query,
     field_name: &str,
     cancel: Option<&Arc<AtomicBool>>,
+    qs: &Arc<QueryStats>,
 ) -> Result<Vec<String>, String> {
     let q_holder;
     let q = if is_last_pipe_uniq(q.pipes()) {
@@ -1308,7 +1394,7 @@ fn get_field_values_generic(
         }
     });
 
-    run_query(storage, tenant_ids, q, write_block, cancel)?;
+    run_query(storage, tenant_ids, q, write_block, cancel, qs)?;
 
     let values = std::mem::take(&mut *values.lock().unwrap());
     Ok(values)
@@ -1329,6 +1415,7 @@ fn get_rows(
     tenant_ids: &[TenantID],
     q: &Query,
     cancel: Option<&Arc<AtomicBool>>,
+    qs: &Arc<QueryStats>,
 ) -> Result<Vec<Vec<Field>>, String> {
     let max_state_size = (esl_common::memory::allowed() as f64 * 0.2) as i64;
     let state_size_budget = Arc::new(std::sync::atomic::AtomicI64::new(max_state_size));
@@ -1371,7 +1458,7 @@ fn get_rows(
         rows_w.lock().unwrap().extend(block_rows);
     });
 
-    run_query(storage, tenant_ids, q, write_block, cancel)?;
+    run_query(storage, tenant_ids, q, write_block, cancel, qs)?;
 
     if state_size_budget.load(Ordering::SeqCst) < 0 {
         return Err(format!(
@@ -1391,14 +1478,16 @@ fn get_rows(
 /// PORT NOTE: Go rewrites shared filter/pipe trees via `cloneShallow` +
 /// `copyFilter`; Rust filters/pipes are single-owner trait objects, so a query
 /// with subqueries is cloned via re-parsing ([`Query::clone`]) and rewritten
-/// in place. Go's `eagerExecute` mode (cluster-only, `NewNetQueryRunner`) and
-/// `initStreamContextPipes` (`stream_context` runQuery wiring — see
-/// pipe_stream_context.rs) stay deferred.
+/// in place. Go's `eagerExecute` mode (cluster-only, `NewNetQueryRunner`) is
+/// ported in `net_query_runner::init_subqueries_net`; `initStreamContextPipes`
+/// (`stream_context` runQuery wiring — see pipe_stream_context.rs) stays
+/// deferred.
 fn init_subqueries(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
     cancel: Option<&Arc<AtomicBool>>,
+    qs: &Arc<QueryStats>,
 ) -> Result<Option<Query>, String> {
     let has_in = q.has_filter_in_with_query();
     let has_join = q.pipes().iter().any(|p| p.is_join_pipe());
@@ -1414,18 +1503,18 @@ fn init_subqueries(
         // Go `getValuesForQuery` caches subquery results in an `inValuesCache`
         // keyed by the subquery string; the cache is folded into the closure.
         let mut cache: HashMap<String, Vec<String>> = HashMap::new();
-        let mut get_field_values = |q_text: &str,
-                                    field_name: &str|
-         -> Result<Vec<String>, String> {
-            if let Some(values) = cache.get(q_text) {
-                return Ok(values.clone());
-            }
-            let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
-                .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
-            let values = get_field_values_generic(storage, tenant_ids, &q_sub, field_name, cancel)?;
-            cache.insert(q_text.to_string(), values.clone());
-            Ok(values)
-        };
+        let mut get_field_values =
+            |q_text: &str, field_name: &str| -> Result<Vec<String>, String> {
+                if let Some(values) = cache.get(q_text) {
+                    return Ok(values.clone());
+                }
+                let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
+                    .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
+                let values =
+                    get_field_values_generic(storage, tenant_ids, &q_sub, field_name, cancel, qs)?;
+                cache.insert(q_text.to_string(), values.clone());
+                Ok(values)
+            };
         init_filter_in_values_for_query(&mut q_new, &mut get_field_values, timestamp)
             .map_err(|e| format!("cannot initialize `in` subqueries: {e}"))?;
     }
@@ -1436,7 +1525,7 @@ fn init_subqueries(
         let mut get_join_rows = |q_text: &str| -> Result<Vec<Vec<Field>>, String> {
             let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
                 .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
-            get_rows(storage, tenant_ids, &q_sub, cancel)
+            get_rows(storage, tenant_ids, &q_sub, cancel, qs)
         };
         for p in &mut q_new.pipes {
             p.init_join_map(&mut get_join_rows)
@@ -1452,11 +1541,19 @@ fn init_subqueries(
         let storage_u = Arc::clone(storage);
         let tenant_ids_u: Vec<TenantID> = tenant_ids.to_vec();
         let cancel_u: Option<Arc<AtomicBool>> = cancel.cloned();
+        let qs_u = Arc::clone(qs);
         let run_union_query: crate::pipe::RunUnionQueryFn =
             Arc::new(move |q_text, sink| -> Result<(), String> {
                 let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
                     .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
-                run_query_with_sink(&storage_u, &tenant_ids_u, &q_sub, sink, cancel_u.as_ref())
+                run_query_with_sink(
+                    &storage_u,
+                    &tenant_ids_u,
+                    &q_sub,
+                    sink,
+                    cancel_u.as_ref(),
+                    &qs_u,
+                )
             });
         for p in &mut q_new.pipes {
             p.init_union_query(&run_union_query)
@@ -1689,7 +1786,19 @@ mod tests {
     fn run_query_temp_path(name: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("esl-logstorage-runquery-{name}-{n}"))
+        // pid + nanos keep the path unique across processes, so a test run
+        // killed before its cleanup cannot leak its storage into a later run
+        // of the same test (must_open_storage reopens existing data).
+        std::env::temp_dir().join(format!(
+            "esl-logstorage-runquery-{name}-{}-{}-{n}",
+            std::process::id(),
+            now_nanos()
+        ))
+    }
+
+    /// A fresh `Arc<QueryStats>` for surfaces that require one.
+    fn test_qs() -> Arc<QueryStats> {
+        Arc::new(QueryStats::default())
     }
 
     /// Sums the rows across every DataBlock streamed to `run_query`.
@@ -1773,6 +1882,107 @@ mod tests {
             assert_eq!(rows[0].0, "rows", "stats result column name");
             assert_eq!(rows[0].1, "5", "stats count() value");
         }
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
+    }
+
+    // -- getCommonStreamFilter scheduling pre-filter test ---------------------
+
+    /// A top-level `{...}` filter must prune non-matching blocks at
+    /// scheduling time (Go `getCommonStreamFilter` + partition
+    /// `getSearchOptions` resolving `pso.streamIDs` before `part.search`),
+    /// not merely per-block inside `FilterStream::apply_to_block_search`:
+    /// `blocks_processed` counts every *scheduled* block, so it must drop to
+    /// the matching stream's share while the results stay identical to the
+    /// equivalent per-row field filter.
+    #[test]
+    fn test_common_stream_filter_prunes_block_scheduling() {
+        let path = run_query_temp_path("stream-prune");
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+        // 11 tenants x 3 streams x 5 blocks x 7 rows = 1155 rows.
+        let all_tenant_ids = fill_run_query_fixture(&s);
+        // Settle the part set: a background small-part merge between two
+        // measurements below would legitimately change the per-query block
+        // counts and break the blocks_field == blocks_all comparison.
+        s.must_force_merge("");
+
+        // Runs `query` and returns its sorted result rows plus the number of
+        // blocks that were scheduled and processed.
+        let run = |query: &str| -> (Vec<TestRow>, u64) {
+            let q = ParseQuery(query).unwrap_or_else(|e| panic!("cannot parse [{query}]: {e}"));
+            let qs = test_qs();
+            let rows: Arc<Mutex<Vec<TestRow>>> = Arc::new(Mutex::new(Vec::new()));
+            let rows_w = Arc::clone(&rows);
+            let write: WriteDataBlockFn = Arc::new(move |_wid, db: &mut DataBlock| {
+                let rows_count = db.rows_count();
+                let cs = db.get_columns(false);
+                let mut dst = rows_w.lock().unwrap();
+                for i in 0..rows_count {
+                    let mut row: TestRow = cs
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.name.clone(),
+                                String::from_utf8_lossy(&c.values[i]).into_owned(),
+                            )
+                        })
+                        .collect();
+                    row.sort();
+                    dst.push(row);
+                }
+            });
+            s.run_query_with_stats(&all_tenant_ids, &q, write, None, &qs)
+                .unwrap_or_else(|e| panic!("cannot run [{query}]: {e}"));
+            let mut rows = std::mem::take(&mut *rows.lock().unwrap());
+            rows.sort();
+            (rows, qs.blocks_processed.load(Ordering::SeqCst))
+        };
+
+        // Baseline: `*` schedules every block.
+        let (rows_all, blocks_all) = run("*");
+        assert_eq!(rows_all.len(), 1155, "`*` must match all rows");
+
+        // `{instance="host-1:234"}` selects 1 of the 3 streams per tenant.
+        let (rows_stream, blocks_stream) = run(r#"{instance="host-1:234"}"#);
+        assert_eq!(
+            rows_stream.len(),
+            385,
+            "the stream filter must match one stream per tenant"
+        );
+
+        // Results must be identical to the equivalent per-row field filter
+        // (which cannot use the scheduling pre-filter).
+        let (rows_field, blocks_field) = run("instance:='host-1:234'");
+        assert_eq!(
+            rows_stream, rows_field,
+            "stream-filter results must match the per-row filter results"
+        );
+
+        // The per-row filter still schedules every block...
+        assert_eq!(
+            blocks_field, blocks_all,
+            "a per-row field filter must not prune scheduling"
+        );
+        // ...while the stream filter prunes non-matching blocks at scheduling
+        // time: only the matching stream's third of the blocks is processed.
+        assert!(
+            blocks_stream <= blocks_all / 3,
+            "stream-filter scheduling must prune non-matching blocks: \
+             processed {blocks_stream} of {blocks_all} blocks"
+        );
+        assert!(blocks_stream > 0, "the matching stream must be scheduled");
+
+        // An ANDed stream filter takes the same scheduling shortcut
+        // (Go getCommonStreamFilter's `*filterAnd` arm).
+        let (rows_and, blocks_and) = run(r#"{instance="host-1:234"} "message 3""#);
+        assert_eq!(rows_and.len(), 55, "one row per block of the stream");
+        assert!(
+            blocks_and <= blocks_all / 3,
+            "an ANDed stream filter must prune scheduling too: \
+             processed {blocks_and} of {blocks_all} blocks"
+        );
 
         s.must_close();
         esl_common::fs::must_remove_dir(&path);
@@ -1945,7 +2155,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_names(&all_tenant_ids, &q, "", None)
+                .get_field_names(&all_tenant_ids, &q, "", None, &test_qs())
                 .expect("get_field_names");
             let results_expected = vec![
                 vh("_msg", 1155),
@@ -1965,7 +2175,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_names(&all_tenant_ids, &q, "o", None)
+                .get_field_names(&all_tenant_ids, &q, "o", None, &test_qs())
                 .expect("get_field_names");
             let results_expected = vec![vh("job", 1155), vh("source-file", 1155)];
             assert_eq!(results, results_expected, "field_names-with-filter");
@@ -1977,7 +2187,7 @@ mod tests {
         {
             let q = parse(r#"_stream:{instance=~"host-1:.+"}"#);
             let results = s
-                .get_field_names(&all_tenant_ids, &q, "", None)
+                .get_field_names(&all_tenant_ids, &q, "", None, &test_qs())
                 .expect("get_field_names");
             let results_expected = vec![
                 vh("_msg", 385),
@@ -1997,7 +2207,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "", 0, None)
+                .get_field_values(&all_tenant_ids, &q, "_stream", "", 0, None, &test_qs())
                 .expect("get_field_values");
             let results_expected = vec![
                 vh(r#"{instance="host-0:234",job="foobar"}"#, 385),
@@ -2011,7 +2221,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "1:23", 0, None)
+                .get_field_values(&all_tenant_ids, &q, "_stream", "1:23", 0, None, &test_qs())
                 .expect("get_field_values");
             let results_expected = vec![vh(r#"{instance="host-1:234",job="foobar"}"#, 385)];
             assert_eq!(results, results_expected, "field_values-with-filter");
@@ -2021,7 +2231,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "", 3, None)
+                .get_field_values(&all_tenant_ids, &q, "_stream", "", 3, None, &test_qs())
                 .expect("get_field_values");
             let results_expected = vec![
                 vh(r#"{instance="host-0:234",job="foobar"}"#, 385),
@@ -2035,7 +2245,7 @@ mod tests {
         {
             let q = parse("instance:='host-1:234'");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "", 4, None)
+                .get_field_values(&all_tenant_ids, &q, "_stream", "", 4, None, &test_qs())
                 .expect("get_field_values");
             let results_expected = vec![vh(r#"{instance="host-1:234",job="foobar"}"#, 385)];
             assert_eq!(results, results_expected, "field_values-limit-not-reached");
@@ -2045,7 +2255,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_stream_field_names(&all_tenant_ids, &q, "", None)
+                .get_stream_field_names(&all_tenant_ids, &q, "", None, &test_qs())
                 .expect("get_stream_field_names");
             let results_expected = vec![vh("instance", 1155), vh("job", 1155)];
             assert_eq!(results, results_expected, "stream_field_names");
@@ -2055,7 +2265,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_stream_field_names(&all_tenant_ids, &q, "ob", None)
+                .get_stream_field_names(&all_tenant_ids, &q, "ob", None, &test_qs())
                 .expect("get_stream_field_names");
             let results_expected = vec![vh("job", 1155)];
             assert_eq!(results, results_expected, "stream_field_names-with-filter");
@@ -2065,7 +2275,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_stream_field_values(&all_tenant_ids, &q, "instance", "", 0, None)
+                .get_stream_field_values(&all_tenant_ids, &q, "instance", "", 0, None, &test_qs())
                 .expect("get_stream_field_values");
             let results_expected = vec![
                 vh("host-0:234", 385),
@@ -2079,7 +2289,15 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_stream_field_values(&all_tenant_ids, &q, "instance", "t-2", 0, None)
+                .get_stream_field_values(
+                    &all_tenant_ids,
+                    &q,
+                    "instance",
+                    "t-2",
+                    0,
+                    None,
+                    &test_qs(),
+                )
                 .expect("get_stream_field_values");
             let results_expected = vec![vh("host-2:234", 385)];
             assert_eq!(results, results_expected, "stream_field_values-with-filter");
@@ -2089,7 +2307,7 @@ mod tests {
         {
             let q = parse("*");
             let values = s
-                .get_stream_field_values(&all_tenant_ids, &q, "instance", "", 3, None)
+                .get_stream_field_values(&all_tenant_ids, &q, "instance", "", 3, None, &test_qs())
                 .expect("get_stream_field_values");
             let results_expected = vec![
                 vh("host-0:234", 385),
@@ -2103,7 +2321,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_streams(&all_tenant_ids, &q, 0, None)
+                .get_streams(&all_tenant_ids, &q, 0, None, &test_qs())
                 .expect("get_streams");
             let results_expected = vec![
                 vh(r#"{instance="host-0:234",job="foobar"}"#, 385),
@@ -2117,7 +2335,7 @@ mod tests {
         {
             let q = parse("*");
             let mut results = s
-                .get_stream_ids(&all_tenant_ids, &q, 0, None)
+                .get_stream_ids(&all_tenant_ids, &q, 0, None, &test_qs())
                 .expect("get_stream_ids");
 
             // Verify the first 5 results with the smallest _stream_id value.

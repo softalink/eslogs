@@ -199,6 +199,32 @@ pub(crate) fn new_pipe_facets(
 }
 
 impl Pipe for PipeFacets {
+    /// Port of Go `pipeFacets.splitToRemoteAndLocal`: every node returns all
+    /// its facet hits (no limit); the local side sums, filters and re-limits
+    /// them.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        let p_remote = PipeFacets {
+            limit: u64::MAX,
+            max_values_per_field: self.max_values_per_field,
+            max_value_len: self.max_value_len,
+            keep_const_fields: self.keep_const_fields,
+        };
+
+        let ps_local_str = format!(
+            "stats by (field_name, field_value) sum(hits) as hits
+	        | total_stats by (field_name) count() as field_values_count
+		| filter field_values_count:<={}
+		| delete field_values_count
+		| sort by (hits desc) limit {} partition by (field_name)
+		| sort by (field_name, hits desc, field_value)
+		| fields field_name, field_value, hits",
+            self.max_values_per_field, self.limit
+        );
+        let ps_local = crate::pipe::must_parse_pipes(&ps_local_str, timestamp);
+
+        (Some(Box::new(p_remote)), ps_local)
+    }
+
     fn to_string(&self) -> String {
         let mut s = "facets".to_string();
         if self.limit != PIPE_FACETS_DEFAULT_LIMIT {

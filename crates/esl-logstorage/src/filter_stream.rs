@@ -66,7 +66,7 @@ impl FilterStream {
             return Arc::clone(ids);
         }
         let ids: Arc<HashSet<StreamID>> = Arc::new(
-            idb.search_stream_ids(&bs.search_options().tenant_ids, &self.f)
+            idb.search_stream_ids(&bs.search_options().stream_filter_tenant_ids, &self.f)
                 .into_iter()
                 .collect(),
         );
@@ -149,5 +149,13 @@ impl Filter for FilterStream {
         if !stream_ids.contains(&sid) {
             bm.reset_bits();
         }
+    }
+
+    fn as_stream_filter(&self) -> Option<&StreamFilter> {
+        Some(&self.f)
+    }
+
+    fn take_stream_filter(&mut self) -> Option<StreamFilter> {
+        Some(std::mem::take(&mut self.f))
     }
 }

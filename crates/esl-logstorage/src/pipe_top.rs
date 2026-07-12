@@ -178,6 +178,33 @@ pub(crate) fn new_pipe_top(
 }
 
 impl Pipe for PipeTop {
+    /// Port of Go `pipeTop.splitToRemoteAndLocal`: every node counts hits per
+    /// group; the local side sums them and selects the top groups.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        let hits_quoted = crate::stream_filter::quote_token_if_needed(&self.hits_field_name);
+        let fields_quoted = crate::stats_count::field_names_string(&self.by_fields);
+
+        let mut p_local_str = format!(
+            "stats by ({fields_quoted}) sum({hits_quoted}) as {hits_quoted} | first {} by ({hits_quoted} desc, {fields_quoted})",
+            self.limit
+        );
+        if !self.rank_field_name.is_empty() {
+            p_local_str += &rank_field_name_string(&self.rank_field_name);
+        }
+        p_local_str += &format!(" | fields {fields_quoted}, {hits_quoted}");
+        if !self.rank_field_name.is_empty() {
+            p_local_str += ", ";
+            p_local_str += &crate::stream_filter::quote_token_if_needed(&self.rank_field_name);
+        }
+
+        let ps_local = crate::pipe::must_parse_pipes(&p_local_str, timestamp);
+
+        let p_remote_str = format!("stats by ({fields_quoted}) count() as {hits_quoted}");
+        let p_remote = crate::pipe::must_parse_pipe(&p_remote_str, timestamp);
+
+        (Some(p_remote), ps_local)
+    }
+
     fn to_string(&self) -> String {
         let mut s = "top".to_string();
         if self.limit != PIPE_TOP_DEFAULT_LIMIT {

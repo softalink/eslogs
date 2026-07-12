@@ -45,6 +45,12 @@ fn get_float64_compatible_hash(v: &[u8]) -> f64 {
 }
 
 impl Pipe for PipeHash {
+    /// Port of Go `pipeHash.splitToRemoteAndLocal`: the pipe runs fully
+    /// remote, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new())
+    }
+
     fn to_string(&self) -> String {
         let mut s = format!("hash({})", quote_token_if_needed(&self.field_name));
         if !is_msg_field_name(&self.result_field) {

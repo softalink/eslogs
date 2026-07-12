@@ -49,6 +49,12 @@ pub(crate) fn new_pipe_json_array_len(
 }
 
 impl Pipe for PipeJSONArrayLen {
+    /// Port of Go `pipeJSONArrayLen.splitToRemoteAndLocal`: the pipe runs fully
+    /// remote, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new())
+    }
+
     fn to_string(&self) -> String {
         let mut s = format!(
             "json_array_len({})",

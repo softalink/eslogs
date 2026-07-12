@@ -1362,10 +1362,11 @@ impl Storage {
     /// Runs the parsed query `q` for the given `tenant_ids` and streams each
     /// result [`DataBlock`] to `write_block_fn` (Go `Storage.RunQuery`).
     ///
-    /// PORT NOTE: Go takes a `*QueryContext` carrying the tenantIDs, context and
-    /// query stats; the port passes `tenant_ids` explicitly and drops the stats
-    /// accumulation. Context cancellation is available via
-    /// [`Storage::run_query_with_cancel`]. The search spine lives in
+    /// PORT NOTE: Go takes a `*QueryContext` carrying the tenantIDs, context
+    /// and query stats; the port passes `tenant_ids` explicitly. Context
+    /// cancellation and per-query stats accumulation (Go `qctx.QueryStats`)
+    /// are available via [`Storage::run_query_with_stats`]; this convenience
+    /// wrapper discards the stats. The search spine lives in
     /// `storage_search.rs` (`run_query` / `search_parallel`).
     pub fn run_query(
         self: &Arc<Storage>,
@@ -1373,7 +1374,8 @@ impl Storage {
         q: &crate::parser::Query,
         write_block_fn: crate::storage_search::WriteDataBlockFn,
     ) -> Result<(), String> {
-        crate::storage_search::run_query(self, tenant_ids, q, write_block_fn, None)
+        let qs = Arc::new(crate::query_stats::QueryStats::default());
+        crate::storage_search::run_query(self, tenant_ids, q, write_block_fn, None, &qs)
     }
 
     /// Like [`Storage::run_query`], but aborts early when `cancel` is set,
@@ -1393,7 +1395,24 @@ impl Storage {
         write_block_fn: crate::storage_search::WriteDataBlockFn,
         cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), String> {
-        crate::storage_search::run_query(self, tenant_ids, q, write_block_fn, cancel)
+        let qs = Arc::new(crate::query_stats::QueryStats::default());
+        crate::storage_search::run_query(self, tenant_ids, q, write_block_fn, cancel, &qs)
+    }
+
+    /// Like [`Storage::run_query_with_cancel`], but additionally accumulates
+    /// the query execution stats into `qs` — the port of Go's
+    /// `qctx.QueryStats` threading. The same `qs` may accumulate several
+    /// sequential queries serving one request (Go shares one
+    /// `commonArgs.qs`/`commonParams.qs` across them).
+    pub fn run_query_with_stats(
+        self: &Arc<Storage>,
+        tenant_ids: &[TenantID],
+        q: &crate::parser::Query,
+        write_block_fn: crate::storage_search::WriteDataBlockFn,
+        cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+        qs: &Arc<crate::query_stats::QueryStats>,
+    ) -> Result<(), String> {
+        crate::storage_search::run_query(self, tenant_ids, q, write_block_fn, cancel, qs)
     }
 }
 

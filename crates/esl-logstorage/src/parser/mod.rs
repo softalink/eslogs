@@ -14,21 +14,18 @@
 //! * [`parse_stats`] — `stats` / `running_stats` grammar (all `parseStatsX`).
 //! * [`query`] — [`Query`], `queryOptions`, `Filter`, and `ParseQuery*`.
 //!
-//! # PORT NOTES — deferred, pending downcast infrastructure
-//! Go's `parser.go` post-parse `optimize()` (`flattenFiltersAnd/Or`,
-//! `removeStarFilters`, `mergeFiltersStream`, the `optimize*Pipes` passes, and
-//! `mergeFiltersAnd` of a leading `filter` pipe into `q.f`) plus the
-//! concrete-filter-type switches (`getFilterTimeRange`, `getStreamIDs`,
-//! `getFinalFilter`, `updateFilterWithTimeOffset`, `addTimeFilter`,
-//! `initStatsRateFuncSteps`, `GetStatsLabels*`, `GetLastNResultsQuery`, ...) all
-//! require `copyFilter` + a downcast hook (`as_any`) on the `Filter`/`Pipe`
-//! traits. `filter.rs`'s own PORT NOTE defers `copyFilter` "together with the
-//! first consumer (parser.rs)", but wiring a downcast into every one of the
-//! ~34 filter and ~56 pipe impls is out of scope for this port (those files are
-//! frozen). Those query methods are therefore stubbed with PORT NOTEs and the
-//! affected `parser_test.go` cases (nested-and/or flattening, `*`-removal,
-//! offset/limit/filter pipe merging, `_time` range extraction) are marked. The
-//! full lexer + parse grammar — the LogsQL parity spec — is ported in full.
+//! # PORT NOTES — optimize() status
+//! Go's `parser.go` post-parse `optimize()` is ported for the filter passes
+//! (`flattenFiltersAnd/Or`, `removeStarFilters`, `mergeFiltersStream`) and
+//! the `optimizeOffsetLimitPipes` pipe pass, expressed through purpose-built
+//! `Filter`/`Pipe` trait hooks instead of Go's `copyFilter` + type switches
+//! (see `query::optimize_no_subqueries`), as are `optimizeFilterPipes` and
+//! the leading-`filter`-pipe merge (via the rendered-pipe-string route). The
+//! rewrites needing further `Pipe`-trait hooks (`optimizeUniqLimitPipes`,
+//! marking a leading `pipeFieldNames` as first pipe) and
+//! `updateFilterWithTimeOffset` remain deferred with PORT NOTEs at their
+//! stubs. The full lexer + parse grammar — the LogsQL parity spec — is
+//! ported in full.
 
 #[cfg(test)]
 mod tests;

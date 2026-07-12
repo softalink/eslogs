@@ -14,6 +14,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use esl_common::httpserver::{Request, ResponseWriter, get_quoted_remote_addr};
 use esl_common::timeutil::parse_time_at;
 use esl_logstorage::parser::{Filter, ParseFilter, Query};
+use esl_logstorage::query_stats::QueryStats;
 use esl_logstorage::storage::Storage;
 use esl_logstorage::storage_search::{
     BlockColumn, DataBlock, WriteDataBlockFn, is_query_canceled_error,
@@ -591,12 +592,9 @@ pub(crate) fn parse_extra_stream_filters(s: &str) -> Result<Option<Filter>, Stri
 
 /// Go `commonArgs`: the parsed args shared by all `/select/logsql/*` endpoints.
 ///
-/// PORT NOTE: Go also carries `allowPartialResponse` (cluster-only),
-/// `hiddenFieldsFilters` and the `qs logstorage.QueryStats` context used by
-/// `newQueryContext`/`updatePerQueryStatsMetrics`. The single-node Rust engine
-/// surface (`Storage::run_query(tenant_ids, q, write_fn)`) has no query-context
-/// or per-query stats plumbing, so those args are parsed for validation (their
-/// parse errors are user-visible in Go) and dropped.
+/// PORT NOTE: Go also carries `allowPartialResponse` (cluster-only) and
+/// `hiddenFieldsFilters`; those args are parsed for validation (their parse
+/// errors are user-visible in Go) and dropped.
 pub(crate) struct CommonArgs {
     /// The parsed query. It includes optional extra_filters,
     /// extra_stream_filters and (start, end) time range filter.
@@ -605,11 +603,23 @@ pub(crate) struct CommonArgs {
     /// The list of tenantIDs to query.
     pub(crate) tenant_ids: Vec<TenantID>,
 
+    /// Query execution stats accumulated across the queries served by the
+    /// request (Go `commonArgs.qs`, threaded via `newQueryContext`).
+    pub(crate) qs: Arc<QueryStats>,
+
     /// The start of the selected time range aligned to the given step.
     pub(crate) start_aligned: i64,
 
     /// The aligned end of the selected time range aligned to the given step.
     pub(crate) end_aligned: i64,
+}
+
+/// Go registers `defer ca.updatePerQueryStatsMetrics()` in every handler right
+/// after `parseCommonArgs` succeeds; the Drop impl is the Rust equivalent.
+impl Drop for CommonArgs {
+    fn drop(&mut self) {
+        esl_storage::query_stats::update_per_query_stats_metrics(&self.qs);
+    }
 }
 
 impl CommonArgs {
@@ -761,6 +771,7 @@ pub(crate) fn parse_common_args_with_config(
     Ok(CommonArgs {
         q,
         tenant_ids,
+        qs: Arc::new(QueryStats::default()),
         start_aligned,
         end_aligned,
     })
@@ -943,6 +954,7 @@ pub(crate) fn process_query_request(storage: &Arc<Storage>, req: &Request, w: &m
                     &ca.q,
                     "",
                     cancel.as_deref(),
+                    &ca.qs,
                 ) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1024,7 +1036,7 @@ pub(crate) fn process_query_request(storage: &Arc<Storage>, req: &Request, w: &m
     // request ctx, and a canceled query writes no response (Go stops writing
     // to the closed conn); the buffered partial output is discarded.
     if let Err(e) =
-        storage.run_query_with_cancel(&ca.tenant_ids, &ca.q, write_fn, cancel.as_deref())
+        storage.run_query_with_stats(&ca.tenant_ids, &ca.q, write_fn, cancel.as_deref(), &ca.qs)
     {
         if is_query_canceled_error(&e) {
             // The client disconnected: there is nobody to respond to.
@@ -1195,14 +1207,9 @@ mod tests {
         // LogsQL filter
         f("foobar", "foobar");
         f("foo:bar", "foo:bar");
-        // PORT NOTE: Go expects `{foo="bar",baz="z"} (foo:bar or foo:baz)
-        // error _time:5m` here. The parsed filter tree is identical and
-        // FilterAnd now parenthesizes or-children like Go; the remaining
-        // divergence is the deferred mergeFiltersStream optimize pass (stream
-        // filter moved to front — parser/mod.rs PORT NOTE).
         f(
             r#"foo:(bar or baz) error _time:5m {"foo"=bar,baz="z"}"#,
-            r#"(foo:bar or foo:baz) error _time:5m {foo="bar",baz="z"}"#,
+            r#"{foo="bar",baz="z"} (foo:bar or foo:baz) error _time:5m"#,
         );
     }
 
@@ -1254,13 +1261,9 @@ mod tests {
         // LogsQL filter
         f("foobar", "foobar");
         f("foo:bar", "foo:bar");
-        // PORT NOTE: Go expects `{foo="bar",baz="z"} (foo:bar or foo:baz)
-        // error _time:5m` here; the or-grouping now matches Go, the deferred
-        // mergeFiltersStream pass (stream filter moved to front) is the
-        // remaining Display divergence.
         f(
             r#"foo:(bar or baz) error _time:5m {"foo"=bar,baz="z"}"#,
-            r#"(foo:bar or foo:baz) error _time:5m {foo="bar",baz="z"}"#,
+            r#"{foo="bar",baz="z"} (foo:bar or foo:baz) error _time:5m"#,
         );
     }
 

@@ -26,6 +26,15 @@ pub(crate) fn new_pipe_offset(offset: u64) -> PipeOffset {
 }
 
 impl Pipe for PipeOffset {
+    /// Port of Go `pipeOffset.splitToRemoteAndLocal`.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        if self.offset == 0 {
+            // Special case - `offset 0` is safe to push to the remote side.
+            return (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new());
+        }
+        (None, vec![crate::pipe::clone_pipe(self, timestamp)])
+    }
+
     fn offset_pipe_value(&self) -> Option<u64> {
         Some(self.offset)
     }

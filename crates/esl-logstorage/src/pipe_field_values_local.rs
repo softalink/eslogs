@@ -31,10 +31,9 @@ pub struct PipeFieldValuesLocal {
 
 /// Constructs a `field_values_local` pipe from already-parsed components.
 ///
-/// PORT NOTE: this pipe is produced only by Go's deferred `splitToRemoteAndLocal`;
-/// the constructor takes the parsed `field` and `limit` directly.
-// Ported for Go parity; not yet wired into a caller (see PARITY.md).
-#[allow(dead_code)]
+/// This pipe is produced only by `pipeFieldValues.splitToRemoteAndLocal`
+/// (the cluster split); the constructor takes the parsed `field` and `limit`
+/// directly.
 pub(crate) fn new_pipe_field_values_local(field: String, limit: u64) -> PipeFieldValuesLocal {
     PipeFieldValuesLocal { field, limit }
 }
@@ -47,6 +46,13 @@ impl PipeFieldValuesLocal {
 }
 
 impl Pipe for PipeFieldValuesLocal {
+    /// Port of Go `pipeFieldValuesLocal.splitToRemoteAndLocal`: this pipe is only
+    /// ever produced by a split, so splitting it again is a bug.
+    fn split_to_remote_and_local(&self, _timestamp: i64) -> crate::pipe::SplitPipesResult {
+        esl_common::panicf!("BUG: unexpected call for pipeFieldValuesLocal");
+        unreachable!()
+    }
+
     fn to_string(&self) -> String {
         let mut s = format!("field_values_local {}", quote_token_if_needed(&self.field));
         if self.limit > 0 {

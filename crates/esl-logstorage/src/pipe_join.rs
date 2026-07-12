@@ -150,6 +150,12 @@ pub(crate) fn marshal_rows(dst: &mut Vec<u8>, rows: &[Vec<Field>]) {
 }
 
 impl Pipe for PipeJoin {
+    /// Port of Go `pipeJoin.splitToRemoteAndLocal`: the pipe (and
+    /// everything after it) runs locally only.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (None, vec![crate::pipe::clone_pipe(self, timestamp)])
+    }
+
     fn to_string(&self) -> String {
         let mut dst: Vec<u8> = Vec::new();
         dst.extend_from_slice(b"join by (");

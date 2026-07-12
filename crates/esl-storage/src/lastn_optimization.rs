@@ -18,6 +18,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use esl_logstorage::parser::{Query, can_apply_last_n_results_optimization};
+use esl_logstorage::query_stats::QueryStats;
 use esl_logstorage::rows::Field;
 use esl_logstorage::storage::Storage;
 use esl_logstorage::storage_search::{BlockColumn, DataBlock, WriteDataBlockFn};
@@ -29,6 +30,7 @@ use esl_logstorage::tenant_id::TenantID;
 /// with the trailing `sort by (_time) desc offset <offset> limit <limit>` pipe
 /// removed) and streams the last `limit` rows (after `offset`) with the biggest
 /// `_time` values to `write_block`.
+#[allow(clippy::too_many_arguments)] // mirrors Go's runOptimizedLastNResultsQuery + qctx surface
 pub fn run_optimized_last_n_results_query(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
@@ -37,8 +39,9 @@ pub fn run_optimized_last_n_results_query(
     limit: u64,
     write_block: WriteDataBlockFn,
     cancel: Option<&Arc<AtomicBool>>,
+    qs: &Arc<QueryStats>,
 ) -> Result<(), String> {
-    let rows = get_last_n_query_results(storage, tenant_ids, q, offset + limit, cancel)?;
+    let rows = get_last_n_query_results(storage, tenant_ids, q, offset + limit, cancel, qs)?;
     if offset >= rows.len() as u64 {
         return Ok(());
     }
@@ -67,12 +70,13 @@ fn get_last_n_query_results(
     q_orig: &Query,
     limit: u64,
     cancel: Option<&Arc<AtomicBool>>,
+    qs: &Arc<QueryStats>,
 ) -> Result<Vec<LogRow>, String> {
     let timestamp = q_orig.get_timestamp();
 
     let mut q = q_orig.clone(timestamp);
     q.add_pipe_offset_limit(0, 2 * limit);
-    let rows = get_query_results(storage, tenant_ids, &q, cancel)?;
+    let rows = get_query_results(storage, tenant_ids, &q, cancel, qs)?;
 
     if (rows.len() as u64) < 2 * limit {
         // Fast path - the requested time range contains up to 2*limit rows.
@@ -92,7 +96,7 @@ fn get_last_n_query_results(
     loop {
         let mut q = q_orig.clone_with_time_filter(timestamp, start, end - 1);
         q.add_pipe_offset_limit(0, 2 * n);
-        let rows = get_query_results(storage, tenant_ids, &q, cancel)?;
+        let rows = get_query_results(storage, tenant_ids, &q, cancel, qs)?;
 
         if end / 2 - start / 2 <= 0 {
             // The [start ... end) time range doesn't exceed a nanosecond, e.g. it cannot be adjusted more.
@@ -108,7 +112,8 @@ fn get_last_n_query_results(
             // so search for the rows on the adjusted time range [start+(end/2-start/2) ... end).
             if !can_apply_last_n_results_optimization(start, end) {
                 // It is faster obtaining the last N logs as is on such a small time range instead of using binary search.
-                let rows = get_log_rows_last_n(storage, tenant_ids, q_orig, start, end, n, cancel)?;
+                let rows =
+                    get_log_rows_last_n(storage, tenant_ids, q_orig, start, end, n, cancel, qs)?;
                 rows_found.extend(rows);
                 let rows_found = get_last_n_rows(rows_found, limit);
                 return Ok(rows_found);
@@ -138,6 +143,7 @@ fn get_last_n_query_results(
 }
 
 /// Port of Go `getLogRowsLastN`.
+#[allow(clippy::too_many_arguments)] // mirrors Go's getLogRowsLastN + qctx surface
 fn get_log_rows_last_n(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
@@ -146,12 +152,13 @@ fn get_log_rows_last_n(
     end: i64,
     n: u64,
     cancel: Option<&Arc<AtomicBool>>,
+    qs: &Arc<QueryStats>,
 ) -> Result<Vec<LogRow>, String> {
     let timestamp = q_orig.get_timestamp();
     let mut q = q_orig.clone_with_time_filter(timestamp, start, end);
     q.add_pipe_sort_by_time_desc();
     q.add_pipe_offset_limit(0, n);
-    get_query_results(storage, tenant_ids, &q, cancel)
+    get_query_results(storage, tenant_ids, &q, cancel, qs)
 }
 
 /// Port of Go `getQueryResults`.
@@ -160,6 +167,7 @@ fn get_query_results(
     tenant_ids: &[TenantID],
     q: &Query,
     cancel: Option<&Arc<AtomicBool>>,
+    qs: &Arc<QueryStats>,
 ) -> Result<Vec<LogRow>, String> {
     let rows: Arc<Mutex<Vec<LogRow>>> = Arc::new(Mutex::new(Vec::new()));
     let err_local: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -178,7 +186,7 @@ fn get_query_results(
             },
         );
 
-    let result = crate::run_query_with_cancel(storage, tenant_ids, q, write_block, cancel);
+    let result = crate::run_query_with_stats(storage, tenant_ids, q, write_block, cancel, qs);
     if let Some(err) = err_local.lock().unwrap().take() {
         return Err(err);
     }

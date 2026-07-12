@@ -35,6 +35,12 @@ pub(crate) fn new_pipe_coalesce(
 }
 
 impl Pipe for PipeCoalesce {
+    /// Port of Go `pipeCoalesce.splitToRemoteAndLocal`: the pipe runs fully
+    /// remote, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new())
+    }
+
     fn to_string(&self) -> String {
         if self.src_field_filters.is_empty() {
             // Go logs a BUG panic here; keep the assertion text.

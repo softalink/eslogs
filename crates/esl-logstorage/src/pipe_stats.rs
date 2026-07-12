@@ -20,11 +20,11 @@
 //! `marshal_int64_string`, or the raw key bytes).
 //!
 //! # PORT NOTES — deliberate divergences from Go
-//! * `pipeStatsMode` (remote/local/proxy) and `splitToRemoteAndLocal` /
-//!   `import_state` paths are cluster-only and omitted (see `pipe.rs`).
-//!   `pipeStatsSwitch` (parsed via the unported lexer) is likewise omitted; the
+//! * `pipeStatsSwitch` (parsed via the unported lexer) is omitted; the
 //!   `pub(crate)` constructors let the parser build funcs directly once the
-//!   lexer lands.
+//!   lexer lands. `pipeStatsMode` (remote/local/proxy) and the
+//!   `splitToRemoteAndLocal` / `import_state` cluster paths ARE ported — see
+//!   [`PipeStatsMode`] and `net_query_runner.rs`.
 //! * `chunkedAllocator` and the fine-grained `stateSizeBudget` accounting are
 //!   dropped — each processor owns its state (`HashMap`, `Box<dyn ...>`), matching
 //!   the `stats.rs` allocator PORT NOTE. `memory::allowed()` still bounds nothing
@@ -80,10 +80,47 @@ pub(crate) fn new_pipe_stats_func(
     }
 }
 
+/// Execution mode of a `stats` pipe (Go `pipeStatsMode`).
+///
+/// The default mode computes final values. In a cluster split the remote side
+/// runs in `Remote` mode (exporting serialized per-group states instead of
+/// final values) and the local side runs in `Local` mode (importing those
+/// states and finalizing them). `Proxy` both imports and re-exports (a
+/// `stats_remote` pipe split again by an intermediate select frontend).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PipeStatsMode {
+    #[default]
+    Default,
+    Remote,
+    Local,
+    Proxy,
+}
+
+impl PipeStatsMode {
+    /// Go `pipeStatsMode.needExportState`.
+    fn need_export_state(self) -> bool {
+        matches!(self, PipeStatsMode::Remote | PipeStatsMode::Proxy)
+    }
+
+    /// Go `pipeStatsMode.needImportState`.
+    fn need_import_state(self) -> bool {
+        matches!(self, PipeStatsMode::Local | PipeStatsMode::Proxy)
+    }
+}
+
 /// The `| stats by (...) ...` pipe.
 pub struct PipeStats {
     by_fields: Arc<Vec<ByStatsField>>,
     funcs: Arc<Vec<PipeStatsFunc>>,
+    mode: PipeStatsMode,
+}
+
+impl PipeStats {
+    /// Sets the execution mode. Used by the parser for the `stats_remote`
+    /// keyword (Go `parsePipeStatsExt` sets `pipeStatsModeRemote`).
+    pub(crate) fn set_mode(&mut self, mode: PipeStatsMode) {
+        self.mode = mode;
+    }
 }
 
 /// Builds a [`ByStatsField`] with no bucket configuration (the common
@@ -150,12 +187,19 @@ pub(crate) fn new_pipe_stats(
     Ok(PipeStats {
         by_fields: Arc::new(by_fields),
         funcs: Arc::new(funcs),
+        mode: PipeStatsMode::Default,
     })
 }
 
 impl Pipe for PipeStats {
     fn to_string(&self) -> String {
-        let mut s = "stats".to_string();
+        let mut s = match self.mode {
+            PipeStatsMode::Default => "stats",
+            PipeStatsMode::Remote => "stats_remote",
+            PipeStatsMode::Local => "stats_local",
+            PipeStatsMode::Proxy => "stats_proxy",
+        }
+        .to_string();
         if !self.by_fields.is_empty() {
             let a: Vec<String> = self
                 .by_fields
@@ -166,23 +210,64 @@ impl Pipe for PipeStats {
             s += &a.join(", ");
             s += ")";
         }
-        let a: Vec<String> = self
-            .funcs
-            .iter()
-            .map(|f| {
-                // Go pipeStatsFunc.String(): funcStr [ " " iffStr ] " as " quoted(resultName).
-                let mut fs = f.f.to_string();
-                if let Some(iff) = &f.iff {
-                    fs += &format!(" if ({})", iff.to_string());
-                }
-                fs += " as ";
-                fs += &crate::stream_filter::quote_token_if_needed(&f.result_name);
-                fs
-            })
-            .collect();
+        let a: Vec<String> = if self.mode.need_import_state() {
+            // Go: import-state modes render `import_state(name) as name` per func.
+            self.funcs
+                .iter()
+                .map(|f| {
+                    let result_name_quoted =
+                        crate::stream_filter::quote_token_if_needed(&f.result_name);
+                    format!("import_state({result_name_quoted}) as {result_name_quoted}")
+                })
+                .collect()
+        } else {
+            self.funcs
+                .iter()
+                .map(|f| {
+                    // Go pipeStatsFunc.String(): funcStr [ " " iffStr ] " as " quoted(resultName).
+                    let mut fs = f.f.to_string();
+                    if let Some(iff) = &f.iff {
+                        fs += &format!(" if ({})", iff.to_string());
+                    }
+                    fs += " as ";
+                    fs += &crate::stream_filter::quote_token_if_needed(&f.result_name);
+                    fs
+                })
+                .collect()
+        };
         s += " ";
         s += &a.join(", ");
         s
+    }
+
+    /// Port of Go `pipeStats.splitToRemoteAndLocal`: the remote side exports
+    /// per-group states, the local side imports and finalizes them.
+    fn split_to_remote_and_local(&self, _timestamp: i64) -> crate::pipe::SplitPipesResult {
+        let ps_remote = PipeStats {
+            by_fields: self.by_fields.clone(),
+            funcs: self.funcs.clone(),
+            mode: PipeStatsMode::Remote,
+        };
+
+        let local_mode = match self.mode {
+            PipeStatsMode::Default => PipeStatsMode::Local,
+            PipeStatsMode::Remote => PipeStatsMode::Proxy,
+            PipeStatsMode::Local => {
+                esl_common::panicf!("BUG: stats_local cannot be split");
+                unreachable!()
+            }
+            PipeStatsMode::Proxy => {
+                esl_common::panicf!("BUG: stats_proxy cannot be split");
+                unreachable!()
+            }
+        };
+        let ps_local = PipeStats {
+            by_fields: self.by_fields.clone(),
+            funcs: self.funcs.clone(),
+            mode: local_mode,
+        };
+
+        (Some(Box::new(ps_remote)), vec![Box::new(ps_local)])
     }
 
     /// Port of Go `pipeStats.hasFilterInWithQuery`: checks the per-func
@@ -225,6 +310,19 @@ impl Pipe for PipeStats {
     }
 
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
+        if self.mode.need_import_state() {
+            // Go `pipeStats.updateNeededFieldsLocal`: the input carries the
+            // by-field values plus one serialized-state column per func.
+            pf.reset();
+            for bf in self.by_fields.iter() {
+                pf.add_allow_filter(&bf.name);
+            }
+            for f in self.funcs.iter() {
+                pf.add_allow_filter(&f.result_name);
+            }
+            return;
+        }
+
         let pf_orig = pf.clone();
         pf.reset();
 
@@ -310,9 +408,11 @@ impl Pipe for PipeStats {
         Arc::new(PipeStatsProcessor {
             by_fields: self.by_fields.clone(),
             funcs: self.funcs.clone(),
+            mode: self.mode,
             stop,
             pp_next,
             shards: (0..n).map(|_| Mutex::new(Shard::default())).collect(),
+            err: Mutex::new(None),
         })
     }
 }
@@ -372,6 +472,31 @@ impl PipeStatsGroup {
             sfp.merge_state(funcs[i].f.as_ref(), src.sfps[i].as_ref());
         }
     }
+
+    /// Port of Go `pipeStatsGroup.importStateFromRow`: imports one serialized
+    /// state per stats function from the given row.
+    fn import_state_from_row(
+        &mut self,
+        funcs: &[PipeStatsFunc],
+        column_values: &[Vec<Vec<u8>>],
+        row_idx: usize,
+        stop: Option<&AtomicBool>,
+    ) -> Result<(), String> {
+        if column_values.len() != self.sfps.len() {
+            return Err(format!(
+                "unexpected number of columns; got {}; want {}",
+                column_values.len(),
+                self.sfps.len()
+            ));
+        }
+
+        for (i, sfp) in self.sfps.iter_mut().enumerate() {
+            let v = &column_values[i][row_idx];
+            sfp.import_state(v, stop)
+                .map_err(|e| format!("cannot import state for {}: {e}", funcs[i].f.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -420,12 +545,96 @@ fn get_group_generic<'a>(
 struct PipeStatsProcessor {
     by_fields: Arc<Vec<ByStatsField>>,
     funcs: Arc<Vec<PipeStatsFunc>>,
+    mode: PipeStatsMode,
     stop: Arc<AtomicBool>,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<Shard>>,
+    /// First error hit while importing states (Go `pipeStatsProcessor.err`).
+    err: Mutex<Option<String>>,
 }
 
 impl PipeStatsProcessor {
+    /// Records the first error and stops the pipeline (Go
+    /// `pipeStatsProcessor.setError`; Go's `cancel()` is folded into the
+    /// shared stop token, see pipe.rs).
+    fn set_error(&self, err: String) {
+        let mut e = self.err.lock().unwrap();
+        if e.is_none() {
+            *e = Some(err);
+        }
+        drop(e);
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Port of Go `pipeStatsProcessorShard.writeBlockLocal`: consumes blocks
+    /// produced by an upstream `stats_remote` pipe — the leading columns carry
+    /// the `by (...)` values, followed by one serialized-state column per
+    /// stats function — and imports the states into the local groups.
+    fn write_block_local(&self, shard: &mut Shard, br: &mut BlockResult) -> Result<(), String> {
+        let funcs: &[PipeStatsFunc] = &self.funcs;
+        let by_len = self.by_fields.len();
+        let stop = Some(self.stop.as_ref());
+
+        let cols = br.get_columns();
+        let mut column_values: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cols.len());
+        for &c in &cols {
+            column_values.push(br.column_get_values(c).to_vec());
+        }
+        if column_values.len() < by_len + 1 {
+            return Err(format!(
+                "at least {} columns must exist; got {} columns only",
+                by_len + 1,
+                column_values.len()
+            ));
+        }
+        let state_values = column_values.split_off(by_len);
+        let by_field_values = column_values;
+
+        if by_len == 0 {
+            if br.rows_len() != 1 {
+                return Err(format!(
+                    "global stats must have only a single row; got {} rows",
+                    br.rows_len()
+                ));
+            }
+            let group = shard
+                .groups_str
+                .entry(Vec::new())
+                .or_insert_with(|| new_group(funcs));
+            return group.import_state_from_row(funcs, &state_values, 0, stop);
+        }
+
+        if by_len == 1 {
+            let rows_len = br.rows_len();
+            for (row_idx, v) in by_field_values[0].iter().enumerate().take(rows_len) {
+                let group = get_group_generic(shard, funcs, v);
+                group.import_state_from_row(funcs, &state_values, row_idx, stop)?;
+                if self.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+
+        let mut key_buf = std::mem::take(&mut shard.key_buf);
+        for row_idx in 0..br.rows_len() {
+            key_buf.clear();
+            for values in &by_field_values {
+                marshal_bytes(&mut key_buf, &values[row_idx]);
+            }
+            let group = match shard.groups_str.entry(key_buf.clone()) {
+                Entry::Occupied(o) => o.into_mut(),
+                Entry::Vacant(v) => v.insert(new_group(funcs)),
+            };
+            group.import_state_from_row(funcs, &state_values, row_idx, stop)?;
+            if self.stop.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        shard.key_buf = key_buf;
+        Ok(())
+    }
+
     fn apply_per_function_filters(&self, bms: &mut Vec<Bitmap>, br: &mut BlockResult) {
         let funcs = &self.funcs;
         if bms.len() < funcs.len() {
@@ -535,12 +744,23 @@ impl PipeProcessor for PipeStatsProcessor {
         }
         let idx = worker_id.min(self.shards.len() - 1);
         let mut shard = self.shards[idx].lock().unwrap();
+        if self.mode.need_import_state() {
+            if let Err(err) = self.write_block_local(&mut shard, br) {
+                self.set_error(err);
+            }
+            return;
+        }
         let mut bms = std::mem::take(&mut shard.bms);
         self.write_block_default(&mut shard, &mut bms, br);
         shard.bms = bms;
     }
 
     fn flush(&self) -> Result<(), String> {
+        // Go flush: return the error recorded via setError, if any.
+        if let Some(err) = self.err.lock().unwrap().take() {
+            return Err(err);
+        }
+
         let funcs = &self.funcs;
 
         // Merge all shard states into one set of maps.
@@ -662,9 +882,16 @@ impl PipeStatsProcessor {
         for (i, v) in by_values.iter().enumerate() {
             rcs[i].add_value(v);
         }
+        // Go `pipeStatsWriter.writePipeStatsGroup`: remote/proxy modes export
+        // the serialized state instead of the finalized value.
+        let need_export_state = self.mode.need_export_state();
         for (i, sfp) in group.sfps.iter().enumerate() {
             let mut dst = Vec::new();
-            sfp.finalize_stats(self.funcs[i].f.as_ref(), &mut dst, stop);
+            if need_export_state {
+                sfp.export_state(&mut dst, stop);
+            } else {
+                sfp.finalize_stats(self.funcs[i].f.as_ref(), &mut dst, stop);
+            }
             rcs[by_len + i].add_value(&dst);
         }
     }

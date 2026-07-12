@@ -106,6 +106,12 @@ impl PipeStreamContext {
 }
 
 impl Pipe for PipeStreamContext {
+    /// Port of Go `pipeStreamContext.splitToRemoteAndLocal`: the pipe (and
+    /// everything after it) runs locally only.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (None, vec![crate::pipe::clone_pipe(self, timestamp)])
+    }
+
     fn to_string(&self) -> String {
         let mut s = String::from("stream_context");
         if self.lines_before > 0 {

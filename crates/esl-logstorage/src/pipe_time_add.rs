@@ -44,6 +44,12 @@ pub(crate) fn new_pipe_time_add(field: String, offset: i64, offset_str: String) 
 }
 
 impl Pipe for PipeTimeAdd {
+    /// Port of Go `pipeTimeAdd.splitToRemoteAndLocal`: the pipe runs fully
+    /// remote, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new())
+    }
+
     fn to_string(&self) -> String {
         let mut s = format!("time_add {}", self.offset_str);
         if self.field != "_time" {

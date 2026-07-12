@@ -97,6 +97,12 @@ pub(crate) fn new_pipe_running_stats(
 }
 
 impl Pipe for PipeRunningStats {
+    /// Port of Go `pipeRunningStats.splitToRemoteAndLocal`: the pipe (and
+    /// everything after it) runs locally only.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (None, vec![crate::pipe::clone_pipe(self, timestamp)])
+    }
+
     fn stats_labels_tail_op(&self) -> Option<crate::pipe::StatsTailOp> {
         Some(crate::pipe::StatsTailOp::RunningStats {
             by_fields: self.by_fields.as_ref().clone(),

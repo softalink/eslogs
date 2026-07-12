@@ -38,6 +38,12 @@ pub(crate) fn new_pipe_rename(
 }
 
 impl Pipe for PipeRename {
+    /// Port of Go `pipeRename.splitToRemoteAndLocal`: the pipe runs fully
+    /// remote, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new())
+    }
+
     fn to_string(&self) -> String {
         if self.src_field_filters.is_empty() {
             panicf!("BUG: pipeRename must contain at least a single srcFieldFilter");

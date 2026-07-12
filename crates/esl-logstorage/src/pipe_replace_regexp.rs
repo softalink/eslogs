@@ -66,6 +66,12 @@ impl PipeReplaceRegexp {
 }
 
 impl Pipe for PipeReplaceRegexp {
+    /// Port of Go `pipeReplaceRegexp.splitToRemoteAndLocal`: the pipe runs fully
+    /// remote, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new())
+    }
+
     fn to_string(&self) -> String {
         let mut s = String::from("replace_regexp");
         s.push_str(&format!(

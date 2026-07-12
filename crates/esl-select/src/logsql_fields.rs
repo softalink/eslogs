@@ -61,7 +61,7 @@ pub fn process_field_names_request(storage: &Arc<Storage>, req: &Request, w: &mu
     let start_time = Instant::now();
     let cancel = w.watch_disconnect();
     let field_names =
-        match storage.get_field_names(&ca.tenant_ids, &ca.q, filter, cancel.as_deref()) {
+        match storage.get_field_names(&ca.tenant_ids, &ca.q, filter, cancel.as_deref(), &ca.qs) {
             Ok(v) => v,
             Err(e) => {
                 if is_query_canceled_error(&e) {
@@ -127,6 +127,7 @@ pub fn process_field_values_request(storage: &Arc<Storage>, req: &Request, w: &m
         filter,
         limit as u64,
         cancel.as_deref(),
+        &ca.qs,
     ) {
         Ok(v) => v,
         Err(e) => {

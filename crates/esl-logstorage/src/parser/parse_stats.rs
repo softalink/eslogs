@@ -7,8 +7,9 @@
 //!   `pipeStatsSwitch`/`pipeStatsCase`/`appendToFuncs` types, and expanding
 //!   cases needs cloning a `Box<dyn StatsFunc>` (not available). `switch`
 //!   returns an error.
-//! * `stats_remote` is parsed as plain `stats` — `PipeStats` has no
-//!   `pipeStatsMode` field.
+//! * `stats_remote` selects `PipeStatsMode::Remote` on the parsed `PipeStats`
+//!   (Go `pipeStatsModeRemote`), making its processor export serialized
+//!   states — the wire half of the cluster `stats` split (net_query_runner).
 //! * `by (field:bucket offset off)` bucket-offset parsing uses
 //!   [`try_parse_bucket_offset`] (port of Go `tryParseBucketOffset`), which —
 //!   unlike `try_parse_bucket_size` — accepts negative offsets such as
@@ -78,11 +79,13 @@ fn parse_pipe_stats_ext(
     lex: &mut Lexer,
     need_stats_keyword: bool,
 ) -> Result<Box<dyn Pipe>, String> {
+    // Go `parsePipeStatsExt`: the `stats_remote` keyword selects
+    // `pipeStatsModeRemote` (the cluster split's remote half, which exports
+    // serialized states instead of finalized values).
+    let mut is_remote = false;
     if need_stats_keyword {
-        // PORT NOTE: Go distinguishes `stats` (default mode) vs `stats_remote`
-        // (remote mode), but `PipeStats` has no mode field, so both are accepted
-        // identically here.
         if lex.is_keyword(&["stats", "stats_remote"]) {
+            is_remote = lex.is_keyword(&["stats_remote"]);
             lex.next_token();
         } else {
             return Err(format!(
@@ -117,7 +120,10 @@ fn parse_pipe_stats_ext(
         lex.next_token();
     }
 
-    let ps = crate::pipe_stats::new_pipe_stats(by_fields, funcs)?;
+    let mut ps = crate::pipe_stats::new_pipe_stats(by_fields, funcs)?;
+    if is_remote {
+        ps.set_mode(crate::pipe_stats::PipeStatsMode::Remote);
+    }
     Ok(Box::new(ps))
 }
 

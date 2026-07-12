@@ -53,6 +53,38 @@ pub(crate) fn new_pipe_union(
 }
 
 impl Pipe for PipeUnion {
+    /// Port of Go `pipeUnion.splitToRemoteAndLocal`: the pipe (and
+    /// everything after it) runs locally only.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (None, vec![crate::pipe::clone_pipe(self, timestamp)])
+    }
+
+    /// Port of Go `pipeUnion.initUnionQuery` with `eagerExecute == true`
+    /// (`NetQueryRunner`): executes the union subquery via `get_rows` and
+    /// inlines the results as `union rows(...)`.
+    fn init_union_query_eager(
+        &mut self,
+        get_rows: &mut crate::storage_search::GetJoinRowsFn<'_>,
+    ) -> Result<(), String> {
+        if self.rows.is_some() {
+            // Go: rows already inlined — nothing to execute.
+            return Ok(());
+        }
+        let Some(query_text) = self.query_text.clone() else {
+            return Ok(());
+        };
+        let rows = get_rows(&query_text).map_err(|e| {
+            format!(
+                "cannot execute query at pipe [{}]: {e}",
+                crate::pipe::Pipe::to_string(self)
+            )
+        })?;
+        self.rows = Some(rows);
+        // Go: `puNew.q = nil` once the rows are materialized.
+        self.query_text = None;
+        Ok(())
+    }
+
     fn to_string(&self) -> String {
         let mut dst: Vec<u8> = Vec::new();
         dst.extend_from_slice(b"union ");

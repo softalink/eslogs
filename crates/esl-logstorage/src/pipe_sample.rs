@@ -43,6 +43,12 @@ impl PipeSample {
 }
 
 impl Pipe for PipeSample {
+    /// Port of Go `pipeSample.splitToRemoteAndLocal`: the pipe runs fully
+    /// remote, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new())
+    }
+
     fn to_string(&self) -> String {
         format!("sample {}", self.sample)
     }

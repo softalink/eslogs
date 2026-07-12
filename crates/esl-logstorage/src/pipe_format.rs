@@ -92,6 +92,12 @@ impl PipeFormat {
 }
 
 impl Pipe for PipeFormat {
+    /// Port of Go `pipeFormat.splitToRemoteAndLocal`: the pipe runs fully
+    /// remote, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new())
+    }
+
     /// Go `hasFilterInWithQuery` for this pipe: checks the `if (...)` filter.
     fn has_filter_in_with_query(&self) -> bool {
         self.iff

@@ -31,6 +31,20 @@ pub(crate) fn new_pipe_blocks_count(result_name: String) -> PipeBlocksCount {
 }
 
 impl Pipe for PipeBlocksCount {
+    /// Port of Go `pipeBlocksCount.splitToRemoteAndLocal`: per-node block
+    /// counts are summed locally.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        let result_name_quoted = crate::stream_filter::quote_token_if_needed(&self.result_name);
+
+        let p_str = format!("stats sum({result_name_quoted}) as {result_name_quoted}");
+        let p_local = crate::pipe::must_parse_pipe(&p_str, timestamp);
+
+        (
+            Some(crate::pipe::clone_pipe(self, timestamp)),
+            vec![p_local],
+        )
+    }
+
     fn to_string(&self) -> String {
         let mut s = "blocks_count".to_string();
         if self.result_name != "blocks_count" {

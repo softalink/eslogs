@@ -43,6 +43,12 @@ pub(crate) fn new_pipe_unpack_words(
 }
 
 impl Pipe for PipeUnpackWords {
+    /// Port of Go `pipeUnpackWords.splitToRemoteAndLocal`: the pipe runs fully
+    /// remote, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new())
+    }
+
     fn to_string(&self) -> String {
         let mut s = String::from("unpack_words");
         if self.src_field != "_msg" {

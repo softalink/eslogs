@@ -42,9 +42,8 @@ pub struct PipeUniqLocal {
     limit: u64,
 }
 
-/// Builds a [`PipeUniqLocal`] (Go `pipeUniqLocal` wrapping the parent `uniq`).
-// Ported for Go parity; not yet wired into a caller (see PARITY.md).
-#[allow(dead_code)]
+/// Builds a [`PipeUniqLocal`] (Go `pipeUniqLocal` wrapping the parent
+/// `uniq`); produced by `pipeUniq.splitToRemoteAndLocal` (the cluster split).
 pub(crate) fn new_pipe_uniq_local(
     by_fields: Vec<String>,
     hits_field_name: String,
@@ -58,6 +57,13 @@ pub(crate) fn new_pipe_uniq_local(
 }
 
 impl Pipe for PipeUniqLocal {
+    /// Port of Go `pipeUniqLocal.splitToRemoteAndLocal`: this pipe is only
+    /// ever produced by a split, so splitting it again is a bug.
+    fn split_to_remote_and_local(&self, _timestamp: i64) -> crate::pipe::SplitPipesResult {
+        esl_common::panicf!("BUG: unexpected call for pipeUniqLocal");
+        unreachable!()
+    }
+
     fn to_string(&self) -> String {
         let mut s = "uniq_local".to_string();
         if !self.by_fields.is_empty() {

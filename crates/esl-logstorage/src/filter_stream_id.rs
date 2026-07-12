@@ -119,6 +119,11 @@ impl Filter for FilterStreamID {
         self.q_text.is_some()
     }
 
+    /// Go `getStreamIDsFromFilterOr`'s `*filterStreamID` arm.
+    fn stream_ids(&self) -> Option<&[StreamID]> {
+        Some(&self.stream_ids)
+    }
+
     /// Port of the `*filterStreamID` arm of Go `initFilterInValuesForFilter`'s
     /// copyFunc: resolves the subquery values and converts them to a literal
     /// streamID list.

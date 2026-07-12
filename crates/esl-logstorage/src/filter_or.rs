@@ -87,6 +87,10 @@ impl Filter for FilterOr {
         Some(std::mem::take(&mut self.filters))
     }
 
+    fn or_children(&self) -> Option<&[Box<dyn Filter>]> {
+        Some(&self.filters)
+    }
+
     fn is_filter_or(&self) -> bool {
         true
     }

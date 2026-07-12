@@ -1,12 +1,12 @@
 //! Ported subset of `lib/logstorage/parser_test.go`.
 //!
-//! PORT NOTE: `parser_test.go` cases that depend on the deferred `optimize()`
-//! pass (nested same-type and/or flattening, `*`-filter removal, `!!x`
-//! double-negation collapse, and offset/limit/uniq/filter pipe merging) are
-//! omitted — those transformations require the `copyFilter`/downcast
-//! infrastructure that is deferred (see `parser/mod.rs`). The remaining cases
-//! exercise the lexer and the parse grammar (round-trip `String()`), which is
-//! the LogsQL parity spec this port targets.
+//! PORT NOTE: `parser_test.go` cases that depend on the still-deferred parts
+//! of `optimize()` — the `!!x` double-negation collapse and the
+//! `uniq ... | limit N` merge (needs a `Pipe`-trait hook) — are omitted (see
+//! `Query::optimize_no_subqueries`). The ported passes (and/or flattening,
+//! `*`-filter removal, stream-filter merging, offset/limit pipe merging,
+//! `filter` pipe merging) are covered by the `test_parse_query_optimize_*`
+//! tests below.
 
 use crate::parser::ParseQuery;
 use crate::stream_filter::Lexer;
@@ -269,7 +269,7 @@ fn test_parse_query_pipes_and_stats() {
     ok("* | first 3 by (_time)", "* | first 3 by (_time)");
     ok("* | last 3 by (_time)", "* | last 3 by (_time)");
     ok("* | format \"foo\" as bar", "* | format foo as bar");
-    ok("* | filter foo:bar", "* | filter foo:bar");
+    ok("* | filter foo:bar", "foo:bar");
     ok(
         "foo | stats count() n | sort by (n desc)",
         "foo | stats count(*) as n | sort by (n desc)",
@@ -752,15 +752,12 @@ fn test_query_get_stats_labels_add_grouping_by_time_success() {
         &["_time"],
         "* | fields _time, x | stats by (_time:86400000000000) count(*) as x",
     );
-    // PORT NOTE: Go expects `x:y | stats ...` here — its optimize() merges a
-    // leading `filter` pipe into the query filter; that rewrite is deferred
-    // (see parser/mod.rs), so the filter pipe stays in place.
     f(
         "* | filter x:y | count() x",
         NSECS_PER_DAY,
         0,
         &["_time"],
-        "* | filter x:y | stats by (_time:86400000000000) count(*) as x",
+        "x:y | stats by (_time:86400000000000) count(*) as x",
     );
     f(
         "* | format 'x<y>' | count()x",
@@ -1252,11 +1249,9 @@ fn test_query_get_stats_labels_failure() {
 
 /// Port of Go `TestQuery_AddExtraFilters`.
 ///
-/// PORT NOTE: Go's optimizeNoSubqueries() moves stream filters in front of the
-/// other filters; that rewrite is deferred (see parser/mod.rs), so the
-/// mixed-filter expectations keep the extra filters in insertion order.
-/// The "extra filters must be unconditionally propagated into subqueries"
-/// cases are omitted — subquery propagation (`visitSubqueries`) is deferred.
+/// PORT NOTE: the "extra filters must be unconditionally propagated into
+/// subqueries" cases are omitted — subquery propagation (`visitSubqueries`)
+/// is deferred.
 #[test]
 fn test_query_add_extra_filters() {
     #[track_caller]
@@ -1284,17 +1279,12 @@ fn test_query_add_extra_filters() {
         r#""fo o":="=ba:r !""#,
         r#""fo o":="=ba:r !" _time:5m"#,
     );
-    // PORT NOTE: Go expects `{a="b"} "fo o":="=ba:r !" x:=y _time:5m` (stream
-    // filters moved to the front by the deferred optimize pass).
     f(
         "_time:5m {a=b}",
         r#""fo o":="=ba:r !" and x:=y"#,
-        r#""fo o":="=ba:r !" x:=y _time:5m {a="b"}"#,
+        r#"{a="b"} "fo o":="=ba:r !" x:=y _time:5m"#,
     );
-    // PORT NOTE: the Go case f(`a or (b c)`, `foo:=bar`, `foo:=bar (a or b c)`)
-    // is omitted — the Rust `FilterAnd` Display does not yet parenthesize
-    // `filterOr` children (deferred with the optimize pass; see
-    // filter_and.rs PORT NOTE), so the round-trip string differs.
+    f("a or (b c)", "foo:=bar", "foo:=bar (a or b c)");
 
     // extra stream filters
     f("*", r#"{foo="bar",baz!="x"}"#, r#"{foo="bar",baz!="x"}"#);
@@ -1583,4 +1573,179 @@ fn test_query_is_fixed_output_fields_order() {
     f("* | field_names", true);
     f("* | field_values x", true);
     f("* | top x", true);
+}
+
+/// Port of Go `TestParseQuery_OptimizeOffsetLimitPipes`.
+#[test]
+fn test_parse_query_optimize_offset_limit_pipes() {
+    #[track_caller]
+    fn f(s: &str, result_expected: &str) {
+        let q = ParseQuery(s).unwrap_or_else(|e| panic!("cannot parse [{s}]: {e}"));
+        assert_eq!(
+            q.to_string(),
+            result_expected,
+            "unexpected result for [{s}]"
+        );
+    }
+
+    f("* | sort by (x) | limit 30", "* | sort by (x) limit 30");
+    f("* | sort by (x) | offset 10", "* | sort by (x) offset 10");
+    f(
+        "* | sort by (x) | offset 10 | limit 30",
+        "* | sort by (x) offset 10 limit 30",
+    );
+    f("* | sort by (x) | offset 0", "* | sort by (x)");
+    f(
+        "* | sort by (x) | offset 0 | fields a, b",
+        "* | sort by (x) | fields a, b",
+    );
+    f("* | sort by (x) | limit 0", "* | limit 0");
+    f(
+        "* | sort by (x) | limit 0 | keep a, b",
+        "* | limit 0 | fields a, b",
+    );
+
+    f(
+        "* | sort by (x) | limit 30 | limit 20",
+        "* | sort by (x) limit 20",
+    );
+    f(
+        "* | sort by (x) offset 5 | offset 10 | limit 30",
+        "* | sort by (x) offset 15 limit 30",
+    );
+    f(
+        "* | sort by (x) limit 12 | offset 10 | limit 30",
+        "* | sort by (x) offset 10 limit 2",
+    );
+    f(
+        "* | sort by (x) offset 3 limit 12 | offset 10 | limit 30 | fields x",
+        "* | sort by (x) offset 13 limit 2 | fields x",
+    );
+    f(
+        "* | sort by (x) offset 3 limit 10 | offset 10 | limit 30 | fields x",
+        "* | limit 0 | fields x",
+    );
+    f(
+        "* | sort by (x) | limit 30 | limit 20 | offset 4",
+        "* | sort by (x) offset 4 limit 16",
+    );
+    f(
+        "* | sort by (x) | limit 30 | limit 20 | offset 4 | offset 5",
+        "* | sort by (x) offset 9 limit 11",
+    );
+    f(
+        "* | sort by (x) | limit 30 | limit 20 | offset 4 | offset 5 | fields x",
+        "* | sort by (x) offset 9 limit 11 | fields x",
+    );
+
+    // Verify the case without 'sort' pipe and with 'offset 0' pipes.
+    // See https://github.com/VictoriaMetrics/VictoriaLogs/issues/620#issuecomment-3276624504
+    f("* | offset 0", "*");
+    f("* | offset 0 | limit 10", "* | limit 10");
+
+    // 'ofset N | limit M' without preceding 'sort' pipe
+    f("* | offset 10 | limit 30", "* | limit 40 | offset 10");
+    f(
+        "* | offset 10 | limit 30 | fields x",
+        "* | limit 40 | offset 10 | fields x",
+    );
+
+    // 'limit N | offset M' where M >= N
+    f("* | limit 10 | offset 20", "* | limit 0");
+
+    // Multiple offset pipes
+    f("* | offset 10 | offset 30 | offset 50", "* | offset 90");
+
+    // Multiple limit pipes
+    f("* | limit 50 | limit 5 | limit 20", "* | limit 5");
+
+    // Mix of limit and offset pipes
+    f(
+        "* | offset 3 | limit 10 | offset 5 | limit 30 | limit 5",
+        "* | limit 13 | offset 8",
+    );
+    f(
+        "* | offset 3 | limit 10 | offset 5 | limit 30 | limit 15",
+        "* | limit 13 | offset 8",
+    );
+    f(
+        "* | offset 3 | limit 10 | offset 5 | limit 30 | limit 4",
+        "* | limit 12 | offset 8",
+    );
+    f(
+        "* | offset 3 | limit 10 | offset 5 | limit 30 | limit 1",
+        "* | limit 9 | offset 8",
+    );
+    f(
+        "* | offset 3 | limit 10 | offset 5 | limit 30 | limit 0",
+        "* | limit 0",
+    );
+}
+
+/// Port of Go `TestParseQuery_OptimizeStarFilters`.
+#[test]
+fn test_parse_query_optimize_star_filters() {
+    #[track_caller]
+    fn f(s: &str, result_expected: &str) {
+        let q = ParseQuery(s).unwrap_or_else(|e| panic!("cannot parse [{s}]: {e}"));
+        assert_eq!(
+            q.to_string(),
+            result_expected,
+            "unexpected result for [{s}]"
+        );
+    }
+
+    f("*", "*");
+    f("foo * bar", "foo bar");
+    f("foo or * or bar", "*");
+    f("foo and (bar or *)", "foo");
+    f("foo or (* or (baz and (x and *))) x", "foo or x");
+}
+
+/// Port of Go `TestParseQuery_OptimizeStreamFilters`.
+#[test]
+fn test_parse_query_optimize_stream_filters() {
+    #[track_caller]
+    fn f(s: &str, result_expected: &str) {
+        let q = ParseQuery(s).unwrap_or_else(|e| panic!("cannot parse [{s}]: {e}"));
+        assert_eq!(
+            q.to_string(),
+            result_expected,
+            "unexpected result for [{s}]"
+        );
+    }
+
+    // Missing stream filters
+    f("*", "*");
+    f("foo", "foo");
+    f("foo bar", "foo bar");
+
+    // a single stream filter
+    f("{foo=bar}", r#"{foo="bar"}"#);
+    f(
+        r#"{foo=bar,baz=~"x|y"} error"#,
+        r#"{foo="bar",baz=~"x|y"} error"#,
+    );
+    f(
+        r#"a {foo=bar,baz=~"x|y" OR a!=b} x"#,
+        r#"{foo="bar",baz=~"x|y" or a!="b"} a x"#,
+    );
+
+    // multiple stream filters, which can be merged
+    f(r#"{foo=bar} {baz="x"}"#, r#"{foo="bar",baz="x"}"#);
+    f(
+        r#"a {foo=~"bar|x"} (b:c or d) _stream:{x="y"} {foo!~"q.+"} c"#,
+        r#"{foo=~"bar|x",x="y",foo!~"q.+"} a (b:c or d) c"#,
+    );
+
+    // multiple stream filters, which cannot be merged
+    f(
+        r#"{foo="bar" or baz="x"} {a="b"}"#,
+        r#"{foo="bar" or baz="x"} {a="b"}"#,
+    );
+    f(
+        r#"{x="y"} {foo="bar" or baz="x"} {a="b"}"#,
+        r#"{x="y"} {foo="bar" or baz="x"} {a="b"}"#,
+    );
+    f(r#"{foo="bar"} or {baz="x"}"#, r#"{foo="bar"} or {baz="x"}"#);
 }

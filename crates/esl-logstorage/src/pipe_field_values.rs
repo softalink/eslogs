@@ -14,9 +14,10 @@ use crate::stream_filter::quote_token_if_needed;
 
 /// Port of Go `getUniqueResultName` (parser.go).
 ///
-/// PORT NOTE: duplicated here (private) because `parser.rs` — where this helper
-/// belongs — is deferred (matches the copy in `pipe_field_values_local`).
-fn get_unique_result_name(result_name: &str, by_fields: &[String]) -> String {
+/// PORT NOTE: duplicated here because `parser.rs` — where this helper
+/// belongs — is deferred (matches the copy in `pipe_field_values_local`);
+/// `pub(crate)` so `pipe_field_names`' split can reuse it.
+pub(crate) fn get_unique_result_name(result_name: &str, by_fields: &[String]) -> String {
     let mut name = result_name.to_string();
     while by_fields.iter().any(|f| f == &name) {
         name.push('s');
@@ -49,6 +50,19 @@ pub(crate) fn new_pipe_field_values(field: String, filter: String, limit: u64) -
 }
 
 impl Pipe for PipeFieldValues {
+    /// Port of Go `pipeFieldValues.splitToRemoteAndLocal`: per-node value hits
+    /// are merged locally by `field_values_local`.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        let p_local = crate::pipe_field_values_local::new_pipe_field_values_local(
+            self.field.clone(),
+            self.limit,
+        );
+        (
+            Some(crate::pipe::clone_pipe(self, timestamp)),
+            vec![Box::new(p_local)],
+        )
+    }
+
     fn to_string(&self) -> String {
         let mut s = format!("field_values {}", quote_token_if_needed(&self.field));
         if !self.filter.is_empty() {

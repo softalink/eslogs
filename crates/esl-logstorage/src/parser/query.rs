@@ -115,19 +115,45 @@ impl Query {
 
     /// Port of Go `(*Query).optimize`.
     ///
-    /// Only the perf-critical `removeStarFilters` rewrite is ported: `*`
-    /// filters become `FilterNoop` so match-all queries (`*`,
-    /// `* | stats count()`) never read and decompress the `_msg` column.
-    ///
-    /// PORT NOTE: the remaining optimizations (flattening nested and/or,
-    /// stream-filter merging, offset/limit/uniq/filter pipe merging, and
-    /// merging a leading `filter` pipe into `q.f`) require `copyFilter` +
-    /// downcast hooks on the `Filter`/`Pipe` traits, which are not available
-    /// (see `parser/mod.rs`). Affected `parser_test.go` round-trip cases are
-    /// excluded from the ported tests.
+    /// PORT NOTE: Go applies `optimizeNoSubqueries` to every subquery via
+    /// `visitSubqueries`; the Rust subqueries are stored as rendered text and
+    /// re-parsed (which re-runs `optimize` on them), so only the top-level
+    /// query is visited here.
     pub(crate) fn optimize(&mut self) {
+        self.optimize_no_subqueries();
+    }
+
+    /// Port of Go `(*Query).optimizeNoSubqueries`.
+    ///
+    /// PORT NOTE: Go type-switches on `*pipeFilter` for `optimizeFilterPipes`
+    /// and the leading-`filter`-pipe merge; the `Pipe` trait has no downcast
+    /// hook (pipe.rs is owned by another port slice), so both rewrites go
+    /// through the rendered pipe string — the established render/re-parse
+    /// divergence (`Query::clone`, `clone_pipe`). Two rewrites stay deferred
+    /// pending `Pipe`-trait hooks: `optimizeUniqLimitPipes` (merging
+    /// `uniq ... | limit N` needs a uniq-limit mutator) and marking a leading
+    /// `pipeFieldNames` as first pipe (the first-pipe mode itself is
+    /// unimplemented — see `Storage::get_field_names`).
+    pub(crate) fn optimize_no_subqueries(&mut self) {
+        let pipes = std::mem::take(&mut self.pipes);
+        let pipes = optimize_offset_limit_pipes(pipes);
+        self.pipes = optimize_filter_pipes(pipes, self.timestamp);
+
+        // Merge `q | filter ...` into q.
+        if let Some(expr) = self
+            .pipes
+            .first()
+            .and_then(|p| pipe_filter_expr(p.as_ref()))
+            && let Ok(fq) = ParseQueryAtTimestamp(&expr, self.timestamp)
+            && fq.pipes.is_empty()
+        {
+            let f = std::mem::replace(&mut self.f, Box::new(crate::filter_noop::new_filter_noop()));
+            self.f = merge_filters_and(f, fq.f);
+            self.pipes.remove(0);
+        }
+
         let f = std::mem::replace(&mut self.f, Box::new(crate::filter_noop::new_filter_noop()));
-        self.f = remove_star_filters(f);
+        self.f = optimize_filters(f);
     }
 
     /// Port of Go `isStarQuery`.
@@ -203,15 +229,23 @@ impl Query {
         get_filter_time_range(f)
     }
 
-    /// Returns the sorted streamID pre-filter for the query (Go `getStreamIDs`).
+    /// Returns the streamID pre-filter for the query (Go `getStreamIDs`).
     ///
-    /// PORT NOTE: Go extracts a streamID list from `filterStreamID` nodes in the
-    /// final filter to restrict the search to matching streams. That extraction
-    /// needs the deferred filter downcast, so this returns an empty list, which
-    /// makes the search scan all streams by tenantID — correct, just without the
-    /// streamID pruning optimization.
+    /// PORT NOTE: Go type-switches on `*filterAnd` / `*filterOr` /
+    /// `*filterStreamID`; the port dispatches through the `and_children` /
+    /// `or_children` / `stream_ids` trait hooks.
     pub(crate) fn get_stream_ids(&self) -> Vec<StreamID> {
-        Vec::new()
+        let f = self.get_final_filter();
+        if let Some(children) = f.and_children() {
+            for child in children {
+                let (stream_ids, ok) = get_stream_ids_from_filter_or(child.as_ref());
+                if ok {
+                    return stream_ids;
+                }
+            }
+            return Vec::new();
+        }
+        get_stream_ids_from_filter_or(f).0
     }
 
     /// Returns the number of IO-bound parallel readers for the query
@@ -364,12 +398,11 @@ impl Query {
         } else {
             filters.push(f);
         }
-        let f = flatten_filters_and(Box::new(crate::filter_and::new_filter_and(filters)));
+        self.f = Box::new(crate::filter_and::new_filter_and(filters));
 
-        // PORT NOTE: Go runs the full optimizeNoSubqueries() afterwards; only
-        // the ported subset (flatten + removeStarFilters) is applied here (see
-        // `optimize`).
-        self.f = remove_star_filters(f);
+        // Go `addExtraFiltersNoSubqueries` runs the full optimize pass after
+        // prepending the extra filters.
+        self.optimize_no_subqueries();
     }
 
     /// Adds `| sort (_time) desc` pipe to q (Go `AddPipeSortByTimeDesc`).
@@ -489,11 +522,87 @@ fn add_time_filter(
     remove_star_filters(f)
 }
 
+/// Returns the filter expression when `p` is a `filter` pipe.
+///
+/// PORT NOTE: Go type-switches on `*pipeFilter`; the port classifies by the
+/// rendered pipe string (`pipeFilter` is the only pipe rendering as
+/// `filter <expr>`), the established render/re-parse divergence.
+fn pipe_filter_expr(p: &dyn Pipe) -> Option<String> {
+    let s = p.to_string();
+    s.strip_prefix("filter ").map(str::to_string)
+}
+
+/// Port of Go `mergeFiltersAnd` (parser.go): ANDs `f1` and `f2`, folding
+/// existing `filterAnd` children in via the `take_and_children` hook.
+fn merge_filters_and(
+    mut f1: Box<dyn FilterTrait>,
+    mut f2: Box<dyn FilterTrait>,
+) -> Box<dyn FilterTrait> {
+    let mut filters: Vec<Box<dyn FilterTrait>> = Vec::new();
+    if let Some(children) = f1.take_and_children() {
+        filters.extend(children);
+    } else {
+        filters.push(f1);
+    }
+    if let Some(children) = f2.take_and_children() {
+        filters.extend(children);
+    } else {
+        filters.push(f2);
+    }
+    Box::new(crate::filter_and::new_filter_and(filters))
+}
+
+/// Port of Go `optimizeFilterPipes` (parser.go): merges adjacent
+/// `| filter ...` pipes into a single `filter` pipe.
+///
+/// PORT NOTE: Go merges the filter trees via `mergeFiltersAnd`; the port
+/// re-parses the concatenated parenthesized expressions (see
+/// `pipe_filter_expr`), which yields the same AND tree.
+fn optimize_filter_pipes(mut pipes: Vec<Box<dyn Pipe>>, timestamp: i64) -> Vec<Box<dyn Pipe>> {
+    let mut i = 1;
+    while i < pipes.len() {
+        let (Some(e1), Some(e2)) = (
+            pipe_filter_expr(pipes[i - 1].as_ref()),
+            pipe_filter_expr(pipes[i].as_ref()),
+        ) else {
+            i += 1;
+            continue;
+        };
+        let merged = format!("filter ({e1}) ({e2})");
+        pipes[i - 1] = crate::parser::parse_pipe::must_parse_pipe(&merged, timestamp);
+        pipes.remove(i);
+    }
+    pipes
+}
+
+/// Port of Go `optimizeFilters` (parser.go).
+fn optimize_filters(f: Box<dyn FilterTrait>) -> Box<dyn FilterTrait> {
+    // flatten nested AND filters
+    let f = flatten_filters_and(f);
+
+    // flatten nested OR filters
+    let f = flatten_filters_or(f);
+
+    // Substitute '*' prefixFilter with filterNoop in order to avoid reading
+    // _msg data.
+    let f = remove_star_filters(f);
+
+    // Merge multiple {...} filters into a single one.
+    merge_filters_stream(f)
+}
+
 /// Port of Go `flattenFiltersAnd` (parser.go).
 ///
 /// PORT NOTE: Go rewrites via `copyFilter` with a visit check; the port
 /// flattens recursively through the `take_and_children` hook (same result).
 fn flatten_filters_and(mut f: Box<dyn FilterTrait>) -> Box<dyn FilterTrait> {
+    if let Some(children) = f.take_or_children() {
+        // Recurse into OR children so nested `(a (b c)) or d` forms are
+        // flattened too (Go's copyFilter walks the whole tree).
+        let children: Vec<Box<dyn FilterTrait>> =
+            children.into_iter().map(flatten_filters_and).collect();
+        return Box::new(crate::filter_or::new_filter_or(children));
+    }
     let Some(children) = f.take_and_children() else {
         return f;
     };
@@ -507,6 +616,105 @@ fn flatten_filters_and(mut f: Box<dyn FilterTrait>) -> Box<dyn FilterTrait> {
         }
     }
     Box::new(crate::filter_and::new_filter_and(result_filters))
+}
+
+/// Port of Go `flattenFiltersOr` (parser.go).
+///
+/// PORT NOTE: like `flatten_filters_and`, the port flattens recursively
+/// through the `take_or_children` hook instead of Go's `copyFilter`.
+fn flatten_filters_or(mut f: Box<dyn FilterTrait>) -> Box<dyn FilterTrait> {
+    if let Some(children) = f.take_and_children() {
+        // Recurse into AND children so nested `(a or (b or c)) d` forms are
+        // flattened too (Go's copyFilter walks the whole tree).
+        let children: Vec<Box<dyn FilterTrait>> =
+            children.into_iter().map(flatten_filters_or).collect();
+        return Box::new(crate::filter_and::new_filter_and(children));
+    }
+    let Some(children) = f.take_or_children() else {
+        return f;
+    };
+    let mut result_filters: Vec<Box<dyn FilterTrait>> = Vec::with_capacity(children.len());
+    for child in children {
+        let mut child = flatten_filters_or(child);
+        if let Some(grandchildren) = child.take_or_children() {
+            result_filters.extend(grandchildren);
+        } else {
+            result_filters.push(child);
+        }
+    }
+    Box::new(crate::filter_or::new_filter_or(result_filters))
+}
+
+/// Port of Go `mergeFiltersStream` (parser.go): merges multiple `{...}`
+/// filters ANDed at the top level into a single one, moved to the front.
+fn merge_filters_stream(mut f: Box<dyn FilterTrait>) -> Box<dyn FilterTrait> {
+    let Some(children) = f.take_and_children() else {
+        return f;
+    };
+    let mut fss: Vec<crate::stream_filter::StreamFilter> = Vec::with_capacity(children.len());
+    let mut other_filters: Vec<Box<dyn FilterTrait>> = Vec::with_capacity(children.len());
+    for mut child in children {
+        if let Some(sf) = child.take_stream_filter() {
+            fss.push(sf);
+        } else {
+            other_filters.push(child);
+        }
+    }
+    if fss.is_empty() {
+        // Nothing to merge
+        return Box::new(crate::filter_and::new_filter_and(other_filters));
+    }
+
+    let fss = merge_filters_stream_internal(fss);
+    let mut filters: Vec<Box<dyn FilterTrait>> =
+        Vec::with_capacity(fss.len() + other_filters.len());
+    for sf in fss {
+        filters.push(Box::new(crate::filter_stream::new_filter_stream(sf)));
+    }
+    filters.extend(other_filters);
+    Box::new(crate::filter_and::new_filter_and(filters))
+}
+
+/// Port of Go `mergeFiltersStreamInternal` (parser.go).
+fn merge_filters_stream_internal(
+    fss: Vec<crate::stream_filter::StreamFilter>,
+) -> Vec<crate::stream_filter::StreamFilter> {
+    if fss.len() < 2 {
+        return fss;
+    }
+
+    if fss.iter().any(|sf| sf.or_filters.len() != 1) {
+        // Cannot merge or filters :(
+        return fss;
+    }
+
+    let mut tfs = Vec::new();
+    for mut sf in fss {
+        tfs.extend(sf.or_filters.pop().expect("len checked").tag_filters);
+    }
+    vec![crate::stream_filter::StreamFilter {
+        or_filters: vec![crate::stream_filter::AndStreamFilter { tag_filters: tfs }],
+    }]
+}
+
+/// Port of Go `getStreamIDsFromFilterOr` (parser.go).
+fn get_stream_ids_from_filter_or(f: &dyn FilterTrait) -> (Vec<StreamID>, bool) {
+    if let Some(children) = f.or_children() {
+        let mut stream_ids_filters = 0usize;
+        let mut stream_ids: Vec<StreamID> = Vec::new();
+        for child in children {
+            let Some(ids) = child.stream_ids() else {
+                return (Vec::new(), false);
+            };
+            stream_ids_filters += 1;
+            stream_ids.extend_from_slice(ids);
+        }
+        return (stream_ids, stream_ids_filters > 0);
+    }
+    if let Some(ids) = f.stream_ids() {
+        return (ids.to_vec(), true);
+    }
+    (Vec::new(), false)
 }
 
 /// Port of Go `optimizeOffsetLimitPipes` (parser.go).

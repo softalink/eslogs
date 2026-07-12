@@ -33,6 +33,12 @@ pub(crate) fn new_pipe_len(field_name: String, result_field: String) -> PipeLen 
 }
 
 impl Pipe for PipeLen {
+    /// Port of Go `pipeLen.splitToRemoteAndLocal`: the pipe runs fully
+    /// remote, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new())
+    }
+
     fn to_string(&self) -> String {
         let mut s = format!("len({})", quote_token_if_needed(&self.field_name));
         if !is_msg_field_name(&self.result_field) {

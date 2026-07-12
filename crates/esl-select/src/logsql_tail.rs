@@ -129,7 +129,8 @@ pub fn process_live_tail_request(storage: &Arc<Storage>, req: &Request, w: &mut 
         // are instead observed by the flush_chunk call below, once per
         // refresh window — each windowed run_query scans a tail-sized time
         // range, so a mid-window cancel would save little.
-        if let Err(e) = storage.run_query(&ca.tenant_ids, &q, write_block) {
+        if let Err(e) = storage.run_query_with_stats(&ca.tenant_ids, &q, write_block, None, &ca.qs)
+        {
             w.errorf(req, &format!("cannot execute tail query [{q}]: {e}"));
             return;
         }

@@ -14,9 +14,9 @@
 //! PORT NOTE — `QueryContext`: Go bundles ctx cancellation, `QueryStats`,
 //! `AllowPartialResponse` and `HiddenFieldsFilters` into a
 //! `logstorage.QueryContext` passed to `eslstorage.RunQuery`/`Get*`. The ported
-//! `Storage::run_query` takes tenant_ids/query explicitly and does not
-//! accumulate `QueryStats` (see the PORT NOTE on `Storage::run_query`), so the
-//! trailing query-stats block carries zero counters plus the measured
+//! surfaces take tenant_ids/query plus the shared per-request
+//! `CommonParams::qs` (Go `qctx.QueryStats`) explicitly, so the trailing
+//! query-stats block carries the real execution counters plus the measured
 //! `QueryDurationNsecs`. Ctx cancellation IS ported: each query/Get* handler
 //! registers a disconnect-watcher token (`ResponseWriter::watch_disconnect`)
 //! that cancels the running query when the netselect client goes away, and
@@ -34,11 +34,9 @@
 //! response, so frames are accumulated in memory and flushed at the end;
 //! mid-stream write errors (Go `errGlobal`/`sendBuf` failures) cannot occur.
 //!
-//! PORT NOTE — `UpdatePerQueryStatsMetrics` (Go `defer` in every handler)
-//! is not called: the ported queries don't accumulate `QueryStats` (see
-//! above), so the update would only record zeros. The
-//! `esl_storage_per_query_*` histograms are still registered (at zero) by
-//! `esl_storage::query_stats::init`, matching the series Go exposes.
+//! `UpdatePerQueryStatsMetrics` (Go `defer` in every handler) is mirrored by
+//! the `Drop` impl on `CommonParams`, which records the accumulated stats
+//! into the `esl_storage_per_query_*` histograms at handler end.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -328,6 +326,12 @@ fn process_query_request(
     let start_time = Instant::now();
     let cp = get_common_params(req, form, QUERY_PROTOCOL_VERSION)?;
 
+    // Test hook: records the query received on the wire so the netselect
+    // round-trip tests can assert the cluster split (e.g. that a `stats`
+    // query arrives as `stats_remote`).
+    #[cfg(test)]
+    tests::record_wire_query(&cp.query.to_string());
+
     w.set_header("Content-Type", "application/octet-stream");
 
     // The framed output stream (Go: the locked writes to `w` in `sendBuf`).
@@ -357,14 +361,19 @@ fn process_query_request(
         send_buf(bb, disable_compression, &out_wb);
     });
 
-    // PORT NOTE: the ported `Storage::run_query` does not accumulate
-    // QueryStats (see the module docs), so the query-stats block below carries
-    // zero counters plus QueryDurationNsecs. Context cancellation from Go's
-    // `*QueryContext` IS ported: the disconnect-watcher token below cancels
-    // the query when the netselect client goes away, like ctx.Done().
-    let qs = QueryStats::default();
+    // Context cancellation from Go's `*QueryContext` is ported: the
+    // disconnect-watcher token below cancels the query when the netselect
+    // client goes away, like ctx.Done(). The query execution stats accumulate
+    // into cp.qs (Go `qctx.QueryStats`), so the trailing query-stats block
+    // carries the real counters.
     let cancel = w.watch_disconnect();
-    storage.run_query_with_cancel(&cp.tenant_ids, &cp.query, write_block, cancel.as_deref())?;
+    storage.run_query_with_stats(
+        &cp.tenant_ids,
+        &cp.query,
+        write_block,
+        cancel.as_deref(),
+        &cp.qs,
+    )?;
     drop(cancel);
 
     // Send the remaining data.
@@ -378,7 +387,7 @@ fn process_query_request(
     // Write the marker of query stats block.
     bb.push(1);
     // Marshal the block itself.
-    marshal_query_stats_block(&mut bb, &qs, elapsed_nsecs(start_time));
+    marshal_query_stats_block(&mut bb, &cp.qs, elapsed_nsecs(start_time));
     send_buf(&mut bb, disable_compression, &out);
 
     w.write_bytes(&out.lock().unwrap());
@@ -423,13 +432,13 @@ fn process_field_names_request(
 
     let cancel = w.watch_disconnect();
     let field_names = storage
-        .get_field_names(&cp.tenant_ids, &cp.query, filter, cancel.as_deref())
+        .get_field_names(&cp.tenant_ids, &cp.query, filter, cancel.as_deref(), &cp.qs)
         .map_err(|err| format!("cannot obtain field names: {err}"))?;
     drop(cancel);
 
     write_values_with_hits(
         w,
-        &QueryStats::default(),
+        &cp.qs,
         elapsed_nsecs(start_time),
         &field_names,
         cp.disable_compression,
@@ -460,13 +469,14 @@ fn process_field_values_request(
             filter,
             limit as u64,
             cancel.as_deref(),
+            &cp.qs,
         )
         .map_err(|err| format!("cannot obtain field values: {err}"))?;
     drop(cancel);
 
     write_values_with_hits(
         w,
-        &QueryStats::default(),
+        &cp.qs,
         elapsed_nsecs(start_time),
         &field_values,
         cp.disable_compression,
@@ -487,13 +497,13 @@ fn process_stream_field_names_request(
 
     let cancel = w.watch_disconnect();
     let field_names = storage
-        .get_stream_field_names(&cp.tenant_ids, &cp.query, filter, cancel.as_deref())
+        .get_stream_field_names(&cp.tenant_ids, &cp.query, filter, cancel.as_deref(), &cp.qs)
         .map_err(|err| format!("cannot obtain stream field names: {err}"))?;
     drop(cancel);
 
     write_values_with_hits(
         w,
-        &QueryStats::default(),
+        &cp.qs,
         elapsed_nsecs(start_time),
         &field_names,
         cp.disable_compression,
@@ -524,13 +534,14 @@ fn process_stream_field_values_request(
             filter,
             limit as u64,
             cancel.as_deref(),
+            &cp.qs,
         )
         .map_err(|err| format!("cannot obtain stream field values: {err}"))?;
     drop(cancel);
 
     write_values_with_hits(
         w,
-        &QueryStats::default(),
+        &cp.qs,
         elapsed_nsecs(start_time),
         &field_values,
         cp.disable_compression,
@@ -551,13 +562,19 @@ fn process_streams_request(
 
     let cancel = w.watch_disconnect();
     let streams = storage
-        .get_streams(&cp.tenant_ids, &cp.query, limit as u64, cancel.as_deref())
+        .get_streams(
+            &cp.tenant_ids,
+            &cp.query,
+            limit as u64,
+            cancel.as_deref(),
+            &cp.qs,
+        )
         .map_err(|err| format!("cannot obtain streams: {err}"))?;
     drop(cancel);
 
     write_values_with_hits(
         w,
-        &QueryStats::default(),
+        &cp.qs,
         elapsed_nsecs(start_time),
         &streams,
         cp.disable_compression,
@@ -578,13 +595,19 @@ fn process_stream_ids_request(
 
     let cancel = w.watch_disconnect();
     let stream_ids = storage
-        .get_stream_ids(&cp.tenant_ids, &cp.query, limit as u64, cancel.as_deref())
+        .get_stream_ids(
+            &cp.tenant_ids,
+            &cp.query,
+            limit as u64,
+            cancel.as_deref(),
+            &cp.qs,
+        )
         .map_err(|err| format!("cannot obtain streams: {err}"))?;
     drop(cancel);
 
     write_values_with_hits(
         w,
-        &QueryStats::default(),
+        &cp.qs,
         elapsed_nsecs(start_time),
         &stream_ids,
         cp.disable_compression,
@@ -692,6 +715,10 @@ struct CommonParams {
     tenant_ids: Vec<TenantID>,
     query: Query,
 
+    /// Query execution stats accumulated across the queries served by the
+    /// request (Go `commonParams.qs`, threaded via the `*QueryContext`).
+    qs: Arc<QueryStats>,
+
     /// Whether to disable compression of the response sent to the eslselect.
     disable_compression: bool,
 
@@ -740,11 +767,21 @@ fn get_common_params(
         tenant_ids,
         query,
 
+        qs: Arc::new(QueryStats::default()),
+
         disable_compression,
 
         allow_partial_response,
         hidden_fields_filters,
     })
+}
+
+/// Go registers `defer cp.UpdatePerQueryStatsMetrics()` in every handler right
+/// after `getCommonParams` succeeds; the Drop impl is the Rust equivalent.
+impl Drop for CommonParams {
+    fn drop(&mut self) {
+        esl_storage::query_stats::update_per_query_stats_metrics(&self.qs);
+    }
 }
 
 /// Port of Go `checkProtocolVersion`.
@@ -956,6 +993,25 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// Queries received by `process_query_request` (its `#[cfg(test)]` hook).
+    /// Global across parallel tests, so assertions must filter by a
+    /// test-unique marker inside the query text.
+    static WIRE_QUERIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(super) fn record_wire_query(q: &str) {
+        WIRE_QUERIES.lock().unwrap().push(q.to_string());
+    }
+
+    fn wire_queries_containing(marker: &str) -> Vec<String> {
+        WIRE_QUERIES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|q| q.contains(marker))
+            .cloned()
+            .collect()
+    }
+
     /// Opens a temp Storage, ingests `msgs` as rows (each with `_msg` and a
     /// `host` stream field), and flushes.
     fn open_storage_with_rows(name: &str, msgs: &[&str]) -> (Arc<Storage>, PathBuf) {
@@ -1075,6 +1131,33 @@ mod tests {
                 "disable_compression={disable_compression}"
             );
 
+            // The trailing query-stats blocks must carry the real execution
+            // counters (Go qctx.QueryStats), accumulated into the client-side
+            // qs by the netselect decoder: 3 queries x 5 rows processed each.
+            {
+                use std::sync::atomic::Ordering;
+                assert_eq!(
+                    qs.rows_processed.load(Ordering::SeqCst),
+                    15,
+                    "RowsProcessed must be accumulated from the query stats blocks"
+                );
+                // RowsFound counts rows matched by the search (before the
+                // pipes): 5 (`*`) + 2 (`error`) + 5 (`* | stats ...`).
+                assert_eq!(
+                    qs.rows_found.load(Ordering::SeqCst),
+                    12,
+                    "RowsFound must be accumulated from the query stats blocks"
+                );
+                assert!(
+                    qs.blocks_processed.load(Ordering::SeqCst) > 0,
+                    "BlocksProcessed must be non-zero"
+                );
+                assert!(
+                    qs.get_bytes_read_total() > 0,
+                    "BytesRead* must be non-zero in the query stats blocks"
+                );
+            }
+
             // The values-with-hits endpoints, decoded by the client through
             // unmarshal_values_with_hits + merge_values_with_hits.
             let q = ParseQueryAtTimestamp("*", unique_nsec()).expect("parse query");
@@ -1134,6 +1217,86 @@ mod tests {
         handle.stop();
         storage.must_close();
         esl_common::fs::must_remove_dir(&path);
+    }
+
+    /// End-to-end cluster split over TWO storage nodes: a `stats` query must
+    /// reach each node as a partial `stats_remote` query (asserted via the
+    /// `record_wire_query` test hook), and the per-node exported states must
+    /// merge locally (`net_query_runner` + the `stats_local` import path)
+    /// into the correct total.
+    #[test]
+    fn test_process_query_request_two_node_stats_merge() {
+        // 3 rows on node 1 (2 contain "error"), 4 rows on node 2 (1 does).
+        let msgs1 = ["alpha error one", "beta ok two", "gamma error three"];
+        let msgs2 = [
+            "delta ok four",
+            "epsilon error five",
+            "zeta ok six",
+            "eta ok seven",
+        ];
+        let (storage1, path1) = open_storage_with_rows("query2a", &msgs1);
+        let (storage2, path2) = open_storage_with_rows("query2b", &msgs2);
+        let handle1 = serve_storage(&storage1);
+        let handle2 = serve_storage(&storage2);
+
+        let client = netselect::new_storage(
+            &[
+                format!("{}", handle1.local_addr()),
+                format!("{}", handle2.local_addr()),
+            ],
+            vec![AuthConfig::default(), AuthConfig::default()],
+            true,
+        );
+        let qs = QueryStats::default();
+
+        // Global count across both nodes: 3 + 4 = 7. The result name is
+        // test-unique so the wire-query assertion below cannot pick up
+        // queries recorded by other tests running in parallel.
+        let got = run_query_collect(&client, &qs, "* | stats count() rows_2node", "rows_2node")
+            .expect("run_query 2-node stats failed");
+        assert_eq!(got, vec!["7".to_string()]);
+
+        // The wire must have carried the PARTIAL (split) query — one per node.
+        let wire = wire_queries_containing("rows_2node");
+        assert_eq!(wire.len(), 2, "wire queries: {wire:?}");
+        for q in &wire {
+            assert_eq!(q, "* | stats_remote count(*) as rows_2node");
+        }
+
+        // Filter + grouped-state merge: "error" matches 2 rows on node 1 and
+        // 1 row on node 2.
+        let got = run_query_collect(
+            &client,
+            &qs,
+            "error | stats count() errors_2node",
+            "errors_2node",
+        )
+        .expect("run_query 2-node filtered stats failed");
+        assert_eq!(got, vec!["3".to_string()]);
+        let wire = wire_queries_containing("errors_2node");
+        assert_eq!(wire.len(), 2, "wire queries: {wire:?}");
+        for q in &wire {
+            assert_eq!(q, "error | stats_remote count(*) as errors_2node");
+        }
+
+        // A `stats by (...)` split: group by the stream field shared by all
+        // rows, so the two per-node groups must merge into one row.
+        let got = run_query_collect(
+            &client,
+            &qs,
+            "* | stats by (host) count() hits_2node",
+            "hits_2node",
+        )
+        .expect("run_query 2-node stats-by failed");
+        assert_eq!(got, vec!["7".to_string()]);
+
+        client.must_stop();
+        handle1.stop();
+        handle2.stop();
+        storage1.must_close();
+        storage2.must_close();
+        esl_common::fs::must_remove_dir(&path1);
+        esl_common::fs::must_remove_dir(&path2);
     }
 
     /// End-to-end round trip for the `/internal/delete/*` endpoints.

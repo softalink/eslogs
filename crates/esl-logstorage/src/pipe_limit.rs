@@ -26,6 +26,15 @@ pub(crate) fn new_pipe_limit(limit: u64) -> PipeLimit {
 }
 
 impl Pipe for PipeLimit {
+    /// Port of Go `pipeLimit.splitToRemoteAndLocal`: the pipe runs both
+    /// remotely and locally, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (
+            Some(crate::pipe::clone_pipe(self, timestamp)),
+            vec![crate::pipe::clone_pipe(self, timestamp)],
+        )
+    }
+
     fn limit_pipe_value(&self) -> Option<u64> {
         Some(self.limit)
     }

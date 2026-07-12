@@ -98,7 +98,7 @@ pub fn process_facets_request(storage: &Arc<Storage>, req: &Request, w: &mut Res
     // Execute the query, canceling on client disconnect (Go: request ctx).
     let cancel = w.watch_disconnect();
     if let Err(e) =
-        storage.run_query_with_cancel(&ca.tenant_ids, &ca.q, write_fn, cancel.as_deref())
+        storage.run_query_with_stats(&ca.tenant_ids, &ca.q, write_fn, cancel.as_deref(), &ca.qs)
     {
         if is_query_canceled_error(&e) {
             // The client disconnected: there is nobody to respond to.

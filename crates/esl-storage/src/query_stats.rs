@@ -63,9 +63,10 @@ pub fn init() {
 /// Updates query stats metrics with the given qs
 /// (Go `UpdatePerQueryStatsMetrics`).
 ///
-/// PORT NOTE: the ported `Storage::run_query` does not accumulate QueryStats
-/// (see the esl-select internalselect PORT NOTEs), so nothing calls this on
-/// the query path yet; the histograms stay registered at zero.
+/// Called after every executed query, mirroring Go's
+/// `defer ca.updatePerQueryStatsMetrics()` /
+/// `defer cp.UpdatePerQueryStatsMetrics()` in the esl-select handlers
+/// (logsql.rs `CommonArgs::drop`, internalselect.rs).
 pub fn update_per_query_stats_metrics(qs: &QueryStats) {
     BYTES_READ_PER_QUERY_COLUMNS_HEADERS
         .update(qs.bytes_read_columns_headers.load(Ordering::SeqCst) as f64);

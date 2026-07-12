@@ -31,6 +31,12 @@ pub(crate) fn new_pipe_generate_sequence(n: u64) -> PipeGenerateSequence {
 }
 
 impl Pipe for PipeGenerateSequence {
+    /// Port of Go `pipeGenerateSequence.splitToRemoteAndLocal`: the pipe (and
+    /// everything after it) runs locally only.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (None, vec![crate::pipe::clone_pipe(self, timestamp)])
+    }
+
     fn to_string(&self) -> String {
         format!("generate_sequence {}", self.n)
     }

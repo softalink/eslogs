@@ -98,6 +98,16 @@ pub struct PartitionSearchOptions<'f> {
     /// If it is empty, then the search is performed by tenantIDs.
     pub stream_ids: Vec<StreamID>,
 
+    /// The tenantIDs of the query, consumed by lazily-resolved `_stream`
+    /// filters.
+    ///
+    /// PORT NOTE: Go's `initStreamFilters` binds `sso.tenantIDs` into
+    /// per-partition `filterStream` copies before `tenant_ids` above is
+    /// cleared for a streamID-keyed search; the port's shared `FilterStream`
+    /// reads them from here instead (see filter_stream.rs). Unlike
+    /// `tenant_ids`, this list is never cleared.
+    pub stream_filter_tenant_ids: Vec<TenantID>,
+
     /// minTimestamp is the minimum timestamp for the search.
     pub min_timestamp: i64,
 

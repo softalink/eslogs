@@ -24,6 +24,16 @@ pub(crate) fn new_pipe_query_stats() -> PipeQueryStats {
 }
 
 impl Pipe for PipeQueryStats {
+    /// Port of Go `pipeQueryStats.splitToRemoteAndLocal`: per-node query stats
+    /// are merged locally by `query_stats_local`.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        let ps_local = crate::pipe_query_stats_local::new_pipe_query_stats_local();
+        (
+            Some(crate::pipe::clone_pipe(self, timestamp)),
+            vec![Box::new(ps_local)],
+        )
+    }
+
     fn to_string(&self) -> String {
         "query_stats".to_string()
     }

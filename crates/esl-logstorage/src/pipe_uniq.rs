@@ -140,6 +140,28 @@ pub(crate) fn new_pipe_uniq(
 }
 
 impl Pipe for PipeUniq {
+    /// Port of Go `pipeUniq.splitToRemoteAndLocal`: without hits the same
+    /// `uniq` runs on both sides; with hits the local side merges per-node
+    /// hits via `uniq_local`.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        if self.hits_field_name.is_empty() {
+            return (
+                Some(crate::pipe::clone_pipe(self, timestamp)),
+                vec![crate::pipe::clone_pipe(self, timestamp)],
+            );
+        }
+
+        let p_local = crate::pipe_uniq_local::new_pipe_uniq_local(
+            self.by_fields.clone(),
+            self.hits_field_name.clone(),
+            self.limit,
+        );
+        (
+            Some(crate::pipe::clone_pipe(self, timestamp)),
+            vec![Box::new(p_local)],
+        )
+    }
+
     fn to_string(&self) -> String {
         let mut s = format!("uniq by ({})", self.by_fields.join(", "));
         if !self.filter.is_empty() {

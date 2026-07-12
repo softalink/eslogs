@@ -38,8 +38,13 @@ pub fn process_streams_request(storage: &Arc<Storage>, req: &Request, w: &mut Re
     // (Go: the request context).
     let start_time = Instant::now();
     let cancel = w.watch_disconnect();
-    let streams = match storage.get_streams(&ca.tenant_ids, &ca.q, limit as u64, cancel.as_deref())
-    {
+    let streams = match storage.get_streams(
+        &ca.tenant_ids,
+        &ca.q,
+        limit as u64,
+        cancel.as_deref(),
+        &ca.qs,
+    ) {
         Ok(v) => v,
         Err(e) => {
             if is_query_canceled_error(&e) {
@@ -83,18 +88,23 @@ pub fn process_stream_ids_request(storage: &Arc<Storage>, req: &Request, w: &mut
     // Obtain streamIDs for the given query
     let start_time = Instant::now();
     let cancel = w.watch_disconnect();
-    let stream_ids =
-        match storage.get_stream_ids(&ca.tenant_ids, &ca.q, limit as u64, cancel.as_deref()) {
-            Ok(v) => v,
-            Err(e) => {
-                if is_query_canceled_error(&e) {
-                    // The client disconnected: there is nobody to respond to.
-                    return;
-                }
-                w.errorf(req, &format!("cannot obtain stream_ids: {e}"));
+    let stream_ids = match storage.get_stream_ids(
+        &ca.tenant_ids,
+        &ca.q,
+        limit as u64,
+        cancel.as_deref(),
+        &ca.qs,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            if is_query_canceled_error(&e) {
+                // The client disconnected: there is nobody to respond to.
                 return;
             }
-        };
+            w.errorf(req, &format!("cannot obtain stream_ids: {e}"));
+            return;
+        }
+    };
 
     // Write response headers
     w.set_header("Content-Type", "application/json");
@@ -128,21 +138,26 @@ pub fn process_stream_field_names_request(
     // Obtain stream field names for the given query
     let start_time = Instant::now();
     let cancel = w.watch_disconnect();
-    let names =
-        match storage.get_stream_field_names(&ca.tenant_ids, &ca.q, filter, cancel.as_deref()) {
-            Ok(v) => v,
-            Err(e) => {
-                if is_query_canceled_error(&e) {
-                    // The client disconnected: there is nobody to respond to.
-                    return;
-                }
-                w.errorf(
-                    req,
-                    &format!("cannot obtain stream field names with filter {filter:?}: {e}"),
-                );
+    let names = match storage.get_stream_field_names(
+        &ca.tenant_ids,
+        &ca.q,
+        filter,
+        cancel.as_deref(),
+        &ca.qs,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            if is_query_canceled_error(&e) {
+                // The client disconnected: there is nobody to respond to.
                 return;
             }
-        };
+            w.errorf(
+                req,
+                &format!("cannot obtain stream field names with filter {filter:?}: {e}"),
+            );
+            return;
+        }
+    };
 
     // Write response headers
     w.set_header("Content-Type", "application/json");
@@ -199,6 +214,7 @@ pub fn process_stream_field_values_request(
         filter,
         limit as u64,
         cancel.as_deref(),
+        &ca.qs,
     ) {
         Ok(v) => v,
         Err(e) => {

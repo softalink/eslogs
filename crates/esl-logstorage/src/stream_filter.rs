@@ -16,6 +16,11 @@ use crate::rows::Field;
 use crate::tokenizer::is_token_rune;
 
 /// StreamFilter is a filter for streams, e.g. `_stream:{...}`
+///
+/// `Default` (an empty, match-all filter) supports
+/// `Filter::take_stream_filter`, which moves the filter out of a
+/// `FilterStream` during `Query::optimize` (Go `mergeFiltersStream`).
+#[derive(Default)]
 pub struct StreamFilter {
     pub(crate) or_filters: Vec<AndStreamFilter>,
 }
@@ -694,86 +699,12 @@ pub(crate) fn quote_token_if_needed(s: &str) -> String {
 }
 
 fn need_quote_token(s: &str) -> bool {
-    if s == "." {
-        return true;
-    }
-
-    let s_lower = s.to_lowercase();
-    if RESERVED_KEYWORDS.contains(&s_lower.as_str()) {
-        return true;
-    }
-    // PORT NOTE: Go additionally quotes isPipeName(sLower) and
-    // isStatsFuncName(sLower); pipes and stats functions are unported
-    // (Layer 4) — re-add these checks when porting them.
-
-    s.chars().any(|r| !is_token_rune(r))
+    // Delegates to the parser's port of Go `needQuoteToken`, which also
+    // quotes pipe names (`isPipeName`) and stats function names
+    // (`isStatsFuncName`) — required since the pipe/stats parsers landed
+    // (e.g. `blocks_count` must render as `"blocks_count"`).
+    crate::parser::need_quote_token(s)
 }
-
-const RESERVED_KEYWORDS: &[&str] = &[
-    // An empty keyword means end of parsed string
-    "",
-    // boolean operator tokens for 'foo and bar or baz not xxx'
-    "and",
-    "or",
-    "not",
-    "!", // synonym for "not"
-    // parens for '(foo or bar) and baz'
-    "(",
-    ")",
-    // stream filter tokens for '_stream:{foo=~"bar", baz="a"}'
-    "{",
-    "}",
-    "=",
-    "!=",
-    "=~",
-    "!~",
-    ",",
-    // delimiter between query parts:
-    // 'foo and bar | extract "<*> foo <time>" | filter x:y | ...'
-    "|",
-    // delimiter between field name and query in filter: 'foo:bar'
-    ":",
-    // prefix search: 'foo*'
-    "*",
-    // keywords for _time filter: '_time:(now-1h, now]'
-    "[",
-    "]",
-    "now",
-    "offset",
-    "-",
-    // functions
-    "contains_all",
-    "contains_any",
-    "json_array_contains_any",
-    "contains_common_case",
-    "eq_field",
-    "equals_common_case",
-    "exact",
-    "i",
-    "in",
-    "ipv4_range",
-    "ipv6_range",
-    "le_field",
-    "len_range",
-    "lt_field",
-    "pattern_match",
-    "pattern_match_full",
-    "pattern_match_prefix",
-    "pattern_match_suffix",
-    "range",
-    "re",
-    "seq",
-    "string_range",
-    "value_type",
-    // queryOptions start with this keyword
-    "options",
-    // 'if' is used in conditional pipes such as `format if (...) ...`
-    "if",
-    // 'by' is used in various pipes such as `stats by (...) ...`
-    "by",
-    // 'as' is used in various pipes such as `format ... as ...`
-    "as",
-];
 
 // ---------------------------------------------------------------------------
 // Go strconv / regexp helpers.

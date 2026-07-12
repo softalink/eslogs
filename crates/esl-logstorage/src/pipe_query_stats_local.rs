@@ -18,15 +18,21 @@ pub struct PipeQueryStatsLocal {}
 
 /// Constructs a `query_stats_local` pipe.
 ///
-/// PORT NOTE: this pipe is produced only by Go's deferred `splitToRemoteAndLocal`
-/// and carries no parameters, so this constructor takes none.
-// Ported for Go parity; not yet wired into a caller (see PARITY.md).
-#[allow(dead_code)]
+/// This pipe is produced only by `pipeQueryStats.splitToRemoteAndLocal`
+/// (the cluster split) and carries no parameters, so this constructor takes
+/// none.
 pub(crate) fn new_pipe_query_stats_local() -> PipeQueryStatsLocal {
     PipeQueryStatsLocal {}
 }
 
 impl Pipe for PipeQueryStatsLocal {
+    /// Port of Go `pipeQueryStatsLocal.splitToRemoteAndLocal`: this pipe is only
+    /// ever produced by a split, so splitting it again is a bug.
+    fn split_to_remote_and_local(&self, _timestamp: i64) -> crate::pipe::SplitPipesResult {
+        esl_common::panicf!("BUG: unexpected call for pipeQueryStatsLocal");
+        unreachable!()
+    }
+
     fn to_string(&self) -> String {
         "query_stats_local".to_string()
     }

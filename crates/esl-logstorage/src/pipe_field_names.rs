@@ -47,6 +47,36 @@ pub(crate) fn new_pipe_field_names(result_name: String, filter: String) -> PipeF
 }
 
 impl Pipe for PipeFieldNames {
+    /// Port of Go `pipeFieldNames.splitToRemoteAndLocal`: per-node name hits
+    /// are summed locally by `stats by (name) sum(hits)`; the remote result
+    /// name is made unique against the `hits` column and renamed back locally
+    /// when needed.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        let result_name_local = crate::pipe_field_values::get_unique_result_name(
+            &self.result_name,
+            &["hits".to_string()],
+        );
+        let mut p_str = format!(
+            "stats by ({}) sum(hits) as hits",
+            quote_token_if_needed(&result_name_local)
+        );
+        if result_name_local != self.result_name {
+            p_str += &format!(
+                " | rename {} as {}",
+                quote_token_if_needed(&result_name_local),
+                quote_token_if_needed(&self.result_name)
+            );
+        }
+        let ps_local = crate::pipe::must_parse_pipes(&p_str, timestamp);
+
+        let p_remote = PipeFieldNames {
+            result_name: result_name_local,
+            filter: self.filter.clone(),
+            is_first_pipe: self.is_first_pipe,
+        };
+        (Some(Box::new(p_remote)), ps_local)
+    }
+
     fn to_string(&self) -> String {
         let mut s = "field_names".to_string();
         if !self.filter.is_empty() {

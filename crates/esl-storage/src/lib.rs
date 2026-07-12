@@ -569,6 +569,22 @@ pub fn run_query_with_cancel(
     write_block: WriteDataBlockFn,
     cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), String> {
+    let qs = Arc::new(esl_logstorage::query_stats::QueryStats::default());
+    run_query_with_stats(storage, tenant_ids, q, write_block, cancel, &qs)
+}
+
+/// Like [`run_query_with_cancel`], but additionally accumulates the query
+/// execution stats into `qs` (Go `qctx.QueryStats`). The stats of every
+/// subquery of the last-N optimization accumulate into the same `qs`, exactly
+/// like Go's shared query context.
+pub fn run_query_with_stats(
+    storage: &Arc<Storage>,
+    tenant_ids: &[TenantID],
+    q: &Query,
+    write_block: WriteDataBlockFn,
+    cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    qs: &Arc<esl_logstorage::query_stats::QueryStats>,
+) -> Result<(), String> {
     if let Some((q_opt, offset, limit)) = q.get_last_n_results_query() {
         return lastn_optimization::run_optimized_last_n_results_query(
             storage,
@@ -578,10 +594,11 @@ pub fn run_query_with_cancel(
             limit,
             write_block,
             cancel,
+            qs,
         );
     }
 
-    storage.run_query_with_cancel(tenant_ids, q, write_block, cancel)
+    storage.run_query_with_stats(tenant_ids, q, write_block, cancel, qs)
 }
 
 // PORT NOTE: the Go `GetFieldNames`/`GetFieldValues`/`GetStreamFieldNames`/

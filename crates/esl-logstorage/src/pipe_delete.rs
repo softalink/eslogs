@@ -30,6 +30,12 @@ pub(crate) fn new_pipe_delete(field_filters: Vec<String>) -> PipeDelete {
 }
 
 impl Pipe for PipeDelete {
+    /// Port of Go `pipeDelete.splitToRemoteAndLocal`: the pipe runs fully
+    /// remote, unchanged.
+    fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
+        (Some(crate::pipe::clone_pipe(self, timestamp)), Vec::new())
+    }
+
     fn is_fields_or_delete_pipe(&self) -> bool {
         true
     }
