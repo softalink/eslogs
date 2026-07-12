@@ -2,19 +2,15 @@
 //! which joins the input rows against the rows produced by a subquery (or by
 //! inline `rows(...)`) on the `by` fields.
 //!
-//! PORT NOTE — SUBQUERY DEFERRED: Go's `pipeJoin` embeds `q *Query`, the
-//! subquery whose results are joined against. The `Query` type is unported and
-//! subquery execution (Go `initJoinMap` via `getJoinRows(pj.q)`, plus
-//! `visitSubqueries`/`initFilterInValues`) is deferred per `crate::pipe` PORT
-//! NOTES. This port therefore:
-//!   * models the subquery as an opaque already-rendered query string
-//!     ([`PipeJoin::query_text`]) used only by `to_string`;
-//!   * fully ports the INLINE-rows path (Go `rows`): the join map is built from
-//!     the inline rows at construction time (a faithful port of the map-building
-//!     half of Go `initJoinMap`), and `write_block` joins against it;
-//!   * leaves the join map empty when only a subquery is present — that map is
-//!     what `initJoinMap` would populate by executing `q`. See the PORT NOTE at
-//!     [`new_pipe_join`].
+//! PORT NOTE — subquery representation: Go's `pipeJoin` embeds `q *Query`;
+//! the port models it as the already-rendered query text
+//! ([`PipeJoin::query_text`]), the established subquery pattern. The join map:
+//!   * INLINE-rows path (Go `rows`): built from the inline rows at
+//!     construction time (the map-building half of Go `initJoinMap`);
+//!   * SUBQUERY path: built by [`Pipe::init_join_map`] — the port of the
+//!     subquery half of Go `initJoinMap` — which
+//!     `storage_search::init_subqueries` drives before the search, executing
+//!     the subquery via its `get_join_rows` callback (Go `getJoinRowsFunc`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +33,8 @@ pub struct PipeJoin {
     /// Opaque rendered text of the join subquery (Go `q.String()`), present only
     /// when the join uses a subquery rather than inline rows.
     ///
-    /// PORT NOTE: this stands in for Go's `q *Query`; execution is deferred.
+    /// PORT NOTE: this stands in for Go's `q *Query`; it is executed (and
+    /// cleared, like Go's `pjNew.q = nil`) by [`Pipe::init_join_map`].
     pub(crate) query_text: Option<String>,
 
     /// Inline rows to join against (Go `rows`). `Some` iff the join was built
@@ -55,17 +52,13 @@ pub struct PipeJoin {
     m: HashMap<Vec<u8>, Vec<Vec<Field>>>,
 }
 
-/// Constructs a `join` pipe from already-parsed components.
+/// Constructs a `join` pipe from already-parsed components (the tail of Go's
+/// `parsePipeJoin`, whose lexer half lives in `parser::parse_pipe`).
 ///
-/// PORT NOTE: Go's `parsePipeJoin` (and `parseRows`) are lexer-dependent and
-/// deferred; this constructor takes the parsed `by` fields, the join source
-/// (inline `rows` or an opaque `query_text`), the `inner` flag and the prefix.
-///
-/// PORT NOTE — SUBQUERY DEFERRED: when `rows` is `Some`, the join map is built
-/// here — a faithful port of the map-building half of Go `initJoinMap` (the
-/// half that runs when `pj.rows != nil`). When only `query_text` is set, the
-/// map stays empty; Go would fill it by executing the subquery inside
-/// `initJoinMap`, which requires the unported `Query` engine.
+/// When `rows` is `Some`, the join map is built here — the map-building half
+/// of Go `initJoinMap` (the path that runs when `pj.rows != nil`). When only
+/// `query_text` is set, the map is built by [`Pipe::init_join_map`] once
+/// `storage_search::init_subqueries` executes the subquery.
 pub(crate) fn new_pipe_join(
     by_fields: Vec<String>,
     rows: Option<Vec<Vec<Field>>>,
@@ -167,8 +160,8 @@ impl Pipe for PipeJoin {
             marshal_rows(&mut dst, rows);
         } else {
             dst.push(b'(');
-            // PORT NOTE: Go appends `pj.q.String()`; the subquery is deferred, so
-            // its already-rendered text is used verbatim.
+            // PORT NOTE: Go appends `pj.q.String()`; the port stores the
+            // already-rendered subquery text and uses it verbatim.
             dst.extend_from_slice(self.query_text.as_deref().unwrap_or("").as_bytes());
             dst.push(b')');
         }
@@ -214,6 +207,42 @@ impl Pipe for PipeJoin {
         // Do not check for in(...) filters at pj.q, since they are checked
         // separately during pj.q execution at initJoinMap.
         false
+    }
+
+    fn is_join_pipe(&self) -> bool {
+        true
+    }
+
+    /// Port of Go `(*pipeJoin).initJoinMap` (the subquery half; the inline-rows
+    /// half runs at construction — see [`new_pipe_join`]).
+    fn init_join_map(
+        &mut self,
+        get_join_rows: &mut crate::storage_search::GetJoinRowsFn<'_>,
+    ) -> Result<(), String> {
+        if self.rows.is_some() {
+            // The join map was already built from the inline rows at
+            // construction (Go rebuilds it from pj.rows here; same map).
+            return Ok(());
+        }
+        let Some(q_text) = self.query_text.as_deref() else {
+            return Ok(());
+        };
+        let rows = get_join_rows(q_text).map_err(|e| {
+            format!(
+                "cannot execute query at pipe [{}]: {e}",
+                Pipe::to_string(self)
+            )
+        })?;
+        self.m = build_join_map(&rows, &self.by_fields, &self.prefix);
+        // Go: pjNew.q = nil; pjNew.rows = rows — after init the pipe renders as
+        // rows(...).
+        // PORT NOTE: Go's map building strips the by-fields / applies the
+        // prefix inside the shared row slices, so Go's post-init `String()`
+        // shows the transformed rows; the port keeps the fetched rows as is
+        // (they are only read by `to_string` after init).
+        self.rows = Some(rows);
+        self.query_text = None;
+        Ok(())
     }
 
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
@@ -464,10 +493,11 @@ mod tests {
     use super::*;
     use crate::pipe_update::test_utils::{assert_needed_fields, assert_rows_eq, rows, run_pipe};
 
-    // PORT NOTE: `TestParsePipeJoinSuccess` / `TestParsePipeJoinFailure` and
-    // `TestParseRows_Success` / `TestParseRows_Failure` exercise the
-    // lexer-based `parsePipeJoin` / `parseRows`, which are deferred; they are
-    // omitted until the LogsQL parser is ported.
+    // PORT NOTE: the `TestParsePipeJoinSuccess` / `TestParsePipeJoinFailure`
+    // cases (incl. `TestParseRows_*`) are covered as query round-trips in
+    // `parser::tests::test_parse_query_subqueries`; the subquery execution
+    // path (`init_join_map`) is covered by
+    // `storage_search::tests::test_storage_run_query_subqueries`.
 
     fn subquery_join(by_fields: &[&str], is_inner: bool) -> PipeJoin {
         new_pipe_join(

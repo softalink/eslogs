@@ -54,9 +54,24 @@ impl Pipe for PipeFilter {
         self.f.update_needed_fields(pf);
     }
 
-    // PORT NOTE: Go's `hasFilterInWithQuery` inspects the filter for
-    // `in(subquery)` clauses. Subquery execution is deferred crate-wide (see
-    // pipe.rs PORT NOTES), so this keeps the default `false`.
+    /// Port of Go `pipeFilter.hasFilterInWithQuery`.
+    fn has_filter_in_with_query(&self) -> bool {
+        crate::storage_search::has_filter_in_with_query_for_filter(self.f.as_ref())
+    }
+
+    /// Port of Go `pipeFilter.initFilterInValues`.
+    fn init_filter_in_values(
+        &mut self,
+        get_values: &mut crate::storage_search::GetFieldValuesFn<'_>,
+        timestamp: i64,
+    ) -> Result<(), String> {
+        if let Some(f_new) = crate::storage_search::init_filter_in_values_for_shared_filter(
+            &self.f, get_values, timestamp,
+        )? {
+            self.f = f_new;
+        }
+        Ok(())
+    }
 
     fn new_pipe_processor(
         &self,

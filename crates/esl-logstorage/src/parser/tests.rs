@@ -297,6 +297,137 @@ fn test_parse_query_options() {
     );
 }
 
+/// Ported subquery round-trip cases from Go `TestParseQuery_Success`
+/// (parser_test.go): the `in(<subquery>)` / `contains_any(<subquery>)` /
+/// `contains_all(<subquery>)` / `_stream_id:in(<subquery>)` forms plus the
+/// `join`/`union` subquery pipes (Go `TestParsePipeJoinSuccess` /
+/// `TestParsePipeUnionSuccess`).
+#[test]
+fn test_parse_query_subqueries() {
+    // in(<subquery>)
+    ok("in(err|fields x)", "in(err | fields x)");
+    ok(
+        "ip:in(foo and user:in(admin, moderator)|fields ip)",
+        "ip:in(foo user:in(admin,moderator) | fields ip)",
+    );
+    ok(
+        "x:in(_time:5m y:in(*|fields z) | stats by (q) count() rows|fields q)",
+        "x:in(_time:5m y:in(* | fields z) | stats by (q) count(*) as rows | fields q)",
+    );
+    ok(
+        "in(bar:in(1,2,3) | uniq (x)) | stats count() rows",
+        "in(bar:in(1,2,3) | uniq by (x)) | stats count(*) as rows",
+    );
+    ok(
+        "in((1) | fields z) | stats count() rows",
+        "in(1 | fields z) | stats count(*) as rows",
+    );
+    // in(*) with a star subquery collapses to `*` (Go parseInQuery returns a
+    // nil query).
+    ok("in(*)", "*");
+    ok("foo:in(*)", "*");
+
+    // contains_any(<subquery>) / contains_all(<subquery>) go through the same
+    // parseInValues path (Go exercises them in TestQueryAddTimeFilter and the
+    // parseFilterContains* unit tests).
+    ok("contains_any(x|fields foo)", "contains_any(x | fields foo)");
+    ok(
+        "a:contains_any(* | fields bar)",
+        "a:contains_any(* | fields bar)",
+    );
+    ok("contains_all(x|fields foo)", "contains_all(x | fields foo)");
+    ok(
+        "a:contains_all(* | fields bar)",
+        "a:contains_all(* | fields bar)",
+    );
+
+    // trailing ';' inside subqueries
+    ok("a:in(x | keep a;);", "a:in(x | fields a)");
+    ok(
+        "a:in(x | keep a;) | stats count() if (x;) y;",
+        "a:in(x | fields a) | stats count(*) if (x) as y",
+    );
+
+    // subqueries inside `if (...)` filters of stats pipes
+    ok(
+        "* | stats count(x) if (error ip:in(_time:1d | fields ip)) rows",
+        "* | stats count(x) if (error ip:in(_time:1d | fields ip)) as rows",
+    );
+    ok(
+        "* | join by (x) (y) | count() if (a:in((a b) c (d e) | keep a)) z",
+        "* | join by (x) (y) | stats count(*) if (a:in(a b c d e | fields a)) as z",
+    );
+
+    // options round-trips with subqueries (incl. global_filter and option
+    // printing inside the subquery)
+    ok(
+        r#"options(global_filter=(_time:5m {host="abc"})) _time:1h foo:in(_time:3m | keep foo)"#,
+        r#"options(global_filter=(_time:5m {host="abc"})) _time:1h foo:in(_time:3m | fields foo)"#,
+    );
+    ok(
+        "options (concurrency=2) foo bar:in(a:b | uniq(bar)) | union (abc) | join on (x) (y)",
+        "options(concurrency=2) foo bar:in(a:b | uniq by (bar)) | union (abc) | join by (x) (y)",
+    );
+    ok(
+        "options (concurrency=2) foo bar:in(options (concurrency=10, ignore_global_time_filter=true) a:b | uniq(bar)) | union (abc) | join on(x) (y)",
+        "options(concurrency=2) foo bar:in(options(concurrency=10, ignore_global_time_filter=true) a:b | uniq by (bar)) | union (abc) | join by (x) (y)",
+    );
+
+    // _stream_id:in(...) (Go TestParseFilterStreamID round-trips)
+    ok("_stream_id:in()", "_stream_id:in()");
+    ok(
+        "_stream_id:in(0000007b000001c8302bc96e02e54e5524b3a68ec271e55e)",
+        "_stream_id:0000007b000001c8302bc96e02e54e5524b3a68ec271e55e",
+    );
+    ok(
+        r#"_stream_id:in(0000007b000001c8302bc96e02e54e5524b3a68ec271e55e, "0000007b000001c850d9950ea6196b1a4812081265faa1c7")"#,
+        "_stream_id:in(0000007b000001c8302bc96e02e54e5524b3a68ec271e55e,0000007b000001c850d9950ea6196b1a4812081265faa1c7)",
+    );
+    ok(
+        "_stream_id:in(_time:5m | fields _stream_id)",
+        "_stream_id:in(_time:5m | fields _stream_id)",
+    );
+    ok("_stream_id:in(*)", "*");
+    ok("'_stream_id':in(*)", "*");
+
+    // join/union subquery pipes (Go TestParsePipeJoinSuccess /
+    // TestParsePipeUnionSuccess, wrapped in `* | ...`)
+    ok("* | join by (foo) (error)", "* | join by (foo) (error)");
+    ok(
+        "* | join by (foo, bar) (a:b | fields x, y)",
+        "* | join by (foo, bar) (a:b | fields x, y)",
+    );
+    ok(
+        "* | join by (foo) (a:b) prefix c",
+        "* | join by (foo) (a:b) prefix c",
+    );
+    ok(
+        "* | join by (foo) (bar | join by (x, z) (y))",
+        "* | join by (foo) (bar | join by (x, z) (y))",
+    );
+    ok("* | join by (x) (y) inner", "* | join by (x) (y) inner");
+    ok(
+        r#"* | join by (x) ({foo="bar"})"#,
+        r#"* | join by (x) ({foo="bar"})"#,
+    );
+    ok("* | union (*)", "* | union (*)");
+    ok("* | union (foo)", "* | union (foo)");
+    ok(
+        "* | union (foo | union (bar | stats count(*) as x))",
+        "* | union (foo | union (bar | stats count(*) as x))",
+    );
+
+    // failures (Go TestParseQuery_Failure / TestParsePipeJoinFailure /
+    // TestParsePipeUnionFailure)
+    fail("a:in(b;|keep a)");
+    fail("in(foo|bar)");
+    fail("in(err | count() x)"); // missing 'fields' or 'uniq' pipe at the end
+    fail("* | join by (x) ()");
+    fail("* | join by (x) (abc");
+    fail("* | union");
+    fail("* | union()");
+}
+
 #[test]
 fn test_parse_query_failures() {
     fail("");

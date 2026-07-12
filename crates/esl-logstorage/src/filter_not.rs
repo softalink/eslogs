@@ -57,4 +57,11 @@ impl Filter for FilterNot {
     fn visit_subfilters(&self, visit_func: &mut dyn FnMut(&dyn Filter) -> bool) -> bool {
         visit_filter_recursive(self.f.as_ref(), visit_func)
     }
+
+    fn take_not_child(&mut self) -> Option<Box<dyn Filter>> {
+        Some(std::mem::replace(
+            &mut self.f,
+            Box::new(crate::filter_noop::new_filter_noop()),
+        ))
+    }
 }

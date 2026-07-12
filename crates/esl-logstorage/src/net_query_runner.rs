@@ -16,7 +16,9 @@
 //! omitted from the `Pipe` trait** for the single-node port (see pipe.rs
 //! PORT NOTES) — implementing it means adding remote/local pipe splits to all
 //! ~56 pipe impls (`pipe_*_remote` / `pipe_*_local` pairs). `initSubqueries`
-//! (the other dependency) is likewise deferred in `storage_search.rs`.
+//! (the other dependency) IS now ported in `storage_search.rs`, but only in
+//! its lazy single-node mode; the `eagerExecute = true` mode this runner needs
+//! is deferred with it.
 //! Single-node EsLogs serves queries via `Storage::run_query` directly,
 //! so this runner is not needed until the cluster/eslselect-over-RPC layer
 //! lands. The structure is transcribed below as an executable spec so the

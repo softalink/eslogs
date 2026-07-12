@@ -294,8 +294,8 @@ impl PipeProcessor for PipeStreamContextProcessor {
                 // PORT NOTE). Attach a seam via `with_run_query`.
                 return Err(
                     "PORT NOTE: 'stream_context' requires subquery re-execution \
-                     (Go withRunQuery/runQueryFunc), which is deferred until the LogsQL query \
-                     engine is ported"
+                     (Go initStreamContextPipes/withRunQuery), which is not wired into \
+                     storage_search::init_subqueries yet"
                         .to_string(),
                 );
             }

@@ -2,24 +2,21 @@
 //! appends the rows produced by a subquery (or by inline `rows(...)`) after all
 //! the input rows have been processed.
 //!
-//! PORT NOTE — SUBQUERY DEFERRED: Go's `pipeUnion` embeds `q *Query`, the
-//! subquery whose results are appended, and a `runQuery` callback wired up by
-//! `initUnionQuery`. The `Query` type is unported and subquery execution
-//! (`initUnionQuery`, `runQuery`, `visitSubqueries`/`initFilterInValues`) is
-//! deferred per `crate::pipe` PORT NOTES. This port therefore:
-//!   * models the subquery as an opaque already-rendered query string
-//!     ([`PipeUnion::query_text`]) used only by `to_string`;
-//!   * fully ports the local pass-through (`write_block`) and the INLINE-rows
-//!     side of `flush` (Go's `pu.rows != nil` branch);
-//!   * makes `flush` a no-op when only a subquery is present — that is exactly
-//!     where Go would execute `runQuery`. See the PORT NOTE on
-//!     [`PipeUnionProcessor::flush`].
+//! PORT NOTE — subquery representation: Go's `pipeUnion` embeds `q *Query` and
+//! a `runQuery` callback wired up by `initUnionQuery`; the port models the
+//! subquery as its already-rendered query text ([`PipeUnion::query_text`]) —
+//! the established subquery pattern — and `storage_search::init_subqueries`
+//! wires the [`crate::pipe::RunUnionQueryFn`] callback via
+//! [`Pipe::init_union_query`] before the search. `flush` then executes the
+//! subquery and streams its blocks to `pp_next`, exactly like Go's lazy
+//! single-node path (`eagerExecute == false`; the eager cluster path is
+//! deferred with `net_query_runner`).
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::block_result::BlockResult;
-use crate::pipe::{Pipe, PipeProcessor};
+use crate::pipe::{Pipe, PipeProcessor, RunUnionQueryFn};
 use crate::prefix_filter;
 use crate::rows::Field;
 
@@ -28,24 +25,31 @@ pub struct PipeUnion {
     /// Opaque rendered text of the union subquery (Go `q.String()`), present
     /// only when the union uses a subquery rather than inline rows.
     ///
-    /// PORT NOTE: this stands in for Go's `q *Query`; execution is deferred.
+    /// PORT NOTE: this stands in for Go's `q *Query`; it is executed by the
+    /// processor's `flush` via `run_query`.
     pub(crate) query_text: Option<String>,
 
     /// Inline rows to append after the input (Go `rows`). `Some` iff the union
     /// was built with `rows(...)` instead of a subquery.
     pub(crate) rows: Option<Vec<Vec<Field>>>,
+
+    /// Executes the union subquery; wired by
+    /// `storage_search::init_subqueries` via [`Pipe::init_union_query`]
+    /// before query execution (Go `runQuery runUnionQueryFunc`).
+    pub(crate) run_query: Option<RunUnionQueryFn>,
 }
 
-/// Constructs a `union` pipe from already-parsed components.
-///
-/// PORT NOTE: Go's `parsePipeUnion` (and `parseRows`) are lexer-dependent and
-/// deferred; this constructor takes either the parsed inline `rows` or an
-/// opaque `query_text` for the subquery.
+/// Constructs a `union` pipe from already-parsed components (the tail of Go's
+/// `parsePipeUnion`, whose lexer half lives in `parser::parse_pipe`).
 pub(crate) fn new_pipe_union(
     rows: Option<Vec<Vec<Field>>>,
     query_text: Option<String>,
 ) -> PipeUnion {
-    PipeUnion { query_text, rows }
+    PipeUnion {
+        query_text,
+        rows,
+        run_query: None,
+    }
 }
 
 impl Pipe for PipeUnion {
@@ -57,8 +61,8 @@ impl Pipe for PipeUnion {
             crate::pipe_join::marshal_rows(&mut dst, rows);
         } else {
             dst.push(b'(');
-            // PORT NOTE: Go appends `pu.q.String()`; the subquery is deferred, so
-            // its already-rendered text is used verbatim.
+            // PORT NOTE: Go appends `pu.q.String()`; the port stores the
+            // already-rendered subquery text and uses it verbatim.
             dst.extend_from_slice(self.query_text.as_deref().unwrap_or("").as_bytes());
             dst.push(b')');
         }
@@ -117,6 +121,18 @@ impl Pipe for PipeUnion {
         false
     }
 
+    fn is_union_pipe(&self) -> bool {
+        true
+    }
+
+    /// Port of Go `(*pipeUnion).initUnionQuery` (lazy single-node path:
+    /// `eagerExecute == false`, so the subquery runs at the processor's
+    /// `flush`).
+    fn init_union_query(&mut self, run_query: &RunUnionQueryFn) -> Result<(), String> {
+        self.run_query = Some(Arc::clone(run_query));
+        Ok(())
+    }
+
     fn update_needed_fields(&self, _pf: &mut prefix_filter::Filter) {
         // nothing to do
     }
@@ -128,14 +144,18 @@ impl Pipe for PipeUnion {
         pp_next: Arc<dyn PipeProcessor>,
     ) -> Arc<dyn PipeProcessor> {
         Arc::new(PipeUnionProcessor {
+            query_text: self.query_text.clone(),
             rows: self.rows.clone(),
+            run_query: self.run_query.clone(),
             pp_next,
         })
     }
 }
 
 struct PipeUnionProcessor {
+    query_text: Option<String>,
     rows: Option<Vec<Vec<Field>>>,
+    run_query: Option<RunUnionQueryFn>,
     pp_next: Arc<dyn PipeProcessor>,
 }
 
@@ -148,20 +168,25 @@ impl PipeProcessor for PipeUnionProcessor {
     }
 
     fn flush(&self) -> Result<(), String> {
-        match &self.rows {
-            Some(rows) => {
-                let mut br = BlockResult::default();
-                br.must_init_from_rows(rows);
-                self.pp_next.write_block(0, &mut br);
-                Ok(())
-            }
-            None => {
-                // PORT NOTE: subquery execution deferred (Query unported). Go
-                // runs `pu.runQuery(ctx, pu.q, pu.ppNext.writeBlock)` here to
-                // append the subquery results; that path needs the unported
-                // `Query` engine and is intentionally a no-op until it lands.
-                Ok(())
-            }
+        // execute the query to union
+        //
+        // PORT NOTE: Go wraps the pipeline stop channel into a context here
+        // (`contextutil.NewStopChanContext`); the Rust `run_query` has no
+        // cancellation (see its PORT NOTE), so nothing is threaded through.
+        if let Some(rows) = &self.rows {
+            let mut br = BlockResult::default();
+            br.must_init_from_rows(rows);
+            self.pp_next.write_block(0, &mut br);
+            return Ok(());
+        }
+
+        match (&self.query_text, &self.run_query) {
+            (Some(q_text), Some(run_query)) => run_query(q_text, Arc::clone(&self.pp_next)),
+            // PORT NOTE: reachable only when the pipe runs outside
+            // `Storage::run_query` (unit harnesses) — `init_union_query`
+            // wires `run_query` before every real query execution (Go would
+            // nil-panic here).
+            _ => Ok(()),
         }
     }
 }
@@ -171,9 +196,11 @@ mod tests {
     use super::*;
     use crate::pipe_update::test_utils::{assert_needed_fields, assert_rows_eq, rows, run_pipe};
 
-    // PORT NOTE: `TestParsePipeUnionSuccess` / `TestParsePipeUnionFailure`
-    // exercise the lexer-based `parsePipeUnion`, which is deferred; they are
-    // omitted until the LogsQL parser is ported.
+    // PORT NOTE: the `TestParsePipeUnionSuccess` / `TestParsePipeUnionFailure`
+    // cases are covered as query round-trips in
+    // `parser::tests::test_parse_query_subqueries`; the subquery execution
+    // path (`init_union_query` + processor `flush`) is covered by
+    // `storage_search::tests::test_storage_run_query_subqueries`.
 
     fn subquery_union(query_text: &str) -> PipeUnion {
         new_pipe_union(None, Some(query_text.to_string()))

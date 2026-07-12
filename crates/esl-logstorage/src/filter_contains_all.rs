@@ -11,9 +11,8 @@ use crate::bitmap::Bitmap;
 use crate::block_header::ColumnHeader;
 use crate::block_result::{BlockResult, ColRef};
 use crate::block_search::BlockSearch;
-use crate::filter::FieldFilter;
+use crate::filter::{FieldFilter, Filter};
 use crate::filter_generic::{FilterGeneric, clone_column_header, new_filter_generic};
-use crate::filter_in::in_values_string;
 use crate::filter_phrase::{
     match_bloom_filter_all_tokens, match_encoded_values_dict, match_phrase, to_float64_string,
     to_ipv4_string, to_timestamp_iso8601_string, visit_values,
@@ -38,6 +37,21 @@ pub(crate) fn new_filter_contains_all_values(
         field_name,
         Box::new(FilterContainsAll {
             values: InValues::new(values),
+        }),
+    )
+}
+
+/// Builds a `contains_all(<subquery>)` filter (Go `parseFilterContainsAll`
+/// with `iv.q` set).
+pub(crate) fn new_filter_contains_all_query(
+    field_name: &str,
+    q_text: String,
+    q_field_name: String,
+) -> FilterGeneric {
+    new_filter_generic(
+        field_name,
+        Box::new(FilterContainsAll {
+            values: InValues::new_from_query(q_text, q_field_name),
         }),
     )
 }
@@ -67,7 +81,15 @@ impl FilterContainsAll {
 
 impl FieldFilter for FilterContainsAll {
     fn to_string(&self) -> String {
-        format!("contains_all({})", in_values_string(&self.values.values))
+        format!("contains_all({})", self.values.string())
+    }
+
+    fn in_values(&self) -> Option<&InValues> {
+        Some(&self.values)
+    }
+
+    fn new_with_values(&self, field_name: &str, values: Vec<String>) -> Option<Box<dyn Filter>> {
+        Some(Box::new(new_filter_contains_all_values(field_name, values)))
     }
 
     fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {

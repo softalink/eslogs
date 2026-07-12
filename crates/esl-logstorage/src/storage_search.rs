@@ -33,9 +33,12 @@
 //! * **Stream pre-filtering.** `get_stream_ids` / `getCommonStreamFilter`
 //!   return empty/None (scan all streams by tenantID), so the search always
 //!   goes through the tenantID path.
-//! * **Subqueries / unions / joins / `filter in(subquery)`.**
-//!   `initSubqueries`/`initUnionQueries`/`initJoinMaps`/`initFilterInValues`
-//!   are deferred (single-node, no subqueries); `q` is executed directly.
+//!
+//! **Subqueries** (`in(<subquery>)` filters, `join`/`union` subqueries) are
+//! ported: [`init_subqueries`] mirrors Go `initSubqueries` and runs at the top
+//! of [`run_query`] (see its PORT NOTE for the clone-by-reparse divergence).
+//! Only `initStreamContextPipes` (the `stream_context` runQuery wiring) stays
+//! deferred — see pipe_stream_context.rs.
 //!
 //! PORT NOTE: Go's `searchParallel` uses a channel of pooled
 //! `blockSearchWorkBatch`es fed by concurrent partition searchers. Since
@@ -453,7 +456,7 @@ fn are_const_values(values: &[Vec<u8>]) -> bool {
 
 /// Search options for a Storage search (Go `storageSearchOptions`).
 ///
-/// PORT NOTE: `streamFilter`/`hiddenFieldsFilter`/subquery passes are deferred
+/// PORT NOTE: the `streamFilter`/`hiddenFieldsFilter` passes are deferred
 /// (see the module deferral notes). `filter` is borrowed from the query (the
 /// `Filter` trait has no clone hook and the query outlives the search).
 struct StorageSearchOptions<'f> {
@@ -640,14 +643,29 @@ where
 ///
 /// PORT NOTE: Go takes a `*QueryContext` (context/cancellation/tenantIDs/stats);
 /// the port passes `tenant_ids` explicitly and drops context cancellation.
-/// `initSubqueries`/`initUnionQueries`/`initJoinMaps`/`initFilterInValues` are
-/// deferred (single-node, no subqueries); `q` is executed directly.
 pub(crate) fn run_query(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
     write_block_fn: WriteDataBlockFn,
 ) -> Result<(), String> {
+    let sink: Arc<dyn PipeProcessor> = Arc::new(BlockResultWriter { f: write_block_fn });
+    run_query_with_sink(storage, tenant_ids, q, sink)
+}
+
+/// Go `Storage.runQuery`, with the terminal `writeBlock` generalized to a
+/// [`PipeProcessor`] sink so `union` subqueries can stream their block results
+/// straight into the outer pipeline (Go passes `writeBlockResultFunc`s around
+/// instead).
+fn run_query_with_sink(
+    storage: &Arc<Storage>,
+    tenant_ids: &[TenantID],
+    q: &Query,
+    sink: Arc<dyn PipeProcessor>,
+) -> Result<(), String> {
+    let q_new = init_subqueries(storage, tenant_ids, q)?;
+    let q = q_new.as_ref().unwrap_or(q);
+
     let sso = get_search_options(tenant_ids, q);
     let qs = QueryStats::default();
 
@@ -655,8 +673,6 @@ pub(crate) fn run_query(
     let workers = q
         .get_parallel_readers(storage.default_parallel_readers)
         .max(1);
-
-    let sink: Arc<dyn PipeProcessor> = Arc::new(BlockResultWriter { f: write_block_fn });
 
     let res = run_pipes(
         q.pipes(),
@@ -1063,10 +1079,331 @@ impl Storage {
     }
 }
 
-// PORT NOTE: Go's `getFieldValuesGeneric` / `isLastPipeUniq` / `getRows` are
-// used only by `initSubqueries` (`in(subquery)` / `join` initialization),
-// which is deferred (see the module deferral notes above); they are not
-// ported yet.
+// ---------------------------------------------------------------------------
+// Subquery initialization (Go initSubqueries / initFilterInValues /
+// initJoinMaps / initUnionQueries and their helpers)
+// ---------------------------------------------------------------------------
+
+/// Port of Go `getFieldValuesFunc`: executes the subquery given as rendered
+/// text and returns the unique values of the given field
+/// (`fn(q_text, q_field_name)`).
+pub(crate) type GetFieldValuesFn<'a> = dyn FnMut(&str, &str) -> Result<Vec<String>, String> + 'a;
+
+/// Port of Go `getJoinRowsFunc`: executes the join subquery given as rendered
+/// text and returns its result rows.
+pub(crate) type GetJoinRowsFn<'a> = dyn FnMut(&str) -> Result<Vec<Vec<Field>>, String> + 'a;
+
+/// Port of Go `hasFilterInWithQueryForFilter` (its type-switch on
+/// `*filterGeneric` / `*filterStreamID` is the
+/// [`crate::filter::Filter::has_filter_in_with_query`] hook).
+pub(crate) fn has_filter_in_with_query_for_filter(f: &dyn crate::filter::Filter) -> bool {
+    crate::filter::visit_filter_recursive(f, &mut |f| f.has_filter_in_with_query())
+}
+
+/// Port of Go `initFilterInValuesForFilter`: rewrites the filter tree,
+/// resolving `in(<subquery>)` leaves into literal-values filters via
+/// `get_values(q_text, q_field_name)`.
+///
+/// PORT NOTE: Go rewrites via the generic `copyFilter(visitFunc, copyFunc)`;
+/// the port takes ownership and rebuilds the `and`/`or`/`not` composites
+/// through the `take_*` hooks (like `remove_star_filters`), substituting
+/// leaves via [`crate::filter::Filter::init_filter_in_values`]. Go's
+/// `inValuesCache` (keyed by the subquery string) is folded into the
+/// `get_values` closure built by [`init_subqueries`].
+pub(crate) fn init_filter_in_values_for_filter(
+    mut f: Box<dyn crate::filter::Filter>,
+    get_values: &mut GetFieldValuesFn<'_>,
+) -> Result<Box<dyn crate::filter::Filter>, String> {
+    if let Some(children) = f.take_or_children() {
+        let children = children
+            .into_iter()
+            .map(|c| init_filter_in_values_for_filter(c, get_values))
+            .collect::<Result<Vec<_>, String>>()?;
+        return Ok(Box::new(crate::filter_or::new_filter_or(children)));
+    }
+    if let Some(children) = f.take_and_children() {
+        let children = children
+            .into_iter()
+            .map(|c| init_filter_in_values_for_filter(c, get_values))
+            .collect::<Result<Vec<_>, String>>()?;
+        return Ok(Box::new(crate::filter_and::new_filter_and(children)));
+    }
+    if let Some(child) = f.take_not_child() {
+        let child = init_filter_in_values_for_filter(child, get_values)?;
+        return Ok(Box::new(crate::filter_not::new_filter_not(child)));
+    }
+    if let Some(f_new) = f.init_filter_in_values(get_values)? {
+        return Ok(f_new);
+    }
+    Ok(f)
+}
+
+/// [`init_filter_in_values_for_filter`] over an `Arc`-shared filter (the
+/// `if (...)` filters embedded in pipes, and `pipe_filter`'s filter). Returns
+/// `Some(new)` only when the filter embeds an `in(<subquery>)`.
+///
+/// PORT NOTE: Go rewrites the shared tree via `copyFilter`, sharing unchanged
+/// children by pointer; `Arc<dyn Filter>` children cannot be re-owned, so the
+/// tree is re-parsed from its rendered text at the query `timestamp` (the
+/// established `Query::clone` render/re-parse divergence) and the owned tree
+/// is rewritten.
+pub(crate) fn init_filter_in_values_for_shared_filter(
+    f: &Arc<dyn crate::filter::Filter>,
+    get_values: &mut GetFieldValuesFn<'_>,
+    timestamp: i64,
+) -> Result<Option<Arc<dyn crate::filter::Filter>>, String> {
+    if !has_filter_in_with_query_for_filter(f.as_ref()) {
+        return Ok(None);
+    }
+    let text = f.to_string();
+    let q = crate::parser::ParseQueryAtTimestamp(&text, timestamp)
+        .map_err(|e| format!("BUG: cannot re-parse filter [{text}]: {e}"))?;
+    if !q.pipes().is_empty() {
+        return Err(format!(
+            "BUG: unexpected pipes when re-parsing filter [{text}]"
+        ));
+    }
+    let f_new = init_filter_in_values_for_filter(q.f, get_values)?;
+    Ok(Some(Arc::from(f_new)))
+}
+
+/// Port of Go `initFilterInValues` (query level): rewrites the global filter,
+/// the top-level filter and the pipe-embedded filters of `q`.
+fn init_filter_in_values_for_query(
+    q: &mut Query,
+    get_values: &mut GetFieldValuesFn<'_>,
+    timestamp: i64,
+) -> Result<(), String> {
+    if !q.has_filter_in_with_query() {
+        return Ok(());
+    }
+
+    if let Some(gf) = q.opts.global_filter.take() {
+        let gf = if has_filter_in_with_query_for_filter(gf.as_ref()) {
+            init_filter_in_values_for_filter(gf, get_values)?
+        } else {
+            gf
+        };
+        q.opts.global_filter = Some(gf);
+    }
+
+    if has_filter_in_with_query_for_filter(q.f.as_ref()) {
+        let f = std::mem::replace(&mut q.f, Box::new(crate::filter_noop::new_filter_noop()));
+        q.f = init_filter_in_values_for_filter(f, get_values)?;
+    }
+
+    if q.pipes.iter().any(|p| p.has_filter_in_with_query()) {
+        // Go initFilterInValuesForPipes rebuilds the pipe slice; the port
+        // rewrites the (query-owned) pipes in place.
+        for p in &mut q.pipes {
+            p.init_filter_in_values(get_values, timestamp)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Port of Go `isLastPipeUniq`.
+fn is_last_pipe_uniq(pipes: &[Box<dyn crate::pipe::Pipe>]) -> bool {
+    pipes.last().is_some_and(|p| p.is_uniq_pipe())
+}
+
+/// Port of Go `getFieldValuesGeneric`: appends `| uniq by (field_name)` to `q`
+/// (unless it already ends with a `uniq` pipe) and collects the resulting
+/// unique values.
+///
+/// PORT NOTE: Go shards the collected values per CPU with a chunked allocator;
+/// the port uses a single mutex-guarded Vec (subquery value sets are small).
+/// Go's `// TODO: track memory usage` applies here too.
+fn get_field_values_generic(
+    storage: &Arc<Storage>,
+    tenant_ids: &[TenantID],
+    q: &Query,
+    field_name: &str,
+) -> Result<Vec<String>, String> {
+    let q_holder;
+    let q = if is_last_pipe_uniq(q.pipes()) {
+        q
+    } else {
+        let mut q_new = q.clone(q.get_timestamp());
+        let quoted_field_name = crate::parser::quote_token_if_needed(field_name);
+        q_new.must_append_pipe(&format!("uniq by ({quoted_field_name})"));
+        q_holder = q_new;
+        &q_holder
+    };
+
+    let values: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let values_w = Arc::clone(&values);
+    let write_block: WriteDataBlockFn = Arc::new(move |_worker_id, db: &mut DataBlock| {
+        if db.rows_count() == 0 {
+            return;
+        }
+
+        let cs = db.get_columns(false);
+        if cs.len() != 1 {
+            esl_common::panicf!("BUG: expecting one column; got {} columns", cs.len());
+        }
+
+        let mut dst = values_w.lock().unwrap();
+        for v in &cs[0].values {
+            dst.push(String::from_utf8_lossy(v).into_owned());
+        }
+    });
+
+    run_query(storage, tenant_ids, q, write_block)?;
+
+    let values = std::mem::take(&mut *values.lock().unwrap());
+    Ok(values)
+}
+
+/// Port of Go `getRows`: runs `q` and collects its result rows (dropping
+/// empty-valued fields), bounded by a state-size budget of 20% of the allowed
+/// memory.
+///
+/// PORT NOTE: Go shards rows per worker (`atomicutil.Slice`) with per-shard
+/// budget chunks stolen from the global budget and `unsafe.Sizeof`-based
+/// accounting; the port uses one mutex-guarded Vec and subtracts an
+/// equivalent per-block size estimate from the shared budget. Observable
+/// behavior matches: rows are collected until the budget is exhausted, in
+/// which case an error is returned.
+fn get_rows(
+    storage: &Arc<Storage>,
+    tenant_ids: &[TenantID],
+    q: &Query,
+) -> Result<Vec<Vec<Field>>, String> {
+    let max_state_size = (esl_common::memory::allowed() as f64 * 0.2) as i64;
+    let state_size_budget = Arc::new(std::sync::atomic::AtomicI64::new(max_state_size));
+    let rows: Arc<std::sync::Mutex<Vec<Vec<Field>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let rows_w = Arc::clone(&rows);
+    let budget_w = Arc::clone(&state_size_budget);
+    let write_block: WriteDataBlockFn = Arc::new(move |_worker_id, db: &mut DataBlock| {
+        if db.rows_count() == 0 {
+            return;
+        }
+        if budget_w.load(Ordering::SeqCst) < 0 {
+            // The state size is too big. Stop processing data in order to
+            // avoid OOM crash.
+            return;
+        }
+
+        let rows_count = db.rows_count();
+        let cs = db.get_columns(false);
+
+        let mut block_rows: Vec<Vec<Field>> = Vec::with_capacity(rows_count);
+        let mut block_size = 0i64;
+        for row_idx in 0..rows_count {
+            let mut fields: Vec<Field> = Vec::with_capacity(cs.len());
+            for c in cs {
+                let v = &c.values[row_idx];
+                if v.is_empty() {
+                    continue;
+                }
+                let name = c.name.clone();
+                let value = String::from_utf8_lossy(v).into_owned();
+                block_size +=
+                    (name.len() + value.len()) as i64 + 2 * std::mem::size_of::<String>() as i64;
+                fields.push(Field { name, value });
+            }
+            block_size += std::mem::size_of::<Vec<Field>>() as i64;
+            block_rows.push(fields);
+        }
+        budget_w.fetch_sub(block_size, Ordering::SeqCst);
+        rows_w.lock().unwrap().extend(block_rows);
+    });
+
+    run_query(storage, tenant_ids, q, write_block)?;
+
+    if state_size_budget.load(Ordering::SeqCst) < 0 {
+        return Err(format!(
+            "cannot load rows for [{q}] because they occupy more than {}MB of memory",
+            max_state_size / (1 << 20)
+        ));
+    }
+
+    let rows = std::mem::take(&mut *rows.lock().unwrap());
+    Ok(rows)
+}
+
+/// Port of Go `initSubqueries`: resolves `in(<subquery>)` filter values,
+/// builds `join` maps and wires `union` subqueries before the search starts.
+/// Returns `None` when `q` embeds no subqueries (it is executed as is).
+///
+/// PORT NOTE: Go rewrites shared filter/pipe trees via `cloneShallow` +
+/// `copyFilter`; Rust filters/pipes are single-owner trait objects, so a query
+/// with subqueries is cloned via re-parsing ([`Query::clone`]) and rewritten
+/// in place. Go's `eagerExecute` mode (cluster-only, `NewNetQueryRunner`) and
+/// `initStreamContextPipes` (`stream_context` runQuery wiring — see
+/// pipe_stream_context.rs) stay deferred.
+fn init_subqueries(
+    storage: &Arc<Storage>,
+    tenant_ids: &[TenantID],
+    q: &Query,
+) -> Result<Option<Query>, String> {
+    let has_in = q.has_filter_in_with_query();
+    let has_join = q.pipes().iter().any(|p| p.is_join_pipe());
+    let has_union = q.pipes().iter().any(|p| p.is_union_pipe());
+    if !has_in && !has_join && !has_union {
+        return Ok(None);
+    }
+
+    let timestamp = q.get_timestamp();
+    let mut q_new = q.clone(timestamp);
+
+    if has_in {
+        // Go `getValuesForQuery` caches subquery results in an `inValuesCache`
+        // keyed by the subquery string; the cache is folded into the closure.
+        let mut cache: HashMap<String, Vec<String>> = HashMap::new();
+        let mut get_field_values =
+            |q_text: &str, field_name: &str| -> Result<Vec<String>, String> {
+                if let Some(values) = cache.get(q_text) {
+                    return Ok(values.clone());
+                }
+                let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
+                    .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
+                let values = get_field_values_generic(storage, tenant_ids, &q_sub, field_name)?;
+                cache.insert(q_text.to_string(), values.clone());
+                Ok(values)
+            };
+        init_filter_in_values_for_query(&mut q_new, &mut get_field_values, timestamp)
+            .map_err(|e| format!("cannot initialize `in` subqueries: {e}"))?;
+    }
+
+    if has_join {
+        // Go `initJoinMaps` (its `*pipeJoin` type-switch is the
+        // `Pipe::init_join_map` hook).
+        let mut get_join_rows = |q_text: &str| -> Result<Vec<Vec<Field>>, String> {
+            let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
+                .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
+            get_rows(storage, tenant_ids, &q_sub)
+        };
+        for p in &mut q_new.pipes {
+            p.init_join_map(&mut get_join_rows)
+                .map_err(|e| format!("cannot initialize `join` subqueries: {e}"))?;
+        }
+    }
+
+    if has_union {
+        // Go `initUnionQueries` (its `*pipeUnion` type-switch is the
+        // `Pipe::init_union_query` hook). The wired callback executes the
+        // union subquery lazily at the union processor's `flush`, exactly like
+        // Go's single-node path (`eagerExecute == false`).
+        let storage_u = Arc::clone(storage);
+        let tenant_ids_u: Vec<TenantID> = tenant_ids.to_vec();
+        let run_union_query: crate::pipe::RunUnionQueryFn =
+            Arc::new(move |q_text, sink| -> Result<(), String> {
+                let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
+                    .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
+                run_query_with_sink(&storage_u, &tenant_ids_u, &q_sub, sink)
+            });
+        for p in &mut q_new.pipes {
+            p.init_union_query(&run_union_query)
+                .map_err(|e| format!("cannot initialize 'union' subqueries: {e}"))?;
+        }
+    }
+
+    Ok(Some(q_new))
+}
 
 /// Port of Go `toValuesWithHits` (`map[string]*uint64` becomes an owned map).
 fn to_values_with_hits(m: HashMap<String, u64>) -> Vec<ValueWithHits> {
@@ -1386,8 +1723,9 @@ mod tests {
     // (storage_search_test.go). The storage layout matches the Go test:
     // 11 tenants x 3 streams x 5 blocks x 7 rows = 1155 rows.
 
-    #[test]
-    fn test_storage_run_query_values_with_hits() {
+    /// Fills `s` with the Go `TestStorageRunQuery` fixture layout:
+    /// 11 tenants x 3 streams x 5 blocks x 7 rows = 1155 rows.
+    fn fill_run_query_fixture(s: &Arc<Storage>) -> Vec<TenantID> {
         const TENANTS_COUNT: u32 = 11;
         const STREAMS_PER_TENANT: usize = 3;
         const BLOCKS_PER_STREAM: usize = 5;
@@ -1400,18 +1738,6 @@ mod tests {
             }
         }
 
-        fn vh(value: &str, hits: u64) -> ValueWithHits {
-            ValueWithHits {
-                value: value.to_string(),
-                hits,
-            }
-        }
-
-        let path = run_query_temp_path("values-with-hits");
-        let cfg = StorageConfig::default();
-        let s = Storage::must_open_storage(&path, &cfg);
-
-        // fill the storage with data
         let mut all_tenant_ids: Vec<TenantID> = Vec::new();
         let base_timestamp = now_nanos() - 3600 * 1_000_000_000;
         let stream_tags = ["job", "instance"];
@@ -1442,6 +1768,24 @@ mod tests {
             }
         }
         s.debug_flush();
+        all_tenant_ids
+    }
+
+    #[test]
+    fn test_storage_run_query_values_with_hits() {
+        fn vh(value: &str, hits: u64) -> ValueWithHits {
+            ValueWithHits {
+                value: value.to_string(),
+                hits,
+            }
+        }
+
+        let path = run_query_temp_path("values-with-hits");
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+
+        // fill the storage with data
+        let all_tenant_ids = fill_run_query_fixture(&s);
 
         let parse = |q: &str| ParseQuery(q).expect("parse query");
 
@@ -1635,6 +1979,283 @@ mod tests {
             ];
             assert_eq!(results, results_expected, "stream_ids");
         }
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
+    }
+
+    // -- Subquery execution tests --------------------------------------------
+    //
+    // Port of the subquery subtests of Go `TestStorageRunQuery`
+    // (storage_search_test.go): `in-filter-with-subquery-{match,mismatch}`,
+    // `_stream_id-filter`, `in-filter-with-subquery-in-conditional-stats-mismatch`,
+    // `query_stats-subquery`, `union-pipe`, `pipe-extract-if-filter-with-subquery*`
+    // and `pipe-join{,-prefix,-inline-rows,-inline-rows-prefix}`.
+
+    /// A collected result row as sorted `(name, value)` pairs.
+    type TestRow = Vec<(String, String)>;
+
+    #[test]
+    fn test_storage_run_query_subqueries() {
+        let path = run_query_temp_path("subqueries");
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+        let all_tenant_ids = fill_run_query_fixture(&s);
+
+        // Go `f` helper: run the query and compare the collected rows
+        // (order-insensitive, like Go `assertRowsEqual`/`sortTestRows`).
+        let f = |query: &str, rows_expected: &[&[(&str, &str)]]| {
+            let q = ParseQuery(query).unwrap_or_else(|e| panic!("cannot parse [{query}]: {e}"));
+            let rows: Arc<Mutex<Vec<TestRow>>> = Arc::new(Mutex::new(Vec::new()));
+            let rows_w = Arc::clone(&rows);
+            let write: WriteDataBlockFn = Arc::new(move |_wid, db: &mut DataBlock| {
+                let rows_count = db.rows_count();
+                let cs = db.get_columns(false);
+                if cs.is_empty() {
+                    return;
+                }
+                let mut dst = rows_w.lock().unwrap();
+                for i in 0..rows_count {
+                    let mut row: Vec<(String, String)> = cs
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.name.clone(),
+                                String::from_utf8_lossy(&c.values[i]).into_owned(),
+                            )
+                        })
+                        .collect();
+                    row.sort();
+                    dst.push(row);
+                }
+            });
+            s.run_query(&all_tenant_ids, &q, write)
+                .unwrap_or_else(|e| panic!("cannot run [{query}]: {e}"));
+
+            let mut rows = std::mem::take(&mut *rows.lock().unwrap());
+            rows.sort();
+            let mut rows_expected: Vec<Vec<(String, String)>> = rows_expected
+                .iter()
+                .map(|row| {
+                    let mut row: Vec<(String, String)> = row
+                        .iter()
+                        .map(|(n, v)| (n.to_string(), v.to_string()))
+                        .collect();
+                    row.sort();
+                    row
+                })
+                .collect();
+            rows_expected.sort();
+            assert_eq!(rows, rows_expected, "unexpected rows for [{query}]");
+        };
+
+        // in-filter-with-subquery-match
+        f(
+            "tenant.id:in(tenant.id:2 | fields tenant.id) | stats count() rows",
+            &[&[("rows", "105")]],
+        );
+
+        // in-filter-with-subquery-mismatch
+        f(
+            "tenant.id:in(tenant.id:23243 | fields tenant.id) | stats count() rows",
+            &[&[("rows", "0")]],
+        );
+
+        // _stream_id-filter (in(<subquery>))
+        f(
+            "_stream_id:in(tenant.id:2 | fields _stream_id) | stats count() rows",
+            &[&[("rows", "105")]],
+        );
+
+        // query_stats-subquery, adapted: the Go case asserts the shared
+        // QueryStats (which count the subquery's reads through the shared
+        // qctx — the Rust QueryStats are per-run_query); the port asserts the
+        // row counts instead. The subquery ends with a `uniq` pipe, so
+        // get_field_values_generic must not append another one.
+        f(
+            r#"non-existing-field:in("message" | uniq tenant.id) | stats count() rows"#,
+            &[&[("rows", "0")]],
+        );
+        f(
+            r#"tenant.id:in("message" | uniq tenant.id) | stats count() rows"#,
+            &[&[("rows", "1155")]],
+        );
+
+        // in-filter-with-subquery-in-conditional-stats-mismatch
+        f(
+            "* | stats \
+                count() rows_total, \
+                count() if (tenant.id:in(tenant.id:3 | fields tenant.id)) rows_nonzero, \
+                count() if (tenant.id:in(tenant.id:23243 | fields tenant.id)) rows_zero",
+            &[&[
+                ("rows_total", "1155"),
+                ("rows_nonzero", "105"),
+                ("rows_zero", "0"),
+            ]],
+        );
+
+        // union-pipe
+        f(
+            r#"{instance=~"host-1.+"} | union ({instance=~"host-2.+"}) | count() hits"#,
+            &[&[("hits", "770")]],
+        );
+
+        // pipe-extract-if-filter-with-subquery
+        f(
+            r#"* | extract
+                if (tenant.id:in(tenant.id:(3 or 4) | fields tenant.id))
+                "host-<host>:" from instance
+            | filter host:~"1|2"
+            | uniq (tenant.id, host) with hits
+            | sort by (tenant.id, host)"#,
+            &[
+                &[
+                    ("tenant.id", "{accountID=3,projectID=31}"),
+                    ("host", "1"),
+                    ("hits", "35"),
+                ],
+                &[
+                    ("tenant.id", "{accountID=3,projectID=31}"),
+                    ("host", "2"),
+                    ("hits", "35"),
+                ],
+                &[
+                    ("tenant.id", "{accountID=4,projectID=41}"),
+                    ("host", "1"),
+                    ("hits", "35"),
+                ],
+                &[
+                    ("tenant.id", "{accountID=4,projectID=41}"),
+                    ("host", "2"),
+                    ("hits", "35"),
+                ],
+            ],
+        );
+
+        // pipe-extract-if-filter-with-subquery-non-empty-host
+        f(
+            r#"* | extract
+                if (tenant.id:in(tenant.id:3 | fields tenant.id))
+                "host-<host>:" from instance
+            | filter host:*
+            | uniq (host) with hits
+            | sort by (host)"#,
+            &[
+                &[("host", "0"), ("hits", "35")],
+                &[("host", "1"), ("hits", "35")],
+                &[("host", "2"), ("hits", "35")],
+            ],
+        );
+
+        // pipe-extract-if-filter-with-subquery-empty-host
+        f(
+            r#"* | extract
+                if (tenant.id:in(tenant.id:3 | fields tenant.id))
+                "host-<host>:" from instance
+            | filter host:""
+            | uniq (host) with hits
+            | sort by (host)"#,
+            &[&[("host", ""), ("hits", "1050")]],
+        );
+
+        // pipe-join (left join)
+        f(
+            "'message 5' | stats by (instance) count() x \
+            | join on (instance) ( \
+                'block 0' instance:host-1 | stats by (instance) \
+                    count() total, \
+                    count_uniq(stream-id) streams, \
+                    count_uniq(stream-id) x \
+            )",
+            &[
+                &[("instance", "host-0:234"), ("x", "55")],
+                &[("instance", "host-2:234"), ("x", "55")],
+                &[
+                    ("instance", "host-1:234"),
+                    ("x", "55"),
+                    ("total", "77"),
+                    ("streams", "1"),
+                ],
+            ],
+        );
+
+        // pipe-join (inner join)
+        f(
+            "'message 5' | stats by (instance) count() x \
+            | join on (instance) ( \
+                'block 0' instance:host-1 | stats by (instance) \
+                    count() total, \
+                    count_uniq(stream-id) streams, \
+                    count_uniq(stream-id) x \
+            ) inner",
+            &[&[
+                ("instance", "host-1:234"),
+                ("x", "55"),
+                ("total", "77"),
+                ("streams", "1"),
+            ]],
+        );
+
+        // pipe-join-prefix
+        f(
+            "'message 5' | stats by (instance) count() x \
+            | join on (instance) ( \
+                'block 0' instance:host-1 | stats by (instance) \
+                    count() total, \
+                    count_uniq(stream-id) streams, \
+                    count_uniq(stream-id) x \
+            ) prefix \"abc.\"",
+            &[
+                &[("instance", "host-0:234"), ("x", "55")],
+                &[("instance", "host-2:234"), ("x", "55")],
+                &[
+                    ("instance", "host-1:234"),
+                    ("x", "55"),
+                    ("abc.total", "77"),
+                    ("abc.streams", "1"),
+                    ("abc.x", "1"),
+                ],
+            ],
+        );
+
+        // pipe-join-inline-rows
+        f(
+            r#"'message 5' | stats by (instance) count() x
+            | join on (instance) rows(
+                {"instance":"host-0:234","foo":"bar"}
+                {"instance":"host-2:234","abc":"def","x":"y","z":"qwe"}
+            )"#,
+            &[
+                &[("instance", "host-0:234"), ("x", "55"), ("foo", "bar")],
+                &[
+                    ("instance", "host-2:234"),
+                    ("x", "55"),
+                    ("abc", "def"),
+                    ("z", "qwe"),
+                ],
+                &[("instance", "host-1:234"), ("x", "55")],
+            ],
+        );
+
+        // pipe-join-inline-rows-prefix
+        f(
+            r#"'message 5' | stats by (instance) count() x
+            | join on (instance) rows(
+                {"instance":"host-0:234","foo":"bar"}
+                {"instance":"host-2:234","abc":"def","x":"y","z":"qwe"}
+            ) prefix "abc.""#,
+            &[
+                &[("instance", "host-0:234"), ("x", "55"), ("abc.foo", "bar")],
+                &[
+                    ("instance", "host-2:234"),
+                    ("x", "55"),
+                    ("abc.abc", "def"),
+                    ("abc.x", "y"),
+                    ("abc.z", "qwe"),
+                ],
+                &[("instance", "host-1:234"), ("x", "55")],
+            ],
+        );
 
         s.must_close();
         esl_common::fs::must_remove_dir(&path);

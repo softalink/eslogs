@@ -60,6 +60,27 @@ pub(crate) fn new_pipe_unpack_json(
 }
 
 impl Pipe for PipeUnpackJSON {
+    /// Go `hasFilterInWithQuery` for this pipe: checks the `if (...)` filter.
+    fn has_filter_in_with_query(&self) -> bool {
+        self.iff
+            .as_ref()
+            .is_some_and(|iff| iff.has_filter_in_with_query())
+    }
+
+    /// Go `initFilterInValues` for this pipe: rewrites the `if (...)` filter.
+    fn init_filter_in_values(
+        &mut self,
+        get_values: &mut crate::storage_search::GetFieldValuesFn<'_>,
+        timestamp: i64,
+    ) -> Result<(), String> {
+        if let Some(iff) = &self.iff
+            && let Some(iff_new) = iff.init_filter_in_values(get_values, timestamp)?
+        {
+            self.iff = Some(iff_new);
+        }
+        Ok(())
+    }
+
     fn stats_labels_tail_op(&self) -> Option<crate::pipe::StatsTailOp> {
         // The unpack_json pipe generates additional by(...) labels from
         // `fields (...)`. PORT NOTE: Go keeps `fieldFilters` empty when

@@ -188,5 +188,15 @@ INGESTION fully wired → 4/5 benchmark metrics don't need this; only query late
   global full-heap threshold in pipe_sort_topk), monotone-timestamps early
   break in topk, zero-copy bloom probes (`ReaderAt::mmap_slice` +
   `BloomFilter::bytes_contain_all`).
-- math/eval pipe parser errors; stats switch errors; subqueries literal-only.
+- math/eval pipe parser errors; stats switch errors.
+- Subqueries ARE ported: `in(<subquery>)` / `contains_any(<subquery>)` /
+  `contains_all(<subquery>)` / `_stream_id:in(<subquery>)` parse into
+  rendered-text subqueries (`InValues::q_text`, `FilterStreamID::q_text`,
+  `PipeJoin`/`PipeUnion::query_text`) and are resolved before the search by
+  `storage_search::init_subqueries` (Go `initSubqueries`/`initFilterInValues`/
+  `initJoinMaps`/`initUnionQueries`). Still deferred: `visitSubqueries`-based
+  propagation (`AddTimeFilter`/`AddExtraFilters`/`optimize` do not descend into
+  subqueries), `stream_context` runQuery wiring (`initStreamContextPipes`) and
+  the eager cluster mode (`initSubqueries(..., eagerExecute=true)` with
+  `net_query_runner`).
 - filter_and/not Display omit parens; filter_phrase Display incomplete quoter.

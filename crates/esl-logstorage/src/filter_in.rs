@@ -12,14 +12,13 @@ use crate::bitmap::Bitmap;
 use crate::block_header::ColumnHeader;
 use crate::block_result::{BlockResult, ColRef};
 use crate::block_search::BlockSearch;
-use crate::filter::FieldFilter;
+use crate::filter::{FieldFilter, Filter};
 use crate::filter_generic::{FilterGeneric, clone_column_header, new_filter_generic};
 use crate::filter_phrase::{
     match_bloom_filter_all_tokens, match_encoded_values_dict, visit_values,
 };
 use crate::in_values::InValues;
 use crate::rows::{Field, get_field_value_by_name};
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::ValueType;
 
 // It is faster to match every row in the block instead of checking too big
@@ -28,12 +27,11 @@ const MAX_TOKEN_SETS_TO_INIT: usize = 1000;
 
 /// `FilterIn` matches any exact value from the values set.
 ///
-/// Example LogsQL: `in("foo", "bar baz")`.
+/// Example LogsQL: `in("foo", "bar baz")` or `in(<subquery> | fields x)`.
 ///
-/// PORT NOTE: Go's `inValues` also carries an optional `q *Query` subquery whose
-/// values are resolved before execution. `Query` is not ported, so the Rust
-/// `InValues` drops that field and this filter only supports the literal-values
-/// form.
+/// The subquery form carries the rendered subquery in
+/// [`InValues::q_text`]; its values are resolved by
+/// `storage_search::init_subqueries` before filter execution.
 pub(crate) struct FilterIn {
     pub(crate) values: InValues,
 }
@@ -47,13 +45,18 @@ pub(crate) fn new_filter_in_values(field_name: &str, values: Vec<String>) -> Fil
     )
 }
 
-/// Port of Go `inValues.String()` (literal-values form).
-pub(crate) fn in_values_string(values: &[String]) -> String {
-    values
-        .iter()
-        .map(|v| quote_token_if_needed(v))
-        .collect::<Vec<_>>()
-        .join(",")
+/// Builds an `in(<subquery>)` filter (Go `parseFilterIn` with `iv.q` set).
+pub(crate) fn new_filter_in_query(
+    field_name: &str,
+    q_text: String,
+    q_field_name: String,
+) -> FilterGeneric {
+    new_filter_generic(
+        field_name,
+        Box::new(FilterIn {
+            values: InValues::new_from_query(q_text, q_field_name),
+        }),
+    )
 }
 
 impl FilterIn {
@@ -70,7 +73,15 @@ impl FilterIn {
 
 impl FieldFilter for FilterIn {
     fn to_string(&self) -> String {
-        format!("in({})", in_values_string(&self.values.values))
+        format!("in({})", self.values.string())
+    }
+
+    fn in_values(&self) -> Option<&InValues> {
+        Some(&self.values)
+    }
+
+    fn new_with_values(&self, field_name: &str, values: Vec<String>) -> Option<Box<dyn Filter>> {
+        Some(Box::new(new_filter_in_values(field_name, values)))
     }
 
     fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {

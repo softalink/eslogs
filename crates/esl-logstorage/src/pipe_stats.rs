@@ -185,6 +185,45 @@ impl Pipe for PipeStats {
         s
     }
 
+    /// Port of Go `pipeStats.hasFilterInWithQuery`: checks the per-func
+    /// `if (...)` filters.
+    fn has_filter_in_with_query(&self) -> bool {
+        self.funcs.iter().any(|f| {
+            f.iff
+                .as_deref()
+                .is_some_and(crate::storage_search::has_filter_in_with_query_for_filter)
+        })
+    }
+
+    /// Port of Go `pipeStats.initFilterInValues`: rewrites the per-func
+    /// `if (...)` filters.
+    fn init_filter_in_values(
+        &mut self,
+        get_values: &mut crate::storage_search::GetFieldValuesFn<'_>,
+        _timestamp: i64,
+    ) -> Result<(), String> {
+        if !self.has_filter_in_with_query() {
+            return Ok(());
+        }
+        // The funcs Arc is only shared with processors, which are created
+        // after subquery initialization; get_mut cannot fail here.
+        let Some(funcs) = Arc::get_mut(&mut self.funcs) else {
+            return Err("BUG: PipeStats funcs are shared during init_filter_in_values".to_string());
+        };
+        for func in funcs.iter_mut() {
+            if let Some(iff) = func.iff.take() {
+                func.iff = Some(
+                    if crate::storage_search::has_filter_in_with_query_for_filter(iff.as_ref()) {
+                        crate::storage_search::init_filter_in_values_for_filter(iff, get_values)?
+                    } else {
+                        iff
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
         let pf_orig = pf.clone();
         pf.reset();

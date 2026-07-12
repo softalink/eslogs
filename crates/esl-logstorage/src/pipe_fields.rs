@@ -75,6 +75,20 @@ impl Pipe for PipeFields {
         Some(self.field_filters.clone())
     }
 
+    /// Go `getFieldNameFromPipes`' `*pipeFields` arm.
+    fn in_query_field_name(&self) -> Option<Result<String, String>> {
+        // Go isSingleField(t.fieldFilters).
+        if self.field_filters.len() != 1
+            || crate::prefix_filter::is_wildcard_filter(&self.field_filters[0])
+        {
+            return Some(Err(format!(
+                "'{}' pipe must contain only a single field name",
+                Pipe::to_string(self)
+            )));
+        }
+        Some(Ok(self.field_filters[0].clone()))
+    }
+
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
         let f_orig = pf.clone();
         pf.reset();

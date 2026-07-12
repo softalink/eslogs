@@ -78,6 +78,33 @@ impl Filter for FilterGeneric {
         !self.is_wildcard && is_msg_field_name(&self.field_name) && self.f.is_empty_prefix()
     }
 
+    /// Port of Go `filterGeneric.hasFilterInWithQuery`.
+    fn has_filter_in_with_query(&self) -> bool {
+        self.f.in_values().is_some_and(|iv| iv.q_text.is_some())
+    }
+
+    /// Port of Go `filterGeneric.initFilterInValues` (the type switch on
+    /// `*filterIn`/`*filterContainsAny`/`*filterContainsAll` is expressed via
+    /// the `FieldFilter::in_values`/`new_with_values` hooks).
+    fn init_filter_in_values(
+        &self,
+        get_values: &mut crate::storage_search::GetFieldValuesFn<'_>,
+    ) -> Result<Option<Box<dyn Filter>>, String> {
+        let Some(iv) = self.f.in_values() else {
+            return Ok(None);
+        };
+        let Some(q_text) = &iv.q_text else {
+            return Ok(None);
+        };
+        let values = get_values(q_text, &iv.q_field_name).map_err(|e| {
+            format!(
+                "cannot obtain unique values for {}: {e}",
+                self.f.to_string()
+            )
+        })?;
+        Ok(self.f.new_with_values(&self.field_name, values))
+    }
+
     fn match_row(&self, fields: &[Field]) -> bool {
         if !self.is_wildcard {
             // Fast path - match the row by the given field name.

@@ -9,9 +9,9 @@ use crate::bitmap::Bitmap;
 use crate::block_header::ColumnHeader;
 use crate::block_result::{BlockResult, ColRef};
 use crate::block_search::BlockSearch;
-use crate::filter::FieldFilter;
+use crate::filter::{FieldFilter, Filter};
 use crate::filter_generic::{FilterGeneric, clone_column_header, new_filter_generic};
-use crate::filter_in::{in_values_string, match_any_value, match_column_by_bin_values};
+use crate::filter_in::{match_any_value, match_column_by_bin_values};
 use crate::filter_phrase::{
     match_bloom_filter_all_tokens, match_encoded_values_dict, match_phrase, to_float64_string,
     to_ipv4_string, to_timestamp_iso8601_string, visit_values,
@@ -40,6 +40,21 @@ pub(crate) fn new_filter_contains_any_values(
     )
 }
 
+/// Builds a `contains_any(<subquery>)` filter (Go `parseFilterContainsAny`
+/// with `iv.q` set).
+pub(crate) fn new_filter_contains_any_query(
+    field_name: &str,
+    q_text: String,
+    q_field_name: String,
+) -> FilterGeneric {
+    new_filter_generic(
+        field_name,
+        Box::new(FilterContainsAny {
+            values: InValues::new_from_query(q_text, q_field_name),
+        }),
+    )
+}
+
 /// Port of Go `matchAnyPhrase`.
 pub(crate) fn match_any_phrase<S: AsRef<str>>(v: &str, phrases: &[S]) -> bool {
     phrases.iter().any(|p| match_phrase(v, p.as_ref()))
@@ -55,7 +70,15 @@ impl FilterContainsAny {
 
 impl FieldFilter for FilterContainsAny {
     fn to_string(&self) -> String {
-        format!("contains_any({})", in_values_string(&self.values.values))
+        format!("contains_any({})", self.values.string())
+    }
+
+    fn in_values(&self) -> Option<&InValues> {
+        Some(&self.values)
+    }
+
+    fn new_with_values(&self, field_name: &str, values: Vec<String>) -> Option<Box<dyn Filter>> {
+        Some(Box::new(new_filter_contains_any_values(field_name, values)))
     }
 
     fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {

@@ -6,12 +6,17 @@
 //! constructors. See the module PORT NOTES in `parser/mod.rs` for the
 //! optimize()/downcast deferrals.
 //!
-//! PORT NOTE — subqueries: `in(subquery | fields x)` and
-//! `_stream_id:in(subquery)` are NOT supported. The Rust `InValues`
-//! (`in_values.rs`) has no `q`/`qFieldName` fields and `filter_stream_id` has no
-//! from-query constructor, so only the literal `in(a, b, c)` form is parsed; the
-//! subquery form returns the literal-form parse error (Go would fall through to
-//! `parseInQuery`). Callers that need subqueries are tracked for a later pass.
+//! Subqueries are supported: `in(<subquery> | fields x)` /
+//! `contains_any(<subquery>)` / `contains_all(<subquery>)` (via
+//! [`parse_in_values`] → [`parse_in_query`]) and `_stream_id:in(<subquery>)`
+//! (via [`parse_filter_stream_id_in`]). The parsed subquery is stored as
+//! rendered query text (the established subquery pattern — see pipe_join.rs)
+//! and resolved before execution by `storage_search::init_subqueries`.
+//!
+//! PORT NOTE: Go's `q.optimize()` visits subqueries after the top-level parse;
+//! since the Rust filters store subqueries as rendered text, [`parse_in_query`]
+//! applies the ported `optimize()` subset to the subquery before rendering it
+//! (same round-trip result for the ported optimize subset).
 
 use esl_common::regexutil::Regex;
 
@@ -473,15 +478,87 @@ enum InKind {
     ContainsAny,
 }
 
+/// Port of Go `parseInValues`.
 fn parse_in_values(lex: &mut Lexer, field_name: &str, kind: InKind) -> Result<BoxFilter, String> {
-    // Only the literal `in(a, b, c)` form is supported (see module PORT NOTE).
-    match parse_func_args_possible_wildcard(lex)? {
-        None => Ok(Box::new(new_filter_noop())),
-        Some(args) => Ok(match kind {
-            InKind::In => Box::new(new_filter_in_values(field_name, args)),
-            InKind::ContainsAll => Box::new(new_filter_contains_all_values(field_name, args)),
-            InKind::ContainsAny => Box::new(new_filter_contains_any_values(field_name, args)),
+    // Try parsing in(arg1, ..., argN) at first
+    let lex_state = lex.clone();
+    let err_first = match parse_func_args_possible_wildcard(lex) {
+        Ok(None) => return Ok(Box::new(new_filter_noop())),
+        Ok(Some(args)) => {
+            return Ok(match kind {
+                InKind::In => Box::new(new_filter_in_values(field_name, args)),
+                InKind::ContainsAll => Box::new(new_filter_contains_all_values(field_name, args)),
+                InKind::ContainsAny => Box::new(new_filter_contains_any_values(field_name, args)),
+            });
+        }
+        Err(e) => e,
+    };
+    let state_first = lex.clone();
+
+    // Parse in(query | fields someField) then
+    *lex = lex_state;
+    lex.next_token();
+
+    match parse_in_query(lex) {
+        Err(_) => {
+            // Return the previous error from parsing in(arg1, ..., argN) for
+            // simpler debugging.
+            *lex = state_first;
+            Err(err_first)
+        }
+        Ok(None) => Ok(Box::new(new_filter_noop())),
+        Ok(Some((q_text, q_field_name))) => Ok(match kind {
+            InKind::In => Box::new(crate::filter_in::new_filter_in_query(
+                field_name,
+                q_text,
+                q_field_name,
+            )),
+            InKind::ContainsAll => {
+                Box::new(crate::filter_contains_all::new_filter_contains_all_query(
+                    field_name,
+                    q_text,
+                    q_field_name,
+                ))
+            }
+            InKind::ContainsAny => {
+                Box::new(crate::filter_contains_any::new_filter_contains_any_query(
+                    field_name,
+                    q_text,
+                    q_field_name,
+                ))
+            }
         }),
+    }
+}
+
+/// Port of Go `parseInQuery`. Returns `None` for a star subquery (Go returns a
+/// nil query), otherwise the subquery's rendered text plus the field name whose
+/// values it yields.
+///
+/// PORT NOTE: Go keeps the parsed `*Query`; the Rust filters store its rendered
+/// text (see the module docs), so the subquery is optimized (the ported subset,
+/// as Go's top-level `optimize()` would via `visitSubqueries`) and rendered
+/// here.
+fn parse_in_query(lex: &mut Lexer) -> Result<Option<(String, String)>, String> {
+    let mut q = crate::parser::query::parse_query_in_parens(lex)
+        .map_err(|e| format!("cannot parse in(...) query: {e}"))?;
+    if q.is_star_query() {
+        return Ok(None);
+    }
+    let q_field_name = get_field_name_from_pipes(q.pipes())
+        .map_err(|e| format!("cannot determine field name for values in 'in({q})': {e}"))?;
+    q.optimize();
+    Ok(Some((q.to_string(), q_field_name)))
+}
+
+/// Port of Go `getFieldNameFromPipes`.
+fn get_field_name_from_pipes(pipes: &[Box<dyn crate::pipe::Pipe>]) -> Result<String, String> {
+    let Some(last) = pipes.last() else {
+        return Err("missing 'fields' or 'uniq' pipes at the end of query".to_string());
+    };
+    match last.in_query_field_name() {
+        Some(res) => res,
+        None => Err("missing 'fields' or 'uniq' pipe at the end of query".to_string()),
     }
 }
 
@@ -1283,26 +1360,51 @@ fn parse_filter_stream_id_in(lex: &mut Lexer) -> Result<BoxFilter, String> {
             go_quote(&lex.token)
         ));
     }
-    // PORT NOTE: only the literal `in(id1, id2, ...)` form is supported; the
-    // `in(subquery)` form is deferred (no from-query filterStreamID ctor).
-    match parse_func_args_possible_wildcard(lex)? {
-        None => Ok(Box::new(new_filter_noop())),
-        Some(args) => {
-            let mut stream_ids = Vec::with_capacity(args.len());
-            for arg in &args {
-                let mut sid = StreamID::default();
-                if !sid.try_unmarshal_from_string(arg) {
-                    return Err(format!(
-                        "cannot unmarshal _stream_id from {}",
-                        go_quote(arg)
-                    ));
+
+    // Try parsing in(arg1, ..., argN) at first
+    let lex_state = lex.clone();
+    let parse_literal = |lex: &mut Lexer| -> Result<BoxFilter, String> {
+        match parse_func_args_possible_wildcard(lex)? {
+            None => Ok(Box::new(new_filter_noop())),
+            Some(args) => {
+                let mut stream_ids = Vec::with_capacity(args.len());
+                for arg in &args {
+                    let mut sid = StreamID::default();
+                    if !sid.try_unmarshal_from_string(arg) {
+                        return Err(format!(
+                            "cannot unmarshal _stream_id from {}",
+                            go_quote(arg)
+                        ));
+                    }
+                    stream_ids.push(sid);
                 }
-                stream_ids.push(sid);
+                Ok(Box::new(crate::filter_stream_id::new_filter_stream_id(
+                    stream_ids,
+                )))
             }
-            Ok(Box::new(crate::filter_stream_id::new_filter_stream_id(
-                stream_ids,
-            )))
         }
+    };
+    let err_first = match parse_literal(lex) {
+        Ok(fs) => return Ok(fs),
+        Err(e) => e,
+    };
+    let state_first = lex.clone();
+
+    // Try parsing in(query)
+    *lex = lex_state;
+    lex.next_token();
+
+    match parse_in_query(lex) {
+        Err(_) => {
+            // Return the previous error from parsing in(arg1, ..., argN) for
+            // simpler debugging.
+            *lex = state_first;
+            Err(err_first)
+        }
+        Ok(None) => Ok(Box::new(new_filter_noop())),
+        Ok(Some((q_text, q_field_name))) => Ok(Box::new(
+            crate::filter_stream_id::new_filter_stream_id_from_query(q_text, q_field_name),
+        )),
     }
 }
 

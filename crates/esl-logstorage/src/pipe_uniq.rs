@@ -160,6 +160,22 @@ impl Pipe for PipeUniq {
         pf.add_allow_filters(&self.by_fields);
     }
 
+    /// Go `isLastPipeUniq`'s `*pipeUniq` type-switch arm.
+    fn is_uniq_pipe(&self) -> bool {
+        true
+    }
+
+    /// Go `getFieldNameFromPipes`' `*pipeUniq` arm.
+    fn in_query_field_name(&self) -> Option<Result<String, String>> {
+        if self.by_fields.len() != 1 {
+            return Some(Err(format!(
+                "'{}' pipe must contain only a single non-star field name",
+                Pipe::to_string(self)
+            )));
+        }
+        Some(Ok(self.by_fields[0].clone()))
+    }
+
     fn is_fixed_output_fields_order(&self) -> bool {
         true
     }

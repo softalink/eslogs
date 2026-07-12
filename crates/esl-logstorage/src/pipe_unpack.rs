@@ -61,6 +61,33 @@ pub(crate) fn new_if_filter(f: Arc<dyn Filter>) -> IfFilter {
     IfFilter { f, allow_filters }
 }
 
+impl IfFilter {
+    /// Port of Go `(iff *ifFilter).hasFilterInWithQuery`.
+    pub(crate) fn has_filter_in_with_query(&self) -> bool {
+        crate::storage_search::has_filter_in_with_query_for_filter(self.f.as_ref())
+    }
+
+    /// Port of Go `(iff *ifFilter).initFilterInValues`: returns a new
+    /// `IfFilter` with the `in(<subquery>)` values resolved, or `None` when
+    /// there is nothing to resolve (Go returns a copy either way; the callers
+    /// keep the existing iff on `None`).
+    pub(crate) fn init_filter_in_values(
+        &self,
+        get_values: &mut crate::storage_search::GetFieldValuesFn<'_>,
+        timestamp: i64,
+    ) -> Result<Option<IfFilter>, String> {
+        match crate::storage_search::init_filter_in_values_for_shared_filter(
+            &self.f, get_values, timestamp,
+        )? {
+            Some(f) => Ok(Some(IfFilter {
+                f,
+                allow_filters: self.allow_filters.clone(),
+            })),
+            None => Ok(None),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // updateNeededFieldsForUnpackPipe
 // ---------------------------------------------------------------------------

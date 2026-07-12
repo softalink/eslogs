@@ -16,17 +16,24 @@ use crate::values_encoder::{
 /// inValues keeps values for in(...), contains_any(...) and contains_all(...)
 /// filters.
 ///
-/// PORT NOTE: Go's inValues.q (*Query) and qFieldName fields — used for
-/// populating values from a subquery before filter execution — are deferred
-/// until parser.go lands (Layer 4); values must be populated by the caller.
-/// The String() method is deferred for the same reason (it needs
-/// quoteTokenIfNeeded from parser.go).
-///
 /// PORT NOTE: each Go sync.Once + field pair is merged into a single
 /// OnceLock field.
 #[derive(Debug, Default)]
 pub struct InValues {
     pub values: Vec<String>,
+
+    /// If set, then `values` must be populated from this subquery before
+    /// filter execution (Go `q *Query`).
+    ///
+    /// PORT NOTE: Go stores the parsed subquery; the Rust port stores its
+    /// rendered text (the established subquery pattern — see pipe_join.rs) and
+    /// `storage_search::init_subqueries` re-parses it at the outer query
+    /// timestamp before execution.
+    pub q_text: Option<String>,
+
+    /// The field name for obtaining values from if `q_text` is set
+    /// (Go `qFieldName`).
+    pub q_field_name: String,
 
     tokens_hashes_any: OnceLock<(Vec<u64>, Vec<Vec<u64>>)>,
 
@@ -59,6 +66,28 @@ impl InValues {
             values,
             ..Default::default()
         }
+    }
+
+    /// Builds an `InValues` whose values are populated from the given subquery
+    /// before filter execution (Go `inValues{q: ..., qFieldName: ...}`).
+    pub fn new_from_query(q_text: String, q_field_name: String) -> InValues {
+        InValues {
+            q_text: Some(q_text),
+            q_field_name,
+            ..Default::default()
+        }
+    }
+
+    /// Port of Go `inValues.String()`.
+    pub fn string(&self) -> String {
+        if let Some(q_text) = &self.q_text {
+            return q_text.clone();
+        }
+        self.values
+            .iter()
+            .map(|v| crate::stream_filter::quote_token_if_needed(v))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     pub fn is_empty(&self) -> bool {

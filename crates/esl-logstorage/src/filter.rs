@@ -106,6 +106,39 @@ pub trait Filter: Send + Sync {
         None
     }
 
+    /// `storage_search::init_filter_in_values_for_filter` support: takes
+    /// ownership of the sub-filter of a `FilterNot`, replacing it with a noop.
+    /// Returns `None` for every other filter.
+    ///
+    /// PORT NOTE: Go's `copyFilterInternal` type-switches on `*filterNot`; the
+    /// accessor lives on the trait with a `None` default (see
+    /// `take_and_children`).
+    fn take_not_child(&mut self) -> Option<Box<dyn Filter>> {
+        None
+    }
+
+    /// Whether this filter is an `in`/`contains_any`/`contains_all`/
+    /// `_stream_id:in` filter with a subquery whose values must be resolved
+    /// before execution (Go `hasFilterInWithQueryForFilter`'s visit callback,
+    /// which type-switches on `*filterGeneric` / `*filterStreamID`). Combined
+    /// with [`visit_filter_recursive`] by
+    /// `storage_search::has_filter_in_with_query_for_filter`.
+    fn has_filter_in_with_query(&self) -> bool {
+        false
+    }
+
+    /// `storage_search::init_filter_in_values_for_filter` support (the leaf
+    /// arm of Go `initFilterInValuesForFilter`'s copyFunc): when this filter
+    /// embeds an `in(<subquery>)`, executes the subquery via
+    /// `get_values(q_text, q_field_name)` and returns the literal-values
+    /// replacement filter. `Ok(None)` (the default) keeps the filter as is.
+    fn init_filter_in_values(
+        &self,
+        _get_values: &mut crate::storage_search::GetFieldValuesFn<'_>,
+    ) -> Result<Option<Box<dyn Filter>>, String> {
+        Ok(None)
+    }
+
     /// `Query::get_filter_time_range` support (Go `getFilterTimeRange`): a
     /// read-only view of the sub-filters of a `FilterAnd`.
     ///
@@ -162,6 +195,27 @@ pub trait FieldFilter: Send + Sync {
     fn is_empty_prefix(&self) -> bool {
         false
     }
+
+    /// `FilterGeneric::has_filter_in_with_query`/`init_filter_in_values`
+    /// support: the [`crate::in_values::InValues`] of an
+    /// `in`/`contains_any`/`contains_all` field filter; `None` for every other
+    /// field filter.
+    ///
+    /// PORT NOTE: Go's `filterGeneric.hasFilterInWithQuery`/`initFilterInValues`
+    /// type-switch on `*filterIn`/`*filterContainsAny`/`*filterContainsAll`;
+    /// the accessor lives on the trait with a `None` default.
+    fn in_values(&self) -> Option<&crate::in_values::InValues> {
+        None
+    }
+
+    /// `FilterGeneric::init_filter_in_values` support: builds the
+    /// literal-values replacement for this field filter kind (Go
+    /// `newFilterInValues` / `newFilterContainsAnyValues` /
+    /// `newFilterContainsAllValues`). Only implemented by the field filters
+    /// whose [`FieldFilter::in_values`] returns `Some`.
+    fn new_with_values(&self, _field_name: &str, _values: Vec<String>) -> Option<Box<dyn Filter>> {
+        None
+    }
 }
 
 /// Recursively calls `visit_func` for filters inside `f`.
@@ -199,18 +253,15 @@ pub fn visit_filters_recursive(
     false
 }
 
-// PORT NOTE: Go's `copyFilter` / `copyFilterInternal` / `copyFilters` are
-// deferred. They rebuild `filterAnd`/`filterOr`/`filterNot` from copied
-// children while returning every other (leaf) filter unchanged. A faithful
-// Rust port needs a per-filter reconstruction hook — an object-safe
-// `fn copy_filter_internal(self: Box<Self>, visit_func, copy_func)
-//   -> Result<Box<dyn Filter>, String>` trait method whose default is
-// `Ok(self)` (the leaf "return f as-is" arm) and which the three composite
-// filters override. That method would have to be implemented by every one of
-// the ~34 filter ports, yet its only callers are `parser.go` and
-// `storage_search.go`, both of which are still unported. To avoid burdening
-// the parallel filter fan-out with an API that currently has no consumer, it
-// is added together with the first consumer (parser.rs / storage_search.rs).
+// PORT NOTE: Go's generic `copyFilter` / `copyFilterInternal` / `copyFilters`
+// are not ported as such. Their only consumer with subquery support landed —
+// `initFilterInValuesForFilter` (storage_search.go) — and it is expressed as
+// the ownership-based tree rewrite `storage_search::init_filter_in_values_for_filter`,
+// which recurses through the `take_or_children`/`take_and_children`/
+// `take_not_child` hooks (the `copyFilterInternal` composite arms) and
+// substitutes leaves via [`Filter::init_filter_in_values`] (the copyFunc leaf
+// arm). Other copyFilter consumers (`flattenFiltersOr`, `mergeFiltersStream`,
+// time-offset shifting) remain deferred with the unported optimize() passes.
 
 // PORT NOTE: upstream `filter_test.go` (TestComplexFilters) is a full
 // filter-subsystem integration test (it builds `filterAnd`/`filterOr`/

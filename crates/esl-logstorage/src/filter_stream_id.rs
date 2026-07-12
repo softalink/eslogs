@@ -18,15 +18,21 @@ use crate::stream_id::StreamID;
 use crate::values_encoder::ValueType;
 
 /// `FilterStreamID` is the filter for `_stream_id:id`.
-///
-/// PORT NOTE: Go's `filterStreamID` also carries `q *Query` / `qFieldName` for
-/// the `_stream_id:in(<subquery>)` form, whose `streamIDs` are populated from
-/// the subquery just before filter execution. `Query` and that resolution step
-/// (`storage_search.go`) are not ported yet, so the query-backed constructor and
-/// its `String()` branch are deferred together with the first consumer. The
-/// direct `new_filter_stream_id([...])` form used by the tests is fully ported.
 pub(crate) struct FilterStreamID {
     stream_ids: Vec<StreamID>,
+
+    /// If set, then `stream_ids` must be populated from this subquery before
+    /// filter execution (Go `q *Query`).
+    ///
+    /// PORT NOTE: Go stores the parsed subquery; the Rust port stores its
+    /// rendered text (the established subquery pattern — see pipe_join.rs) and
+    /// `storage_search::init_subqueries` re-parses it at the outer query
+    /// timestamp before execution.
+    q_text: Option<String>,
+
+    /// The field name for obtaining values from if `q_text` is set
+    /// (Go `qFieldName`).
+    q_field_name: String,
 
     stream_ids_map: OnceLock<HashSet<Vec<u8>>>,
 }
@@ -34,6 +40,21 @@ pub(crate) struct FilterStreamID {
 pub(crate) fn new_filter_stream_id(stream_ids: Vec<StreamID>) -> FilterStreamID {
     FilterStreamID {
         stream_ids,
+        q_text: None,
+        q_field_name: String::new(),
+        stream_ids_map: OnceLock::new(),
+    }
+}
+
+/// Port of Go `newFilterStreamIDFromQuery`.
+pub(crate) fn new_filter_stream_id_from_query(
+    q_text: String,
+    q_field_name: String,
+) -> FilterStreamID {
+    FilterStreamID {
+        stream_ids: Vec::new(),
+        q_text: Some(q_text),
+        q_field_name,
         stream_ids_map: OnceLock::new(),
     }
 }
@@ -67,6 +88,10 @@ impl FilterStreamID {
 
 impl Filter for FilterStreamID {
     fn to_string(&self) -> String {
+        if let Some(q_text) = &self.q_text {
+            return format!("_stream_id:in({q_text})");
+        }
+
         let stream_ids = &self.stream_ids;
         if stream_ids.len() == 1 {
             let mut b = Vec::new();
@@ -87,6 +112,40 @@ impl Filter for FilterStreamID {
 
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
         pf.add_allow_filter("_stream_id");
+    }
+
+    /// Go `hasFilterInWithQueryForFilter`'s `*filterStreamID` arm (`t.q != nil`).
+    fn has_filter_in_with_query(&self) -> bool {
+        self.q_text.is_some()
+    }
+
+    /// Port of the `*filterStreamID` arm of Go `initFilterInValuesForFilter`'s
+    /// copyFunc: resolves the subquery values and converts them to a literal
+    /// streamID list.
+    fn init_filter_in_values(
+        &self,
+        get_values: &mut crate::storage_search::GetFieldValuesFn<'_>,
+    ) -> Result<Option<Box<dyn Filter>>, String> {
+        let Some(q_text) = &self.q_text else {
+            return Ok(None);
+        };
+        let values = get_values(q_text, &self.q_field_name).map_err(|e| {
+            format!(
+                "cannot obtain unique values for {}: {e}",
+                Filter::to_string(self)
+            )
+        })?;
+
+        // convert values to streamID list
+        let mut stream_ids = Vec::with_capacity(values.len());
+        for v in &values {
+            let mut sid = StreamID::default();
+            if sid.try_unmarshal_from_string(v) {
+                stream_ids.push(sid);
+            }
+        }
+
+        Ok(Some(Box::new(new_filter_stream_id(stream_ids))))
     }
 
     fn match_row(&self, fields: &[Field]) -> bool {

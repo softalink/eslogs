@@ -28,13 +28,17 @@
 //!
 //! # PORT NOTES — deliberately trimmed for single-node
 //! The following `pipe`-interface methods are **omitted** from this trait
-//! because they only serve the cluster query planner / subqueries, which are
-//! out of scope for the single-node port:
+//! because they only serve the cluster query planner, which is out of scope
+//! for the single-node port:
 //!   * `splitToRemoteAndLocal` — single-node never splits a pipe across nodes.
-//!   * `initFilterInValues` + `visitSubqueries` — `in(subquery)` support needs
-//!     the unported `Query` type; deferred. Pipes that embed subqueries
-//!     (`pipe_join`, `filter in(subquery)`) defer just that path with a PORT
-//!     NOTE and otherwise port fully.
+//!   * `visitSubqueries` — only needed by `Query.AddTimeFilter`/
+//!     `AddExtraFilters`/`optimize` subquery propagation, which stays deferred
+//!     (see the PORT NOTEs in `parser::query`).
+//!
+//! Subquery execution (`in(<subquery>)` filters, `join`/`union` subqueries) is
+//! ported: `initFilterInValues`/`hasFilterInWithQuery` and the
+//! `initJoinMap`/`initUnionQuery` type-switch targets are trait hooks below,
+//! driven by `storage_search::init_subqueries` before the search starts.
 //!
 //! The `cancel func()` argument of Go's `newPipeProcessor` is folded into the
 //! shared `stop` token: a processor signals "stop sending" by setting it.
@@ -44,6 +48,13 @@ use std::sync::atomic::AtomicBool;
 
 use crate::block_result::BlockResult;
 use crate::prefix_filter;
+
+/// Executes a `union` subquery (given as rendered query text) and streams its
+/// block results to the given processor. Port of Go `runUnionQueryFunc`; wired
+/// into `union` pipes by `storage_search::init_subqueries` via
+/// [`Pipe::init_union_query`].
+pub type RunUnionQueryFn =
+    Arc<dyn Fn(&str, Arc<dyn PipeProcessor>) -> Result<(), String> + Send + Sync>;
 
 /// The `by (...)` / result-field structure of a `| stats ...` pipe, as needed
 /// by `Query::get_stats_labels*` (Go downcasts to `*pipeStats` and reads
@@ -150,10 +161,71 @@ pub trait Pipe: Send + Sync {
 
     /// Whether this pipe (recursively) contains an `in(subquery)` filter
     /// (Go `hasFilterInWithQuery`). Defaults to false; the pipes that can embed
-    /// filters override it. Full subquery execution is deferred (see module
-    /// PORT NOTES).
+    /// filters override it.
     fn has_filter_in_with_query(&self) -> bool {
         false
+    }
+
+    /// Resolves `in(<subquery>)` filters embedded in this pipe by substituting
+    /// literal values obtained via `get_values(q_text, q_field_name)`
+    /// (Go `initFilterInValues`).
+    ///
+    /// PORT NOTE: Go returns a new pipe (sharing unchanged parts); the Rust
+    /// port rewrites the (query-owned) pipe in place. `timestamp` is the outer
+    /// query timestamp, used to re-parse `Arc`-shared `if (...)` filters from
+    /// their rendered text before rewriting (see
+    /// `storage_search::init_filter_in_values_for_shared_filter`).
+    fn init_filter_in_values(
+        &mut self,
+        _get_values: &mut crate::storage_search::GetFieldValuesFn<'_>,
+        _timestamp: i64,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// True for `join` pipes (Go `hasJoinPipes`' `*pipeJoin` type-switch).
+    fn is_join_pipe(&self) -> bool {
+        false
+    }
+
+    /// Builds the join map of a `join` pipe, executing its subquery via
+    /// `get_join_rows(q_text)` when the pipe was built from a subquery
+    /// (Go `pipeJoin.initJoinMap`, dispatched from `initJoinMaps`).
+    /// Default: no-op for all other pipes.
+    fn init_join_map(
+        &mut self,
+        _get_join_rows: &mut crate::storage_search::GetJoinRowsFn<'_>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// True for `union` pipes (Go `hasUnionPipes`' `*pipeUnion` type-switch).
+    fn is_union_pipe(&self) -> bool {
+        false
+    }
+
+    /// Wires the run-query callback into a `union` pipe so its processor can
+    /// execute the union subquery at `flush` (Go `pipeUnion.initUnionQuery`,
+    /// dispatched from `initUnionQueries`). Default: no-op for all other pipes.
+    ///
+    /// PORT NOTE: Go's `eagerExecute` mode (cluster-only, used by
+    /// `NewNetQueryRunner`) is deferred with `net_query_runner`.
+    fn init_union_query(&mut self, _run_query: &RunUnionQueryFn) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// True for `uniq` pipes (Go `isLastPipeUniq`'s `*pipeUniq` type-switch).
+    fn is_uniq_pipe(&self) -> bool {
+        false
+    }
+
+    /// `parseInQuery` support (Go `getFieldNameFromPipes` type-switch): for
+    /// `fields`/`uniq` pipes, the single field name whose values an
+    /// `in(<subquery>)` filter yields (or an error when the pipe has more than
+    /// one field). `None` (the default) means the pipe cannot terminate an
+    /// `in(<subquery>)` query.
+    fn in_query_field_name(&self) -> Option<Result<String, String>> {
+        None
     }
 
     /// `Query::get_last_n_results_query` support (Go `getOffsetLimitFromPipe`):

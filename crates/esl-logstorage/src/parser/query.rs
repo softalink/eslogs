@@ -125,9 +125,41 @@ impl Query {
     /// downcast hooks on the `Filter`/`Pipe` traits, which are not available
     /// (see `parser/mod.rs`). Affected `parser_test.go` round-trip cases are
     /// excluded from the ported tests.
-    fn optimize(&mut self) {
+    pub(crate) fn optimize(&mut self) {
         let f = std::mem::replace(&mut self.f, Box::new(crate::filter_noop::new_filter_noop()));
         self.f = remove_star_filters(f);
+    }
+
+    /// Port of Go `isStarQuery`.
+    ///
+    /// PORT NOTE: Go type-switches on `*filterNoop` / `*filterGeneric` with an
+    /// empty-prefix `filterPrefix` on `_msg`; both cases are exactly the
+    /// `is_match_all` trait classification used by `removeStarFilters`.
+    pub(crate) fn is_star_query(&self) -> bool {
+        if !self.pipes.is_empty() {
+            return false;
+        }
+        if self.opts.need_print {
+            return false;
+        }
+        self.f.is_match_all()
+    }
+
+    /// Port of Go `hasFilterInWithQuery` over a whole query: true when the
+    /// query's global filter, top-level filter or any pipe embeds an
+    /// `in(<subquery>)` filter (the condition guarding Go
+    /// `initFilterInValues`).
+    pub(crate) fn has_filter_in_with_query(&self) -> bool {
+        use crate::storage_search::has_filter_in_with_query_for_filter;
+        if let Some(gf) = &self.opts.global_filter
+            && has_filter_in_with_query_for_filter(gf.as_ref())
+        {
+            return true;
+        }
+        if has_filter_in_with_query_for_filter(self.f.as_ref()) {
+            return true;
+        }
+        self.pipes.iter().any(|p| p.has_filter_in_with_query())
     }
 
     /// PORT NOTE: Go `initStatsRateFuncSteps` requires downcasting pipes to
@@ -296,9 +328,11 @@ impl Query {
     /// Adds global filter `_time:[start ... end]` to q (Go `AddTimeFilter`).
     ///
     /// PORT NOTE: Go applies the filter to subqueries too (`visitSubqueries`
-    /// over `join`/`union`/`in(...)` pipes); subquery hooks on the `Pipe` trait
-    /// are deferred (see pipe.rs), so only the top-level query is updated
-    /// (Go `addTimeFilterNoSubqueries`), matching queries without subqueries.
+    /// over `join`/`union`/`in(...)` subqueries); the Rust subqueries are
+    /// stored as rendered text and `visitSubqueries`-based propagation is
+    /// deferred, so only the top-level query is updated (Go
+    /// `addTimeFilterNoSubqueries`) — subqueries keep their own `_time`
+    /// filters, without inheriting the global one.
     pub fn add_time_filter(&mut self, start: i64, end: i64) {
         if self.opts.ignore_global_time_filter == Some(true) {
             return;
