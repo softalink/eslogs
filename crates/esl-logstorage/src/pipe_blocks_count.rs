@@ -3,10 +3,8 @@
 //! Counts the number of blocks passed through the pipe and emits a single row
 //! with the count in `result_name` (default `blocks_count`).
 //!
-//! PORT NOTE: the `splitToRemoteAndLocal` cluster path and the lexer-based
-//! `parsePipeBlocksCount` are out of scope for the single-node port (see
-//! `pipe.rs` module notes). A `pub(crate)` constructor is exposed for the parser
-//! to build once the lexer lands.
+//! `splitToRemoteAndLocal` is implemented below; the lexer-based
+//! `parsePipeBlocksCount` lives in `parser/parse_pipe.rs`.
 
 use std::sync::Arc;
 use std::sync::Mutex;

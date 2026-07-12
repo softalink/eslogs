@@ -18,10 +18,8 @@ use crate::filter_generic::{FilterGeneric, clone_column_header, new_filter_gener
 use crate::filter_phrase::{match_column_by_generic, match_encoded_values_dict, visit_values};
 use crate::rows::{Field, get_field_value_by_name};
 use crate::values_encoder::{
-    ValueType, try_parse_bytes, try_parse_duration, try_parse_float64, try_parse_ipv4,
-    try_parse_timestamp_rfc3339_nano, unmarshal_float64, unmarshal_int64, unmarshal_ipv4,
-    unmarshal_timestamp_iso8601, unmarshal_uint8, unmarshal_uint16, unmarshal_uint32,
-    unmarshal_uint64,
+    ValueType, unmarshal_float64, unmarshal_int64, unmarshal_ipv4, unmarshal_timestamp_iso8601,
+    unmarshal_uint8, unmarshal_uint16, unmarshal_uint32, unmarshal_uint64,
 };
 
 // ---------------------------------------------------------------------------
@@ -395,91 +393,10 @@ pub(crate) fn match_range(s: &str, min_value: f64, max_value: f64) -> bool {
     f >= min_value && f <= max_value
 }
 
-/// Port of Go `parseMathNumber` (pipe_math.go).
-///
-/// PORT NOTE: `parse_math_number`/`try_parse_number`/`is_likely_number`/
-/// `parse_int_go` live in Go's `pipe_math.go` (still unported). They are needed
-/// by `filter_range` and `filter_le_field`, so they are homed here `pub(crate)`.
-/// `block_result.rs` currently keeps a private copy of `try_parse_number`;
-/// dedup once `pipe_math.rs` lands.
-pub(crate) fn parse_math_number(s: &str) -> f64 {
-    if let Some(f) = try_parse_number(s) {
-        return f;
-    }
-    if let Some(nsecs) = try_parse_timestamp_rfc3339_nano(s) {
-        return nsecs as f64;
-    }
-    if let Some(ip) = try_parse_ipv4(s) {
-        return ip as f64;
-    }
-    f64::NAN
-}
-
-fn try_parse_number(s: &str) -> Option<f64> {
-    if s.is_empty() {
-        return None;
-    }
-    if let Some(f) = try_parse_float64(s) {
-        return Some(f);
-    }
-    if let Some(nsecs) = try_parse_duration(s) {
-        return Some(nsecs as f64);
-    }
-    if let Some(bytes) = try_parse_bytes(s) {
-        return Some(bytes as f64);
-    }
-    if is_likely_number(s) {
-        if let Ok(f) = s.parse::<f64>() {
-            return Some(f);
-        }
-        if let Some(n) = parse_int_go(s) {
-            return Some(n as f64);
-        }
-    }
-    None
-}
-
-fn is_likely_number(s: &str) -> bool {
-    let b = s.as_bytes();
-    if b.is_empty() {
-        return false;
-    }
-    let c = b[0];
-    if !c.is_ascii_digit() && c != b'-' && c != b'+' && c != b'.' {
-        return false;
-    }
-    if s.matches('.').count() > 1 {
-        // Likely an IP address.
-        return false;
-    }
-    if s.contains(':') || s.matches('-').count() > 2 {
-        // Likely a timestamp.
-        return false;
-    }
-    true
-}
-
-/// Mirrors Go's `strconv.ParseInt(s, 0, 64)` base detection (0x/0o/0b prefixes
-/// and plain decimal).
-fn parse_int_go(s: &str) -> Option<i64> {
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (radix, digits) =
-        if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            (16, h)
-        } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
-            (8, o)
-        } else if let Some(bin) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
-            (2, bin)
-        } else {
-            (10, body)
-        };
-    let digits = digits.replace('_', "");
-    let n = i64::from_str_radix(&digits, radix).ok()?;
-    Some(if neg { -n } else { n })
-}
+/// Go `parseMathNumber` (pipe_math.go): re-exported from the ported
+/// `pipe_math` module for `filter_range` / `filter_le_field` / the parser's
+/// `parse_number` (Go calls the same function from all of these).
+pub(crate) use crate::pipe_math::parse_math_number;
 
 /// Ceils `min_value`, floors `max_value`, and clamps both into `u64`.
 /// Port of Go `toUint64Range`.

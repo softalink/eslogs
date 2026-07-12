@@ -3,8 +3,6 @@
 //! (top values per log field with hit counts).
 //!
 //! # PORT NOTES
-//! * `splitToRemoteAndLocal` and the lexer parser are out of scope; a
-//!   `pub(crate)` constructor is exposed instead.
 //! * `valueTypeDict` uses `forEachDictValueWithHits`, which `block_result.rs`
 //!   does not expose; dict columns fall back to the generic per-row path
 //!   (identical hit totals, more map ops).

@@ -31,15 +31,15 @@
 //! the caller's `run_net_query`. The observable results are identical; only
 //! the execution moment differs (runner construction vs. pipe flush).
 //!
-//! PORT NOTE — helper duplication: `run_pipes`, the `BlockResult` ⇄
-//! `DataBlock` adapters and the generic subquery helpers
-//! (`getFieldValuesGeneric` / `getRows` / `initFilterInValues` /
-//! `isLastPipeUniq`) exist in `storage_search.rs` specialized for the local
-//! `Storage`. Go shares them by being generic over `runQuery`; the ported
-//! versions here are generic over [`RunNetQueryFn`] instead and mirror the
-//! same Go functions. `Query.addFieldsFilters` / `toFieldsFilters` /
-//! `getNeededColumns(pipes)` (parser.go) are also hosted here to keep the
-//! cluster-split surface in one module.
+//! PORT NOTE — shared helpers: `run_pipes`, the `BlockResult` → `DataBlock`
+//! sink (`BlockResultWriter`), `initFilterInValues` and `isLastPipeUniq` are
+//! reused from `storage_search.rs` (Go shares the same functions). The
+//! subquery *executors* (`getFieldValuesGeneric` / `getRows`) are duplicated
+//! here generic over [`RunNetQueryFn`] instead of the local `Storage`,
+//! mirroring how Go parameterizes them over `runQuery`.
+//! `Query.addFieldsFilters` / `toFieldsFilters` / `getNeededColumns(pipes)`
+//! (parser.go) are hosted here to keep the cluster-split surface in one
+//! module.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -50,7 +50,10 @@ use crate::parser::{ParseQueryAtTimestamp, Query};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
 use crate::rows::Field;
-use crate::storage_search::{DataBlock, WriteDataBlockFn};
+use crate::storage_search::{
+    BlockResultWriter, DataBlock, WriteDataBlockFn, init_filter_in_values_for_query,
+    is_last_pipe_uniq, run_pipes,
+};
 
 /// Runs the given (distributed) query and passes the result data blocks to the
 /// write callback (Go `RunNetQueryFunc`).
@@ -102,7 +105,7 @@ pub fn new_net_query_runner(
     Ok(NetQueryRunner {
         q_remote,
         pipes_local: q_local.pipes,
-        write_block: Arc::new(DataBlockSink { f: write_net_block }),
+        write_block: Arc::new(BlockResultWriter { f: write_net_block }),
     })
 }
 
@@ -140,76 +143,6 @@ impl NetQueryRunner {
             Arc::clone(&self.write_block),
         )
     }
-}
-
-/// The terminal pipe processor converting each [`BlockResult`] into a
-/// [`DataBlock`] for the caller's write callback (Go
-/// `writeNetBlock.newBlockResultWriter()`; mirrors the private
-/// `BlockResultWriter` in storage_search.rs).
-struct DataBlockSink {
-    f: WriteDataBlockFn,
-}
-
-impl PipeProcessor for DataBlockSink {
-    fn write_block(&self, worker_id: usize, br: &mut BlockResult) {
-        if br.rows_len() == 0 {
-            return;
-        }
-        let mut db = DataBlock::default();
-        db.must_init_from_block_result(br);
-        (self.f)(worker_id, &mut db);
-    }
-
-    fn flush(&self) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-/// Go `runPipes`, duplicated from storage_search.rs (private there): wires the
-/// pipe chain between `search` and the terminal `sink`.
-fn run_pipes<F>(
-    pipes: &[Box<dyn Pipe>],
-    concurrency: usize,
-    search: F,
-    sink: Arc<dyn PipeProcessor>,
-) -> Result<(), String>
-where
-    F: FnOnce(&AtomicBool, &Arc<dyn PipeProcessor>) -> Result<(), String>,
-{
-    let stop = Arc::new(AtomicBool::new(false));
-
-    if pipes.is_empty() {
-        // Fast path: no pipes — search writes directly to the terminal sink.
-        return search(&stop, &sink);
-    }
-
-    let mut pp: Arc<dyn PipeProcessor> = sink;
-    let mut pps: Vec<Arc<dyn PipeProcessor>> = Vec::with_capacity(pipes.len());
-    for p in pipes.iter().rev() {
-        pp = p.new_pipe_processor(concurrency, Arc::clone(&stop), pp);
-        pps.push(Arc::clone(&pp));
-    }
-    // pps is inner→outer (last pipe first); reverse to first→last for flushing.
-    pps.reverse();
-    let head = pp;
-
-    let err_search = search(&stop, &head);
-    if err_search.is_err() {
-        stop.store(true, Ordering::SeqCst);
-    }
-
-    let mut err_flush: Result<(), String> = Ok(());
-    for pp in &pps {
-        if let Err(e) = pp.flush()
-            && err_flush.is_ok()
-        {
-            stop.store(true, Ordering::SeqCst);
-            err_flush = Err(e);
-        }
-    }
-
-    err_search?;
-    err_flush
 }
 
 /// Splits `q` into a remotely executed query and locally executed pipes
@@ -299,8 +232,9 @@ fn add_fields_filters(q: &mut Query, pf: &prefix_filter::Filter) {
     q.pipes.extend(q_tmp.pipes);
 }
 
-/// Go `toFieldsFilters` (parser.go).
-fn to_fields_filters(pf: &prefix_filter::Filter) -> String {
+/// Go `toFieldsFilters` (parser.go). Also used by the `stream_context` wiring
+/// in `storage_search::init_subqueries`.
+pub(crate) fn to_fields_filters(pf: &prefix_filter::Filter) -> String {
     if pf.match_nothing() {
         return " | delete *".to_string();
     }
@@ -347,7 +281,7 @@ fn init_subqueries_net(q: &mut Query, run_net_query: &RunNetQueryFn<'_>) -> Resu
                 cache.insert(q_text.to_string(), values.clone());
                 Ok(values)
             };
-        init_filter_in_values_for_query_net(q, &mut get_field_values, timestamp)
+        init_filter_in_values_for_query(q, &mut get_field_values, timestamp)
             .map_err(|e| format!("cannot initialize `in` subqueries: {e}"))?;
     }
 
@@ -378,46 +312,6 @@ fn init_subqueries_net(q: &mut Query, run_net_query: &RunNetQueryFn<'_>) -> Resu
     }
 
     Ok(())
-}
-
-/// Go `initFilterInValues` (query level), duplicated from storage_search.rs
-/// (private there): rewrites the global filter, the top-level filter and the
-/// pipe-embedded filters of `q`.
-fn init_filter_in_values_for_query_net(
-    q: &mut Query,
-    get_values: &mut crate::storage_search::GetFieldValuesFn<'_>,
-    timestamp: i64,
-) -> Result<(), String> {
-    if !q.has_filter_in_with_query() {
-        return Ok(());
-    }
-
-    if let Some(gf) = q.opts.global_filter.take() {
-        let gf = if crate::storage_search::has_filter_in_with_query_for_filter(gf.as_ref()) {
-            crate::storage_search::init_filter_in_values_for_filter(gf, get_values)?
-        } else {
-            gf
-        };
-        q.opts.global_filter = Some(gf);
-    }
-
-    if crate::storage_search::has_filter_in_with_query_for_filter(q.f.as_ref()) {
-        let f = std::mem::replace(&mut q.f, Box::new(crate::filter_noop::new_filter_noop()));
-        q.f = crate::storage_search::init_filter_in_values_for_filter(f, get_values)?;
-    }
-
-    if q.pipes.iter().any(|p| p.has_filter_in_with_query()) {
-        for p in &mut q.pipes {
-            p.init_filter_in_values(get_values, timestamp)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Go `isLastPipeUniq` (storage_search.go; private there).
-fn is_last_pipe_uniq(pipes: &[Box<dyn Pipe>]) -> bool {
-    pipes.last().is_some_and(|p| p.is_uniq_pipe())
 }
 
 /// Go `getFieldValuesGeneric` over `run_net_query`: appends
@@ -659,10 +553,7 @@ mod tests {
         );
         f("foo | len(x) as y", "foo | len(x) as y", "");
         f("foo | limit 10", "foo | limit 10", "limit 10");
-        // PORT NOTE: Go also checks `foo | math x+y as z` (fully remote);
-        // omitted because the math-expression sub-grammar is deferred in the
-        // Rust parser (see parser/parse_pipe.rs). `PipeMath` itself carries
-        // the same fully-remote `split_to_remote_and_local`.
+        f("foo | math x+y as z", "foo | math (x + y) as z", "");
         f("foo | offset 10", "foo", "offset 10");
         f("foo | pack_json", "foo | pack_json", "");
         f("foo | pack_logfmt", "foo | pack_logfmt", "");

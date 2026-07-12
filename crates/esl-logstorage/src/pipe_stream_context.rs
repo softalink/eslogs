@@ -8,22 +8,18 @@
 //! within `time_window`), merges/deduplicates overlapping context windows, and
 //! emits them ordered by `_time`.
 //!
-//! ## Deferred infrastructure (PORT NOTEs)
+//! ## PORT NOTES
 //!
-//! * `parsePipeStreamContext` / `parsePipeStreamContextBeforeAfter` are
-//!   lexer-dependent and deferred — build the pipe via [`new_pipe_stream_context`].
-//! * `splitToRemoteAndLocal`, `initFilterInValues`, `visitSubqueries` are
-//!   single-node/subquery plumbing and are omitted per the port conventions.
 //! * The surrounding-log fetch re-executes a LogsQL query against storage. Go
-//!   wires this via `withRunQuery(qctx, runQuery, fieldsFilter)`. The storage
-//!   query engine (`ParseQuery`, `NewQueryContext`, tenant scoping,
-//!   `toFieldsFilters`) is not ported here, so the re-execution seam is modelled
-//!   as an injectable [`RunQueryFn`] (Go's `runQueryFunc`) attached via
-//!   [`PipeStreamContext::with_run_query`]. The full before/after selection,
-//!   sorting and de-duplication algorithm IS ported and runs on whatever blocks
-//!   the seam yields; only "how a LogsQL string hits storage" is deferred.
-//!   Without a `run_query`, `flush` returns a descriptive error instead of
-//!   producing output.
+//!   wires this via `withRunQuery(qctx, runQuery, fieldsFilter)` from
+//!   `initStreamContextPipes`; the port wires the equivalent [`RunQueryFn`]
+//!   seam (plus the rendered `toFieldsFilters` tail) from
+//!   `storage_search::init_subqueries` via [`Pipe::init_stream_context_query`].
+//!   The seam receives the `_stream_id` string so the callback can scope the
+//!   subquery to the stream's tenant (Go `getTenantIDFromStreamIDString` +
+//!   `NewQueryContext`). Without a `run_query` (the `NetQueryRunner` local
+//!   pipe chain does not wire it — see PARITY.md), `flush` returns a
+//!   descriptive error instead of producing output.
 //! * The `stateSizeBudget` memory guard (Go `memory.Allowed()` /
 //!   `stateSizeBudgetChunk`) is dropped; the `maxStreams` / `maxRowsPerStream`
 //!   count guards are kept.
@@ -49,17 +45,33 @@ const PIPE_STREAM_CONTEXT_DEFAULT_TIME_WINDOW: i64 = NSECS_PER_HOUR;
 const PIPE_STREAM_CONTEXT_MAX_STREAMS: usize = 100;
 const PIPE_STREAM_CONTEXT_MAX_ROWS_PER_STREAM: usize = 1000;
 
-/// Re-executes a LogsQL query string, invoking `write_block` for every result
-/// block. Port of Go's `runQueryFunc`.
+/// Receives every result [`BlockResult`] of a re-executed subquery.
 ///
-/// PORT NOTE: Go's signature is
-/// `func(qctx *QueryContext, writeBlock func(workerID uint, br *blockResult)) error`.
-/// The `QueryContext` (parsed query, tenant scoping, partial-response and hidden
-/// fields config assembled by `withRunQuery`) is deferred; here the caller
-/// receives the already-formatted query string and yields blocks through the
-/// callback.
+/// PORT NOTE: `Arc`-shared (rather than `&mut dyn FnMut`) because the storage
+/// search fans blocks out from multiple worker threads; the mutable
+/// accumulation happens behind a `Mutex` inside the callback, exactly like the
+/// `mu` guarding `contextRows` in Go's `executeQuery` writeBlock closure.
+pub(crate) type WriteBlockResultFn = Arc<dyn Fn(&mut BlockResult) + Send + Sync>;
+
+/// Re-executes a LogsQL query string against storage, invoking the callback
+/// for every result block. Port of Go's `runQueryFunc` as used by
+/// `pipeStreamContextProcessor.executeQuery`.
+///
+/// Arguments: `(stream_id, q_str, write_block)`. The `stream_id` hex string
+/// lets the callback derive the tenant to scope the subquery to
+/// (Go `getTenantIDFromStreamIDString` + `NewQueryContext` inside
+/// `executeQuery`; the port folds that into the wired closure).
 pub(crate) type RunQueryFn =
-    Arc<dyn Fn(&str, &mut dyn FnMut(&mut BlockResult)) -> Result<(), String> + Send + Sync>;
+    Arc<dyn Fn(&str, &str, WriteBlockResultFn) -> Result<(), String> + Send + Sync>;
+
+/// Port of Go `getTenantIDFromStreamIDString` (pipe_stream_context.go).
+pub(crate) fn get_tenant_id_from_stream_id_string(s: &str) -> Option<crate::tenant_id::TenantID> {
+    let mut sid = crate::stream_id::StreamID::default();
+    if !sid.try_unmarshal_from_string(s) {
+        return None;
+    }
+    Some(sid.tenant_id)
+}
 
 /// `pipeStreamContext` processes `| stream_context ...` queries.
 pub struct PipeStreamContext {
@@ -71,16 +83,19 @@ pub struct PipeStreamContext {
     pub(crate) time_window: i64,
 
     /// Subquery re-execution seam (Go `runQuery`, set via `withRunQuery`).
-    /// `None` until [`PipeStreamContext::with_run_query`] is called.
+    /// `None` until [`Pipe::init_stream_context_query`] is called.
     pub(crate) run_query: Option<RunQueryFn>,
+
+    /// Rendered `toFieldsFilters(fieldsFilter)` tail appended to the
+    /// surrounding-logs query (Go `pc.fieldsFilter`, set via `withRunQuery`);
+    /// empty when all fields are needed.
+    pub(crate) fields_filter: String,
 }
 
-/// Constructs a `stream_context` pipe from already-parsed components.
-///
-/// PORT NOTE: Go's `parsePipeStreamContext` is lexer-dependent and deferred;
-/// this constructor takes the parsed `before` / `after` line counts and the
-/// time window directly. `lines_before`/`lines_after` are non-negative (Go
-/// rejects negatives at parse time).
+/// Constructs a `stream_context` pipe from already-parsed components
+/// (`parsePipeStreamContext` itself lives in `parser/parse_pipe.rs`).
+/// `lines_before`/`lines_after` are non-negative (Go rejects negatives at
+/// parse time).
 pub(crate) fn new_pipe_stream_context(
     lines_before: usize,
     lines_after: usize,
@@ -91,17 +106,7 @@ pub(crate) fn new_pipe_stream_context(
         lines_after,
         time_window,
         run_query: None,
-    }
-}
-
-impl PipeStreamContext {
-    /// Attaches the subquery re-execution seam. Port of Go's `withRunQuery`
-    /// (qctx/fieldsFilter are folded into the closure; see module PORT NOTE).
-    // Ported for Go parity; not yet wired into a caller (see PARITY.md).
-    #[allow(dead_code)]
-    pub(crate) fn with_run_query(mut self, run_query: RunQueryFn) -> Self {
-        self.run_query = Some(run_query);
-        self
+        fields_filter: String::new(),
     }
 }
 
@@ -136,6 +141,19 @@ impl Pipe for PipeStreamContext {
     // hasFilterInWithQuery are all false for stream_context, matching the Pipe
     // trait defaults, so they are left unoverridden.
 
+    /// Go `initStreamContextPipes`' `*pipeStreamContext` type-switch arm.
+    fn is_stream_context_pipe(&self) -> bool {
+        true
+    }
+
+    /// Port of Go `pipeStreamContext.withRunQuery` (Go returns a shallow copy;
+    /// the port mutates the query-owned pipe in place, like the other
+    /// `init_*` hooks).
+    fn init_stream_context_query(&mut self, run_query: &RunQueryFn, fields_filter: &str) {
+        self.run_query = Some(Arc::clone(run_query));
+        self.fields_filter = fields_filter.to_string();
+    }
+
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
         pf.add_allow_filter("_time");
         pf.add_allow_filter("_stream_id");
@@ -155,6 +173,7 @@ impl Pipe for PipeStreamContext {
             lines_after: self.lines_after,
             time_window: self.time_window,
             run_query: self.run_query.clone(),
+            fields_filter: self.fields_filter.clone(),
             pp_next,
             shards,
             stop,
@@ -207,6 +226,7 @@ struct PipeStreamContextProcessor {
     lines_after: usize,
     time_window: i64,
     run_query: Option<RunQueryFn>,
+    fields_filter: String,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<PipeStreamContextProcessorShard>>,
     stop: Arc<AtomicBool>,
@@ -295,13 +315,14 @@ impl PipeProcessor for PipeStreamContextProcessor {
         let run_query = match &self.run_query {
             Some(f) => f.clone(),
             None => {
-                // PORT NOTE: producing output requires re-querying storage for
-                // surrounding logs; the query engine is deferred (see module
-                // PORT NOTE). Attach a seam via `with_run_query`.
+                // PORT NOTE: the local `Storage::run_query` path wires the
+                // seam in `storage_search::init_subqueries`; the
+                // `NetQueryRunner` local pipe chain does not (see PARITY.md),
+                // so it surfaces this error instead of Go's wired behavior.
                 return Err(
-                    "PORT NOTE: 'stream_context' requires subquery re-execution \
-                     (Go initStreamContextPipes/withRunQuery), which is not wired into \
-                     storage_search::init_subqueries yet"
+                    "PORT NOTE: 'stream_context' requires the subquery re-execution seam \
+                     (Go initStreamContextPipes/withRunQuery), which is not wired on this \
+                     execution path"
                         .to_string(),
                 );
             }
@@ -389,7 +410,7 @@ fn get_time_ranges_for_stream_rowss(
     let time_filter = get_time_filter(tr.start, tr.end);
     let q_str = format!("_stream_id:{stream_id} {time_filter} | fields _time");
 
-    let rowss = execute_query(pcp, &q_str, needed_timestamps, run_query)?;
+    let rowss = execute_query(pcp, stream_id, &q_str, needed_timestamps, run_query)?;
 
     let mut trs = Vec::with_capacity(rowss.len());
     for rows in &rowss {
@@ -477,11 +498,12 @@ fn get_stream_rowss_by_time_ranges(
         q_str.push_str(&time_filters.join(" OR "));
         q_str.push(')');
     }
-    // PORT NOTE: Go appends `toFieldsFilters(pc.fieldsFilter)` here to restrict
-    // the fetched fields to the query's needed set. `fieldsFilter` is wired by
-    // the deferred `withRunQuery`, so no fields filter is appended.
+    // Go: `qStr += toFieldsFilters(pcp.pc.fieldsFilter)` — restrict the
+    // fetched fields to the query's needed set (rendered by the wiring in
+    // `storage_search::init_subqueries`).
+    q_str.push_str(&pcp.fields_filter);
 
-    execute_query(pcp, &q_str, needed_timestamps, run_query)
+    execute_query(pcp, stream_id, &q_str, needed_timestamps, run_query)
 }
 
 /// Port of Go `getTimeFilter`.
@@ -499,28 +521,33 @@ fn get_time_filter(start: i64, end: i64) -> String {
 
 /// Port of Go `(*pipeStreamContextProcessor).executeQuery`.
 ///
-/// PORT NOTE: Go parses `q_str` into a `Query`, builds a tenant-scoped
-/// `QueryContext` (via `getTenantIDFromStreamIDString`) and runs it through
-/// `pc.runQuery`. Here the already-formatted `q_str` is handed to the injected
-/// [`RunQueryFn`] seam; the per-block before/after accumulation below is a
-/// faithful port of Go's `writeBlock` callback.
+/// The wired [`RunQueryFn`] parses `q_str`, scopes it to the tenant derived
+/// from `stream_id` and streams the result blocks into the callback (Go
+/// parses/scopes inline here); the per-block before/after accumulation below
+/// is a faithful port of Go's `writeBlock` callback, with the `Mutex` playing
+/// the role of Go's `mu` around `contextRows`.
 fn execute_query(
     pcp: &PipeStreamContextProcessor,
+    stream_id: &str,
     q_str: &str,
     needed_timestamps: &[i64],
     run_query: &RunQueryFn,
 ) -> Result<Vec<Vec<StreamContextRow>>, String> {
-    let mut context_rows: Vec<StreamContextRows> = needed_timestamps
+    let context_rows: Vec<StreamContextRows> = needed_timestamps
         .iter()
         .map(|&t| StreamContextRows::new(t, pcp.lines_before, pcp.lines_after))
         .collect();
     // Snapshot the needed timestamps so the neighbor guards below can read them
-    // without aliasing the mutably-borrowed `context_rows`.
+    // without touching the locked `context_rows`.
     let needed: Vec<i64> = context_rows.iter().map(|c| c.needed_timestamp).collect();
 
-    let mut callback = |br: &mut BlockResult| {
+    let state = Arc::new(Mutex::new(context_rows));
+    let state_cb = Arc::clone(&state);
+    let stop = Arc::clone(&pcp.stop);
+    let callback: WriteBlockResultFn = Arc::new(move |br: &mut BlockResult| {
+        let mut context_rows = state_cb.lock().unwrap();
         for i in 0..context_rows.len() {
-            if pcp.stop.load(AtomicOrdering::Relaxed) {
+            if stop.load(AtomicOrdering::Relaxed) {
                 return;
             }
             if !context_rows[i].can_update(br) {
@@ -538,9 +565,10 @@ fn execute_query(
                 context_rows[i].update(br, j, timestamp);
             }
         }
-    };
-    run_query(q_str, &mut callback)?;
+    });
+    run_query(stream_id, q_str, callback)?;
 
+    let context_rows = std::mem::take(&mut *state.lock().unwrap());
     let mut rowss = Vec::with_capacity(context_rows.len());
     for ctx in context_rows {
         let mut rows = ctx.rows_before;
@@ -1071,6 +1099,7 @@ mod tests {
             lines_after: 1,
             time_window: PIPE_STREAM_CONTEXT_DEFAULT_TIME_WINDOW,
             run_query: None,
+            fields_filter: String::new(),
             pp_next: Arc::new(crate::pipe_update::test_utils::CollectProcessor::default()),
             shards: vec![Mutex::new(PipeStreamContextProcessorShard::default())],
             stop: Arc::new(AtomicBool::new(false)),
@@ -1118,7 +1147,7 @@ mod tests {
             &[("_time", &ts_str(20)), ("_stream_id", "s1"), ("_msg", "b")],
             &[("_time", &ts_str(30)), ("_stream_id", "s1"), ("_msg", "c")],
         ]);
-        let run_query: RunQueryFn = Arc::new(move |_q_str, cb| {
+        let run_query: RunQueryFn = Arc::new(move |_stream_id, _q_str, cb| {
             let mut br = BlockResult::default();
             br.must_init_from_rows(&full_stream);
             cb(&mut br);
@@ -1127,7 +1156,8 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let collector = Arc::new(crate::pipe_update::test_utils::CollectProcessor::default());
-        let p = stream_context(1, 1).with_run_query(run_query);
+        let mut p = stream_context(1, 1);
+        p.init_stream_context_query(&run_query, "");
         let pp = p.new_pipe_processor(1, stop, collector.clone());
 
         // The matching input row (t=20) fed to the pipe.

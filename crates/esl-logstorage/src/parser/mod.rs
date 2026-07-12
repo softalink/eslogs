@@ -17,15 +17,14 @@
 //! # PORT NOTES — optimize() status
 //! Go's `parser.go` post-parse `optimize()` is ported for the filter passes
 //! (`flattenFiltersAnd/Or`, `removeStarFilters`, `mergeFiltersStream`) and
-//! the `optimizeOffsetLimitPipes` pipe pass, expressed through purpose-built
-//! `Filter`/`Pipe` trait hooks instead of Go's `copyFilter` + type switches
-//! (see `query::optimize_no_subqueries`), as are `optimizeFilterPipes` and
-//! the leading-`filter`-pipe merge (via the rendered-pipe-string route). The
-//! rewrites needing further `Pipe`-trait hooks (`optimizeUniqLimitPipes`,
-//! marking a leading `pipeFieldNames` as first pipe) and
-//! `updateFilterWithTimeOffset` remain deferred with PORT NOTEs at their
-//! stubs. The full lexer + parse grammar — the LogsQL parity spec — is
-//! ported in full.
+//! the pipe passes (`optimizeOffsetLimitPipes`, `optimizeUniqLimitPipes`,
+//! marking a leading `pipeFieldNames` as first pipe), expressed through
+//! purpose-built `Filter`/`Pipe` trait hooks instead of Go's `copyFilter` +
+//! type switches (see `query::optimize_no_subqueries`), as are
+//! `optimizeFilterPipes` and the leading-`filter`-pipe merge (via the
+//! rendered-pipe-string route). `updateFilterWithTimeOffset` remains deferred
+//! with a PORT NOTE at its stub. The full lexer + parse grammar — the LogsQL
+//! parity spec — is ported in full.
 
 #[cfg(test)]
 mod tests;

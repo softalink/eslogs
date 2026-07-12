@@ -22,10 +22,8 @@ const DENIED_FIRST_COMPOUND_TOKENS: &[&str] = &["/", ".", "$"];
 /// glueCompoundTokens — tokens allowed inside unquoted compound tokens.
 const GLUE_COMPOUND_TOKENS: &[&str] = &["+", "-", "/", ":", ".", "$"];
 
-/// mathStopCompoundTokens — glue tokens disallowed in math compound tokens.
-/// Only consumed by `next_compound_math_token`, which the deferred `math`/`eval`
-/// pipe parser would use (see `parse_pipe.rs` PORT NOTE).
-#[allow(dead_code)]
+/// mathStopCompoundTokens — glue tokens disallowed in math compound tokens
+/// (consumed by `next_compound_math_token` in the `math`/`eval` pipe parser).
 const MATH_STOP_COMPOUND_TOKENS: &[&str] = &["+", "-", "/"];
 
 /// queryPartTrailers — tokens that terminate a query part.
@@ -44,7 +42,6 @@ pub(crate) trait LexerExt {
     fn is_prev_raw_token(&self, tokens: &[&str]) -> bool;
     fn check_prev_adjacent_token(&self, tokens: &[&str]) -> Result<(), String>;
     fn next_compound_token_ext(&mut self, stop_tokens: &[&str]) -> Result<String, String>;
-    #[allow(dead_code)]
     fn next_compound_math_token(&mut self) -> Result<String, String>;
     fn is_allowed_compound_token(&self, stop_tokens: &[&str]) -> bool;
 }

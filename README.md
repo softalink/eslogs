@@ -83,9 +83,13 @@ log storage:
 
 The port is **functionally complete** for single-node use: the full
 `lib/logstorage` engine (storage, LogsQL filters/stats/pipes, parser), the app
-layer, and the `es-logs` server binary run end-to-end on Linux and
-Windows, returning results identical to upstream. 974 tests — the upstream Go
-tests, ported alongside the code — pass across the workspace.
+layer, and the `es-logs` server binary run end-to-end on Linux and Windows,
+returning results identical to upstream on the ported behavior (the known
+residual divergences — e.g. HTTP auth flags, log-deletion execution, and a
+set of parser/engine edge cases — are enumerated exhaustively in the parity
+ledger, [docs/PARITY.md](docs/PARITY.md) § "Parity ledger (v1.51.0)").
+1,123 tests — the upstream Go tests, ported alongside the code — pass across
+the workspace.
 
 - **Ingestion**: jsonline, Elasticsearch bulk, Loki (JSON + protobuf), OTLP,
   DataDog, journald, Splunk HEC, syslog (TCP/UDP/unix listeners), native.
@@ -112,9 +116,8 @@ tests, ported alongside the code — pass across the workspace.
   the Kubernetes collector and `eslogscli -tls*`, plus server-side TLS for
   `-syslog.tls*` and the HTTP server's `-tls`/`-tlsCertFile`/`-tlsKeyFile`/
   `-tlsMinVersion`/`-tlsCipherSuites` serving flags (es-logs and eslagent).
-- Out of scope / PORT-NOTEd: cluster-mode query fan-out (netinsert/netselect
-  are ported; the query splitter is single-node-stubbed), the Prometheus
-  metrics registry.
+- Residual divergences are tracked exhaustively in the parity ledger:
+  [docs/PARITY.md](docs/PARITY.md) § "Parity ledger (v1.51.0)".
 
 ### Quick start
 
@@ -373,7 +376,7 @@ goes uncovered. Full workflow: [docs/UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md).
 Every change must pass all three before commit:
 
 ```sh
-cargo test --workspace                # 974 tests
+cargo test --workspace                # 1,123 tests
 cargo clippy --workspace              # clean
 XWIN_ACCEPT_LICENSE=1 cargo xwin check --target x86_64-pc-windows-msvc --workspace
 ```

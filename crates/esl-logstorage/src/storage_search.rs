@@ -33,11 +33,11 @@
 //! sorted block headers and skips non-matching blocks entirely (Go
 //! `sso.streamFilter`/`sso.streamIDs` -> `pso.streamIDs`).
 //!
-//! **Subqueries** (`in(<subquery>)` filters, `join`/`union` subqueries) are
-//! ported: [`init_subqueries`] mirrors Go `initSubqueries` and runs at the top
-//! of [`run_query`] (see its PORT NOTE for the clone-by-reparse divergence).
-//! Only `initStreamContextPipes` (the `stream_context` runQuery wiring) stays
-//! deferred — see pipe_stream_context.rs.
+//! **Subqueries** (`in(<subquery>)` filters, `join`/`union` subqueries, the
+//! `stream_context` surrounding-logs seam) are ported: [`init_subqueries`]
+//! mirrors Go `initSubqueries` (including `initStreamContextPipes`) and runs
+//! at the top of [`run_query`] (see its PORT NOTE for the clone-by-reparse
+//! divergence).
 //!
 //! PORT NOTE: Go's `searchParallel` uses a channel of pooled
 //! `blockSearchWorkBatch`es fed by concurrent partition searchers. Since
@@ -663,8 +663,8 @@ pub type WriteDataBlockFn = Arc<dyn Fn(usize, &mut DataBlock) + Send + Sync>;
 /// PORT NOTE: Go pools per-worker `DataBlock`s via `atomicutil.Slice`; the port
 /// allocates a fresh `DataBlock` per non-empty block (correctness over the pool
 /// micro-optimization).
-struct BlockResultWriter {
-    f: WriteDataBlockFn,
+pub(crate) struct BlockResultWriter {
+    pub(crate) f: WriteDataBlockFn,
 }
 
 impl PipeProcessor for BlockResultWriter {
@@ -682,8 +682,30 @@ impl PipeProcessor for BlockResultWriter {
     }
 }
 
-/// Go `runPipes`: wires the pipe chain between `search` and the terminal `sink`.
-fn run_pipes<F>(
+/// Terminal pipe processor handing each raw [`BlockResult`] to a
+/// `stream_context` [`WriteBlockResultFn`] callback (Go passes the
+/// `writeBlock func(workerID uint, br *blockResult)` closure directly into
+/// `runQuery`).
+struct BlockResultCallbackSink {
+    f: crate::pipe_stream_context::WriteBlockResultFn,
+}
+
+impl PipeProcessor for BlockResultCallbackSink {
+    fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
+        if br.rows_len() == 0 {
+            return;
+        }
+        (self.f)(br);
+    }
+
+    fn flush(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Go `runPipes`: wires the pipe chain between `search` and the terminal
+/// `sink`. Shared with `net_query_runner` (Go reuses the same function).
+pub(crate) fn run_pipes<F>(
     pipes: &[Box<dyn crate::pipe::Pipe>],
     concurrency: usize,
     search: F,
@@ -1004,14 +1026,13 @@ impl Storage {
             pipe_str += " filter ";
             pipe_str += &crate::parser::quote_token_if_needed(filter);
         }
-        // PORT NOTE: Go sets `pf.isFirstPipe = len(pipes) == 0`, which makes
-        // the pipe read field names straight from the per-block columns header
-        // instead of materializing the columns. The Rust `BlockResult` does
-        // not carry a block-search/columns-header reference (Go `br.bs`), so
-        // the pipe is left in its non-first-pipe mode — the exact path Go
-        // takes for pre-v1 part formats: all columns are fetched and their
-        // names counted. Same results, without the header-only optimization.
-        let p = crate::parser::parse_pipe::must_parse_pipe(&pipe_str, q.get_timestamp());
+        // Go sets `pf.isFirstPipe = len(pipes) == 0`, enabling the pipe's
+        // columns-header fast path (names read per block without
+        // materializing the columns).
+        let mut p = crate::parser::parse_pipe::must_parse_pipe(&pipe_str, q.get_timestamp());
+        if q_new.pipes.is_empty() {
+            p.mark_first_pipe();
+        }
         q_new.pipes.push(p);
 
         self.run_values_with_hits_query(tenant_ids, &q_new, cancel, qs)
@@ -1311,7 +1332,7 @@ pub(crate) fn init_filter_in_values_for_shared_filter(
 
 /// Port of Go `initFilterInValues` (query level): rewrites the global filter,
 /// the top-level filter and the pipe-embedded filters of `q`.
-fn init_filter_in_values_for_query(
+pub(crate) fn init_filter_in_values_for_query(
     q: &mut Query,
     get_values: &mut GetFieldValuesFn<'_>,
     timestamp: i64,
@@ -1346,7 +1367,7 @@ fn init_filter_in_values_for_query(
 }
 
 /// Port of Go `isLastPipeUniq`.
-fn is_last_pipe_uniq(pipes: &[Box<dyn crate::pipe::Pipe>]) -> bool {
+pub(crate) fn is_last_pipe_uniq(pipes: &[Box<dyn crate::pipe::Pipe>]) -> bool {
     pipes.last().is_some_and(|p| p.is_uniq_pipe())
 }
 
@@ -1472,16 +1493,16 @@ fn get_rows(
 }
 
 /// Port of Go `initSubqueries`: resolves `in(<subquery>)` filter values,
-/// builds `join` maps and wires `union` subqueries before the search starts.
-/// Returns `None` when `q` embeds no subqueries (it is executed as is).
+/// builds `join` maps, wires `union` subqueries and wires the
+/// `stream_context` surrounding-logs seam (Go `initStreamContextPipes`)
+/// before the search starts. Returns `None` when `q` embeds no subqueries
+/// (it is executed as is).
 ///
 /// PORT NOTE: Go rewrites shared filter/pipe trees via `cloneShallow` +
 /// `copyFilter`; Rust filters/pipes are single-owner trait objects, so a query
 /// with subqueries is cloned via re-parsing ([`Query::clone`]) and rewritten
 /// in place. Go's `eagerExecute` mode (cluster-only, `NewNetQueryRunner`) is
-/// ported in `net_query_runner::init_subqueries_net`; `initStreamContextPipes`
-/// (`stream_context` runQuery wiring — see pipe_stream_context.rs) stays
-/// deferred.
+/// ported in `net_query_runner::init_subqueries_net`.
 fn init_subqueries(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
@@ -1492,7 +1513,8 @@ fn init_subqueries(
     let has_in = q.has_filter_in_with_query();
     let has_join = q.pipes().iter().any(|p| p.is_join_pipe());
     let has_union = q.pipes().iter().any(|p| p.is_union_pipe());
-    if !has_in && !has_join && !has_union {
+    let has_stream_context = q.pipes().iter().any(|p| p.is_stream_context_pipe());
+    if !has_in && !has_join && !has_union && !has_stream_context {
         return Ok(None);
     }
 
@@ -1558,6 +1580,62 @@ fn init_subqueries(
         for p in &mut q_new.pipes {
             p.init_union_query(&run_union_query)
                 .map_err(|e| format!("cannot initialize 'union' subqueries: {e}"))?;
+        }
+    }
+
+    if has_stream_context {
+        // Go `initStreamContextPipes`: `stream_context` is only valid as the
+        // first pipe (directly after the filter)...
+        for i in 1..q_new.pipes.len() {
+            if q_new.pipes[i].is_stream_context_pipe() {
+                return Err(format!(
+                    "[{}] pipe must go after [{}] filter; now it goes after the [{}] pipe",
+                    q_new.pipes[i].to_string(),
+                    q_new.f.to_string(),
+                    q_new.pipes[i - 1].to_string()
+                ));
+            }
+        }
+
+        // ...where it gets the runQuery seam for fetching the surrounding
+        // logs, scoped to the tenant encoded in each `_stream_id`
+        // (Go `pc.withRunQuery(qctx, runQuery, fieldsFilter)` +
+        // `executeQuery`'s ParseQuery/NewQueryContext).
+        if q_new
+            .pipes
+            .first()
+            .is_some_and(|p| p.is_stream_context_pipe())
+        {
+            let fields_filter =
+                crate::net_query_runner::to_fields_filters(&q_new.get_needed_columns());
+
+            let storage_sc = Arc::clone(storage);
+            let cancel_sc: Option<Arc<AtomicBool>> = cancel.cloned();
+            let qs_sc = Arc::clone(qs);
+            let run_sc_query: crate::pipe_stream_context::RunQueryFn = Arc::new(
+                move |stream_id, q_text, write_block| -> Result<(), String> {
+                    let q_sub = crate::parser::ParseQuery(q_text)
+                        .map_err(|e| format!("BUG: cannot parse query [{q_text}]: {e}"))?;
+                    let Some(tenant_id) =
+                        crate::pipe_stream_context::get_tenant_id_from_stream_id_string(stream_id)
+                    else {
+                        return Err(format!(
+                            "BUG: cannot obtain tenantID from streamID {stream_id:?}"
+                        ));
+                    };
+                    let sink: Arc<dyn PipeProcessor> =
+                        Arc::new(BlockResultCallbackSink { f: write_block });
+                    run_query_with_sink(
+                        &storage_sc,
+                        &[tenant_id],
+                        &q_sub,
+                        sink,
+                        cancel_sc.as_ref(),
+                        &qs_sc,
+                    )
+                },
+            );
+            q_new.pipes[0].init_stream_context_query(&run_sc_query, &fields_filter);
         }
     }
 
@@ -1887,6 +1965,129 @@ mod tests {
         esl_common::fs::must_remove_dir(&path);
     }
 
+    /// `stream_context` end-to-end: the surrounding-logs seam wired by
+    /// `init_subqueries` (Go `initStreamContextPipes`) must return the
+    /// before/after context rows around each matching row, and a misplaced
+    /// `stream_context` pipe must fail like Go.
+    #[test]
+    fn test_run_query_stream_context_end_to_end() {
+        let path = run_query_temp_path("stream-context");
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+
+        // Non-default tenant: proves the seam derives the tenant from the
+        // `_stream_id` string (Go getTenantIDFromStreamIDString).
+        let tenant = TenantID {
+            account_id: 3,
+            project_id: 7,
+        };
+
+        let msgs = ["one", "two", "three", "four", "five"];
+        let mut lr = get_log_rows(&["host"], &[], &[], &[], "");
+        let base = now_nanos();
+        for (i, msg) in msgs.iter().enumerate() {
+            let mut fields = vec![
+                Field {
+                    name: "_msg".to_string(),
+                    value: msg.to_string(),
+                },
+                Field {
+                    name: "host".to_string(),
+                    value: "node-1".to_string(),
+                },
+            ];
+            lr.must_add(tenant, base + (i as i64) * 1_000_000, &mut fields, -1);
+        }
+        s.must_add_rows(&lr);
+        s.debug_flush();
+
+        // `three` matches one row; before 1 / after 1 adds `two` and `four`.
+        let q = ParseQuery("three | stream_context before 1 after 1").expect("parse query");
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let write: WriteDataBlockFn = Arc::new(move |_wid, db: &mut DataBlock| {
+            let n = db.rows_count();
+            let cs = db.get_columns(false);
+            let mut dst = cap.lock().unwrap();
+            for i in 0..n {
+                for c in cs {
+                    if c.name == "_msg" {
+                        dst.push(String::from_utf8_lossy(&c.values[i]).into_owned());
+                    }
+                }
+            }
+        });
+        s.run_query(&[tenant], &q, write)
+            .expect("run_query stream_context");
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["two".to_string(), "three".to_string(), "four".to_string()],
+            "stream_context must return the matching row with its before/after context in _time order"
+        );
+
+        // Go initStreamContextPipes: stream_context anywhere but first errors.
+        let q_bad =
+            ParseQuery("* | limit 10 | stream_context after 1").expect("parse misplaced query");
+        let noop: WriteDataBlockFn = Arc::new(|_wid, _db: &mut DataBlock| {});
+        let err = s
+            .run_query(&[tenant], &q_bad, noop)
+            .expect_err("misplaced stream_context must fail");
+        assert!(
+            err.contains("pipe must go after"),
+            "unexpected error: {err}"
+        );
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
+    }
+
+    /// `GetFieldNames` first-pipe fast mode (names read from the per-block
+    /// columns-header index) must yield exactly the results of the slow
+    /// all-columns mode. The slow mode is forced by a huge pass-through
+    /// `limit` pipe in front, which keeps `field_names` out of first-pipe
+    /// position without changing the matched rows.
+    #[test]
+    fn test_get_field_names_fast_path_matches_slow_path() {
+        let path = run_query_temp_path("fieldnames-fastpath");
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+        let all_tenant_ids = fill_run_query_fixture(&s);
+        let qs = test_qs();
+
+        let q_fast = ParseQuery("*").expect("parse query");
+        let fast = s
+            .get_field_names(&all_tenant_ids, &q_fast, "", None, &qs)
+            .expect("get_field_names fast");
+
+        let q_slow = ParseQuery("* | limit 999999999").expect("parse query");
+        let slow = s
+            .get_field_names(&all_tenant_ids, &q_slow, "", None, &qs)
+            .expect("get_field_names slow");
+
+        assert!(!fast.is_empty(), "fixture must yield field names");
+        assert_eq!(
+            fast, slow,
+            "first-pipe fast mode must match the all-columns slow mode"
+        );
+
+        // The name filter takes the same fast path.
+        let fast_filtered = s
+            .get_field_names(&all_tenant_ids, &q_fast, "_stream", None, &qs)
+            .expect("get_field_names fast filtered");
+        let slow_filtered = s
+            .get_field_names(&all_tenant_ids, &q_slow, "_stream", None, &qs)
+            .expect("get_field_names slow filtered");
+        assert_eq!(fast_filtered, slow_filtered);
+        assert!(
+            fast_filtered.iter().all(|vh| vh.value.contains("_stream")),
+            "filtered names must contain the filter substring"
+        );
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
+    }
+
     // -- getCommonStreamFilter scheduling pre-filter test ---------------------
 
     /// A top-level `{...}` filter must prune non-matching blocks at
@@ -1905,7 +2106,10 @@ mod tests {
         let all_tenant_ids = fill_run_query_fixture(&s);
         // Settle the part set: a background small-part merge between two
         // measurements below would legitimately change the per-query block
-        // counts and break the blocks_field == blocks_all comparison.
+        // counts. The forced merge consolidates most of it, but background
+        // merges may still consolidate small same-stream blocks afterwards,
+        // so the per-row-filter comparison below brackets its measurement
+        // with two `*` baselines instead of assuming a stable block count.
         s.must_force_merge("");
 
         // Runs `query` and returns its sorted result rows plus the number of
@@ -1954,16 +2158,22 @@ mod tests {
 
         // Results must be identical to the equivalent per-row field filter
         // (which cannot use the scheduling pre-filter).
+        let (_, blocks_all_before) = run("*");
         let (rows_field, blocks_field) = run("instance:='host-1:234'");
+        let (_, blocks_all_after) = run("*");
         assert_eq!(
             rows_stream, rows_field,
             "stream-filter results must match the per-row filter results"
         );
 
-        // The per-row filter still schedules every block...
-        assert_eq!(
-            blocks_field, blocks_all,
-            "a per-row field filter must not prune scheduling"
+        // The per-row filter still schedules every block: its block count
+        // must sit between the `*` baselines measured around it (background
+        // merges only ever reduce the total block count).
+        assert!(
+            blocks_all_after <= blocks_field && blocks_field <= blocks_all_before,
+            "a per-row field filter must not prune scheduling: \
+             processed {blocks_field} blocks; `*` processed {blocks_all_before} before \
+             and {blocks_all_after} after"
         );
         // ...while the stream filter prunes non-matching blocks at scheduling
         // time: only the matching stream's third of the blocks is processed.

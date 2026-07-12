@@ -1,30 +1,20 @@
 //! Port of `lib/logstorage/pipe_math.go` — the `| math ...` (aka `| eval ...`)
 //! pipe: per-row arithmetic expression evaluation producing new fields.
 //!
-//! PORT NOTE — parser deferred: Go's `parsePipeMath`/`parseMathExpr`/… drive the
-//! shared `lexer` type (`lex.isKeyword`, `lex.nextCompoundMathToken`, …), which
-//! is not ported yet. The lexer-driven parse is therefore omitted; instead the
-//! `MathExpr`/`MathEntry`/`PipeMath` constructors are exposed `pub(crate)` so a
-//! future parser (and the tests here) can build the expression tree directly.
-//! The self-contained pieces — the expression tree, `String()` rendering,
-//! operator-priority table, the full evaluator and every `mathFunc` — are ported.
+//! The expression tree, `String()` rendering, operator-priority table, the
+//! full evaluator and every `mathFunc` live here; the lexer-driven
+//! `parsePipeMath`/`parseMathExpr` grammar is ported in
+//! `parser/parse_pipe.rs` (against the `pub(crate)` constructors below).
 //!
 //! PORT NOTE — `try_parse_number`: Go's `tryParseNumber` lives in
-//! `block_result.go`; private copies were homed in `stats_histogram.rs` and
-//! `filter_range.rs` (as noted there). It is exposed here `pub(crate)` per the
-//! porting task; those copies should later be replaced by a `use` of this one
-//! (they are out of scope for this change).
+//! `block_result.go`; the shared port is hosted here `pub(crate)` and reused
+//! by `block_result.rs`, `stats_histogram.rs` and `filter_range.rs`
+//! (`parse_math_number` likewise).
 //!
 //! PORT NOTE — per-worker scratch: Go pools scratch buffers per worker via
 //! `atomicutil.Slice[pipeMathProcessorShard]`. Here `write_block` allocates its
 //! scratch per call (no cross-block state exists for `math`), which is simpler
 //! and behaviorally identical.
-//!
-//! PORT NOTE — dead_code: the `pub(crate)` `PipeMath`/`MathEntry`/`MathExpr`
-//! constructors are the surface the deferred parser (and query planner) will
-//! call. Until that lexer-driven registration lands they have no non-test
-//! caller, so the module allows `dead_code`; drop the allow once wired.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -212,6 +202,35 @@ impl MathExpr {
         Self::new_func("unary_minus", vec![arg])
     }
 
+    /// Number of args (used by the parser's per-function arity checks).
+    pub(crate) fn args_len(&self) -> usize {
+        self.args.len()
+    }
+
+    /// Marks the expr as parenthesized (Go `me.wrappedInParens = true` in
+    /// `parseMathExprInParens`); parenthesized exprs opt out of the operator
+    /// rebalancing in [`MathExpr::new_binary_balanced`].
+    pub(crate) fn mark_wrapped_in_parens(&mut self) {
+        self.wrapped_in_parens = true;
+    }
+
+    /// Combines `left <op> right` into a binary expr, rebalancing the operands
+    /// by operator priority — the balancing block at the end of Go
+    /// `parseMathExpr`.
+    pub(crate) fn new_binary_balanced(op: &str, mut left: MathExpr, right: MathExpr) -> Self {
+        if !left.wrapped_in_parens
+            && is_math_binary_op(&left.op)
+            && get_math_binary_op_priority(&left.op) > get_math_binary_op_priority(op)
+        {
+            // Go: me.args[0] = left.args[1]; left.args[1] = me; me = left
+            let left_right = left.args.pop().expect("binary expr has two args");
+            let me = MathExpr::new_binary(op, left_right, right);
+            left.args.push(me);
+            return left;
+        }
+        MathExpr::new_binary(op, left, right)
+    }
+
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
         if self.is_const {
             return;
@@ -240,7 +259,7 @@ fn math_binary_op_priority(op: &str) -> Option<i32> {
     }
 }
 
-fn is_math_binary_op(op: &str) -> bool {
+pub(crate) fn is_math_binary_op(op: &str) -> bool {
     math_binary_op_priority(op).is_some()
 }
 
@@ -658,7 +677,7 @@ fn is_likely_number(s: &str) -> bool {
 }
 
 /// Port of Go's `isNumberPrefix` (parser.go).
-fn is_number_prefix(s: &str) -> bool {
+pub(crate) fn is_number_prefix(s: &str) -> bool {
     let mut b = s.as_bytes();
     if b.is_empty() {
         return false;
@@ -708,11 +727,11 @@ mod tests {
     use crate::rows::Field;
     use std::sync::Mutex;
 
-    // PORT NOTE: Go's TestParsePipeMathSuccess/Failure and the lexer-driven
-    // `expectPipeResults` harness in TestPipeMath cannot be ported until the
-    // shared query lexer lands. The evaluation cases below rebuild the same
-    // expression trees directly and assert the same expected outputs; the
-    // String()/needed-fields/number-parsing logic is covered directly.
+    // PORT NOTE: Go's TestParsePipeMathSuccess/Failure live with the ported
+    // parser in `parser/tests.rs`. The evaluation cases below rebuild the Go
+    // TestPipeMath expression trees directly (plus parser-driven cases at the
+    // end) and assert the same expected outputs; the String()/needed-fields/
+    // number-parsing logic is covered directly.
 
     struct CapturePp {
         rows: Mutex<Vec<Vec<(String, String)>>>,
@@ -749,6 +768,10 @@ mod tests {
     }
 
     fn run(pm: &PipeMath, rows: &[Vec<Field>]) -> Vec<Vec<(String, String)>> {
+        run_pipe(pm, rows)
+    }
+
+    fn run_pipe(pm: &dyn Pipe, rows: &[Vec<Field>]) -> Vec<Vec<(String, String)>> {
         let capture = Arc::new(CapturePp {
             rows: Mutex::new(Vec::new()),
         });
@@ -934,6 +957,44 @@ mod tests {
         pm.update_needed_fields(&mut pf);
         assert!(pf.match_string("x"));
         assert!(!pf.match_string("y"));
+    }
+
+    /// Port of the parser-driven Go `TestPipeMath` case exercising timestamp /
+    /// duration / IPv4 / hex parsing and the bitwise ops through the ported
+    /// `parsePipeMath` grammar.
+    #[test]
+    fn test_pipe_math_parsed_timestamps_and_bitwise() {
+        let p = crate::parser::parse_pipe::must_parse_pipe(
+            "math \
+             '2024-05-30T01:02:03Z' + 10e9 as time, \
+             10m5s + 10e9 as duration, \
+             '123.45.67.89' + 1000 as ip, \
+             time - time % time_step as time_rounded, \
+             duration - duration % duration_step as duration_rounded, \
+             (ip & ip_mask or 0x1234) xor 5678 as subnet",
+            0,
+        );
+        let out = run_pipe(
+            p.as_ref(),
+            &[vec![
+                field("time_step", "30m"),
+                field("duration_step", "30s"),
+                field("ip_mask", "0xffffff00"),
+            ]],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(get(&out[0], "time").as_deref(), Some("1717030933000000000"));
+        assert_eq!(get(&out[0], "duration").as_deref(), Some("615000000000"));
+        assert_eq!(get(&out[0], "ip").as_deref(), Some("2066564929"));
+        assert_eq!(
+            get(&out[0], "time_rounded").as_deref(),
+            Some("1717030800000000000")
+        );
+        assert_eq!(
+            get(&out[0], "duration_rounded").as_deref(),
+            Some("600000000000")
+        );
+        assert_eq!(get(&out[0], "subnet").as_deref(), Some("2066563354"));
     }
 
     #[test]

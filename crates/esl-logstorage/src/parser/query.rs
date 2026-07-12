@@ -127,16 +127,14 @@ impl Query {
     ///
     /// PORT NOTE: Go type-switches on `*pipeFilter` for `optimizeFilterPipes`
     /// and the leading-`filter`-pipe merge; the `Pipe` trait has no downcast
-    /// hook (pipe.rs is owned by another port slice), so both rewrites go
-    /// through the rendered pipe string — the established render/re-parse
-    /// divergence (`Query::clone`, `clone_pipe`). Two rewrites stay deferred
-    /// pending `Pipe`-trait hooks: `optimizeUniqLimitPipes` (merging
-    /// `uniq ... | limit N` needs a uniq-limit mutator) and marking a leading
-    /// `pipeFieldNames` as first pipe (the first-pipe mode itself is
-    /// unimplemented — see `Storage::get_field_names`).
+    /// hook, so both rewrites go through the rendered pipe string — the
+    /// established render/re-parse divergence (`Query::clone`, `clone_pipe`).
+    /// The `*pipeUniq` / `*pipeFieldNames` type switches are the
+    /// `uniq_merge_limit` / `mark_first_pipe` trait hooks.
     pub(crate) fn optimize_no_subqueries(&mut self) {
         let pipes = std::mem::take(&mut self.pipes);
         let pipes = optimize_offset_limit_pipes(pipes);
+        let pipes = optimize_uniq_limit_pipes(pipes);
         self.pipes = optimize_filter_pipes(pipes, self.timestamp);
 
         // Merge `q | filter ...` into q.
@@ -150,6 +148,11 @@ impl Query {
             let f = std::mem::replace(&mut self.f, Box::new(crate::filter_noop::new_filter_noop()));
             self.f = merge_filters_and(f, fq.f);
             self.pipes.remove(0);
+        }
+
+        // Optimize `q | field_names ...` by marking pipeFieldNames as first pipe.
+        if let Some(p) = self.pipes.first_mut() {
+            p.mark_first_pipe();
         }
 
         let f = std::mem::replace(&mut self.f, Box::new(crate::filter_noop::new_filter_noop()));
@@ -809,6 +812,24 @@ fn optimize_offset_limit_pipes_internal(mut pipes: Vec<Box<dyn Pipe>>) -> Vec<Bo
     pipes = optimize_sort_offset_pipes(pipes);
     pipes = optimize_sort_limit_pipes(pipes);
 
+    pipes
+}
+
+/// Port of Go `optimizeUniqLimitPipes` (parser.go): merges
+/// `uniq ... | limit N` into `uniq ... limit N`.
+pub(crate) fn optimize_uniq_limit_pipes(mut pipes: Vec<Box<dyn Pipe>>) -> Vec<Box<dyn Pipe>> {
+    let mut i = 1;
+    while i < pipes.len() {
+        let Some(limit) = pipes[i].limit_pipe_value() else {
+            i += 1;
+            continue;
+        };
+        if !pipes[i - 1].uniq_merge_limit(limit) {
+            i += 1;
+            continue;
+        }
+        pipes.remove(i);
+    }
     pipes
 }
 

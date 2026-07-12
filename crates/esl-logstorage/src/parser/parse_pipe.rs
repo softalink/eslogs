@@ -2,10 +2,6 @@
 //! `parsePipeX`).
 //!
 //! PORT NOTES:
-//! * `math` / `eval` parsing is deferred: `pipe_math.rs` exposes only
-//!   `PipeMath::new(Vec<MathEntry>)` with a private `MathExpr` (no math-
-//!   expression parser), so the `parseMathExpr` sub-grammar cannot be built
-//!   against the frozen module. `math`/`eval` return an error.
 //! * `replace` / `replace_regexp`: the Rust structs carry no `iff` field, so a
 //!   leading `if (...)` is parsed (to consume tokens) and dropped. Round-trip
 //!   `String()` omits the `if (...)` for these two pipes.
@@ -25,6 +21,7 @@ use crate::parser::parse_stats::{
 use crate::parser::query::parse_query_in_parens;
 use crate::parser::{go_quote, quote_token_if_needed};
 use crate::pipe::Pipe;
+use crate::pipe_math::{MathEntry, MathExpr, PipeMath};
 use crate::pipe_sort::{BySortField, PipeSort};
 use crate::rows::Field;
 use crate::stream_filter::Lexer;
@@ -1304,8 +1301,13 @@ fn parse_pipe_join(lex: &mut Lexer) -> Result<BoxPipe, String> {
     if lex.is_keyword(&["rows"]) {
         rows = Some(parse_rows(lex).map_err(|e| format!("cannot parse rows inside 'join': {e}"))?);
     } else {
-        let q = parse_query_in_parens(lex)
+        let mut q = parse_query_in_parens(lex)
             .map_err(|e| format!("cannot parse subquery inside 'join': {e}"))?;
+        // PORT NOTE: Go keeps the parsed `*Query` and optimizes it later via
+        // the top-level `optimize()`'s `visitSubqueries`; the Rust pipe stores
+        // rendered text, so the subquery is optimized before rendering (same
+        // as `parse_in_query`).
+        q.optimize();
         query_text = Some(q.to_string());
     }
     let mut is_inner = false;
@@ -1337,8 +1339,11 @@ fn parse_pipe_union(lex: &mut Lexer) -> Result<BoxPipe, String> {
     if lex.is_keyword(&["rows"]) {
         rows = Some(parse_rows(lex).map_err(|e| format!("cannot parse rows inside 'union': {e}"))?);
     } else {
-        let q = parse_query_in_parens(lex)
+        let mut q = parse_query_in_parens(lex)
             .map_err(|e| format!("cannot parse subquery inside 'union': {e}"))?;
+        // PORT NOTE: subquery optimized before rendering, mirroring Go's
+        // `visitSubqueries` (see the 'join' subquery above).
+        q.optimize();
         query_text = Some(q.to_string());
     }
     Ok(Box::new(crate::pipe_union::new_pipe_union(
@@ -1601,13 +1606,291 @@ fn parse_pipe_unroll(lex: &mut Lexer) -> Result<BoxPipe, String> {
     )))
 }
 
-// ---- math (deferred) ----
+// ---- math ----
 
-fn parse_pipe_math(_lex: &mut Lexer) -> Result<BoxPipe, String> {
-    Err(
-        "'math'/'eval' pipe parsing is not supported by this port (the math-expression sub-grammar is deferred; see parser/parse_pipe.rs PORT NOTE)"
-            .to_string(),
-    )
+/// Port of Go `parsePipeMath` (pipe_math.go).
+fn parse_pipe_math(lex: &mut Lexer) -> Result<BoxPipe, String> {
+    if !lex.is_keyword(&["math", "eval"]) {
+        return Err(format!(
+            "unexpected token: {}; want 'math' or 'eval'",
+            go_quote(&lex.token)
+        ));
+    }
+    lex.next_token();
+
+    let mut entries: Vec<MathEntry> = Vec::new();
+    loop {
+        let e = parse_math_entry(lex)?;
+        entries.push(e);
+
+        if lex.is_keyword(&[","]) {
+            lex.next_token();
+        } else if lex.is_query_part_trailer() {
+            return Ok(Box::new(PipeMath::new(entries)));
+        } else {
+            return Err(format!(
+                "unexpected token after 'math' expression [{}]: {}; expecting ',', '|', ';' or ')'",
+                entries.last().expect("entries is non-empty"),
+                go_quote(&lex.token)
+            ));
+        }
+    }
+}
+
+/// Port of Go `parseMathEntry` (pipe_math.go).
+fn parse_math_entry(lex: &mut Lexer) -> Result<MathEntry, String> {
+    let me = parse_math_expr(lex)?;
+
+    let result_field = if lex.is_keyword(&[","]) || lex.is_query_part_trailer() {
+        me.to_string()
+    } else {
+        if lex.is_keyword(&["as"]) {
+            // skip optional 'as'
+            lex.next_token();
+        }
+        parse_field_name(lex).map_err(|e| format!("cannot parse result name for [{me}]: {e}"))?
+    };
+
+    Ok(MathEntry::new(result_field, me))
+}
+
+/// Port of Go `parseMathExpr` (pipe_math.go); operator rebalancing lives in
+/// [`MathExpr::new_binary_balanced`].
+fn parse_math_expr(lex: &mut Lexer) -> Result<MathExpr, String> {
+    // parse left operand
+    let mut left = parse_math_expr_operand(lex)?;
+
+    loop {
+        if !crate::pipe_math::is_math_binary_op(&lex.token) {
+            // There is no right operand
+            return Ok(left);
+        }
+
+        // parse operator
+        let op = lex.token.clone();
+        lex.next_token();
+
+        // parse right operand
+        let right = parse_math_expr_operand(lex)
+            .map_err(|e| format!("cannot parse operand after [{left} {op}]: {e}"))?;
+
+        // balance operands according to their priority
+        left = MathExpr::new_binary_balanced(&op, left, right);
+    }
+}
+
+/// Port of Go `parseMathExprInParens` (pipe_math.go).
+fn parse_math_expr_in_parens(lex: &mut Lexer) -> Result<MathExpr, String> {
+    if !lex.is_keyword(&["("]) {
+        return Err("missing '('".to_string());
+    }
+    lex.next_token();
+
+    let mut me = parse_math_expr(lex)?;
+    me.mark_wrapped_in_parens();
+
+    if !lex.is_keyword(&[")"]) {
+        return Err(format!("missing ')'; got {} instead", go_quote(&lex.token)));
+    }
+    lex.next_token();
+    Ok(me)
+}
+
+/// Port of Go `parseMathExprOperand` (pipe_math.go).
+fn parse_math_expr_operand(lex: &mut Lexer) -> Result<MathExpr, String> {
+    if lex.is_keyword(&["("]) {
+        return parse_math_expr_in_parens(lex);
+    }
+
+    if lex.is_keyword(&["abs"]) {
+        return parse_math_expr_one_arg_func(lex, "abs", "accepts only one arg");
+    }
+    if lex.is_keyword(&["exp"]) {
+        return parse_math_expr_one_arg_func(lex, "exp", "accepts only one arg");
+    }
+    if lex.is_keyword(&["ln"]) {
+        return parse_math_expr_one_arg_func(lex, "ln", "accepts only one arg");
+    }
+    if lex.is_keyword(&["max"]) {
+        return parse_math_expr_min_max(lex, "max");
+    }
+    if lex.is_keyword(&["min"]) {
+        return parse_math_expr_min_max(lex, "min");
+    }
+    if lex.is_keyword(&["now"]) {
+        return parse_math_expr_no_args_func(lex, "now");
+    }
+    if lex.is_keyword(&["rand"]) {
+        return parse_math_expr_no_args_func(lex, "rand");
+    }
+    if lex.is_keyword(&["round"]) {
+        return parse_math_expr_round(lex);
+    }
+    if lex.is_keyword(&["ceil"]) {
+        return parse_math_expr_one_arg_func(lex, "ceil", "needs one arg");
+    }
+    if lex.is_keyword(&["floor"]) {
+        return parse_math_expr_one_arg_func(lex, "floor", "needs one arg");
+    }
+    if lex.is_keyword(&["-"]) {
+        return parse_math_expr_unary_minus(lex);
+    }
+    if lex.is_keyword(&["+"]) {
+        // just skip unary plus
+        lex.next_token();
+        return parse_math_expr_operand(lex);
+    }
+    if crate::pipe_math::is_number_prefix(&lex.token) {
+        return parse_math_expr_const_number(lex);
+    }
+    parse_math_expr_field_name(lex)
+}
+
+/// Go `parseMathExprAbs`/`Exp`/`Ln`/`Ceil`/`Floor`: a generic-func parse plus
+/// the exactly-one-arg check (Go duplicates the wrapper per function; only the
+/// error wording differs).
+fn parse_math_expr_one_arg_func(
+    lex: &mut Lexer,
+    func_name: &str,
+    arity_msg: &str,
+) -> Result<MathExpr, String> {
+    let me = parse_math_expr_generic_func(lex, func_name)?;
+    if me.args_len() != 1 {
+        return Err(format!(
+            "'{func_name}' function {arity_msg}; got {} args: [{me}]",
+            me.args_len()
+        ));
+    }
+    Ok(me)
+}
+
+/// Go `parseMathExprMax` / `parseMathExprMin`.
+fn parse_math_expr_min_max(lex: &mut Lexer, func_name: &str) -> Result<MathExpr, String> {
+    let me = parse_math_expr_generic_func(lex, func_name)?;
+    if me.args_len() < 2 {
+        return Err(format!(
+            "'{func_name}' function needs at least 2 args; got {} args: [{me}]",
+            me.args_len()
+        ));
+    }
+    Ok(me)
+}
+
+/// Go `parseMathExprNow` / `parseMathExprRand`.
+fn parse_math_expr_no_args_func(lex: &mut Lexer, func_name: &str) -> Result<MathExpr, String> {
+    if !lex.is_keyword(&[func_name]) {
+        return Err(format!("missing '{func_name}' keyword"));
+    }
+    lex.next_token();
+
+    let args = parse_math_func_args(lex)
+        .map_err(|e| format!("cannot parse args for '{func_name}' function: {e}"))?;
+    if !args.is_empty() {
+        return Err(format!(
+            "'{func_name}' function must have no args; got {} args",
+            args.len()
+        ));
+    }
+    Ok(MathExpr::new_func(func_name, Vec::new()))
+}
+
+/// Go `parseMathExprRound`.
+fn parse_math_expr_round(lex: &mut Lexer) -> Result<MathExpr, String> {
+    let me = parse_math_expr_generic_func(lex, "round")?;
+    if me.args_len() != 1 && me.args_len() != 2 {
+        return Err(format!(
+            "'round' function needs 1 or 2 args; got {} args: [{me}]",
+            me.args_len()
+        ));
+    }
+    Ok(me)
+}
+
+/// Port of Go `parseMathExprGenericFunc` (pipe_math.go).
+fn parse_math_expr_generic_func(lex: &mut Lexer, func_name: &str) -> Result<MathExpr, String> {
+    if !lex.is_keyword(&[func_name]) {
+        return Err(format!("missing {} keyword", go_quote(func_name)));
+    }
+    lex.next_token();
+
+    let args = parse_math_func_args(lex).map_err(|e| {
+        format!(
+            "cannot parse args for {} function: {e}",
+            go_quote(func_name)
+        )
+    })?;
+    if args.is_empty() {
+        return Err(format!(
+            "{} function needs at least one arg",
+            go_quote(func_name)
+        ));
+    }
+    Ok(MathExpr::new_func(func_name, args))
+}
+
+/// Port of Go `parseMathFuncArgs` (pipe_math.go).
+fn parse_math_func_args(lex: &mut Lexer) -> Result<Vec<MathExpr>, String> {
+    if !lex.is_keyword(&["("]) {
+        return Err("missing '('".to_string());
+    }
+    lex.next_token();
+
+    let mut args = Vec::new();
+    loop {
+        if lex.is_keyword(&[")"]) {
+            lex.next_token();
+            return Ok(args);
+        }
+
+        let me = parse_math_expr(lex)?;
+        args.push(me);
+
+        if lex.is_keyword(&[")"]) {
+            continue;
+        }
+        if lex.is_keyword(&[","]) {
+            lex.next_token();
+            continue;
+        }
+        return Err(format!(
+            "unexpected token after [{}]: {}; want ',' or ')'",
+            args.last().expect("args is non-empty"),
+            go_quote(&lex.token)
+        ));
+    }
+}
+
+/// Port of Go `parseMathExprUnaryMinus` (pipe_math.go).
+fn parse_math_expr_unary_minus(lex: &mut Lexer) -> Result<MathExpr, String> {
+    if !lex.is_keyword(&["-"]) {
+        return Err("missing '-'".to_string());
+    }
+    lex.next_token();
+
+    let expr = parse_math_expr_operand(lex)?;
+    Ok(MathExpr::new_unary_minus(expr))
+}
+
+/// Port of Go `parseMathExprConstNumber` (pipe_math.go).
+fn parse_math_expr_const_number(lex: &mut Lexer) -> Result<MathExpr, String> {
+    if !crate::pipe_math::is_number_prefix(&lex.token) {
+        return Err(format!("cannot parse number from {}", go_quote(&lex.token)));
+    }
+    let num_str = lex
+        .next_compound_math_token()
+        .map_err(|e| format!("cannot parse number: {e}"))?;
+    let f = crate::pipe_math::parse_math_number(&num_str);
+    if f.is_nan() {
+        return Err(format!("cannot parse number from {}", go_quote(&num_str)));
+    }
+    Ok(MathExpr::new_const(f, num_str))
+}
+
+/// Port of Go `parseMathExprFieldName` (pipe_math.go).
+fn parse_math_expr_field_name(lex: &mut Lexer) -> Result<MathExpr, String> {
+    let field_name = lex.next_compound_math_token()?;
+    let field_name = crate::log_rows::get_canonical_column_name(&field_name);
+    Ok(MathExpr::new_field(field_name))
 }
 
 // ---- helpers ----

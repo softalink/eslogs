@@ -425,6 +425,43 @@ impl BlockResult {
             as *mut BlockSearch<'static>
     }
 
+    /// Returns the block's field names straight from its columns-header index,
+    /// without materializing the columns — the `pipeFieldNames.writeBlock`
+    /// fast path (Go reads `br.bs.getColumnsHeaderIndex()` directly).
+    ///
+    /// Returns `None` when the block is not backed by a block search or the
+    /// part format predates the header index
+    /// (Go: `br.bs == nil || br.bs.partFormatVersion() < 1`); callers must
+    /// fall back to `get_columns` then. The returned names cover the column
+    /// headers and const columns only — the caller adds the generated
+    /// `_time` / `_stream` / `_stream_id` columns itself, like Go.
+    pub(crate) fn field_names_from_columns_header_index(&mut self) -> Option<Vec<String>> {
+        self.bs?;
+        let bs = self.bs_ptr();
+        // SAFETY: bs points at the BlockSearch that initialized this
+        // BlockResult (`must_init`) and outlives it; single-threaded access
+        // per the `bs_ptr` contract.
+        unsafe {
+            if (*bs).part_format_version() < 1 {
+                return None;
+            }
+            let csh_index =
+                (*bs).get_columns_header_index() as *const crate::block_header::ColumnsHeaderIndex;
+            // SAFETY: csh_index points into bs's stable csh_index_cache; the
+            // `get_column_name_by_id` calls below only take shared borrows of
+            // bs and do not invalidate that cache.
+            let refs = (*csh_index)
+                .column_headers_refs
+                .iter()
+                .chain((*csh_index).const_columns_refs.iter());
+            let mut names = Vec::new();
+            for cr in refs {
+                names.push((*bs).get_column_name_by_id(cr.column_name_id).to_string());
+            }
+            Some(names)
+        }
+    }
+
     /// Initializes columns in `self` according to the given prefix filter.
     pub fn init_columns(&mut self, pf: &Filter) {
         if let Some(fields) = pf.get_allow_strings() {
@@ -2267,71 +2304,8 @@ fn has_wildcard_filters(column_filters: &[String]) -> bool {
     column_filters.iter().any(|f| is_wildcard_filter(f))
 }
 
-fn try_parse_number(s: &str) -> Option<f64> {
-    if s.is_empty() {
-        return None;
-    }
-    if let Some(f) = try_parse_float64(s) {
-        return Some(f);
-    }
-    if let Some(nsecs) = try_parse_duration(s) {
-        return Some(nsecs as f64);
-    }
-    if let Some(bytes) = try_parse_bytes(s) {
-        return Some(bytes as f64);
-    }
-    if is_likely_number(s) {
-        if let Ok(f) = s.parse::<f64>() {
-            return Some(f);
-        }
-        if let Some(n) = parse_int_go(s) {
-            return Some(n as f64);
-        }
-    }
-    None
-}
-
-/// PORT NOTE: mirrors Go's `strconv.ParseInt(s, 0, 64)` base detection (0x/0o/0b
-/// prefixes and plain decimal), used only by `try_parse_number`'s fallback.
-fn parse_int_go(s: &str) -> Option<i64> {
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (radix, digits) =
-        if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            (16, h)
-        } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
-            (8, o)
-        } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
-            (2, b)
-        } else {
-            (10, body)
-        };
-    let digits = digits.replace('_', "");
-    let n = i64::from_str_radix(&digits, radix).ok()?;
-    Some(if neg { -n } else { n })
-}
-
-fn is_likely_number(s: &str) -> bool {
-    let b = s.as_bytes();
-    if b.is_empty() {
-        return false;
-    }
-    let c = b[0];
-    if !c.is_ascii_digit() && c != b'-' && c != b'+' && c != b'.' {
-        return false;
-    }
-    if s.matches('.').count() > 1 {
-        // Likely an IP address.
-        return false;
-    }
-    if s.contains(':') || s.matches('-').count() > 2 {
-        // Likely a timestamp.
-        return false;
-    }
-    true
-}
+// Go `tryParseNumber` (block_result.go): shared port lives in `pipe_math.rs`.
+use crate::pipe_math::try_parse_number;
 
 /// PORT NOTE: minimal port of `tryParseBucketSize` (pipe_stats.go); only the
 /// named units used by `truncate_timestamp` tests plus the numeric/duration/

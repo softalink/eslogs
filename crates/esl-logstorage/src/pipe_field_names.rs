@@ -23,21 +23,18 @@ pub(crate) struct PipeFieldNames {
     /// If non-empty, only field names containing this substring are returned.
     pub(crate) filter: String,
 
-    /// If set, there is no need to load the columns header in `write_block`.
-    ///
-    /// PORT NOTE: the block-search fast path this flag enables (reading field
-    /// names directly from `columnsHeaderIndex`) needs the unported
-    /// `block_search`; the port always uses the `get_columns` path, which is
-    /// correct for pipe-produced blocks.
+    /// If set, there is no need to load the columns in `write_block`: the
+    /// processor reads the field names straight from the block's
+    /// columns-header index
+    /// ([`BlockResult::field_names_from_columns_header_index`]).
     pub(crate) is_first_pipe: bool,
 }
 
 /// Builds a `| field_names` pipe.
 ///
-/// PORT NOTE: `parsePipeFieldNames` is lexer-dependent and deferred; this
-/// constructor exposes the parsed result for the future parser. `is_first_pipe`
-/// is set later by the query optimizer, matching Go's `parsePipeFieldNames`
-/// which leaves it `false`.
+/// `is_first_pipe` is set later by the query optimizer
+/// ([`Pipe::mark_first_pipe`]), matching Go's `parsePipeFieldNames` which
+/// leaves it `false`.
 pub(crate) fn new_pipe_field_names(result_name: String, filter: String) -> PipeFieldNames {
     PipeFieldNames {
         result_name,
@@ -92,6 +89,11 @@ impl Pipe for PipeFieldNames {
         true
     }
 
+    /// Go `optimizeNoSubqueries`' `*pipeFieldNames` type-switch arm.
+    fn mark_first_pipe(&mut self) {
+        self.is_first_pipe = true;
+    }
+
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
         if self.is_first_pipe {
             pf.reset();
@@ -112,6 +114,7 @@ impl Pipe for PipeFieldNames {
         Arc::new(PipeFieldNamesProcessor {
             result_name: self.result_name.clone(),
             filter: self.filter.clone(),
+            is_first_pipe: self.is_first_pipe,
             stop,
             pp_next,
             shards,
@@ -122,6 +125,7 @@ impl Pipe for PipeFieldNames {
 struct PipeFieldNamesProcessor {
     result_name: String,
     filter: String,
+    is_first_pipe: bool,
     stop: Arc<AtomicBool>,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<PipeFieldNamesProcessorShard>>,
@@ -156,6 +160,23 @@ impl PipeProcessor for PipeFieldNamesProcessor {
         // Assume that the column is set for all rows in the block. This is much
         // faster than reading all column values and counting non-empty rows.
         let hits = br.rows_len() as u64;
+
+        // First-pipe fast path (Go: `pf.isFirstPipe && br.bs != nil &&
+        // br.bs.partFormatVersion() >= 1`): read the names straight from the
+        // block's columns-header index instead of materializing the columns,
+        // and account for the generated columns explicitly.
+        if self.is_first_pipe
+            && let Some(names) = br.field_names_from_columns_header_index()
+        {
+            let mut shard = self.shards[worker_id].lock().unwrap();
+            for name in &names {
+                shard.update_column_hits(name, &self.filter, hits);
+            }
+            shard.update_column_hits("_time", &self.filter, hits);
+            shard.update_column_hits("_stream", &self.filter, hits);
+            shard.update_column_hits("_stream_id", &self.filter, hits);
+            return;
+        }
 
         let cols = br.get_columns();
         let names: Vec<String> = cols

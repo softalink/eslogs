@@ -29,9 +29,8 @@ use crate::block_result::BlockResult;
 use crate::prefix_filter;
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::values_encoder::{
-    ValueType, marshal_uint64_string, try_parse_bytes, try_parse_duration, try_parse_float64,
-    unmarshal_float64, unmarshal_int64, unmarshal_uint8, unmarshal_uint16, unmarshal_uint32,
-    unmarshal_uint64,
+    ValueType, marshal_uint64_string, unmarshal_float64, unmarshal_int64, unmarshal_uint8,
+    unmarshal_uint16, unmarshal_uint32, unmarshal_uint64,
 };
 
 /// The `histogram(field)` stats function.
@@ -309,70 +308,8 @@ impl StatsProcessor for StatsHistogramProcessor {
     }
 }
 
-/// PORT NOTE: duplicates `block_result.rs`'s private `try_parse_number` (the
-/// same acknowledged duplication as `filter_range.rs`), until it is promoted to
-/// a shared `pub(crate)` location.
-fn try_parse_number(s: &str) -> Option<f64> {
-    if s.is_empty() {
-        return None;
-    }
-    if let Some(f) = try_parse_float64(s) {
-        return Some(f);
-    }
-    if let Some(nsecs) = try_parse_duration(s) {
-        return Some(nsecs as f64);
-    }
-    if let Some(bytes) = try_parse_bytes(s) {
-        return Some(bytes as f64);
-    }
-    if is_likely_number(s) {
-        if let Ok(f) = s.parse::<f64>() {
-            return Some(f);
-        }
-        if let Some(n) = parse_int_go(s) {
-            return Some(n as f64);
-        }
-    }
-    None
-}
-
-fn parse_int_go(s: &str) -> Option<i64> {
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (radix, digits) =
-        if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            (16, h)
-        } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
-            (8, o)
-        } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
-            (2, b)
-        } else {
-            (10, body)
-        };
-    let digits = digits.replace('_', "");
-    let n = i64::from_str_radix(&digits, radix).ok()?;
-    Some(if neg { -n } else { n })
-}
-
-fn is_likely_number(s: &str) -> bool {
-    let b = s.as_bytes();
-    if b.is_empty() {
-        return false;
-    }
-    let c = b[0];
-    if !c.is_ascii_digit() && c != b'-' && c != b'+' && c != b'.' {
-        return false;
-    }
-    if s.matches('.').count() > 1 {
-        return false;
-    }
-    if s.contains(':') || s.matches('-').count() > 2 {
-        return false;
-    }
-    true
-}
+// Go `tryParseNumber` (block_result.go): shared port lives in `pipe_math.rs`.
+use crate::pipe_math::try_parse_number;
 
 // ---------------------------------------------------------------------------
 // metrics.Histogram port (see module docs).

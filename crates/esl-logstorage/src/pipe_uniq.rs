@@ -10,8 +10,6 @@
 //! merged in `flush`). `top`/`facets` embed their own copy of the same shape.
 //!
 //! # PORT NOTES
-//! * `splitToRemoteAndLocal` (→ `pipe_uniq_local`) and the lexer parser are
-//!   out of scope; a `pub(crate)` constructor is exposed instead.
 //! * `valueTypeDict` uses `forEachDictValueWithHits`, which `block_result.rs`
 //!   does not expose; the dict column falls back to the generic per-row path
 //!   (identical totals, more map ops).
@@ -184,6 +182,15 @@ impl Pipe for PipeUniq {
 
     /// Go `isLastPipeUniq`'s `*pipeUniq` type-switch arm.
     fn is_uniq_pipe(&self) -> bool {
+        true
+    }
+
+    /// Go `optimizeUniqLimitPipes`' `*pipeUniq` type-switch arm: merges a
+    /// trailing `| limit N` into `uniq ... limit N`.
+    fn uniq_merge_limit(&mut self, limit: u64) -> bool {
+        if self.limit == 0 || limit < self.limit {
+            self.limit = limit;
+        }
         true
     }
 

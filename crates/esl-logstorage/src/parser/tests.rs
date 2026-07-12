@@ -1,12 +1,11 @@
 //! Ported subset of `lib/logstorage/parser_test.go`.
 //!
-//! PORT NOTE: `parser_test.go` cases that depend on the still-deferred parts
-//! of `optimize()` — the `!!x` double-negation collapse and the
-//! `uniq ... | limit N` merge (needs a `Pipe`-trait hook) — are omitted (see
+//! PORT NOTE: `parser_test.go` cases that depend on the still-deferred `!!x`
+//! double-negation collapse in `optimize()` are omitted (see
 //! `Query::optimize_no_subqueries`). The ported passes (and/or flattening,
 //! `*`-filter removal, stream-filter merging, offset/limit pipe merging,
-//! `filter` pipe merging) are covered by the `test_parse_query_optimize_*`
-//! tests below.
+//! `uniq ... | limit N` merging, `filter` pipe merging) are covered by the
+//! `test_parse_query_optimize_*` tests below.
 
 use crate::parser::ParseQuery;
 use crate::stream_filter::Lexer;
@@ -192,8 +191,9 @@ fn test_parse_query_func_filters() {
     ok("range[123, 456)", "range[123, 456)");
     ok("range(123, 445]", "range(123, 445]");
     ok("range(1_000, 0o7532)", "range(1_000, 0o7532)");
-    // PORT NOTE: `range(..., inf)` is excluded — the frozen
-    // `filter_range::parse_math_number` returns NaN for "inf" (Go's accepts it).
+    ok("range(0x1ff, inf)", "range(0x1ff, inf)");
+    ok("range(-INF,+inF)", "range(-INF, +inF)");
+    ok("foo:range(5,inf)", "foo:range(5, inf)");
     ok("value_type(foo)", "value_type(foo)");
     ok(r#"x:value_type("dict")"#, "x:value_type(dict)");
     ok("x:value_type(dict:x)", r#"x:value_type("dict:x")"#);
@@ -286,6 +286,106 @@ fn test_parse_query_pipes_and_stats() {
         "* | running_stats count() c",
         "* | running_stats count(*) as c",
     );
+}
+
+/// Port of Go `TestParsePipeStreamContextSuccess` / `...Failure`
+/// (pipe_stream_context_test.go); the success strings are canonical, so they
+/// round-trip unchanged.
+#[test]
+fn test_parse_pipe_stream_context() {
+    fn p(pipe_str: &str) {
+        let q_str = format!("* | {pipe_str}");
+        ok(&q_str, &q_str);
+    }
+
+    p("stream_context before 5");
+    p("stream_context after 10");
+    p("stream_context after 0");
+    p("stream_context before 10 after 20");
+    p("stream_context after 1 time_window 2h30m");
+    p("stream_context before 1 time_window 2h30m");
+    p("stream_context before 1 after 3 time_window 2h30m");
+
+    fn pf(pipe_str: &str) {
+        fail(&format!("* | {pipe_str}"));
+    }
+
+    pf("stream_context");
+    pf("stream_context before");
+    pf("stream_context after");
+    pf("stream_context before after");
+    pf("stream_context after before");
+    pf("stream_context before -4");
+    pf("stream_context after -4");
+    pf("stream_context time_window");
+    pf("stream_context before 3 time_window");
+    pf("stream_context before 3 time_window foobar");
+}
+
+/// Port of Go `TestParsePipeMathSuccess` (pipe_math_test.go); the pipe strings
+/// are canonical, so they round-trip unchanged. The final case is the `math`
+/// round-trip from Go `TestParseQuery_Success` (parser_test.go).
+#[test]
+fn test_parse_pipe_math_success() {
+    fn p(pipe_str: &str) {
+        let q_str = format!("* | {pipe_str}");
+        ok(&q_str, &q_str);
+    }
+
+    p("math b as a");
+    p("math -123 as a");
+    p("math 12.345KB as a");
+    p("math (-2 + 2) as a");
+    p("math x as a, z as y");
+    p("math (foo / bar + baz * abc % -45ms) as a");
+    p("math (foo / (bar + baz) * abc ^ 2) as a");
+    p("math (foo / ((bar + baz) * abc) ^ -2) as a");
+    p("math (foo + bar / baz - abc) as a");
+    p("math min(3, foo, (1 + bar) / baz) as a, max(a, b) as b, (abs(c) + 5) as d");
+    p("math round(foo) as x");
+    p("math rand() as y");
+    p("math round(foo, 0.1) as y");
+    p("math (a / b default 10) as z");
+    p("math (ln(a) + exp(b)) as x");
+    p("math (x / (24 * 3600)) as x");
+    p("math (x / (1d / 1s)) as x");
+    p("math (x / 1d * 1s) as x");
+    p("math (x - y + z) as x");
+    p("math (x - (y + z)) as x");
+    p("math now() as current_time");
+    p("math round((now() - max_time) / 1s) as duration_seconds");
+
+    // TestParseQuery_Success: implicit result name + trailing ';'.
+    ok("* | math a+b c;", "* | math (a + b) as c");
+}
+
+/// Port of Go `TestParsePipeMathFailure` (pipe_math_test.go) plus the `math`
+/// case from Go `TestParseQuery_Failure` (parser_test.go).
+#[test]
+fn test_parse_pipe_math_failure() {
+    fn p(pipe_str: &str) {
+        fail(&format!("* | {pipe_str}"));
+    }
+
+    p("math");
+    p("math * as y");
+    p("math (foo*) as y");
+    p("math foo as *");
+    p("math foo as y*");
+    p("math x as");
+    p("math abs() as x");
+    p("math abs(a, b) as x");
+    p("math min() as x");
+    p("math min(a) as x");
+    p("math max() as x");
+    p("math max(a) as x");
+    p("math round() as x");
+    p("math round(a, b, c) as x");
+    p("math rand(123) as x");
+    p("math now(123) as x");
+
+    // TestParseQuery_Failure.
+    fail("* | math.x + y");
 }
 
 #[test]
@@ -609,10 +709,13 @@ fn test_query_get_stats_labels_add_grouping_by_time_success() {
         &["_time", "x", "y"],
         "* | stats by (_time:86400000000000, x, y) count(*) as hits | total_stats by (x) sum(hits) as total",
     );
-    // PORT NOTE: the Go `| math ...` cases are omitted throughout these tests —
-    // the `math` pipe parse grammar is deferred (see parser/parse_pipe.rs);
-    // the `StatsTailOp::Math` transform itself is ported for programmatically
-    // built pipes.
+    f(
+        "* | count() hits | math hits+bar as baz",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | stats by (_time:86400000000000) count(*) as hits | math (hits + bar) as baz",
+    );
     f(
         "* | count() hits | fields _time, hits, bar",
         NSECS_PER_DAY,
@@ -787,8 +890,13 @@ fn test_query_get_stats_labels_add_grouping_by_time_success() {
         &["_time"],
         "* | len(x) | stats by (_time:86400000000000) count(*) as x",
     );
-    // PORT NOTE: `* | math x+y as z | count() x` omitted (math parse grammar
-    // deferred).
+    f(
+        "* | math x+y as z | count() x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        "* | math (x + y) as z | stats by (_time:86400000000000) count(*) as x",
+    );
     f(
         "* | pack_json | count() x",
         NSECS_PER_DAY,
@@ -906,8 +1014,20 @@ fn test_query_get_stats_labels_add_grouping_by_time_success() {
         r#"* | stats by (_time:86400000000000, x) count(*) as "count(*)" | total_stats by (x) sum(hits) as x"#,
     );
 
-    // PORT NOTE: `* | count() | math a+b _time` and `* | by (x) count() |
-    // math a+b x` omitted (math parse grammar deferred).
+    f(
+        "* | count() | math a+b _time",
+        NSECS_PER_DAY,
+        0,
+        &[],
+        r#"* | stats by (_time:86400000000000) count(*) as "count(*)" | math (a + b) as _time"#,
+    );
+    f(
+        "* | by (x) count() | math a+b x",
+        NSECS_PER_DAY,
+        0,
+        &["_time"],
+        r#"* | stats by (_time:86400000000000, x) count(*) as "count(*)" | math (a + b) as x"#,
+    );
 
     f(
         "* | count() | rm _time",
@@ -1079,9 +1199,22 @@ fn test_query_get_stats_labels_success() {
         &["x", "y"],
     );
 
-    // PORT NOTE: the Go "math pipe is allowed after stats" / "derive math
-    // results" cases are omitted — the `math` pipe parse grammar is deferred
-    // (see parser/parse_pipe.rs).
+    // math pipe is allowed after stats
+    f(
+        "foo | stats by (x) count() total, count() if (error) errors | math errors / total",
+        &["x"],
+    );
+    f(
+        "foo | stats by (x, y) count() hits | total_stats by (x) sum(hits) total | math hits / total",
+        &["x", "y"],
+    );
+
+    // derive math results
+    f("foo | stats count() x | math x / 10 as y | rm x", &[]);
+    f(
+        "foo | stats by (z) count() x | math x / 10 as y | rm x",
+        &["z"],
+    );
 
     // keep containing all the by(...) fields
     f(
@@ -1175,8 +1308,7 @@ fn test_query_get_stats_labels_success() {
     f("foo | by (a, b) count() | delete a", &["b"]);
     f("foo | by (a, b) count() | delete a*", &["b"]);
 
-    // PORT NOTE: `foo | by (x) count() y | math y*100 as x` omitted (math
-    // parse grammar deferred).
+    f("foo | by (x) count() y | math y*100 as x", &[]);
 
     f("* | by (x) count() | format 'foo' as x", &["x"]);
 }
@@ -1576,6 +1708,36 @@ fn test_query_is_fixed_output_fields_order() {
 }
 
 /// Port of Go `TestParseQuery_OptimizeOffsetLimitPipes`.
+#[test]
+fn test_parse_query_optimize_uniq_limit_pipes() {
+    // Go `optimizeUniqLimitPipes`: `uniq ... | limit N` merges into
+    // `uniq ... limit N`, keeping the smaller of the two limits.
+    ok("* | uniq by (x) | limit 5", "* | uniq by (x) limit 5");
+    ok("* | uniq (x, y) | limit 5", "* | uniq by (x, y) limit 5");
+    ok(
+        "* | uniq by (x) limit 3 | limit 5",
+        "* | uniq by (x) limit 3",
+    );
+    ok(
+        "* | uniq by (x) limit 5 | limit 3",
+        "* | uniq by (x) limit 3",
+    );
+    ok(
+        "* | uniq by (x) hits | limit 5",
+        "* | uniq by (x) with hits limit 5",
+    );
+    // Chained limits collapse first (optimizeOffsetLimitPipes), then merge.
+    ok(
+        "* | uniq by (x) | limit 5 | limit 3",
+        "* | uniq by (x) limit 3",
+    );
+    // Go TestParseQuery_Success: the merge applies inside subqueries too.
+    ok(
+        "foo | union (bar | uniq(x) | limit 10)",
+        "foo | union (bar | uniq by (x) limit 10)",
+    );
+}
+
 #[test]
 fn test_parse_query_optimize_offset_limit_pipes() {
     #[track_caller]

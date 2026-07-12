@@ -226,6 +226,23 @@ pub trait Pipe: Send + Sync {
         false
     }
 
+    /// True for `stream_context` pipes (Go `initStreamContextPipes`'
+    /// `*pipeStreamContext` type-switch).
+    fn is_stream_context_pipe(&self) -> bool {
+        false
+    }
+
+    /// Wires the surrounding-logs re-execution seam plus the rendered
+    /// `toFieldsFilters` tail into a `stream_context` pipe
+    /// (Go `pipeStreamContext.withRunQuery`, dispatched from
+    /// `initStreamContextPipes`). Default: no-op for all other pipes.
+    fn init_stream_context_query(
+        &mut self,
+        _run_query: &crate::pipe_stream_context::RunQueryFn,
+        _fields_filter: &str,
+    ) {
+    }
+
     /// `parseInQuery` support (Go `getFieldNameFromPipes` type-switch): for
     /// `fields`/`uniq` pipes, the single field name whose values an
     /// `in(<subquery>)` filter yields (or an error when the pipe has more than
@@ -287,6 +304,21 @@ pub trait Pipe: Send + Sync {
     fn sort_merge_limit(&mut self, _limit: u64) -> bool {
         false
     }
+
+    /// `optimizeUniqLimitPipes` support: merges a trailing `| limit N` into a
+    /// `PipeUniq` (`uniq ... limit N`). Returns true when merged.
+    ///
+    /// PORT NOTE: Go mutates `*pipeUniq` in place after a type switch (see
+    /// `sort_merge_limit`).
+    fn uniq_merge_limit(&mut self, _limit: u64) -> bool {
+        false
+    }
+
+    /// `optimizeNoSubqueries` support (Go's `*pipeFieldNames` type switch):
+    /// called on the query's first pipe after optimization; `PipeFieldNames`
+    /// sets `is_first_pipe`, enabling the columns-header fast path in its
+    /// processor. Default: no-op for all other pipes.
+    fn mark_first_pipe(&mut self) {}
 
     /// `Query::add_count_by_time_pipe` support (Go `isPipeSafeForHits`):
     /// whether hits grouped by `_time` may be calculated after this pipe.

@@ -9,18 +9,14 @@
 //!
 //! Consequences for this port:
 //!
-//! * `parsePipeTotalStats` is lexer-dependent and deferred (see the parser
-//!   PORT NOTES), so there is nothing lexer-free to expose here.
-//! * The backing struct, its `String` / `updateNeededFields` / processor logic
-//!   and the running-stats functions (`count`, `first`, `last`, `max`, `min`,
-//!   `sum`) all live in the separate `pipe_running_stats` module (and the
-//!   `running_stats_*` modules), which are not part of this port and are still
-//!   stubs. Duplicating `pipeRunningStats` here would create a conflicting
-//!   second definition, so no type is defined in this file.
-//! * The upstream behaviour tests `TestPipeTotalStats` and
-//!   `TestPipeTotalStatsUpdateNeededFields` (in `pipe_total_stats_test.go`)
-//!   exercise `pipeRunningStats` via the parser. They must be ported alongside
-//!   the `pipe_running_stats` module — once `PipeRunningStats` gains an
-//!   `is_total` flag and a lexer-free constructor — rather than here.
-//! * `TestParsePipeTotalStatsSuccess` / `TestParsePipeTotalStatsFailure`
-//!   exercise the deferred lexer and are omitted, per the parse-test policy.
+//! * The parser lives in `parser/parse_stats.rs` (`parse_pipe_total_stats`,
+//!   delegating to the shared running-stats parser like Go).
+//! * The backing struct (`PipeRunningStats` with its `is_total` flag), its
+//!   `String` / `update_needed_fields` / processor logic and the
+//!   running-stats functions (`count`, `first`, `last`, `max`, `min`, `sum`)
+//!   live in `pipe_running_stats.rs` and the `running_stats_*` modules.
+//!   Duplicating the type here would create a conflicting second definition,
+//!   so no type is defined in this file.
+//! * The upstream behaviour tests (`TestPipeTotalStats*`,
+//!   `TestParsePipeTotalStats*`) are ported alongside `pipe_running_stats.rs`
+//!   and the parser tests rather than here.

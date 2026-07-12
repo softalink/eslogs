@@ -8,8 +8,6 @@
 //! always empty for `top`). See that file for the shape rationale.
 //!
 //! # PORT NOTES
-//! * `splitToRemoteAndLocal` and the lexer parser are out of scope; a
-//!   `pub(crate)` constructor is exposed instead.
 //! * Go selects the top entries with a bounded binary min-heap
 //!   (`getTopEntries`); this port collects all entries and does a full sort +
 //!   truncate — identical result, `O(n log n)` instead of `O(n log limit)`.

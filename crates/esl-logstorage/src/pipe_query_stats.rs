@@ -49,9 +49,8 @@ impl Pipe for PipeQueryStats {
         pf.add_allow_filter("*");
     }
 
-    // PORT NOTE: Go's `splitToRemoteAndLocal`, `initFilterInValues` and
-    // `visitSubqueries` are single-node/subquery machinery and are deferred per
-    // the port spec.
+    // PORT NOTE: Go's `initFilterInValues` and `visitSubqueries` are no-ops
+    // for this pipe; `splitToRemoteAndLocal` is implemented above.
 
     fn new_pipe_processor(
         &self,
