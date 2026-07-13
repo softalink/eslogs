@@ -44,10 +44,11 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use esl_common::encoding::{marshal_bytes, unmarshal_bytes};
+use esl_common::memory;
 
 use crate::bitmap::Bitmap;
 use crate::block_result::{BlockResult, ByStatsField, ResultColumn};
@@ -467,6 +468,7 @@ impl Pipe for PipeStats {
         pp_next: Arc<dyn PipeProcessor>,
     ) -> Arc<dyn PipeProcessor> {
         let n = concurrency.max(1);
+        let max_state_size = (memory::allowed() as f64 * 0.4) as i64;
         Arc::new(PipeStatsProcessor {
             by_fields: self.by_fields.clone(),
             funcs: self.funcs.clone(),
@@ -475,6 +477,9 @@ impl Pipe for PipeStats {
             pp_next,
             shards: (0..n).map(|_| Mutex::new(Shard::default())).collect(),
             err: Mutex::new(None),
+            max_state_size,
+            state_size_budget: AtomicI64::new(max_state_size),
+            ps_str: self.to_string(),
         })
     }
 }
@@ -484,49 +489,68 @@ struct PipeStatsGroup {
     sfps: Vec<Box<dyn StatsProcessor>>,
 }
 
+/// Chunk of the global state-size budget a shard steals at a time (Go
+/// `stateSizeBudgetChunk`).
+const STATE_SIZE_BUDGET_CHUNK: i64 = 1 << 20;
+
 fn new_group(funcs: &[PipeStatsFunc]) -> PipeStatsGroup {
     PipeStatsGroup {
         sfps: funcs.iter().map(|f| f.f.new_stats_processor()).collect(),
     }
 }
 
+/// Approximate in-memory size of a freshly-created group (Go charges the group
+/// struct + its per-func processors when inserting into the group map).
+fn new_group_size_bytes(funcs: &[PipeStatsFunc]) -> i64 {
+    (std::mem::size_of::<PipeStatsGroup>()
+        + funcs.len() * std::mem::size_of::<Box<dyn StatsProcessor>>()) as i64
+}
+
 impl PipeStatsGroup {
+    /// Returns the change in accumulated state size in bytes (Go
+    /// `pipeStatsGroup.updateStatsForAllRows`), for the budget accounting.
     fn update_all_rows(
         &mut self,
         funcs: &[PipeStatsFunc],
         bms: &[Bitmap],
         br: &mut BlockResult,
         br_tmp: &mut BlockResult,
-    ) {
+    ) -> i64 {
+        let mut delta = 0i64;
         for (i, sfp) in self.sfps.iter_mut().enumerate() {
             let f = &funcs[i];
             match &f.iff {
                 None => {
-                    sfp.update_stats_for_all_rows(f.f.as_ref(), br);
+                    delta += sfp.update_stats_for_all_rows(f.f.as_ref(), br);
                 }
                 Some(_) => {
                     br_tmp.init_from_filter_all_columns(br, &bms[i]);
                     if br_tmp.rows_len() > 0 {
-                        sfp.update_stats_for_all_rows(f.f.as_ref(), br_tmp);
+                        delta += sfp.update_stats_for_all_rows(f.f.as_ref(), br_tmp);
                     }
                 }
             }
         }
+        delta
     }
 
+    /// Returns the change in accumulated state size in bytes (Go
+    /// `pipeStatsGroup.updateStatsForRow`).
     fn update_row(
         &mut self,
         funcs: &[PipeStatsFunc],
         bms: &[Bitmap],
         br: &mut BlockResult,
         row_idx: usize,
-    ) {
+    ) -> i64 {
+        let mut delta = 0i64;
         for (i, sfp) in self.sfps.iter_mut().enumerate() {
             let f = &funcs[i];
             if f.iff.is_none() || bms[i].is_set_bit(row_idx) {
-                sfp.update_stats_for_row(f.f.as_ref(), br, row_idx);
+                delta += sfp.update_stats_for_row(f.f.as_ref(), br, row_idx);
             }
         }
+        delta
     }
 
     fn merge(&mut self, funcs: &[PipeStatsFunc], src: &PipeStatsGroup) {
@@ -536,14 +560,15 @@ impl PipeStatsGroup {
     }
 
     /// Port of Go `pipeStatsGroup.importStateFromRow`: imports one serialized
-    /// state per stats function from the given row.
+    /// state per stats function from the given row. Returns the change in
+    /// accumulated state size in bytes for the budget accounting.
     fn import_state_from_row(
         &mut self,
         funcs: &[PipeStatsFunc],
         column_values: &[Vec<Vec<u8>>],
         row_idx: usize,
         stop: Option<&AtomicBool>,
-    ) -> Result<(), String> {
+    ) -> Result<i64, String> {
         if column_values.len() != self.sfps.len() {
             return Err(format!(
                 "unexpected number of columns; got {}; want {}",
@@ -552,12 +577,14 @@ impl PipeStatsGroup {
             ));
         }
 
+        let mut delta = 0i64;
         for (i, sfp) in self.sfps.iter_mut().enumerate() {
             let v = &column_values[i][row_idx];
-            sfp.import_state(v, stop)
+            delta += sfp
+                .import_state(v, stop)
                 .map_err(|e| format!("cannot import state for {}: {e}", funcs[i].f.to_string()))?;
         }
-        Ok(())
+        Ok(delta)
     }
 }
 
@@ -570,6 +597,9 @@ struct Shard {
     br_tmp: BlockResult,
     key_buf: Vec<u8>,
     col_values: Vec<Vec<Vec<u8>>>,
+    /// Portion of the global budget this shard has stolen (Go
+    /// `pipeStatsProcessorShard.stateSizeBudget`).
+    state_size_budget: i64,
 }
 
 fn bytes_to_str(b: &[u8]) -> &str {
@@ -577,31 +607,37 @@ fn bytes_to_str(b: &[u8]) -> &str {
 }
 
 /// Resolves the group for a generic value, choosing the u64 / negative-i64 /
-/// string bucket exactly like Go's `getPipeStatsGroupGeneric`.
+/// string bucket exactly like Go's `getPipeStatsGroupGeneric`. Returns the
+/// group and the state-size charge for the budget when a new group is created
+/// (0 for an existing group), which the caller applies to
+/// `shard.state_size_budget` once the group borrow is released.
 fn get_group_generic<'a>(
     shard: &'a mut Shard,
     funcs: &[PipeStatsFunc],
     v: &[u8],
-) -> &'a mut PipeStatsGroup {
+) -> (&'a mut PipeStatsGroup, i64) {
     let s = bytes_to_str(v);
     if let Some(n) = try_parse_uint64(s) {
-        return shard
-            .groups_u64
-            .entry(n)
-            .or_insert_with(|| new_group(funcs));
+        return match shard.groups_u64.entry(n) {
+            Entry::Occupied(o) => (o.into_mut(), 0),
+            Entry::Vacant(vac) => (vac.insert(new_group(funcs)), new_group_size_bytes(funcs)),
+        };
     }
     if v.first() == Some(&b'-')
         && let Some(n) = try_parse_int64(s)
     {
-        return shard
-            .groups_neg
-            .entry(n)
-            .or_insert_with(|| new_group(funcs));
+        return match shard.groups_neg.entry(n) {
+            Entry::Occupied(o) => (o.into_mut(), 0),
+            Entry::Vacant(vac) => (vac.insert(new_group(funcs)), new_group_size_bytes(funcs)),
+        };
     }
-    shard
-        .groups_str
-        .entry(v.to_vec())
-        .or_insert_with(|| new_group(funcs))
+    match shard.groups_str.entry(v.to_vec()) {
+        Entry::Occupied(o) => (o.into_mut(), 0),
+        Entry::Vacant(vac) => {
+            let charge = new_group_size_bytes(funcs) + v.len() as i64;
+            (vac.insert(new_group(funcs)), charge)
+        }
+    }
 }
 
 struct PipeStatsProcessor {
@@ -613,6 +649,13 @@ struct PipeStatsProcessor {
     shards: Vec<Mutex<Shard>>,
     /// First error hit while importing states (Go `pipeStatsProcessor.err`).
     err: Mutex<Option<String>>,
+    /// State-size budget (~40% of allowed memory) shared across shards (Go
+    /// `maxStateSize`/`stateSizeBudget`); when exhausted, `flush` errors instead
+    /// of accumulating unbounded group state.
+    max_state_size: i64,
+    state_size_budget: AtomicI64,
+    /// Rendered pipe string for the out-of-memory error (Go `psp.ps.String()`).
+    ps_str: String,
 }
 
 impl PipeStatsProcessor {
@@ -659,18 +702,24 @@ impl PipeStatsProcessor {
                     br.rows_len()
                 ));
             }
-            let group = shard
-                .groups_str
-                .entry(Vec::new())
-                .or_insert_with(|| new_group(funcs));
-            return group.import_state_from_row(funcs, &state_values, 0, stop);
+            let (group, created) = match shard.groups_str.entry(Vec::new()) {
+                Entry::Occupied(o) => (o.into_mut(), false),
+                Entry::Vacant(v) => (v.insert(new_group(funcs)), true),
+            };
+            let d = group.import_state_from_row(funcs, &state_values, 0, stop)?;
+            shard.state_size_budget -= d;
+            if created {
+                shard.state_size_budget -= new_group_size_bytes(funcs);
+            }
+            return Ok(());
         }
 
         if by_len == 1 {
             let rows_len = br.rows_len();
             for (row_idx, v) in by_field_values[0].iter().enumerate().take(rows_len) {
-                let group = get_group_generic(shard, funcs, v);
-                group.import_state_from_row(funcs, &state_values, row_idx, stop)?;
+                let (group, create_charge) = get_group_generic(shard, funcs, v);
+                let d = group.import_state_from_row(funcs, &state_values, row_idx, stop)?;
+                shard.state_size_budget -= d + create_charge;
                 if self.stop.load(Ordering::SeqCst) {
                     break;
                 }
@@ -684,11 +733,15 @@ impl PipeStatsProcessor {
             for values in &by_field_values {
                 marshal_bytes(&mut key_buf, &values[row_idx]);
             }
-            let group = match shard.groups_str.entry(key_buf.clone()) {
-                Entry::Occupied(o) => o.into_mut(),
-                Entry::Vacant(v) => v.insert(new_group(funcs)),
+            let (group, created) = match shard.groups_str.entry(key_buf.clone()) {
+                Entry::Occupied(o) => (o.into_mut(), false),
+                Entry::Vacant(v) => (v.insert(new_group(funcs)), true),
             };
-            group.import_state_from_row(funcs, &state_values, row_idx, stop)?;
+            let d = group.import_state_from_row(funcs, &state_values, row_idx, stop)?;
+            shard.state_size_budget -= d;
+            if created {
+                shard.state_size_budget -= new_group_size_bytes(funcs) + key_buf.len() as i64;
+            }
             if self.stop.load(Ordering::SeqCst) {
                 break;
             }
@@ -721,11 +774,15 @@ impl PipeStatsProcessor {
 
         if self.by_fields.is_empty() {
             // Fast path — all rows go to a single group with the empty key.
-            let group = shard
-                .groups_str
-                .entry(Vec::new())
-                .or_insert_with(|| new_group(funcs));
-            group.update_all_rows(funcs, bms, br, &mut br_tmp);
+            let (group, created) = match shard.groups_str.entry(Vec::new()) {
+                Entry::Occupied(o) => (o.into_mut(), false),
+                Entry::Vacant(v) => (v.insert(new_group(funcs)), true),
+            };
+            let d = group.update_all_rows(funcs, bms, br, &mut br_tmp);
+            shard.state_size_budget -= d;
+            if created {
+                shard.state_size_budget -= new_group_size_bytes(funcs);
+            }
             shard.br_tmp = br_tmp;
             return;
         }
@@ -756,11 +813,15 @@ impl PipeStatsProcessor {
             for vals in &col_values {
                 marshal_bytes(&mut key_buf, &vals[i]);
             }
-            let group = match shard.groups_str.entry(key_buf.clone()) {
-                Entry::Occupied(o) => o.into_mut(),
-                Entry::Vacant(v) => v.insert(new_group(funcs)),
+            let (group, created) = match shard.groups_str.entry(key_buf.clone()) {
+                Entry::Occupied(o) => (o.into_mut(), false),
+                Entry::Vacant(v) => (v.insert(new_group(funcs)), true),
             };
-            group.update_row(funcs, bms, br, i);
+            let d = group.update_row(funcs, bms, br, i);
+            shard.state_size_budget -= d;
+            if created {
+                shard.state_size_budget -= new_group_size_bytes(funcs) + key_buf.len() as i64;
+            }
         }
         shard.key_buf = key_buf;
         shard.col_values = col_values;
@@ -782,8 +843,9 @@ impl PipeStatsProcessor {
         if br.column_is_const(c) && !bucketed {
             // Fast path — a single constant value for the whole block.
             let v = br.column_get_value_at_row(c, 0).as_bytes().to_vec();
-            let group = get_group_generic(shard, funcs, &v);
-            group.update_all_rows(funcs, bms, br, br_tmp);
+            let (group, create_charge) = get_group_generic(shard, funcs, &v);
+            let d = group.update_all_rows(funcs, bms, br, br_tmp);
+            shard.state_size_budget -= d + create_charge;
             return;
         }
 
@@ -793,8 +855,9 @@ impl PipeStatsProcessor {
             br.column_get_values(c).to_vec()
         };
         for (i, value) in values.iter().enumerate() {
-            let group = get_group_generic(shard, funcs, value);
-            group.update_row(funcs, bms, br, i);
+            let (group, create_charge) = get_group_generic(shard, funcs, value);
+            let d = group.update_row(funcs, bms, br, i);
+            shard.state_size_budget -= d + create_charge;
         }
     }
 }
@@ -806,6 +869,23 @@ impl PipeProcessor for PipeStatsProcessor {
         }
         let idx = worker_id.min(self.shards.len() - 1);
         let mut shard = self.shards[idx].lock().unwrap();
+
+        // Steal budget from the global pool when this shard's is exhausted (Go
+        // `writeBlock`'s `stateSizeBudget` loop); stop when the pool is empty.
+        while shard.state_size_budget < 0 {
+            let remaining = self
+                .state_size_budget
+                .fetch_sub(STATE_SIZE_BUDGET_CHUNK, Ordering::SeqCst)
+                - STATE_SIZE_BUDGET_CHUNK;
+            if remaining < 0 {
+                if remaining + STATE_SIZE_BUDGET_CHUNK >= 0 {
+                    self.stop.store(true, Ordering::SeqCst);
+                }
+                return;
+            }
+            shard.state_size_budget += STATE_SIZE_BUDGET_CHUNK;
+        }
+
         if self.mode.need_import_state() {
             if let Err(err) = self.write_block_local(&mut shard, br) {
                 self.set_error(err);
@@ -821,6 +901,16 @@ impl PipeProcessor for PipeStatsProcessor {
         // Go flush: return the error recorded via setError, if any.
         if let Some(err) = self.err.lock().unwrap().take() {
             return Err(err);
+        }
+
+        // The group state exceeded ~40% of memory (Go flush's stateSizeBudget
+        // guard).
+        if self.state_size_budget.load(Ordering::SeqCst) <= 0 {
+            return Err(format!(
+                "cannot calculate [{}], since it requires more than {}MB of memory",
+                self.ps_str,
+                self.max_state_size / (1 << 20)
+            ));
         }
 
         let funcs = &self.funcs;
@@ -1054,6 +1144,30 @@ mod tests {
             None,
             name.to_string(),
         )
+    }
+
+    // When the accumulated group state has consumed the whole budget, flush
+    // reports the OOM error instead of returning results (Go flush's
+    // stateSizeBudget <= 0 guard).
+    #[test]
+    fn test_stats_state_size_budget_exhausted_errors_on_flush() {
+        let processor = PipeStatsProcessor {
+            by_fields: Arc::new(vec![new_by_stats_field("host")]),
+            funcs: Arc::new(vec![count_func("cnt")]),
+            mode: PipeStatsMode::Default,
+            stop: Arc::new(AtomicBool::new(false)),
+            pp_next: Collector::new(),
+            shards: vec![Mutex::new(Shard::default())],
+            err: Mutex::new(None),
+            max_state_size: 8 << 20,
+            state_size_budget: AtomicI64::new(0), // already exhausted
+            ps_str: "stats by (host) count(*) as cnt".to_string(),
+        };
+        let err = processor.flush().unwrap_err();
+        assert!(
+            err.contains("requires more than 8MB of memory"),
+            "unexpected error: {err}"
+        );
     }
 
     // The benchmark-critical query: `* | stats count() rows`.

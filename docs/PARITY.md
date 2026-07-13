@@ -324,9 +324,6 @@ what remains in section (a) is confirmed-present divergence.
   (`update_filter_with_time_offset` is a no-op).
 - `parser/parse_stats.rs:240` — `stats switch(...)` is rejected (`not
   supported by this port`); Go accepts it.
-- `pipe_stats.rs:28` — stats `stateSizeBudget`/cancel is dropped: at extreme
-  group cardinality Go stops with a state-size error while the port keeps
-  accumulating (fuller results or OOM).
 - `pipe_sort.rs:26/:536` — the sort state-size budget charges the copied
   per-value byte lengths where Go charges the cloned block's buffer
   capacities (and shares value bytes in the `byFields` path), so the port
