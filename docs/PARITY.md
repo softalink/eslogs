@@ -447,10 +447,11 @@ what remains in section (a) is confirmed-present divergence.
 
 **Ingestion protections (esl-insert)**
 
-- `journald.rs:13` — the journald HTTP ingest omits the otherwise-ported
-  `writeconcurrencylimiter` backpressure layer Go applies; the syslog stream
-  path also omits it but is at parity there (ingestion is bounded by the
-  listener/reader thread pool instead).
+- The syslog stream path omits the `writeconcurrencylimiter` backpressure
+  layer Go applies, but is at parity there (ingestion is bounded by the
+  listener/reader thread pool instead). (The journald HTTP ingest now wraps its
+  body with `writeconcurrencylimiter::get_reader` like its
+  jsonline/elasticsearch siblings.)
 - `syslog_listeners.rs:25/:445/:539/:806` — unix-socket listeners are
   `cfg(unix)`-only, UDP4/TCP6 network-selection flags (`-enableTCP6`) are not
   honored (the stack is derived from the bind address), and unrecoverable

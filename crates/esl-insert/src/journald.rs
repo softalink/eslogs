@@ -10,11 +10,12 @@
 //! resolve lazily, so the tenant-id and stream-fields initialization happens on
 //! first use via `OnceLock` instead of an explicit init call.
 //!
-//! PORT NOTE: Go's `CanWriteData()` check and the `writeconcurrencylimiter`
-//! reader wrapper are omitted, matching the rest of the port (see
-//! `common_params.rs`). The `Content-Encoding`s Go handles via
+//! PORT NOTE: the `Content-Encoding`s Go handles via
 //! `protoparserutil.GetUncompressedReader` are decompressed transparently by
-//! [`Request::body_reader`] in `esl_common::httpserver`.
+//! [`Request::body_reader`] in `esl_common::httpserver`, so the
+//! `writeconcurrencylimiter` reader wraps the already-decompressed body here
+//! (same bounded-concurrency effect as Go wrapping the raw body then
+//! decompressing), matching the jsonline/elasticsearch siblings.
 
 use std::borrow::Cow;
 use std::io::Read;
@@ -25,6 +26,7 @@ use esl_common::errorf;
 use esl_common::flagutil::{ArrayString, Flag};
 use esl_common::httpserver::{Request, ResponseWriter, get_quoted_remote_addr};
 use esl_common::metrics::{Counter, Summary};
+use esl_common::writeconcurrencylimiter;
 
 use esl_logstorage::rows::Field;
 use esl_logstorage::stream_tags::check_stream_field_names;
@@ -208,9 +210,22 @@ fn handle_journald<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &m
         String::new()
     };
 
-    let mut lmp = cp.new_log_message_processor(storage, "journald");
-    let res = process_stream_internal(&stream_name, req.body_reader(), &remote_ip, &mut lmp, &cp);
-    lmp.close();
+    // Go wraps r.Body with writeconcurrencylimiter.GetReader for ingest
+    // backpressure; on failure it logs and returns without an HTTP error.
+    let res = {
+        let mut wcr = match writeconcurrencylimiter::get_reader(req.body_reader()) {
+            Ok(wcr) => wcr,
+            Err(err) => {
+                ERRORS_TOTAL.inc();
+                errorf!("cannot start reading journald request: {}", err.err);
+                return;
+            }
+        };
+        let mut lmp = cp.new_log_message_processor(storage, "journald");
+        let res = process_stream_internal(&stream_name, &mut wcr, &remote_ip, &mut lmp, &cp);
+        lmp.close();
+        res
+    };
     if let Err(err) = res {
         ERRORS_TOTAL.inc();
         w.errorf(req, &format!("cannot read journald protocol data: {err}"));
