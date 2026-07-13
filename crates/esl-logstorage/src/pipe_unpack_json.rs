@@ -87,6 +87,19 @@ impl Pipe for PipeUnpackJSON {
         Ok(())
     }
 
+    /// Go `visitSubqueries` for this pipe: propagates into the `if (...)` filter.
+    fn visit_subqueries_mut(
+        &mut self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+        if let Some(iff) = &self.iff
+            && let Some(iff_new) = iff.visit_subqueries_mut(timestamp, visit)
+        {
+            self.iff = Some(iff_new);
+        }
+    }
+
     fn stats_labels_tail_op(&self) -> Option<crate::pipe::StatsTailOp> {
         // The unpack_json pipe generates additional by(...) labels from
         // `fields (...)`. PORT NOTE: Go keeps `fieldFilters` empty when

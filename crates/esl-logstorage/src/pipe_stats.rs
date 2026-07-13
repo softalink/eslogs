@@ -309,6 +309,24 @@ impl Pipe for PipeStats {
         Ok(())
     }
 
+    /// Port of Go `pipeStats.visitSubqueries`: propagates into the per-func
+    /// `if (...)` filters. The funcs' iff is an owned `Box<dyn Filter>`, so it
+    /// is visited in place (no shared-filter re-parse needed).
+    fn visit_subqueries_mut(
+        &mut self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+        let Some(funcs) = Arc::get_mut(&mut self.funcs) else {
+            return;
+        };
+        for func in funcs.iter_mut() {
+            if let Some(iff) = func.iff.as_mut() {
+                iff.visit_subqueries_mut(timestamp, visit);
+            }
+        }
+    }
+
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
         if self.mode.need_import_state() {
             // Go `pipeStats.updateNeededFieldsLocal`: the input carries the

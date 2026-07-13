@@ -77,6 +77,22 @@ impl IfFilter {
             None => Ok(None),
         }
     }
+
+    /// Port of Go `(iff *ifFilter).visitSubqueries`: propagates into the
+    /// subqueries embedded in the `if (...)` filter. Returns a replacement
+    /// `IfFilter` when the filter held any subquery, else `None`.
+    pub(crate) fn visit_subqueries_mut(
+        &self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) -> Option<IfFilter> {
+        crate::storage_search::visit_subqueries_in_shared_filter(&self.f, timestamp, visit).map(
+            |f| IfFilter {
+                f,
+                allow_filters: self.allow_filters.clone(),
+            },
+        )
+    }
 }
 
 /// Port of Go `updateNeededFieldsForUpdatePipe`.

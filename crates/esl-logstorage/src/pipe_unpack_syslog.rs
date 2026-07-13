@@ -81,6 +81,19 @@ impl Pipe for PipeUnpackSyslog {
         Ok(())
     }
 
+    /// Go `visitSubqueries` for this pipe: propagates into the `if (...)` filter.
+    fn visit_subqueries_mut(
+        &mut self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+        if let Some(iff) = &self.iff
+            && let Some(iff_new) = iff.visit_subqueries_mut(timestamp, visit)
+        {
+            self.iff = Some(iff_new);
+        }
+    }
+
     fn to_string(&self) -> String {
         let mut s = String::from("unpack_syslog");
         if let Some(iff) = &self.iff {

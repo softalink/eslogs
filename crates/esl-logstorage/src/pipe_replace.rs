@@ -107,6 +107,19 @@ impl Pipe for PipeReplace {
         Ok(())
     }
 
+    /// Go `visitSubqueries` for this pipe: propagates into the `if (...)` filter.
+    fn visit_subqueries_mut(
+        &mut self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+        if let Some(iff) = &self.iff
+            && let Some(iff_new) = iff.visit_subqueries_mut(timestamp, visit)
+        {
+            self.iff = Some(Arc::new(iff_new));
+        }
+    }
+
     fn new_pipe_processor(
         &self,
         concurrency: usize,

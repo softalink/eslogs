@@ -86,6 +86,20 @@ impl IfFilter {
             None => Ok(None),
         }
     }
+
+    /// Port of Go `(iff *ifFilter).visitSubqueries`.
+    pub(crate) fn visit_subqueries_mut(
+        &self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) -> Option<IfFilter> {
+        crate::storage_search::visit_subqueries_in_shared_filter(&self.f, timestamp, visit).map(
+            |f| IfFilter {
+                f,
+                allow_filters: self.allow_filters.clone(),
+            },
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
