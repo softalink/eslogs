@@ -79,6 +79,12 @@ impl Filter for FilterWeekRange {
         pf.add_allow_filter("_time");
     }
 
+    fn update_with_time_offset(&mut self, offset: i64) {
+        // Go `updateFilterWithTimeOffset`'s `*filterWeekRange` arm:
+        // `offset = SubInt64NoOverflow(offset, -timeOffset)`.
+        self.offset = crate::values_encoder::sub_int64_no_overflow(self.offset, -offset);
+    }
+
     fn match_row(&self, fields: &[Field]) -> bool {
         let v = get_field_value_by_name(fields, "_time");
         self.match_timestamp_string(v)

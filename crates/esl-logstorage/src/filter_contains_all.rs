@@ -88,6 +88,10 @@ impl FieldFilter for FilterContainsAll {
         Some(&self.values)
     }
 
+    fn in_values_mut(&mut self) -> Option<&mut InValues> {
+        Some(&mut self.values)
+    }
+
     fn new_with_values(&self, field_name: &str, values: Vec<String>) -> Option<Box<dyn Filter>> {
         Some(Box::new(new_filter_contains_all_values(field_name, values)))
     }

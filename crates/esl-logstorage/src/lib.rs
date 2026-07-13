@@ -20,6 +20,7 @@ pub mod u128;
 
 // Layer 1 — value encoding & parsing helpers
 pub mod encoding;
+pub mod html_entities;
 pub mod in_values;
 pub mod json_parser;
 pub mod json_scanner;

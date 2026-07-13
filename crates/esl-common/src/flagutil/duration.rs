@@ -230,8 +230,8 @@ pub fn positive_duration_value(s: &str, step: i64) -> Result<i64, String> {
 /// The duration in `s` may be combined, i.e. `2h5m`, `-2h5m` or `2h-5m`.
 /// The returned duration value can be negative.
 ///
-/// PORT NOTE: the Grafana-specific `$__interval` pseudo-duration is not
-/// ported; `step`-relative `i` suffixes are supported like in Go.
+/// Like Go, the Grafana-specific `$__interval` pseudo-duration and the
+/// `step`-relative `i` suffix both resolve to `step`.
 pub fn duration_value(s: &str, step: i64) -> Result<i64, String> {
     if s.is_empty() {
         return Err("duration cannot be empty".to_string());
@@ -276,6 +276,9 @@ pub fn duration_value(s: &str, step: i64) -> Result<i64, String> {
 }
 
 fn parse_single_duration(s: &str, step: i64) -> Result<f64, String> {
+    if s == "$__interval" {
+        return Ok(step as f64);
+    }
     let s = s.to_lowercase();
     let mut num_part = &s[..s.len() - 1];
     // Strip trailing m if the duration is in ms.
@@ -305,6 +308,9 @@ fn scan_single_duration(s: &str, can_be_negative: bool) -> i64 {
     let mut i = 0usize;
     if b[0] == b'-' && can_be_negative {
         i += 1;
+    }
+    if &s[i..] == "$__interval" {
+        return (i + "$__interval".len()) as i64;
     }
     while i < b.len() && b[i].is_ascii_digit() {
         i += 1;
@@ -785,6 +791,25 @@ mod tests {
         f("1d");
         f("1w");
         f("1y");
+    }
+
+    #[test]
+    fn test_duration_value_grafana_interval() {
+        // metricsql resolves the Grafana `$__interval` pseudo-duration (and
+        // the `i` suffix) to `step`, like Go.
+        assert_eq!(duration_value("$__interval", 30_000), Ok(30_000));
+        assert_eq!(duration_value("2i", 30_000), Ok(60_000));
+        assert_eq!(positive_duration_value("$__interval", 0), Ok(0));
+        // `-$__interval` scans but fails to parse, like Go.
+        assert!(duration_value("-$__interval", 30_000).is_err());
+
+        // Flag types accept it through PositiveDurationValue, like Go.
+        let mut d = ExtendedDuration::default();
+        d.set("$__interval").unwrap();
+        assert_eq!(d.milliseconds(), 0);
+        let mut r = RetentionDuration::default();
+        r.set("$__interval").unwrap();
+        assert_eq!(r.milliseconds(), 0);
     }
 
     #[test]

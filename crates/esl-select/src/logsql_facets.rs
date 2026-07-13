@@ -97,9 +97,14 @@ pub fn process_facets_request(storage: &Arc<Storage>, req: &Request, w: &mut Res
 
     // Execute the query, canceling on client disconnect (Go: request ctx).
     let cancel = w.watch_disconnect();
-    if let Err(e) =
-        storage.run_query_with_stats(&ca.tenant_ids, &ca.q, write_fn, cancel.as_deref(), &ca.qs)
-    {
+    if let Err(e) = storage.run_query_with_stats(
+        &ca.tenant_ids,
+        &ca.q,
+        &ca.hidden_fields_filters,
+        write_fn,
+        cancel.as_deref(),
+        &ca.qs,
+    ) {
         if is_query_canceled_error(&e) {
             // The client disconnected: there is nobody to respond to.
             return;
@@ -132,11 +137,9 @@ pub fn process_facets_request(storage: &Arc<Storage>, req: &Request, w: &mut Res
 /// `must_append_pipe` is crate-private in esl-logstorage, so the port composes
 /// the same pipe string textually onto the query's `Display` round-trip and
 /// re-parses (the parser `Display` parity is the ported spec). A failure here
-/// is a round-trip bug, so it panics like Go `mustAppendPipe`. Caveat shared
-/// with the engine's own `Query::clone` (which re-parses `Display` the same
-/// way): `FilterAnd::to_string` does not parenthesize or-children (documented
-/// filter_and.rs PORT NOTE), so `a (b or c)` filters lose their grouping on
-/// re-parse; fixing that engine gap fixes this path too.
+/// is a round-trip bug, so it panics like Go `mustAppendPipe`. The re-parse is
+/// lossless: `FilterAnd`/`FilterNot` parenthesize composite children exactly
+/// like Go, so grouping survives the `Display` round-trip.
 fn add_facets_pipe(
     q: &Query,
     limit: i64,

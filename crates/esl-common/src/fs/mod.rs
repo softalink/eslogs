@@ -1,12 +1,11 @@
 //! Port of Softalink LLC `lib/fs` (with the `lib/fs/fsutil` subpackage in
 //! [`fsutil`]).
 //!
-//! PORT NOTE: metrics registration (`RegisterPathFsMetrics`, `getFsType` and
-//! the `vm_fs_*`/`vm_nfs_*`/`vm_mmapped_files` metrics) is not wired to the
-//! `esl_common::metrics` registry: the equivalent disk-space series are
-//! emitted by `esl-storage`'s `write_storage_metrics`, and the remaining
-//! series are Go-runtime/NFS-workaround diagnostics. Counters whose values
-//! appear in user-visible error messages are kept as private atomics.
+//! PORT NOTE: the `vm_fs_*`/`vm_nfs_*`/`vm_mmapped_files` series are exported
+//! as `esm_fs_*`/`esm_nfs_*`/`esm_mmapped_files`, and `RegisterPathFsMetrics`
+//! is ported as [`register_path_fs_metrics`] (`esm_fs_info`). Go registers
+//! the package-level series at init; the port registers them from
+//! `appmetrics::init_start_time` or lazily on first use.
 //!
 //! PORT NOTE: Go panics when `File.Close()` fails; Rust closes files on drop
 //! without reporting errors, so those panics cannot be reproduced.
@@ -41,6 +40,76 @@ pub(crate) fn unix_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Registers the package-level `esm_fs_*`/`esm_nfs_*`/`esm_mmapped_files`
+/// series in the default metrics set (Go registers them at package init).
+pub(crate) fn register_metrics() {
+    reader_at::register_metrics();
+    dir_remover::register_metrics();
+}
+
+/// Exposes filesystem information for the given path as the `esm_fs_info`
+/// gauge (Go `RegisterPathFsMetrics`, `vm_fs_info` rebranded).
+pub fn register_path_fs_metrics(path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    let name = format!(
+        "esm_fs_info{{path={}, fs_type={}}}",
+        crate::flagutil::go_quote(&path.to_string_lossy()),
+        crate::flagutil::go_quote(get_fs_type(path)),
+    );
+    let _ = crate::metrics::get_or_create_gauge(&name, Some(Box::new(|| 1.0)));
+}
+
+// Port of getFsType (fs_linux.go). Windows Go builds return "unknown" too
+// (fs_windows.go); the BSD/solaris variants are not ported.
+#[cfg(target_os = "linux")]
+fn get_fs_type(path: &Path) -> &'static str {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return "unknown";
+    };
+    // SAFETY: statfs(2) only writes into the zero-initialized struct passed
+    // to it.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(cpath.as_ptr(), &mut stat) } != 0 {
+        return "unknown";
+    }
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/uapi/linux/magic.h
+    match stat.f_type as i64 {
+        0xEF53 => "ext2/ext3/ext4",
+        0xabba1974 => "xenfs",
+        0x9123683E => "btrfs",
+        0x3434 => "nilfs",
+        0xF2F52010 => "f2fs",
+        0xf995e849 => "hpfs",
+        0x9660 => "isofs",
+        0x72b6 => "jffs2",
+        0x58465342 => "xfs",
+        0x6165676C => "pstorefs",
+        0xde5e81e4 => "efivarfs",
+        0x00c0ffee => "hostfs",
+        0x794c7630 => "overlayfs",
+        0x65735546 => "fuse",
+        0xca451a4e => "bcachefs",
+        0xadf5 => "adfs",
+        0xadff => "affs",
+        0x5346414F => "afs",
+        0x0187 => "autofs",
+        0xf15f => "ecryptfs",
+        0x414A53 => "efs",
+        0xE0F5E1E2 => "erofs",
+        0x6969 => "nfs",
+        0xFF534D42 => "cifs",
+        0x6c6f6f70 => "binderfs",
+        0xBAD1DEA => "futexfs",
+        _ => "unknown",
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_fs_type(_path: &Path) -> &'static str {
+    "unknown"
 }
 
 /// Fsyncs the path and the parent dir.

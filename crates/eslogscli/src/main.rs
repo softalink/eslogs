@@ -120,6 +120,8 @@ fn main() {
 
     let auth_config = new_auth_config();
 
+    interrupt::spawn_watcher();
+
     let mut rl = Readline::new();
 
     rl.writeln(&format!(
@@ -166,10 +168,12 @@ fn run_readline_loop(rl: &mut Readline, headers: &[HeaderEntry], auth_config: &A
                 }
                 return;
             }
-            // PORT NOTE: Go's readline additionally surfaces ErrInterrupt for
-            // Ctrl+C and stores the incomplete line into history; without a
-            // raw-mode line editor, Ctrl+C terminates the process via the
-            // default signal disposition.
+            // PORT NOTE: Go's readline surfaces ErrInterrupt for Ctrl+C here
+            // and clears a half-entered multiline query (storing it into
+            // history) instead of exiting. Without a raw-mode line editor the
+            // port cannot observe that state: the interrupt watcher (see
+            // `mod interrupt`) handles at-prompt Ctrl+C like Go's
+            // empty-prompt branch (prints "interrupted", exits 130).
             Err(err) => fatalf(&format!("unexpected error in readline: {err}")),
         };
 
@@ -259,10 +263,11 @@ fn run_readline_loop(rl: &mut Readline, headers: &[HeaderEntry], auth_config: &A
             continue;
         }
 
-        // Execute the query
-        // PORT NOTE: Go cancels the in-flight query on Ctrl+C via
-        // signal.NotifyContext; this port has no signal handling, so Ctrl+C
-        // terminates the whole process instead.
+        // Execute the query. Ctrl+C cancels the in-flight query and returns
+        // to the prompt: Go scopes a signal.NotifyContext around this call;
+        // the port's process-wide interrupt watcher plus the per-request
+        // `interrupt::watch_query` registration inside `http_post` cover the
+        // same window (see `mod interrupt`).
         execute_query(rl, &s, output_mode, disable_colors, wrap_long_lines, &rctx);
 
         push_to_history(rl, &mut history_lines, &s);
@@ -390,11 +395,12 @@ fn tail_query(
     };
 
     // PORT NOTE: `output` wraps stdout; the copy below matches Go's
-    // io.Copy(output, respBody).
+    // io.Copy(output, respBody). A Ctrl+C-interrupted tail is silent like
+    // Go's context.Canceled check.
     let stdout = io::stdout();
     let mut w = stdout.lock();
     if let Err(err) = io::copy(&mut resp_body, &mut w) {
-        if !is_err_pipe(&err) {
+        if !is_err_pipe(&err) && !interrupt::interrupted() {
             drop(w);
             output.writeln(&format!("error when live tailing query response: {err}"));
         }
@@ -457,7 +463,12 @@ fn get_query_response(
     let mut resp = match result {
         Ok(resp) => resp,
         Err(err) => {
-            output.writeln(&format!("cannot execute query: {err}"));
+            if interrupt::interrupted() {
+                // Go prints a bare newline for context.Canceled.
+                output.writeln("");
+            } else {
+                output.writeln(&format!("cannot execute query: {err}"));
+            }
             return None;
         }
     };
@@ -477,6 +488,139 @@ fn get_query_response(
 
     // Prettify the response body
     Some(JsonPrettifier::new(resp.body, output_mode))
+}
+
+// ---------------------------------------------------------------------------
+// Ctrl+C handling.
+//
+// Go wraps each interactive query in `signal.NotifyContext(context.Background(),
+// os.Interrupt)` (runReadlineLoop): SIGINT cancels the in-flight HTTP request
+// and the CLI returns to the prompt; at an empty prompt readline surfaces
+// ErrInterrupt and the CLI prints "interrupted" and exits with 128+SIGINT;
+// readWithLess additionally ignores SIGINT while `less` runs so `less` can
+// handle Ctrl+C itself.
+//
+// The port keeps ONE process-wide watcher thread (procutil::new_term_chan)
+// instead of Go's scoped registrations. On SIGINT:
+//  - a query in flight → flag it interrupted and shut down its socket, which
+//    aborts the blocking request/response I/O (Go: ctx cancellation);
+//  - `less` paging without an in-flight query → do nothing (`less` receives
+//    the terminal-delivered SIGINT itself, like under Go's ignoreSignals);
+//  - otherwise → print "interrupted" and exit 130, like Go's empty-prompt
+//    branch.
+//
+// PORT NOTE — remaining divergences from Go, all inherent to the
+// no-raw-mode/no-ctx port: (1) cancellation attaches when the TCP connection
+// is established, so a hanging dial is not abortable (Go's ctx aborts the
+// dial too); (2) the non-interactive EOF execution path is also cancellable,
+// where Go runs it with context.Background() and dies on SIGINT; (3) SIGTERM/
+// SIGHUP exit via `exit(128+sig)` instead of the default kill-by-signal
+// disposition (procutil's handlers cover them process-wide).
+// ---------------------------------------------------------------------------
+
+mod interrupt {
+    use std::net::{Shutdown, TcpStream};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use esl_common::procutil;
+
+    /// The socket of the in-flight query, shut down on SIGINT.
+    static QUERY_SOCK: Mutex<Option<TcpStream>> = Mutex::new(None);
+    /// Whether the current/most recent query was Ctrl+C-interrupted.
+    static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+    /// Non-zero while `less` runs (Go `ignoreSignals(os.Interrupt)`).
+    static IGNORE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+    /// Spawns the signal watcher; see the section comment above for the
+    /// SIGINT decision table.
+    pub fn spawn_watcher() {
+        let term_rx = procutil::new_term_chan();
+        std::thread::Builder::new()
+            .name("eslogscli-interrupt-watcher".to_string())
+            .spawn(move || {
+                for sig in term_rx {
+                    if sig != procutil::SIGINT {
+                        // Go leaves SIGTERM at its default disposition;
+                        // mirror the shell-visible exit status.
+                        std::process::exit(128 + sig);
+                    }
+                    let aborted = {
+                        let sock = QUERY_SOCK.lock().unwrap();
+                        if let Some(sock) = &*sock {
+                            INTERRUPTED.store(true, Ordering::SeqCst);
+                            let _ = sock.shutdown(Shutdown::Both);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if !aborted && IGNORE_DEPTH.load(Ordering::SeqCst) == 0 {
+                        // Go: fmt.Fprintf(rl, "interrupted\n");
+                        //     os.Exit(128 + int(syscall.SIGINT)).
+                        println!("interrupted");
+                        std::process::exit(128 + procutil::SIGINT);
+                    }
+                }
+            })
+            .expect("BUG: cannot spawn the interrupt watcher thread");
+
+        // SIGHUP keeps terminating the CLI (procutil's process-wide handlers
+        // would swallow it otherwise); Go leaves it at the default disposition.
+        let hup_rx = procutil::new_sighup_chan();
+        std::thread::Builder::new()
+            .name("eslogscli-sighup-watcher".to_string())
+            .spawn(move || {
+                if hup_rx.recv().is_ok() {
+                    std::process::exit(128 + procutil::SIGHUP);
+                }
+            })
+            .expect("BUG: cannot spawn the sighup watcher thread");
+    }
+
+    /// Clears the interrupted flag before a new request (Go: a fresh ctx per
+    /// query). Needed separately from [`watch_query`] because a request can
+    /// fail before the connection (and thus the watch) exists.
+    pub fn reset() {
+        INTERRUPTED.store(false, Ordering::SeqCst);
+    }
+
+    /// Registers the just-connected query socket for SIGINT abort; the
+    /// returned token deregisters on drop (Go: the per-query
+    /// signal.NotifyContext scope, released by `cancel()`).
+    pub struct QueryWatch(());
+
+    pub fn watch_query(sock: &TcpStream) -> QueryWatch {
+        *QUERY_SOCK.lock().unwrap() = sock.try_clone().ok();
+        QueryWatch(())
+    }
+
+    impl Drop for QueryWatch {
+        fn drop(&mut self) {
+            *QUERY_SOCK.lock().unwrap() = None;
+        }
+    }
+
+    /// Whether the current/most recent query was Ctrl+C-interrupted
+    /// (Go: `errors.Is(err, context.Canceled)`).
+    pub fn interrupted() -> bool {
+        INTERRUPTED.load(Ordering::SeqCst)
+    }
+
+    /// Suppresses the exit-on-SIGINT branch while alive (Go `ignoreSignals`
+    /// in readWithLess: `less` handles Ctrl+C itself).
+    pub struct IgnoreGuard(());
+
+    pub fn ignore_interrupts() -> IgnoreGuard {
+        IGNORE_DEPTH.fetch_add(1, Ordering::SeqCst);
+        IgnoreGuard(())
+    }
+
+    impl Drop for IgnoreGuard {
+        fn drop(&mut self) {
+            IGNORE_DEPTH.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +748,7 @@ impl HttpResponse {
 }
 
 fn http_post(u: &str, body: &[u8], rctx: &RequestContext<'_>) -> Result<HttpResponse, String> {
+    interrupt::reset();
     let pu = parse_url(u)?;
     let is_tls = pu.scheme == "https";
     let addr = if pu.host_port.contains(':') {
@@ -617,6 +762,11 @@ fn http_post(u: &str, body: &[u8], rctx: &RequestContext<'_>) -> Result<HttpResp
     let stream =
         TcpStream::connect(&addr).map_err(|err| format!("Post {u:?}: dial tcp {addr}: {err}"))?;
     stream.set_nodelay(true).map_err(|err| err.to_string())?;
+
+    // From here on Ctrl+C aborts the request by shutting this socket down
+    // (Go: the query ctx from signal.NotifyContext); the watch lives as long
+    // as the response body.
+    let watch = interrupt::watch_query(&stream);
 
     // When the user overrode the TLS server name, use it as the `Host` header
     // too (Go: `req.Host = ac.tlsServerName` in promauth.Config.SetHeaders).
@@ -712,8 +862,32 @@ fn http_post(u: &str, body: &[u8], rctx: &RequestContext<'_>) -> Result<HttpResp
     Ok(HttpResponse {
         status_code,
         headers,
-        body,
+        body: Box::new(WatchedBody {
+            inner: body,
+            _watch: watch,
+        }),
     })
+}
+
+/// The response body plus its [`interrupt::QueryWatch`] registration: reads
+/// after a Ctrl+C report Go's `context.Canceled` instead of the bare
+/// EOF/reset produced by the socket shutdown.
+struct WatchedBody {
+    inner: Box<dyn Read>,
+    _watch: interrupt::QueryWatch,
+}
+
+impl Read for WatchedBody {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // NOTE: not ErrorKind::Interrupted — io::copy would retry it forever.
+        if interrupt::interrupted() {
+            return Err(io::Error::other("context canceled"));
+        }
+        match self.inner.read(buf) {
+            Ok(0) if interrupt::interrupted() => Err(io::Error::other("context canceled")),
+            other => other,
+        }
+    }
 }
 
 /// The connection to the datasource: plain TCP or TLS over TCP.

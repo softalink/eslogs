@@ -7,13 +7,14 @@ use std::io::Read;
 use std::sync::Arc;
 
 use esl_common::httpserver::{Request, ResponseWriter, get_quoted_remote_addr};
-use esl_common::warnf;
+use esl_common::{errorf, warnf, writeconcurrencylimiter};
 
 use esl_logstorage::json_parser::{get_json_parser, put_json_parser};
 use esl_logstorage::rows::rename_field;
 
 use crate::common_params::{
-    LogMessageProcessor, LogRowsStorage, extract_timestamp_from_fields, get_common_params,
+    LogMessageProcessor, LogRowsStorage, errorf_with_status, extract_timestamp_from_fields,
+    get_common_params,
 };
 use crate::line_reader::LineReader;
 
@@ -37,6 +38,10 @@ pub fn request_handler<S: LogRowsStorage>(
             return;
         }
     };
+    if let Err((msg, status)) = storage.can_write_data() {
+        errorf_with_status(w, req, &msg, status);
+        return;
+    }
 
     let stream_name = format!(
         "remoteAddr={}, requestURI={:?}",
@@ -47,16 +52,28 @@ pub fn request_handler<S: LogRowsStorage>(
     let msg_fields: Vec<&str> = cp.msg_fields.iter().map(String::as_str).collect();
     let preserve_keys: Vec<&str> = cp.preserve_json_keys.iter().map(String::as_str).collect();
 
-    let mut lmp = cp.new_log_message_processor(storage, "jsonline");
-    let res = process_stream_internal(
-        &stream_name,
-        req.body_reader(),
-        &time_fields,
-        &msg_fields,
-        &preserve_keys,
-        &mut lmp,
-    );
-    lmp.close();
+    let res = {
+        // Go wraps r.Body with writeconcurrencylimiter.GetReader; on failure
+        // it logs the error and returns without an HTTP error response.
+        let mut wcr = match writeconcurrencylimiter::get_reader(req.body_reader()) {
+            Ok(wcr) => wcr,
+            Err(err) => {
+                errorf!("cannot start reading jsonline request: {}", err.err);
+                return;
+            }
+        };
+        let mut lmp = cp.new_log_message_processor(storage, "jsonline");
+        let res = process_stream_internal(
+            &stream_name,
+            &mut wcr,
+            &time_fields,
+            &msg_fields,
+            &preserve_keys,
+            &mut lmp,
+        );
+        lmp.close();
+        res
+    };
 
     if let Err(err) = res {
         w.errorf(

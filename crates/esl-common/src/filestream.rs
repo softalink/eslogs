@@ -1,10 +1,15 @@
 //! Port of Softalink LLC `lib/filestream` (filestream.go, parallel.go and
 //! the filestream_linux.go / filestream_windows.go stream trackers).
 //!
-//! PORT NOTE: the `vm_filestream_*` metrics are not wired to the
-//! `esl_common::metrics` registry — the stat wrappers around the underlying
-//! reads/writes were dropped with the ReadCloser/WriteCloser indirection they
-//! hang off in Go, and none of the EsLogs dashboards consume these series.
+//! PORT NOTE: the `vm_filestream_*` series are exported as
+//! `esm_filestream_*`. Go counts "real" reads/writes via statReader/
+//! statWriter shims around the underlying `os.File`; the port counts at the
+//! equivalent underlying-file call sites. One difference: Rust `write_all`
+//! retries short writes inside a single counted "real" write call, where Go
+//! would count each `File.Write` — byte totals match either way.
+//!
+//! PORT NOTE: Go registers the metrics at package init; the port registers
+//! them from `appmetrics::init_start_time` (or lazily on first file use).
 //!
 //! PORT NOTE: Go pools `bufio.Reader`/`bufio.Writer` objects via sync.Pool;
 //! the Rust port pools the raw buffers behind [`Reader`]/[`Writer`], which
@@ -13,10 +18,12 @@
 use std::fs::File;
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::Instant;
 
 use crate::flagutil::Flag;
 use crate::fs::fsutil;
+use crate::metrics::{Counter, FloatCounter};
 use crate::panicf;
 
 static DISABLE_FADVISE: Flag<bool> = Flag::new(
@@ -55,34 +62,90 @@ fn get_write_buffer_size() -> usize {
     *SIZE.get_or_init(|| (memory_allowed() / 1024 / 8).clamp(4 * 1024, 128 * 1024))
 }
 
-// PORT NOTE: lib/memory is ported by a parallel agent; until it lands, this
-// private helper approximates memory.Allowed() as 60% of the total system
-// memory, matching the Go default -memory.allowedPercent=60.
 fn memory_allowed() -> usize {
-    (total_system_memory() / 10) * 6
+    crate::memory::allowed()
 }
 
-#[cfg(unix)]
-fn total_system_memory() -> usize {
-    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
-    if pages > 0 && page_size > 0 {
-        (pages as usize).saturating_mul(page_size as usize)
-    } else {
-        1 << 30
-    }
+// The `vm_filestream_*` package-level metric vars from filestream.go,
+// rebranded `esm_filestream_*` and grouped in one lazily-registered struct.
+struct FilestreamMetrics {
+    read_duration: Arc<FloatCounter>,
+    read_calls_buffered: Arc<Counter>,
+    read_calls_real: Arc<Counter>,
+    read_bytes_buffered: Arc<Counter>,
+    read_bytes_real: Arc<Counter>,
+    readers_count: Arc<Counter>,
+
+    write_duration: Arc<FloatCounter>,
+    write_calls_buffered: Arc<Counter>,
+    write_calls_real: Arc<Counter>,
+    written_bytes_buffered: Arc<Counter>,
+    written_bytes_real: Arc<Counter>,
+    writers_count: Arc<Counter>,
+
+    fsync_duration: Arc<FloatCounter>,
+    fsync_calls: Arc<Counter>,
 }
 
-#[cfg(windows)]
-fn total_system_memory() -> usize {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    let mut ms: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    ms.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    if unsafe { GlobalMemoryStatusEx(&mut ms) } != 0 {
-        ms.ullTotalPhys as usize
-    } else {
-        1 << 30
+static METRICS: LazyLock<FilestreamMetrics> = LazyLock::new(|| FilestreamMetrics {
+    read_duration: crate::metrics::new_float_counter("esm_filestream_read_duration_seconds_total"),
+    read_calls_buffered: crate::metrics::new_counter("esm_filestream_buffered_read_calls_total"),
+    read_calls_real: crate::metrics::new_counter("esm_filestream_real_read_calls_total"),
+    read_bytes_buffered: crate::metrics::new_counter("esm_filestream_buffered_read_bytes_total"),
+    read_bytes_real: crate::metrics::new_counter("esm_filestream_real_read_bytes_total"),
+    readers_count: crate::metrics::new_counter("esm_filestream_readers"),
+
+    write_duration: crate::metrics::new_float_counter(
+        "esm_filestream_write_duration_seconds_total",
+    ),
+    write_calls_buffered: crate::metrics::new_counter("esm_filestream_buffered_write_calls_total"),
+    write_calls_real: crate::metrics::new_counter("esm_filestream_real_write_calls_total"),
+    written_bytes_buffered: crate::metrics::new_counter(
+        "esm_filestream_buffered_written_bytes_total",
+    ),
+    written_bytes_real: crate::metrics::new_counter("esm_filestream_real_written_bytes_total"),
+    writers_count: crate::metrics::new_counter("esm_filestream_writers"),
+
+    fsync_duration: crate::metrics::new_float_counter(
+        "esm_filestream_fsync_duration_seconds_total",
+    ),
+    fsync_calls: crate::metrics::new_counter("esm_filestream_fsync_calls_total"),
+});
+
+fn fs_metrics() -> &'static FilestreamMetrics {
+    &METRICS
+}
+
+/// Registers the `esm_filestream_*` series in the default metrics set (Go
+/// registers them at package init).
+pub(crate) fn register_metrics() {
+    LazyLock::force(&METRICS);
+}
+
+// statReader.Read equivalent: one timed, counted read from the underlying file.
+fn read_real(f: &mut File, p: &mut [u8]) -> std::io::Result<usize> {
+    let m = fs_metrics();
+    let start_time = Instant::now();
+    m.read_calls_real.inc();
+    let res = f.read(p);
+    m.read_duration.add(start_time.elapsed().as_secs_f64());
+    if let Ok(n) = res {
+        m.read_bytes_real.add(n as u64);
     }
+    res
+}
+
+// statWriter.Write equivalent: one timed, counted write to the underlying file.
+fn write_real(f: &mut File, data: &[u8]) -> std::io::Result<()> {
+    let m = fs_metrics();
+    let start_time = Instant::now();
+    m.write_calls_real.inc();
+    let res = f.write_all(data);
+    m.write_duration.add(start_time.elapsed().as_secs_f64());
+    if res.is_ok() {
+        m.written_bytes_real.add(data.len() as u64);
+    }
+    res
 }
 
 static READ_BUF_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
@@ -156,6 +219,8 @@ impl Reader {
         put_read_buf(std::mem::take(&mut self.buf));
         self.pos = 0;
         self.filled = 0;
+
+        fs_metrics().readers_count.dec();
     }
 
     // bufio.Reader.Read semantics: at most one read from the underlying file.
@@ -166,7 +231,7 @@ impl Reader {
         if self.pos == self.filled {
             if p.len() >= self.buf.len() {
                 // Large read: bypass the buffer.
-                return self.file().read(p);
+                return read_real(self.file(), p);
             }
             let n = {
                 let (f, buf) = (
@@ -175,7 +240,7 @@ impl Reader {
                         .expect("BUG: Reader is used after MustClose"),
                     &mut self.buf,
                 );
-                f.read(buf)?
+                read_real(f, buf)?
             };
             self.pos = 0;
             self.filled = n;
@@ -197,7 +262,9 @@ impl ReadCloser for Reader {
 
     /// Reads file contents to p.
     fn read(&mut self, p: &mut [u8]) -> std::io::Result<usize> {
+        fs_metrics().read_calls_buffered.inc();
         let n = self.read_buffered(p)?;
+        fs_metrics().read_bytes_buffered.add(n as u64);
         if let Err(err) = self.st.advise_dont_need(n, false) {
             return Err(std::io::Error::other(format!(
                 "advise error for {:?}: {err}",
@@ -275,6 +342,7 @@ pub fn must_open(path: impl AsRef<Path>, nocache: bool) -> Reader {
     if nocache {
         st.set_fd(&f);
     }
+    fs_metrics().readers_count.inc();
     Reader {
         f: Some(f),
         path: path.to_string_lossy().into_owned(),
@@ -321,6 +389,8 @@ impl Writer {
         // PORT NOTE: Go panics when f.Close() fails; Rust closes the file on
         // drop without error reporting.
         self.f = None;
+
+        fs_metrics().writers_count.dec();
     }
 
     fn flush(&mut self) {
@@ -340,17 +410,21 @@ impl Writer {
                     .expect("BUG: Writer is used after MustClose"),
                 &self.buf,
             );
-            f.write_all(buf)?;
+            write_real(f, buf)?;
             self.buf.clear();
         }
         Ok(())
     }
 
     fn sync(&mut self) {
-        if !fsutil::is_fsync_disabled()
-            && let Err(err) = self.file().sync_all()
-        {
-            panicf!("FATAL: cannot sync file {:?}: {err}", self.path);
+        if !fsutil::is_fsync_disabled() {
+            let start_time = Instant::now();
+            if let Err(err) = self.file().sync_all() {
+                panicf!("FATAL: cannot sync file {:?}: {err}", self.path);
+            }
+            let m = fs_metrics();
+            m.fsync_duration.add(start_time.elapsed().as_secs_f64());
+            m.fsync_calls.inc();
         }
     }
 
@@ -365,7 +439,7 @@ impl Writer {
                     .f
                     .as_mut()
                     .expect("BUG: Writer is used after MustClose");
-                f.write_all(rest)?;
+                write_real(f, rest)?;
                 break;
             }
             let avail = cap - self.buf.len();
@@ -397,7 +471,9 @@ impl WriteCloser for Writer {
 
     /// Writes p to the underlying file.
     fn write(&mut self, p: &[u8]) -> std::io::Result<usize> {
+        fs_metrics().write_calls_buffered.inc();
         let n = self.write_buffered(p)?;
+        fs_metrics().written_bytes_buffered.add(n as u64);
         if let Err(err) = self.st.advise_dont_need(n, true) {
             return Err(std::io::Error::other(format!(
                 "advise error for {:?}: {err}",
@@ -476,6 +552,7 @@ fn new_writer(f: File, path: &Path, nocache: bool) -> Writer {
     if nocache {
         st.set_fd(&f);
     }
+    fs_metrics().writers_count.inc();
     Writer {
         f: Some(f),
         path: path.to_string_lossy().into_owned(),
@@ -794,6 +871,25 @@ mod tests {
 
         test_write_read_with(false, &test_str);
         test_write_read_with(true, &test_str);
+    }
+
+    // Port-only test: the Go package registers its metrics at init and has no
+    // test for them; this pins that the esm_filestream_* counters move with
+    // reader/writer traffic.
+    #[test]
+    fn test_filestream_metrics_move() {
+        let m = fs_metrics();
+        let read_calls0 = m.read_calls_buffered.get();
+        let written_real0 = m.written_bytes_real.get();
+        test_write_read_with(false, "metrics probe payload");
+        assert!(
+            m.read_calls_buffered.get() > read_calls0,
+            "esm_filestream_buffered_read_calls_total must grow"
+        );
+        assert!(
+            m.written_bytes_real.get() > written_real0,
+            "esm_filestream_real_written_bytes_total must grow"
+        );
     }
 
     fn test_write_read_with(nocache: bool, test_str: &str) {

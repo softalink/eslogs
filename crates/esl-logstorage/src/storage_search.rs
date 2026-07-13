@@ -455,21 +455,24 @@ fn are_const_values(values: &[Vec<u8>]) -> bool {
 
 /// Search options for a Storage search (Go `storageSearchOptions`).
 ///
-/// PORT NOTE: the `hiddenFieldsFilter` pass is deferred (see the module
-/// deferral notes). `filter`/`stream_filter` are borrowed from the query (the
+/// PORT NOTE: `filter`/`stream_filter` are borrowed from the query (the
 /// `Filter` trait has no clone hook and the query outlives the search).
-struct StorageSearchOptions<'f> {
+pub(crate) struct StorageSearchOptions<'f> {
     tenant_ids: Vec<TenantID>,
     stream_ids: Vec<StreamID>,
-    min_timestamp: i64,
-    max_timestamp: i64,
+    pub(crate) min_timestamp: i64,
+    pub(crate) max_timestamp: i64,
     /// An optional stream filter to use for the search before applying the
     /// filter: per partition, its matching streamIDs are resolved against the
     /// partition indexdb so block scheduling skips non-matching blocks
     /// entirely (Go `sso.streamFilter` -> `pso.streamIDs`).
     stream_filter: Option<&'f crate::stream_filter::StreamFilter>,
     filter: &'f dyn crate::filter::Filter,
-    fields_filter: prefix_filter::Filter,
+    pub(crate) fields_filter: prefix_filter::Filter,
+    /// The filter of fields which must be hidden during query
+    /// (Go `hiddenFieldsFilter`; the empty filter matches nothing, standing in
+    /// for Go's nil `*prefixfilter.Filter`).
+    hidden_fields_filter: prefix_filter::Filter,
     time_offset: i64,
     /// Feed blocks to the workers newest-first (see `Pipe::is_desc_time_topk`).
     desc_block_order: bool,
@@ -496,14 +499,24 @@ fn stream_id_cmp(a: &StreamID, b: &StreamID) -> Cmp {
 }
 
 /// Go `Storage.getSearchOptions`.
-fn get_search_options<'q>(tenant_ids: &[TenantID], q: &'q Query) -> StorageSearchOptions<'q> {
+pub(crate) fn get_search_options<'q>(
+    tenant_ids: &[TenantID],
+    q: &'q Query,
+    hidden_fields_filters: &[String],
+) -> StorageSearchOptions<'q> {
     let mut stream_ids = q.get_stream_ids();
     stream_ids.sort_by(stream_id_cmp);
 
     let (min_timestamp, max_timestamp) = q.get_filter_time_range();
     let filter = q.get_final_filter();
     let stream_filter = get_common_stream_filter(filter);
-    let fields_filter = q.get_needed_columns();
+    let mut fields_filter = q.get_needed_columns();
+
+    let mut hidden_fields_filter = prefix_filter::Filter::default();
+    if !hidden_fields_filters.is_empty() {
+        fields_filter.add_deny_filters(hidden_fields_filters);
+        hidden_fields_filter.add_allow_filters(hidden_fields_filters);
+    }
 
     let mut tenant_ids = tenant_ids.to_vec();
     tenant_ids.sort_by(tenant_id_cmp);
@@ -516,6 +529,7 @@ fn get_search_options<'q>(tenant_ids: &[TenantID], q: &'q Query) -> StorageSearc
         stream_filter,
         filter,
         fields_filter,
+        hidden_fields_filter,
         time_offset: -q.time_offset(),
         desc_block_order: q
             .pipes()
@@ -585,7 +599,7 @@ fn get_stream_ids_for_tenant_ids(
 /// The port resolves those lazily inside `FilterStream` instead (per-idb
 /// cache, see filter_stream.rs), reading the query tenantIDs from
 /// `stream_filter_tenant_ids`.
-fn partition_search_options<'f>(
+pub(crate) fn partition_search_options<'f>(
     sso: &StorageSearchOptions<'f>,
     pt: &crate::partition::Partition,
 ) -> PartitionSearchOptions<'f> {
@@ -616,7 +630,7 @@ fn partition_search_options<'f>(
         max_timestamp: sso.max_timestamp,
         filter: sso.filter,
         fields_filter: sso.fields_filter.clone(),
-        hidden_fields_filter: prefix_filter::Filter::default(),
+        hidden_fields_filter: sso.hidden_fields_filter.clone(),
     }
 }
 
@@ -753,8 +767,13 @@ where
 /// Runs `q` against `storage` for the given `tenant_ids`, streaming each result
 /// [`DataBlock`] to `write_block_fn` (Go `Storage.RunQuery` / `runQuery`).
 ///
-/// PORT NOTE: Go takes a `*QueryContext` (context/cancellation/tenantIDs/stats);
-/// the port passes `tenant_ids`, the optional external `cancel` token standing
+/// `hidden_fields_filters` is the optional list of field filters which must be
+/// hidden during query execution (Go `qctx.HiddenFieldsFilters`); it may
+/// contain full field names and field prefixes ending with `*`.
+///
+/// PORT NOTE: Go takes a `*QueryContext` (context/cancellation/tenantIDs/stats/
+/// hiddenFieldsFilters); the port passes `tenant_ids`, `hidden_fields_filters`,
+/// the optional external `cancel` token standing
 /// in for `ctx.Done()`, and the shared per-query `qs` (Go `qctx.QueryStats`)
 /// explicitly. `qs` is `Arc`-shared because subquery closures (`union`) must
 /// hold it beyond a borrow. When `cancel` is set the block search aborts
@@ -769,12 +788,21 @@ pub(crate) fn run_query(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
+    hidden_fields_filters: &[String],
     write_block_fn: WriteDataBlockFn,
     cancel: Option<&Arc<AtomicBool>>,
     qs: &Arc<QueryStats>,
 ) -> Result<(), String> {
     let sink: Arc<dyn PipeProcessor> = Arc::new(BlockResultWriter { f: write_block_fn });
-    run_query_with_sink(storage, tenant_ids, q, sink, cancel, qs)
+    run_query_with_sink(
+        storage,
+        tenant_ids,
+        q,
+        hidden_fields_filters,
+        sink,
+        cancel,
+        qs,
+    )
 }
 
 /// Go `Storage.runQuery`, with the terminal `writeBlock` generalized to a
@@ -785,6 +813,7 @@ fn run_query_with_sink(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
+    hidden_fields_filters: &[String],
     sink: Arc<dyn PipeProcessor>,
     cancel: Option<&Arc<AtomicBool>>,
     qs: &Arc<QueryStats>,
@@ -795,10 +824,10 @@ fn run_query_with_sink(
         return Err(QUERY_CANCELED_ERROR.to_string());
     }
 
-    let q_new = init_subqueries(storage, tenant_ids, q, cancel, qs)?;
+    let q_new = init_subqueries(storage, tenant_ids, q, hidden_fields_filters, cancel, qs)?;
     let q = q_new.as_ref().unwrap_or(q);
 
-    let sso = get_search_options(tenant_ids, q);
+    let sso = get_search_options(tenant_ids, q, hidden_fields_filters);
 
     let concurrency = q.get_concurrency().max(1);
     let workers = q
@@ -1007,14 +1036,17 @@ impl Storage {
     /// filter substring are returned.
     ///
     /// PORT NOTE: Go takes a `*QueryContext`; the port passes `tenant_ids`,
-    /// `q` and the optional external `cancel` token explicitly (see
+    /// `q`, `hidden_fields_filters` and the optional external `cancel` token
+    /// explicitly (see
     /// [`Storage::run_query`]). Go clones `q` shallowly (sharing the filter
     /// and pipes); Rust filters/pipes are single-owner trait objects, so the
     /// query is cloned via re-parsing ([`Query::clone`]).
+    #[allow(clippy::too_many_arguments)] // mirrors Go's GetFieldNames + qctx surface
     pub fn get_field_names(
         self: &Arc<Storage>,
         tenant_ids: &[TenantID],
         q: &Query,
+        hidden_fields_filters: &[String],
         filter: &str,
         cancel: Option<&Arc<AtomicBool>>,
         qs: &Arc<QueryStats>,
@@ -1035,7 +1067,7 @@ impl Storage {
         }
         q_new.pipes.push(p);
 
-        self.run_values_with_hits_query(tenant_ids, &q_new, cancel, qs)
+        self.run_values_with_hits_query(tenant_ids, &q_new, hidden_fields_filters, cancel, qs)
     }
 
     /// Returns unique values with the number of hits for the given
@@ -1050,6 +1082,7 @@ impl Storage {
         self: &Arc<Storage>,
         tenant_ids: &[TenantID],
         q: &Query,
+        hidden_fields_filters: &[String],
         field_name: &str,
         filter: &str,
         limit: u64,
@@ -1072,7 +1105,7 @@ impl Storage {
         let p = crate::parser::parse_pipe::must_parse_pipe(&pipe_str, q.get_timestamp());
         q_new.pipes.push(p);
 
-        self.run_values_with_hits_query(tenant_ids, &q_new, cancel, qs)
+        self.run_values_with_hits_query(tenant_ids, &q_new, hidden_fields_filters, cancel, qs)
     }
 
     /// Returns stream field names for the results of `q`
@@ -1084,11 +1117,13 @@ impl Storage {
         self: &Arc<Storage>,
         tenant_ids: &[TenantID],
         q: &Query,
+        hidden_fields_filters: &[String],
         filter: &str,
         cancel: Option<&Arc<AtomicBool>>,
         qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        let streams = self.get_streams(tenant_ids, q, u64::MAX, cancel, qs)?;
+        let streams =
+            self.get_streams(tenant_ids, q, hidden_fields_filters, u64::MAX, cancel, qs)?;
 
         let mut m: HashMap<String, u64> = HashMap::new();
         for_each_stream_field(&streams, |f, hits| {
@@ -1113,13 +1148,15 @@ impl Storage {
         self: &Arc<Storage>,
         tenant_ids: &[TenantID],
         q: &Query,
+        hidden_fields_filters: &[String],
         field_name: &str,
         filter: &str,
         limit: u64,
         cancel: Option<&Arc<AtomicBool>>,
         qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        let streams = self.get_streams(tenant_ids, q, u64::MAX, cancel, qs)?;
+        let streams =
+            self.get_streams(tenant_ids, q, hidden_fields_filters, u64::MAX, cancel, qs)?;
 
         let mut m: HashMap<String, u64> = HashMap::new();
         for_each_stream_field(&streams, |f, hits| {
@@ -1172,11 +1209,21 @@ impl Storage {
         self: &Arc<Storage>,
         tenant_ids: &[TenantID],
         q: &Query,
+        hidden_fields_filters: &[String],
         limit: u64,
         cancel: Option<&Arc<AtomicBool>>,
         qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        self.get_field_values(tenant_ids, q, "_stream", "", limit, cancel, qs)
+        self.get_field_values(
+            tenant_ids,
+            q,
+            hidden_fields_filters,
+            "_stream",
+            "",
+            limit,
+            cancel,
+            qs,
+        )
     }
 
     /// Returns `_stream_id` field values from the results of `q`
@@ -1187,11 +1234,21 @@ impl Storage {
         self: &Arc<Storage>,
         tenant_ids: &[TenantID],
         q: &Query,
+        hidden_fields_filters: &[String],
         limit: u64,
         cancel: Option<&Arc<AtomicBool>>,
         qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
-        self.get_field_values(tenant_ids, q, "_stream_id", "", limit, cancel, qs)
+        self.get_field_values(
+            tenant_ids,
+            q,
+            hidden_fields_filters,
+            "_stream_id",
+            "",
+            limit,
+            cancel,
+            qs,
+        )
     }
 
     /// Go `Storage.runValuesWithHitsQuery`: runs `q` (which must end with a
@@ -1200,6 +1257,7 @@ impl Storage {
         self: &Arc<Storage>,
         tenant_ids: &[TenantID],
         q: &Query,
+        hidden_fields_filters: &[String],
         cancel: Option<&Arc<AtomicBool>>,
         qs: &Arc<QueryStats>,
     ) -> Result<Vec<ValueWithHits>, String> {
@@ -1233,7 +1291,15 @@ impl Storage {
             results_w.lock().unwrap().extend(values_with_hits);
         });
 
-        crate::storage_search::run_query(self, tenant_ids, q, write_block, cancel, qs)?;
+        crate::storage_search::run_query(
+            self,
+            tenant_ids,
+            q,
+            hidden_fields_filters,
+            write_block,
+            cancel,
+            qs,
+        )?;
 
         let mut results = std::mem::take(&mut *results.lock().unwrap());
         crate::pipe_field_values_local::sort_values_with_hits(&mut results);
@@ -1383,6 +1449,7 @@ fn get_field_values_generic(
     tenant_ids: &[TenantID],
     q: &Query,
     field_name: &str,
+    hidden_fields_filters: &[String],
     cancel: Option<&Arc<AtomicBool>>,
     qs: &Arc<QueryStats>,
 ) -> Result<Vec<String>, String> {
@@ -1415,7 +1482,15 @@ fn get_field_values_generic(
         }
     });
 
-    run_query(storage, tenant_ids, q, write_block, cancel, qs)?;
+    run_query(
+        storage,
+        tenant_ids,
+        q,
+        hidden_fields_filters,
+        write_block,
+        cancel,
+        qs,
+    )?;
 
     let values = std::mem::take(&mut *values.lock().unwrap());
     Ok(values)
@@ -1435,6 +1510,7 @@ fn get_rows(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
+    hidden_fields_filters: &[String],
     cancel: Option<&Arc<AtomicBool>>,
     qs: &Arc<QueryStats>,
 ) -> Result<Vec<Vec<Field>>, String> {
@@ -1479,7 +1555,15 @@ fn get_rows(
         rows_w.lock().unwrap().extend(block_rows);
     });
 
-    run_query(storage, tenant_ids, q, write_block, cancel, qs)?;
+    run_query(
+        storage,
+        tenant_ids,
+        q,
+        hidden_fields_filters,
+        write_block,
+        cancel,
+        qs,
+    )?;
 
     if state_size_budget.load(Ordering::SeqCst) < 0 {
         return Err(format!(
@@ -1503,10 +1587,11 @@ fn get_rows(
 /// with subqueries is cloned via re-parsing ([`Query::clone`]) and rewritten
 /// in place. Go's `eagerExecute` mode (cluster-only, `NewNetQueryRunner`) is
 /// ported in `net_query_runner::init_subqueries_net`.
-fn init_subqueries(
+pub(crate) fn init_subqueries(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
+    hidden_fields_filters: &[String],
     cancel: Option<&Arc<AtomicBool>>,
     qs: &Arc<QueryStats>,
 ) -> Result<Option<Query>, String> {
@@ -1532,8 +1617,15 @@ fn init_subqueries(
                 }
                 let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
                     .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
-                let values =
-                    get_field_values_generic(storage, tenant_ids, &q_sub, field_name, cancel, qs)?;
+                let values = get_field_values_generic(
+                    storage,
+                    tenant_ids,
+                    &q_sub,
+                    field_name,
+                    hidden_fields_filters,
+                    cancel,
+                    qs,
+                )?;
                 cache.insert(q_text.to_string(), values.clone());
                 Ok(values)
             };
@@ -1547,7 +1639,14 @@ fn init_subqueries(
         let mut get_join_rows = |q_text: &str| -> Result<Vec<Vec<Field>>, String> {
             let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
                 .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
-            get_rows(storage, tenant_ids, &q_sub, cancel, qs)
+            get_rows(
+                storage,
+                tenant_ids,
+                &q_sub,
+                hidden_fields_filters,
+                cancel,
+                qs,
+            )
         };
         for p in &mut q_new.pipes {
             p.init_join_map(&mut get_join_rows)
@@ -1562,6 +1661,7 @@ fn init_subqueries(
         // Go's single-node path (`eagerExecute == false`).
         let storage_u = Arc::clone(storage);
         let tenant_ids_u: Vec<TenantID> = tenant_ids.to_vec();
+        let hidden_u: Vec<String> = hidden_fields_filters.to_vec();
         let cancel_u: Option<Arc<AtomicBool>> = cancel.cloned();
         let qs_u = Arc::clone(qs);
         let run_union_query: crate::pipe::RunUnionQueryFn =
@@ -1572,6 +1672,7 @@ fn init_subqueries(
                     &storage_u,
                     &tenant_ids_u,
                     &q_sub,
+                    &hidden_u,
                     sink,
                     cancel_u.as_ref(),
                     &qs_u,
@@ -1610,6 +1711,9 @@ fn init_subqueries(
                 crate::net_query_runner::to_fields_filters(&q_new.get_needed_columns());
 
             let storage_sc = Arc::clone(storage);
+            // Go pipe_stream_context.go builds the surrounding-logs
+            // QueryContext with `qctxOrig.HiddenFieldsFilters` preserved.
+            let hidden_sc: Vec<String> = hidden_fields_filters.to_vec();
             let cancel_sc: Option<Arc<AtomicBool>> = cancel.cloned();
             let qs_sc = Arc::clone(qs);
             let run_sc_query: crate::pipe_stream_context::RunQueryFn = Arc::new(
@@ -1629,6 +1733,7 @@ fn init_subqueries(
                         &storage_sc,
                         &[tenant_id],
                         &q_sub,
+                        &hidden_sc,
                         sink,
                         cancel_sc.as_ref(),
                         &qs_sc,
@@ -1667,6 +1772,50 @@ fn for_each_stream_field(streams: &[ValueWithHits], mut f: impl FnMut(&Field, u6
 }
 
 /// Go `part.search`: dispatch to tenantID- or streamID-keyed block scheduling.
+/// Returns true if p contains rows matching pso (Go `part.hasMatchingRows`).
+///
+/// PORT NOTE: Go spins up `cgroup.AvailableCPUs()` worker goroutines fed by a
+/// `workCh` and stops feeding once a match is found; the port schedules the
+/// block-search work up front (like [`search_parallel`]) and fans it out on
+/// the rayon pool, with each worker skipping its blocks once `has_match` is
+/// set — the same early-stop behavior with the port's scheduling model.
+pub(crate) fn part_has_matching_rows(
+    p: &Part<'_>,
+    pso: &PartitionSearchOptions<'_>,
+    stop_ch: &AtomicBool,
+) -> bool {
+    let qs = QueryStats::default();
+    let mut works: Vec<BlockSearchWork> = Vec::new();
+    schedule_part_search(&mut works, p, pso, &qs);
+
+    let has_match = AtomicBool::new(false);
+
+    let process = |w: &BlockSearchWork| {
+        if has_match.load(Ordering::SeqCst) || stop_ch.load(Ordering::SeqCst) {
+            return;
+        }
+        let qs_local = QueryStats::default();
+        let mut bm = get_bitmap(0);
+        let mut br = BlockResult::default();
+        let mut bs = BlockSearch::new(&qs_local, w.p, w.pso, w.bh.clone());
+        bs.search(&mut bm, &mut br);
+        if br.rows_len() > 0 {
+            has_match.store(true, Ordering::SeqCst);
+        }
+    };
+
+    if works.len() <= 1 {
+        for w in &works {
+            process(w);
+        }
+    } else {
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+        works.par_iter().for_each(process);
+    }
+
+    has_match.load(Ordering::SeqCst)
+}
+
 fn schedule_part_search<'s>(
     works: &mut Vec<BlockSearchWork<'s>>,
     p: &'s Part<'s>,
@@ -2057,12 +2206,12 @@ mod tests {
 
         let q_fast = ParseQuery("*").expect("parse query");
         let fast = s
-            .get_field_names(&all_tenant_ids, &q_fast, "", None, &qs)
+            .get_field_names(&all_tenant_ids, &q_fast, &[], "", None, &qs)
             .expect("get_field_names fast");
 
         let q_slow = ParseQuery("* | limit 999999999").expect("parse query");
         let slow = s
-            .get_field_names(&all_tenant_ids, &q_slow, "", None, &qs)
+            .get_field_names(&all_tenant_ids, &q_slow, &[], "", None, &qs)
             .expect("get_field_names slow");
 
         assert!(!fast.is_empty(), "fixture must yield field names");
@@ -2073,10 +2222,10 @@ mod tests {
 
         // The name filter takes the same fast path.
         let fast_filtered = s
-            .get_field_names(&all_tenant_ids, &q_fast, "_stream", None, &qs)
+            .get_field_names(&all_tenant_ids, &q_fast, &[], "_stream", None, &qs)
             .expect("get_field_names fast filtered");
         let slow_filtered = s
-            .get_field_names(&all_tenant_ids, &q_slow, "_stream", None, &qs)
+            .get_field_names(&all_tenant_ids, &q_slow, &[], "_stream", None, &qs)
             .expect("get_field_names slow filtered");
         assert_eq!(fast_filtered, slow_filtered);
         assert!(
@@ -2137,7 +2286,7 @@ mod tests {
                     dst.push(row);
                 }
             });
-            s.run_query_with_stats(&all_tenant_ids, &q, write, None, &qs)
+            s.run_query_with_stats(&all_tenant_ids, &q, &[], write, None, &qs)
                 .unwrap_or_else(|e| panic!("cannot run [{query}]: {e}"));
             let mut rows = std::mem::take(&mut *rows.lock().unwrap());
             rows.sort();
@@ -2365,7 +2514,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_names(&all_tenant_ids, &q, "", None, &test_qs())
+                .get_field_names(&all_tenant_ids, &q, &[], "", None, &test_qs())
                 .expect("get_field_names");
             let results_expected = vec![
                 vh("_msg", 1155),
@@ -2385,7 +2534,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_names(&all_tenant_ids, &q, "o", None, &test_qs())
+                .get_field_names(&all_tenant_ids, &q, &[], "o", None, &test_qs())
                 .expect("get_field_names");
             let results_expected = vec![vh("job", 1155), vh("source-file", 1155)];
             assert_eq!(results, results_expected, "field_names-with-filter");
@@ -2397,7 +2546,7 @@ mod tests {
         {
             let q = parse(r#"_stream:{instance=~"host-1:.+"}"#);
             let results = s
-                .get_field_names(&all_tenant_ids, &q, "", None, &test_qs())
+                .get_field_names(&all_tenant_ids, &q, &[], "", None, &test_qs())
                 .expect("get_field_names");
             let results_expected = vec![
                 vh("_msg", 385),
@@ -2417,7 +2566,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "", 0, None, &test_qs())
+                .get_field_values(&all_tenant_ids, &q, &[], "_stream", "", 0, None, &test_qs())
                 .expect("get_field_values");
             let results_expected = vec![
                 vh(r#"{instance="host-0:234",job="foobar"}"#, 385),
@@ -2431,7 +2580,16 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "1:23", 0, None, &test_qs())
+                .get_field_values(
+                    &all_tenant_ids,
+                    &q,
+                    &[],
+                    "_stream",
+                    "1:23",
+                    0,
+                    None,
+                    &test_qs(),
+                )
                 .expect("get_field_values");
             let results_expected = vec![vh(r#"{instance="host-1:234",job="foobar"}"#, 385)];
             assert_eq!(results, results_expected, "field_values-with-filter");
@@ -2441,7 +2599,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "", 3, None, &test_qs())
+                .get_field_values(&all_tenant_ids, &q, &[], "_stream", "", 3, None, &test_qs())
                 .expect("get_field_values");
             let results_expected = vec![
                 vh(r#"{instance="host-0:234",job="foobar"}"#, 385),
@@ -2455,7 +2613,7 @@ mod tests {
         {
             let q = parse("instance:='host-1:234'");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, "_stream", "", 4, None, &test_qs())
+                .get_field_values(&all_tenant_ids, &q, &[], "_stream", "", 4, None, &test_qs())
                 .expect("get_field_values");
             let results_expected = vec![vh(r#"{instance="host-1:234",job="foobar"}"#, 385)];
             assert_eq!(results, results_expected, "field_values-limit-not-reached");
@@ -2465,7 +2623,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_stream_field_names(&all_tenant_ids, &q, "", None, &test_qs())
+                .get_stream_field_names(&all_tenant_ids, &q, &[], "", None, &test_qs())
                 .expect("get_stream_field_names");
             let results_expected = vec![vh("instance", 1155), vh("job", 1155)];
             assert_eq!(results, results_expected, "stream_field_names");
@@ -2475,7 +2633,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_stream_field_names(&all_tenant_ids, &q, "ob", None, &test_qs())
+                .get_stream_field_names(&all_tenant_ids, &q, &[], "ob", None, &test_qs())
                 .expect("get_stream_field_names");
             let results_expected = vec![vh("job", 1155)];
             assert_eq!(results, results_expected, "stream_field_names-with-filter");
@@ -2485,7 +2643,16 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_stream_field_values(&all_tenant_ids, &q, "instance", "", 0, None, &test_qs())
+                .get_stream_field_values(
+                    &all_tenant_ids,
+                    &q,
+                    &[],
+                    "instance",
+                    "",
+                    0,
+                    None,
+                    &test_qs(),
+                )
                 .expect("get_stream_field_values");
             let results_expected = vec![
                 vh("host-0:234", 385),
@@ -2502,6 +2669,7 @@ mod tests {
                 .get_stream_field_values(
                     &all_tenant_ids,
                     &q,
+                    &[],
                     "instance",
                     "t-2",
                     0,
@@ -2517,7 +2685,16 @@ mod tests {
         {
             let q = parse("*");
             let values = s
-                .get_stream_field_values(&all_tenant_ids, &q, "instance", "", 3, None, &test_qs())
+                .get_stream_field_values(
+                    &all_tenant_ids,
+                    &q,
+                    &[],
+                    "instance",
+                    "",
+                    3,
+                    None,
+                    &test_qs(),
+                )
                 .expect("get_stream_field_values");
             let results_expected = vec![
                 vh("host-0:234", 385),
@@ -2531,7 +2708,7 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_streams(&all_tenant_ids, &q, 0, None, &test_qs())
+                .get_streams(&all_tenant_ids, &q, &[], 0, None, &test_qs())
                 .expect("get_streams");
             let results_expected = vec![
                 vh(r#"{instance="host-0:234",job="foobar"}"#, 385),
@@ -2545,7 +2722,7 @@ mod tests {
         {
             let q = parse("*");
             let mut results = s
-                .get_stream_ids(&all_tenant_ids, &q, 0, None, &test_qs())
+                .get_stream_ids(&all_tenant_ids, &q, &[], 0, None, &test_qs())
                 .expect("get_stream_ids");
 
             // Verify the first 5 results with the smallest _stream_id value.
@@ -2935,5 +3112,211 @@ mod tests {
         check(r#"{foo="bar"}"#, r#"{"foo":"bar"}"#);
         check(r#"{a="b",c="d"}"#, r#"{"a":"b","c":"d"}"#);
         check(r#"{a="a=,b\"c}",b="d"}"#, r#"{"a":"a=,b\"c}","b":"d"}"#);
+    }
+
+    // -- Hidden fields filters (Go TestStorageSearchHiddenFieldsFilters) ----
+
+    const NSECS_PER_DAY: i64 = 24 * 3600 * 1_000_000_000;
+
+    /// Go `checkQueryResults` (storage_test.go): runs `q_str` at `now` with
+    /// the given hidden-fields filters and compares the JSON-marshaled result
+    /// rows against `results_expected`.
+    fn check_query_results(
+        s: &Arc<Storage>,
+        now: i64,
+        tenant_ids: &[TenantID],
+        q_str: &str,
+        hidden_fields_filters: &[String],
+        results_expected: &[&str],
+    ) {
+        let q = crate::parser::ParseQueryAtTimestamp(q_str, now)
+            .unwrap_or_else(|e| panic!("cannot parse query {q_str:?}: {e}"));
+
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let buf_w = Arc::clone(&buf);
+        let write: WriteDataBlockFn = Arc::new(move |_wid, db: &mut DataBlock| {
+            let mut rows: Vec<Vec<Field>> = vec![Vec::new(); db.rows_count()];
+            let columns = db.get_columns(false);
+            for c in columns {
+                for (row_id, v) in c.values.iter().enumerate() {
+                    rows[row_id].push(Field {
+                        name: c.name.clone(),
+                        value: String::from_utf8_lossy(v).into_owned(),
+                    });
+                }
+            }
+
+            let mut buf = buf_w.lock().unwrap();
+            for r in &rows {
+                crate::rows::marshal_fields_to_json(&mut buf, r);
+                buf.push(b'\n');
+            }
+        });
+
+        s.run_query_with_stats(
+            tenant_ids,
+            &q,
+            hidden_fields_filters,
+            write,
+            None,
+            &test_qs(),
+        )
+        .unwrap_or_else(|e| {
+            panic!("unexpected error while running query {q_str:?} for tenants {tenant_ids:?}: {e}")
+        });
+
+        let mut buf = std::mem::take(&mut *buf.lock().unwrap());
+        if !buf.is_empty() {
+            // Drop the last \n
+            buf.pop();
+        }
+        let results_str = String::from_utf8(buf).expect("results must be valid UTF-8");
+        let results_str_expected = results_expected.join("\n");
+        assert_eq!(
+            results_str, results_str_expected,
+            "unexpected results for query {q_str:?} at tenants {tenant_ids:?}"
+        );
+    }
+
+    /// Go `storeRowsForSearchHiddenFieldsFilters`.
+    fn store_rows_for_search_hidden_fields_filters(
+        s: &Arc<Storage>,
+        tenant_ids: &[TenantID],
+        now: i64,
+    ) {
+        // Generate rows and put them in the storage
+
+        let stream_tags = ["host", "app"];
+
+        let mut lr = get_log_rows(&stream_tags, &[], &[], &[], "");
+        let mut fields: Vec<Field> = Vec::new();
+
+        const DAYS: i64 = 7;
+        const STREAMS_PER_TENANT: usize = 5;
+        const ROWS_PER_DAY_PER_STREAM: usize = 100;
+
+        for row_id in 0..ROWS_PER_DAY_PER_STREAM {
+            for stream_id in 0..STREAMS_PER_TENANT {
+                fields.clear();
+                fields.push(Field {
+                    name: "host".to_string(),
+                    value: format!("host-{stream_id}"),
+                });
+                fields.push(Field {
+                    name: "app".to_string(),
+                    value: format!("app-{}", 200 + stream_id),
+                });
+                for tenant_id in tenant_ids {
+                    for day_id in 0..DAYS {
+                        fields.push(Field {
+                            name: "_msg".to_string(),
+                            value: format!(
+                                "value #{row_id} at the day {day_id} for the tenantID={tenant_id} and streamID={stream_id}"
+                            ),
+                        });
+                        fields.push(Field {
+                            name: "row_id".to_string(),
+                            value: format!("{row_id}"),
+                        });
+                        fields.push(Field {
+                            name: "tenant_id".to_string(),
+                            value: tenant_id.to_string(),
+                        });
+                        let timestamp = now - day_id * NSECS_PER_DAY;
+                        lr.must_add(*tenant_id, timestamp, &mut fields, -1);
+                        if lr.need_flush() {
+                            s.must_add_rows(&lr);
+                            lr.reset_keep_settings();
+                        }
+                    }
+                }
+            }
+        }
+        s.must_add_rows(&lr);
+
+        s.debug_flush();
+    }
+
+    /// Port of Go `TestStorageSearchHiddenFieldsFilters`.
+    #[test]
+    fn test_storage_search_hidden_fields_filters() {
+        let tenant_ids = [TenantID {
+            account_id: 123,
+            project_id: 456,
+        }];
+
+        let path = run_query_temp_path("hidden-fields-filters");
+        let cfg = StorageConfig {
+            retention: 30 * NSECS_PER_DAY,
+            ..StorageConfig::default()
+        };
+        let s = Storage::must_open_storage(&path, &cfg);
+
+        let now = now_nanos();
+
+        let hff =
+            |filters: &[&str]| -> Vec<String> { filters.iter().map(|f| f.to_string()).collect() };
+        let check = |q_str: &str, hidden_fields_filters: &[String], rows_expected: &[&str]| {
+            check_query_results(
+                &s,
+                now,
+                &tenant_ids,
+                q_str,
+                hidden_fields_filters,
+                rows_expected,
+            );
+        };
+
+        store_rows_for_search_hidden_fields_filters(&s, &tenant_ids, now);
+
+        // Verify that all the rows are successfully written
+        let q = "*";
+        let hidden_fields_filters = hff(&[]);
+        check(
+            &format!("{q} | count() rows"),
+            &hidden_fields_filters,
+            &[r#"{"rows":"3500"}"#],
+        );
+
+        // Select the specific log
+        let q = r#""value #12" "day 2" "streamID=3" | limit 1 | keep row_id, tenant_id, app, host"#;
+        let hidden_fields_filters = hff(&[]);
+        check(
+            q,
+            &hidden_fields_filters,
+            &[
+                r#"{"row_id":"12","tenant_id":"{accountID=123,projectID=456}","app":"app-203","host":"host-3"}"#,
+            ],
+        );
+
+        // Hide tenant_id and host fields
+        let q = r#""value #12" "day 2" "streamID=3" | limit 1 | keep row_id, tenant_id, app, host"#;
+        let hidden_fields_filters = hff(&["tenant_id", "ho*"]);
+        check(
+            q,
+            &hidden_fields_filters,
+            &[r#"{"row_id":"12","app":"app-203"}"#],
+        );
+
+        // Search for the visible field
+        let q = r#"host:="host-3""#;
+        let hidden_fields_filters = hff(&["tenant_id"]);
+        check(
+            &format!("{q} | count() rows"),
+            &hidden_fields_filters,
+            &[r#"{"rows":"700"}"#],
+        );
+
+        // Search for the hidden field
+        let q = r#"host:="host-3""#;
+        let hidden_fields_filters = hff(&["tenant_id", "ho*"]);
+        check(
+            &format!("{q} | count() rows"),
+            &hidden_fields_filters,
+            &[r#"{"rows":"0"}"#],
+        );
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
     }
 }

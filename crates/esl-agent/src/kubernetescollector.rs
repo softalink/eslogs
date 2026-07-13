@@ -2333,8 +2333,14 @@ impl LogFileProcessor {
 
         let (mut timestamp, ok) = parse_log_row_content(&mut parser, line);
         if !ok {
-            // PORT NOTE: Go stores the raw bytes; owned String fields require
-            // a lossy conversion for non-UTF-8 log lines.
+            // PORT NOTE: Go aliases the raw line bytes as the `_msg` value
+            // (`bytesutil.ToUnsafeString`), so an unstructured container log
+            // line containing invalid UTF-8 is stored verbatim. The Rust
+            // `Field` value is a `String` (crate-wide decision), so each
+            // invalid sequence is U+FFFD-replaced instead: line bytes
+            // `b"a\xffb"` are stored by Go as `a\xffb` and by the port as
+            // `a\u{FFFD}b`. Closing this would require a String→bytes
+            // `Field` refactor.
             parser.fields_mut().push(Field {
                 name: "_msg".to_string(),
                 value: String::from_utf8_lossy(line).into_owned(),
@@ -2431,13 +2437,18 @@ fn parse_log_row_content(p: &mut JSONParser, data: &[u8]) -> (i64, bool) {
         b'I' | b'W' | b'E' | b'F' => {
             let ts = fasttime::unix_timestamp();
             let current = (ts as i64) * 1_000_000_000;
-            // PORT NOTE: Go operates on unvalidated bytes; klog lines are
-            // ASCII, so non-UTF-8 input is treated as non-klog content.
-            let Ok(src) = std::str::from_utf8(data) else {
-                return (0, false);
-            };
+            // PORT NOTE: Go runs tryParseKlog on the unvalidated raw bytes
+            // viewed as a string, so a klog line whose message contains
+            // invalid UTF-8 still parses and Go stores the raw message
+            // bytes. The port lossy-converts the line first so the klog
+            // structure (level/_msg/key="value" fields) matches Go; the
+            // remaining divergence is the message bytes themselves: Go keeps
+            // e.g. a raw 0xFF where the port stores U+FFFD (Field is a
+            // String; a String→bytes refactor would close it). klog headers
+            // are ASCII, so the lossy pass never alters the parsed layout.
+            let src = String::from_utf8_lossy(data);
             let dst = std::mem::take(p.fields_mut());
-            match try_parse_klog(dst, src, current) {
+            match try_parse_klog(dst, &src, current) {
                 Some((timestamp, fields)) => {
                     *p.fields_mut() = fields;
                     (timestamp, true)
@@ -2651,8 +2662,15 @@ fn quoted_prefix(s: &str) -> Option<&str> {
 
 /// Go `strconv.Unquote` subset for double-quoted strings.
 ///
-/// PORT NOTE: `\xHH` escapes above 0x7F produce a Unicode scalar instead of a
-/// raw byte (Go strings may hold invalid UTF-8; Rust Strings cannot).
+/// PORT NOTE: escapes decode to raw bytes exactly like Go's
+/// `strconv.UnquoteChar` (`\xHH`/`\NNN` octal emit the single byte, `\u`/`\U`
+/// emit the rune's UTF-8), so any value whose decoded bytes are valid UTF-8 —
+/// including UTF-8 spelled via `\x` escapes like `\xc3\xa9` → `é` — matches
+/// Go byte-for-byte. Divergence (Field values are Rust `String`s, which must
+/// hold valid UTF-8): when the decoded bytes are NOT valid UTF-8, Go stores
+/// the raw bytes while the port U+FFFD-replaces each invalid sequence (e.g.
+/// `"\xff"` → Go `0xFF`, port `"\u{FFFD}"`). A String→bytes Field refactor
+/// would close this.
 fn unquote(s: &str) -> Option<String> {
     let b = s.as_bytes();
     if b.len() < 2 || b[0] != b'"' || b[b.len() - 1] != b'"' {
@@ -2660,16 +2678,17 @@ fn unquote(s: &str) -> Option<String> {
     }
     let inner = &s[1..s.len() - 1];
     let ib = inner.as_bytes();
-    let mut out = String::with_capacity(inner.len());
+    let mut out: Vec<u8> = Vec::with_capacity(inner.len());
     let mut i = 0;
     while i < ib.len() {
         if ib[i] != b'\\' {
             if ib[i] == b'"' || ib[i] == b'\n' {
                 return None;
             }
-            let ch = inner[i..].chars().next()?;
-            out.push(ch);
-            i += ch.len_utf8();
+            // inner is a &str, so unescaped bytes are already valid UTF-8;
+            // copy them through unchanged (Go copies runes the same way).
+            out.push(ib[i]);
+            i += 1;
             continue;
         }
         i += 1;
@@ -2679,30 +2698,37 @@ fn unquote(s: &str) -> Option<String> {
         let c = ib[i];
         i += 1;
         match c {
-            b'a' => out.push('\u{07}'),
-            b'b' => out.push('\u{08}'),
-            b'f' => out.push('\u{0C}'),
-            b'n' => out.push('\n'),
-            b'r' => out.push('\r'),
-            b't' => out.push('\t'),
-            b'v' => out.push('\u{0B}'),
-            b'\\' => out.push('\\'),
-            b'\'' => out.push('\''),
-            b'"' => out.push('"'),
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0C),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0B),
+            b'\\' => out.push(b'\\'),
+            // Go's unquoteChar rejects \' inside double-quoted strings (the
+            // escape is only valid for the quote char).
+            b'"' => out.push(b'"'),
             b'x' => {
+                // Go appends the raw byte, even if >= 0x80.
                 let v = parse_hex_digits(ib, &mut i, 2)?;
-                out.push(char::from_u32(v)?);
+                out.push(v as u8);
             }
             b'u' => {
                 let v = parse_hex_digits(ib, &mut i, 4)?;
-                out.push(char::from_u32(v)?);
+                let c = char::from_u32(v)?;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             }
             b'U' => {
                 let v = parse_hex_digits(ib, &mut i, 8)?;
-                out.push(char::from_u32(v)?);
+                let c = char::from_u32(v)?;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             }
             b'0'..=b'7' => {
-                // Octal escape: exactly 3 digits, the first already consumed.
+                // Octal escape: exactly 3 digits, raw byte, <= 255 (Go
+                // errors on \400..\777); the first digit already consumed.
                 let mut v = u32::from(c - b'0');
                 for _ in 0..2 {
                     if i >= ib.len() || !(b'0'..=b'7').contains(&ib[i]) {
@@ -2711,12 +2737,18 @@ fn unquote(s: &str) -> Option<String> {
                     v = v * 8 + u32::from(ib[i] - b'0');
                     i += 1;
                 }
-                out.push(char::from_u32(v)?);
+                if v > 255 {
+                    return None;
+                }
+                out.push(v as u8);
             }
             _ => return None,
         }
     }
-    Some(out)
+    Some(
+        String::from_utf8(out)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    )
 }
 
 fn parse_hex_digits(b: &[u8], i: &mut usize, count: usize) -> Option<u32> {
@@ -3743,6 +3775,59 @@ mod tests {
         let want = r#"{"level":"INFO","thread_id":"1234","source_line":"main.go:1","_msg":"foo"}"#;
         let timestamp_expected = 30585600000001000;
         f(input, want, timestamp_expected);
+    }
+
+    // PORT-ONLY TEST: pins the strconv.Unquote escape semantics of unquote().
+    // `\xHH`/octal escapes decode to raw bytes like Go, so UTF-8 spelled via
+    // `\x` matches Go byte-for-byte; decoded bytes that are NOT valid UTF-8
+    // are U+FFFD-replaced where Go keeps the raw bytes (see the PORT NOTE on
+    // unquote).
+    #[test]
+    fn test_unquote_escapes() {
+        // \x escapes composing valid UTF-8 match Go exactly.
+        assert_eq!(unquote(r#""\xc3\xa9""#).unwrap(), "é");
+        // Octal escapes composing valid UTF-8 match Go exactly.
+        assert_eq!(unquote(r#""\303\251""#).unwrap(), "é");
+        // \u/\U escapes.
+        assert_eq!(unquote(r#""é \U0001F600""#).unwrap(), "é 😀");
+        // Lone invalid byte: Go stores raw 0xFF, the port replaces it.
+        assert_eq!(unquote(r#""\xff""#).unwrap(), "\u{FFFD}");
+        // Go errors on octal values > 255, on surrogate \u escapes, and on
+        // \' inside double-quoted strings.
+        assert!(unquote(r#""\400""#).is_none());
+        assert!(unquote(r#""\ud800""#).is_none());
+        assert!(unquote(r#""don\'t""#).is_none());
+    }
+
+    // PORT-ONLY TEST: pins the invalid-UTF-8 handling of
+    // parse_log_row_content. Go parses klog from the raw bytes and stores
+    // the raw message bytes; the port lossy-converts first, so the klog
+    // structure matches Go and only invalid sequences become U+FFFD.
+    #[test]
+    fn test_parse_log_row_content_invalid_utf8() {
+        // klog line with a raw 0xFF byte in the message still parses as klog.
+        let mut p = get_json_parser();
+        let (_, ok) = parse_log_row_content(
+            &mut p,
+            b"I1215 07:34:12.017826       94 serving.go:374] a\xffb",
+        );
+        assert!(ok, "expected klog line to parse");
+        let mut got = Vec::new();
+        marshal_fields_to_json(&mut got, p.fields());
+        let got = String::from_utf8(got).unwrap();
+        assert_eq!(
+            got,
+            "{\"level\":\"INFO\",\"thread_id\":\"94\",\"source_line\":\"serving.go:374\",\"_msg\":\"a\u{FFFD}b\"}",
+            "unexpected result: {got}"
+        );
+        put_json_parser(p);
+
+        // Non-klog, non-JSON line with invalid UTF-8 is not structured
+        // content; the caller stores it as a lossy `_msg`.
+        let mut p = get_json_parser();
+        let (_, ok) = parse_log_row_content(&mut p, b"a\xffb");
+        assert!(!ok, "expected unstructured line");
+        put_json_parser(p);
     }
 
     #[test]

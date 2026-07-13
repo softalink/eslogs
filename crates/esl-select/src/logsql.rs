@@ -592,9 +592,9 @@ pub(crate) fn parse_extra_stream_filters(s: &str) -> Result<Option<Filter>, Stri
 
 /// Go `commonArgs`: the parsed args shared by all `/select/logsql/*` endpoints.
 ///
-/// PORT NOTE: Go also carries `allowPartialResponse` (cluster-only) and
-/// `hiddenFieldsFilters`; those args are parsed for validation (their parse
-/// errors are user-visible in Go) and dropped.
+/// PORT NOTE: Go also carries `allowPartialResponse` (cluster-only); that arg
+/// is parsed for validation (its parse errors are user-visible in Go) and
+/// dropped.
 pub(crate) struct CommonArgs {
     /// The parsed query. It includes optional extra_filters,
     /// extra_stream_filters and (start, end) time range filter.
@@ -606,6 +606,12 @@ pub(crate) struct CommonArgs {
     /// Query execution stats accumulated across the queries served by the
     /// request (Go `commonArgs.qs`, threaded via `newQueryContext`).
     pub(crate) qs: Arc<QueryStats>,
+
+    /// The optional list of field filters which must be hidden during query
+    /// execution (Go `commonArgs.hiddenFieldsFilters`, threaded via
+    /// `newQueryContext`). May contain full field names and field prefixes
+    /// ending with `*`.
+    pub(crate) hidden_fields_filters: Vec<String>,
 
     /// The start of the selected time range aligned to the given step.
     pub(crate) start_aligned: i64,
@@ -761,17 +767,19 @@ pub(crate) fn parse_common_args_with_config(
     // -search.maxQueryTimeRange here; the flag defaults to 0 (disabled) and
     // flags are not ported, so the check is omitted.
 
-    // allow_partial_response / hidden_fields_filters: validate the args like Go
-    // (invalid values are user-visible errors), then drop them (see the
-    // CommonArgs PORT NOTE).
+    // allow_partial_response: validate the arg like Go (invalid values are
+    // user-visible errors), then drop it (see the CommonArgs PORT NOTE).
     let mut allow_partial_response = false;
     get_bool_from_request(&mut allow_partial_response, req, "allow_partial_response")?;
-    let _hidden_fields_filters = get_string_slice_from_request(req, "hidden_fields_filters")?;
+
+    // Parse optional hidden_fields_filters
+    let hidden_fields_filters = get_string_slice_from_request(req, "hidden_fields_filters")?;
 
     Ok(CommonArgs {
         q,
         tenant_ids,
         qs: Arc::new(QueryStats::default()),
+        hidden_fields_filters,
         start_aligned,
         end_aligned,
     })
@@ -952,6 +960,7 @@ pub(crate) fn process_query_request(storage: &Arc<Storage>, req: &Request, w: &m
                 let field_names = match storage.get_field_names(
                     &ca.tenant_ids,
                     &ca.q,
+                    &ca.hidden_fields_filters,
                     "",
                     cancel.as_deref(),
                     &ca.qs,
@@ -1035,9 +1044,14 @@ pub(crate) fn process_query_request(storage: &Arc<Storage>, req: &Request, w: &m
     // ported: the disconnect-watcher token cancels the query like Go's
     // request ctx, and a canceled query writes no response (Go stops writing
     // to the closed conn); the buffered partial output is discarded.
-    if let Err(e) =
-        storage.run_query_with_stats(&ca.tenant_ids, &ca.q, write_fn, cancel.as_deref(), &ca.qs)
-    {
+    if let Err(e) = storage.run_query_with_stats(
+        &ca.tenant_ids,
+        &ca.q,
+        &ca.hidden_fields_filters,
+        write_fn,
+        cancel.as_deref(),
+        &ca.qs,
+    ) {
         if is_query_canceled_error(&e) {
             // The client disconnected: there is nobody to respond to.
             return;

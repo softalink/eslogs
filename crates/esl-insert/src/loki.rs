@@ -12,8 +12,10 @@
 
 use std::sync::Arc;
 
+use esl_common::flagutil::{Bytes, Flag};
 use esl_common::httpserver::{Request, ResponseWriter};
 use esl_common::httputil::get_request_value;
+use esl_common::writeconcurrencylimiter;
 
 use esl_logstorage::json_parser::{JSONParser, get_json_parser, put_json_parser};
 use esl_logstorage::rows::{Field, rename_field};
@@ -22,9 +24,17 @@ use esl_logstorage::tenant_id::parse_tenant_id;
 use esl_common::timeutil::try_parse_unix_timestamp;
 
 use crate::common_params::{
-    CommonParams, LogMessageProcessor, LogRowsStorage, get_common_params, is_json_content_type,
-    now_unix_nanos,
+    CommonParams, LogMessageProcessor, LogRowsStorage, check_max_request_size, errorf_with_status,
+    get_common_params, is_json_content_type, now_unix_nanos,
 };
+
+/// The maximum size of a single Loki request (shared by the JSON and protobuf
+/// variants, like Go's package-level `maxRequestSize` in `loki_json.go`).
+pub(crate) static MAX_REQUEST_SIZE: Flag<Bytes> = Flag::new(
+    "loki.maxRequestSize",
+    "The maximum size in bytes of a single Loki request",
+    || Bytes::with_default(64 * 1024 * 1024),
+);
 
 /// RequestHandler processes Loki insert requests. Returns true if the path was
 /// handled.
@@ -124,9 +134,28 @@ fn handle_json<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &mut R
         }
     };
 
-    // PORT NOTE: Go enforces -loki.maxRequestSize (64MiB) via
-    // ReadUncompressedData; the port reads the (already-decompressed) body in
-    // full without the explicit size cap.
+    if let Err((msg, status)) = storage.can_write_data() {
+        errorf_with_status(w, req, &msg, status);
+        return;
+    }
+
+    // Go streams the body via protoparserutil.ReadUncompressedData, which
+    // waits for the first body byte, takes a writeconcurrencylimiter token
+    // for the read+parse and enforces -loki.maxRequestSize while reading;
+    // the port's read_full_body has already decompressed the body, so the
+    // token is taken here and the cap is checked after the read.
+    let _concurrency_guard = match writeconcurrencylimiter::inc_concurrency_guard() {
+        Ok(g) => g,
+        Err(err) => {
+            errorf_with_status(
+                w,
+                req,
+                &format!("cannot read Loki json data: {}", err.err),
+                err.status_code,
+            );
+            return;
+        }
+    };
     let data = match req.read_full_body() {
         Ok(d) => d,
         Err(err) => {
@@ -134,6 +163,10 @@ fn handle_json<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &mut R
             return;
         }
     };
+    if let Err(err) = check_max_request_size(data.len(), &MAX_REQUEST_SIZE) {
+        w.errorf(req, &format!("cannot read Loki json data: {err}"));
+        return;
+    }
 
     let use_default_stream_fields = cp.cp.stream_fields.is_empty();
     let msg_fields: Vec<&str> = cp.cp.msg_fields.iter().map(String::as_str).collect();

@@ -4,11 +4,14 @@
 //! See [`crate::stats_min`] for the shared helpers and the config-capture PORT
 //! NOTE.
 //!
-//! PORT NOTE — `_time` source companion row. When the source column is `_time`,
-//! Go reads the companion field at row 0 (a quirk of its `getMinTimestamp` fast
-//! path), whereas this port — which scans the decoded values — reads it at the
-//! row that actually holds the minimum timestamp. This only differs for a
-//! `_time` source column and is not exercised by the (deferred) pipe tests.
+//! Go's `_time`-source fast path is ported, including its quirk: the block's
+//! minimum timestamp comes from `getMinTimestamp` and the companion field is
+//! read at row 0 of the winning block — not at the row that actually holds the
+//! minimum timestamp.
+//!
+//! PORT NOTE: Go additionally gates the per-value scan on the column
+//! `valueType` (dict/uint/int/float/ipv4/iso8601 min-value pre-checks); those
+//! are perf-only — the plain scan below selects the same winner.
 
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
@@ -21,6 +24,9 @@ use crate::prefix_filter::Filter;
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::stats_min::less_string;
 use crate::stream_filter::quote_token_if_needed;
+use crate::values_encoder::{
+    marshal_timestamp_rfc3339_nano_string, try_parse_timestamp_rfc3339_nano,
+};
 
 /// Port of `statsFieldMin`.
 pub(crate) struct StatsFieldMin {
@@ -112,6 +118,25 @@ impl StatsProcessor for StatsFieldMinProcessor {
     fn update_stats_for_all_rows(&mut self, _sf: &dyn StatsFunc, br: &mut BlockResult) -> i64 {
         let field_name = self.field_name.clone();
         let c_src = br.get_column_by_name(&self.src_field);
+        if br.column_is_const(c_src) {
+            let v = br.column_get_value_at_row(c_src, 0).to_owned();
+            return self.update_state(&v, br, &field_name, 0);
+        }
+        if br.column_is_time(c_src) {
+            // Go fast path: take the block minimum from `getMinTimestamp` and
+            // read the companion field at row 0 (Go's quirk — not the row
+            // holding the minimum).
+            let timestamp = try_parse_timestamp_rfc3339_nano(&self.min).unwrap_or(i64::MAX);
+            let min_timestamp = br.get_min_timestamp(timestamp);
+            if min_timestamp >= timestamp {
+                return 0;
+            }
+            let mut b = Vec::new();
+            marshal_timestamp_rfc3339_nano_string(&mut b, min_timestamp);
+            let v = to_unsafe_string(&b).to_owned();
+            return self.update_state(&v, br, &field_name, 0);
+        }
+
         let src_vals: Vec<Vec<u8>> = br.column_get_values(c_src).to_vec();
         let mut inc = 0i64;
         for (i, v) in src_vals.iter().enumerate() {
@@ -224,6 +249,98 @@ mod tests {
     fn test_field_min_requires_two_args() {
         assert!(new_stats_field_min(vec!["a".to_string()]).is_err());
         assert!(new_stats_field_min(vec!["a".into(), "b".into(), "c".into()]).is_err());
+    }
+
+    /// Go `TestStatsFieldMin` case `stats field_min(foo, a)`: a missing source
+    /// field yields an empty result.
+    #[test]
+    fn test_field_min_missing_src_field() {
+        let blocks = vec![vec![
+            vec![field("_msg", "abc"), field("a", "2"), field("b", "3")],
+            vec![field("_msg", "def"), field("a", "1")],
+            vec![field("a", "3"), field("b", "54")],
+        ]];
+        assert_eq!(run("foo", "a", &blocks), "");
+    }
+
+    /// `_time`-source fast path over storage-backed blocks: `field_min(_time,
+    /// b)` / `field_max(_time, b)` must take the block min/max timestamp from
+    /// the timestamps header and read the companion at row 0 / the last row
+    /// (Go's quirk; rows within a block are timestamp-sorted, so these are
+    /// also the true min/max rows).
+    #[test]
+    fn test_field_min_max_time_source_end_to_end() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::log_rows::get_log_rows;
+        use crate::parser::ParseQuery;
+        use crate::storage::{Storage, StorageConfig};
+        use crate::storage_search::{DataBlock, WriteDataBlockFn};
+        use crate::tenant_id::TenantID;
+
+        let path = std::env::temp_dir().join(format!(
+            "esl-logstorage-fieldminmax-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+        let tenant = TenantID {
+            account_id: 0,
+            project_id: 0,
+        };
+
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let mut lr = get_log_rows(&["host"], &[], &[], &[], "");
+        for i in 0..10 {
+            let mut fields = vec![
+                field("_msg", &format!("message {i}")),
+                field("host", "node-1"),
+                field("b", &format!("b{i}")),
+            ];
+            lr.must_add(tenant, base + i as i64, &mut fields, -1);
+        }
+        s.must_add_rows(&lr);
+        s.debug_flush();
+
+        let q = ParseQuery("* | stats field_min(_time, b) as xmin, field_max(_time, b) as xmax")
+            .expect("parse query");
+        let captured: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let write: WriteDataBlockFn = Arc::new(move |_wid, db: &mut DataBlock| {
+            let n = db.rows_count();
+            let columns = db.get_columns(false).to_vec();
+            let mut out = cap.lock().unwrap();
+            for i in 0..n {
+                for c in &columns {
+                    out.push((
+                        c.name.clone(),
+                        String::from_utf8_lossy(&c.values[i]).into_owned(),
+                    ));
+                }
+            }
+        });
+        s.run_query(&[tenant], &q, write).expect("run_query");
+
+        let rows = captured.lock().unwrap();
+        let get = |name: &str| -> String {
+            rows.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing stats column {name}"))
+        };
+        assert_eq!(get("xmin"), "b0");
+        assert_eq!(get("xmax"), "b9");
+        drop(rows);
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
     }
 
     #[test]

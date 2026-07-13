@@ -15,6 +15,7 @@
 //! and [`FieldContext::enum_value`] since `bool` and `enum` are reserved words
 //! in Rust.
 
+use std::borrow::Cow;
 use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -311,13 +312,31 @@ impl<'a> FieldContext<'a> {
     ///
     /// `None` is returned if fc doesn't contain string value.
     ///
-    /// PORT NOTE: Go returns arbitrary bytes via an unsafe cast; Rust `&str`
-    /// must be valid UTF-8, so invalid UTF-8 data yields `None`.
+    /// PORT NOTE: Go returns arbitrary bytes via an unsafe cast (a Go string
+    /// may hold invalid UTF-8); Rust `&str` must be valid UTF-8, so invalid
+    /// UTF-8 data yields `None` here. Callers that must accept such data the
+    /// way Go does should use [`FieldContext::string_lossy`] (or
+    /// [`FieldContext::bytes`] to get the raw bytes).
     pub fn string(&self) -> Option<&'a str> {
         if self.wire_type != WIRE_TYPE_LEN {
             return None;
         }
         std::str::from_utf8(self.data).ok()
+    }
+
+    /// String value for fc, accepting invalid UTF-8 the way Go does.
+    ///
+    /// PORT NOTE: Go's `String()` returns the raw bytes via an unsafe cast,
+    /// so a protobuf `string` field with invalid UTF-8 is passed through
+    /// unchanged. A Rust `str` cannot hold those bytes; this variant replaces
+    /// each invalid sequence with U+FFFD instead of failing (e.g. the field
+    /// bytes `b"a\xffb"` become `"a\u{FFFD}b"` where Go keeps `0xFF`).
+    /// `None` is still returned if fc doesn't contain a string value.
+    pub fn string_lossy(&self) -> Option<Cow<'a, str>> {
+        if self.wire_type != WIRE_TYPE_LEN {
+            return None;
+        }
+        Some(String::from_utf8_lossy(self.data))
     }
 
     /// Bytes returns bytes value for fc.
@@ -586,7 +605,8 @@ pub fn get_double(src: &[u8], field_num: u32) -> Result<Option<f64>, String> {
 /// The returned string is valid until src is changed.
 ///
 /// PORT NOTE: invalid UTF-8 data yields an error (Go allows arbitrary bytes in
-/// strings via an unsafe cast).
+/// strings via an unsafe cast). Callers that must accept such data the way Go
+/// does should use [`get_string_lossy`] (or [`get_bytes`] for the raw bytes).
 pub fn get_string(src: &[u8], field_num: u32) -> Result<Option<&str>, String> {
     let mut fc = FieldContext::default();
     if !fc.get_field(src, field_num, WIRE_TYPE_LEN)? {
@@ -598,6 +618,21 @@ pub fn get_string(src: &[u8], field_num: u32) -> Result<Option<&str>, String> {
             "fieldNum={field_num} contains invalid UTF-8 string data"
         )),
     }
+}
+
+/// [`get_string`] variant that accepts invalid UTF-8 the way Go does.
+///
+/// PORT NOTE: Go's `GetString` returns the raw field bytes via an unsafe cast,
+/// so invalid UTF-8 passes through unchanged. A Rust `str` cannot hold those
+/// bytes; this variant replaces each invalid sequence with U+FFFD instead of
+/// failing (e.g. the field bytes `b"a\xffb"` become `"a\u{FFFD}b"` where Go
+/// keeps `0xFF`).
+pub fn get_string_lossy(src: &[u8], field_num: u32) -> Result<Option<Cow<'_, str>>, String> {
+    let mut fc = FieldContext::default();
+    if !fc.get_field(src, field_num, WIRE_TYPE_LEN)? {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(fc.data)))
 }
 
 /// GetBytes returns bytes slice for the given field_num from protobuf-encoded
@@ -1232,6 +1267,34 @@ mod tests {
         let mut expected = vec![0x12, 0x07];
         expected.extend_from_slice(b"testing");
         assert_eq!(dst, expected);
+    }
+
+    // PORT-ONLY TEST: upstream has no invalid-UTF-8 coverage. Pins the
+    // divergence documented on string()/get_string(): Go passes raw bytes
+    // through, the port either rejects (strict) or U+FFFD-replaces (lossy).
+    #[test]
+    fn test_string_invalid_utf8() {
+        // field 1 = string bytes "a\xffb" -> [0x0A, 0x03, 0x61, 0xFF, 0x62].
+        let src = [0x0Au8, 0x03, 0x61, 0xFF, 0x62];
+
+        let mut fc = FieldContext::default();
+        let tail = fc.next_field(&src).unwrap();
+        assert!(tail.is_empty());
+        assert_eq!(fc.field_num, 1);
+        assert_eq!(fc.string(), None);
+        assert_eq!(fc.string_lossy().unwrap(), "a\u{FFFD}b");
+        assert_eq!(fc.bytes().unwrap(), b"a\xffb");
+
+        assert!(get_string(&src, 1).is_err());
+        assert_eq!(get_string_lossy(&src, 1).unwrap().unwrap(), "a\u{FFFD}b");
+
+        // Valid UTF-8 stays borrowed and identical through both accessors.
+        let src = [0x0Au8, 0x03, 0x61, 0x62, 0x63];
+        let mut fc = FieldContext::default();
+        fc.next_field(&src).unwrap();
+        assert_eq!(fc.string(), Some("abc"));
+        assert_eq!(fc.string_lossy().unwrap(), "abc");
+        assert_eq!(get_string_lossy(&src, 1).unwrap().unwrap(), "abc");
     }
 
     #[test]

@@ -38,14 +38,15 @@
 //! reads are bounded by a read timeout). [`ServerHandle::stop`] sets the flag,
 //! wakes each blocked accept with a self-connect, and joins all threads.
 //!
-//! PORT NOTE: basic-auth, `authKey`, pprof, path-prefix and per-connection
-//! deadline jitter from the Go source are intentionally omitted — the
-//! benchmark uses plain HTTP with no auth. Auth checks are effectively no-ops
-//! (all requests allowed), so the `wrong_basic_auth`/`wrong_auth_key` error
-//! counters and the pprof request counters have nothing to count and are not
-//! registered. `esm_http_conn_timeout_closed_conns_total` is omitted with the
-//! deadline jitter. Response compression (`gzhttp`) is also omitted;
-//! responses are small.
+//! PORT NOTE: pprof, path-prefix and per-connection deadline jitter from the
+//! Go source are intentionally omitted, so the pprof request counters have
+//! nothing to count and are not registered, and
+//! `esm_http_conn_timeout_closed_conns_total` is omitted with the deadline
+//! jitter. Response compression (`gzhttp`) is also omitted; responses are
+//! small. Basic auth (`-httpAuth.username`/`-httpAuth.password`) and the
+//! `-metricsAuthKey`/`-flagsAuthKey` auth keys ARE ported — see
+//! [`check_auth_flag`]/[`check_basic_auth`] below. `-pprofAuthKey` is omitted
+//! together with pprof.
 //!
 //! ## TLS serving
 //!
@@ -86,7 +87,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::cgroup::available_cpus;
-use crate::flagutil::{ArrayBool, ArrayString, Flag};
+use crate::flagutil::{ArrayBool, ArrayString, Flag, Password};
 use crate::tlsutil::{TlsServerStream, rustls::ServerConfig};
 
 // Read/write buffer sizes tuned for the ingestion path (large POST bodies).
@@ -118,6 +119,10 @@ const DEFAULT_BLOCK_SIZE: usize = 64 * 1024;
 // snappy has a default limit of ~2GB which is too high for insert requests;
 // mirror the Go 56MB cap to prevent memory-allocation attacks.
 const MAX_SNAPPY_BLOCK_SIZE: usize = 56_000_000;
+
+// Go net/http caps non-multipart POST form bodies at 10MB (`maxFormSize` in
+// ParseForm); mirror it so form parsing cannot buffer unbounded input.
+const MAX_FORM_SIZE: usize = 10 << 20;
 
 // ---------------------------------------------------------------------------
 // TLS serving flags (Go lib/httpserver package-level flag vars)
@@ -160,6 +165,185 @@ static TLS_MIN_VERSION: Flag<ArrayString> = Flag::new(
      Supported values: TLS10, TLS11, TLS12, TLS13",
     ArrayString::default,
 );
+
+// ---------------------------------------------------------------------------
+// Auth (Go lib/httpserver `-httpAuth.*` basic auth and `-*AuthKey` flags)
+// ---------------------------------------------------------------------------
+
+static HTTP_AUTH_USERNAME: Flag<String> = Flag::new(
+    "httpAuth.username",
+    "Username for HTTP server's Basic Auth. The authentication is disabled if empty. \
+     See also -httpAuth.password",
+    String::new,
+);
+static HTTP_AUTH_PASSWORD: Flag<Password> = Flag::new(
+    "httpAuth.password",
+    "Password for HTTP server's Basic Auth. \
+     The authentication is disabled if -httpAuth.username is empty",
+    || Password::new("httpAuth.password"),
+);
+static METRICS_AUTH_KEY: Flag<Password> = Flag::new(
+    "metricsAuthKey",
+    "Auth key for /metrics endpoint. It must be passed via authKey query arg. \
+     It overrides -httpAuth.*",
+    || Password::new("metricsAuthKey"),
+);
+static FLAGS_AUTH_KEY: Flag<Password> = Flag::new(
+    "flagsAuthKey",
+    "Auth key for /flags endpoint. It must be passed via authKey query arg. \
+     It overrides -httpAuth.*",
+    || Password::new("flagsAuthKey"),
+);
+
+/// Port of Go `httpserver.CheckAuthFlag`: checks whether the given authKey is
+/// set and valid.
+///
+/// Falls back to [`check_basic_auth`] if the authKey flag is not set.
+pub fn check_auth_flag(rw: &mut ResponseWriter, req: &Request, expected_key: &Password) -> bool {
+    check_auth_flag_with(rw, req, expected_key, check_basic_auth)
+}
+
+/// Core of [`check_auth_flag`] with an explicit basic-auth fallback, so tests
+/// can exercise the fallback without mutating global flags.
+fn check_auth_flag_with(
+    rw: &mut ResponseWriter,
+    req: &Request,
+    expected_key: &Password,
+    basic_auth_check: fn(&mut ResponseWriter, &Request) -> bool,
+) -> bool {
+    let expected_value = expected_key.get();
+    if expected_value.is_empty() {
+        return basic_auth_check(rw, req);
+    }
+    let auth_key = req.form_value("authKey");
+    if auth_key.is_empty() {
+        auth_key_request_errors().inc();
+        rw.error(
+            &format!(
+                "Expected to receive non-empty authKey when -{} is set",
+                expected_key.name()
+            ),
+            401,
+        );
+        return false;
+    }
+    if auth_key != expected_value {
+        auth_key_request_errors().inc();
+        rw.error(
+            &format!(
+                "The provided authKey doesn't match -{}",
+                expected_key.name()
+            ),
+            401,
+        );
+        return false;
+    }
+    true
+}
+
+/// Port of Go `httpserver.CheckBasicAuth`: validates credentials provided in
+/// the request if `-httpAuth.*` flags are set.
+///
+/// Returns true if credentials are valid or `-httpAuth.*` flags are not set.
+pub fn check_basic_auth(rw: &mut ResponseWriter, req: &Request) -> bool {
+    let expected_username = HTTP_AUTH_USERNAME.get();
+    if expected_username.is_empty() {
+        // HTTP Basic Auth is disabled.
+        return true;
+    }
+    check_basic_auth_with(rw, req, expected_username, &HTTP_AUTH_PASSWORD.get().get())
+}
+
+/// Core of [`check_basic_auth`] with explicit expected credentials, so tests
+/// can exercise it without mutating global flags.
+fn check_basic_auth_with(
+    rw: &mut ResponseWriter,
+    req: &Request,
+    expected_username: &str,
+    expected_password: &str,
+) -> bool {
+    if let Some((username, password)) = basic_auth(req) {
+        if username == expected_username && password == expected_password {
+            return true;
+        }
+        auth_basic_request_errors().inc();
+    }
+    // PORT NOTE: the realm follows the workspace-wide product rebranding
+    // (Go: `Basic realm="VictoriaMetrics"`), like the `/-/healthy` text.
+    rw.set_header("WWW-Authenticate", "Basic realm=\"Softalink LLC\"");
+    rw.error("", 401);
+    false
+}
+
+/// Port of Go `net/http` `Request.BasicAuth`: parses the `Authorization`
+/// header and returns the `(username, password)` pair on success.
+fn basic_auth(req: &Request) -> Option<(String, String)> {
+    let auth = req.header("authorization");
+    const PREFIX: &str = "Basic ";
+    if auth.len() < PREFIX.len() || !auth[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let decoded = base64_std_decode(&auth[PREFIX.len()..])?;
+    let s = String::from_utf8(decoded).ok()?;
+    let (username, password) = s.split_once(':')?;
+    Some((username.to_string(), password.to_string()))
+}
+
+/// Standard base64 decoding (RFC 4648 with mandatory padding), mirroring Go's
+/// `encoding/base64.StdEncoding.DecodeString` acceptance: any invalid
+/// character or bad padding yields `None`.
+fn base64_std_decode(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    fn val(b: u8) -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((b - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (i, chunk) in bytes.chunks(4).enumerate() {
+        let is_last = (i + 1) * 4 == bytes.len();
+        let pad = chunk.iter().filter(|&&b| b == b'=').count();
+        if pad > 2 || (pad > 0 && !is_last) {
+            return None;
+        }
+        // '=' is only allowed as trailing padding.
+        if chunk[..4 - pad].contains(&b'=') {
+            return None;
+        }
+        let mut acc: u32 = 0;
+        for &b in &chunk[..4 - pad] {
+            acc = (acc << 6) | val(b)?;
+        }
+        acc <<= 6 * pad as u32;
+        let full = [(acc >> 16) as u8, (acc >> 8) as u8, acc as u8];
+        out.extend_from_slice(&full[..3 - pad]);
+    }
+    Some(out)
+}
+
+/// Port of Go `httpserver.isProtectedByAuthFlag`: these paths must explicitly
+/// call [`check_auth_flag`] in their handlers, so the global basic-auth check
+/// is skipped for them.
+fn is_protected_by_auth_flag(path: &str) -> bool {
+    path.ends_with("/config")
+        || path.ends_with("/reload")
+        || path.ends_with("/resetRollupResultCache")
+        || path.ends_with("/delSeries")
+        || path.ends_with("/delete_series")
+        || path.ends_with("/force_merge")
+        || path.ends_with("/force_flush")
+        || path.ends_with("/snapshot")
+        || path.starts_with("/snapshot/")
+        || path.ends_with("/admin/status/metric_names_stats/reset")
+}
 
 // ---------------------------------------------------------------------------
 // Connection transport (plain TCP vs TLS)
@@ -431,6 +615,44 @@ impl<'a> Request<'a> {
         Ok(buf)
     }
 
+    /// Like [`Request::read_full_body`], but capped at `max_data_size` bytes
+    /// of decompressed data. `flag_name` is the name of the `-*.maxRequestSize`
+    /// style flag holding the cap, used in the error message.
+    ///
+    /// Port of Go `protoparserutil.ReadUncompressedData` size limiting: the
+    /// cap is enforced *during* the read (via a `max_data_size + 1` limited
+    /// reader), so a compressed decompression bomb cannot allocate unbounded
+    /// memory, and the error message matches Go's
+    /// `too big data size exceeding -<flag>=<N> bytes`. Handlers reading
+    /// bodies in bulk (Loki protobuf, DataDog, OTLP, ...) must use this
+    /// instead of `read_full_body`.
+    ///
+    /// PORT NOTE: for `zstd`/`snappy` bodies Go reads the *compressed* data
+    /// under the same cap and then decompresses in one shot with a
+    /// decompressed-size limit (`too big decompressed data size exceeding
+    /// ...`); the port decompresses in a stream and applies the cap to the
+    /// decompressed bytes, so the error wording for oversized zstd bodies is
+    /// the plain `too big data size ...` form (snappy additionally has the
+    /// 56MB block cap applied at request-parse time). Memory usage is bounded
+    /// the same way in both.
+    pub fn read_full_body_limited(
+        &mut self,
+        max_data_size: i64,
+        flag_name: &str,
+    ) -> Result<Vec<u8>, String> {
+        let max = max_data_size.max(0) as u64;
+        let mut buf = Vec::new();
+        let mut lim = (&mut self.body).take(max + 1);
+        lim.read_to_end(&mut buf)
+            .map_err(|err| format!("cannot read data: {err}"))?;
+        if buf.len() as u64 > max {
+            return Err(format!(
+                "too big data size exceeding -{flag_name}={max_data_size} bytes"
+            ));
+        }
+        Ok(buf)
+    }
+
     /// Reads one block of `\n`-delimited lines from the decompressed body.
     ///
     /// Returns `(dst, tail, eof)`: `dst` holds complete lines (delimiters
@@ -585,6 +807,34 @@ impl Read for ChunkedReader<'_> {
     }
 }
 
+/// Decodes one block-mode snappy body, mirroring Go
+/// `lib/encoding/snappy.Decode` with `maxSnappyBlockSize`: the decompressed
+/// size claimed by the block header is bounded *before* any allocation, so a
+/// small compressed body cannot claim a huge decompressed buffer
+/// (decompression bomb).
+fn decode_snappy_block(comp: &[u8]) -> io::Result<Vec<u8>> {
+    let decoded_len = snap::raw::decompress_len(comp).map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("cannot decode snappy-encoded data block: cannot read snappy header: {e}"),
+        )
+    })?;
+    if decoded_len > MAX_SNAPPY_BLOCK_SIZE {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "cannot decode snappy-encoded data block: too big data size {decoded_len} exceeding {MAX_SNAPPY_BLOCK_SIZE} bytes"
+            ),
+        ));
+    }
+    snap::raw::Decoder::new().decompress_vec(comp).map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("cannot decode snappy-encoded data block: {e}"),
+        )
+    })
+}
+
 fn make_transfer(
     reader: &mut ConnBufReader,
     chunked: bool,
@@ -616,15 +866,7 @@ fn wrap_body<'a>(t: Transfer<'a>, encoding: &str) -> io::Result<Body<'a>> {
                     ),
                 ));
             }
-            let decoded = snap::raw::Decoder::new()
-                .decompress_vec(&comp)
-                .map_err(|e| {
-                    io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!("cannot decode snappy-encoded data block: {e}"),
-                    )
-                })?;
-            Body::Buffered(io::Cursor::new(decoded))
+            Body::Buffered(io::Cursor::new(decode_snappy_block(&comp)?))
         }
         other => {
             return Err(io::Error::new(
@@ -1343,9 +1585,22 @@ fn read_request<'a>(
     let mut post_form = HashMap::new();
     let body = if is_form && has_body {
         // Read the (uncompressed) form body in full and parse it, mirroring
-        // Go's FormValue which merges query args with the POST form.
+        // Go's FormValue which merges query args with the POST form. The read
+        // is capped at Go net/http's ParseForm limit (10MB).
+        // PORT NOTE: Go swallows the "http: POST too large" error inside
+        // FormValue and serves the request with an empty form; the port
+        // rejects the request and closes the connection instead. Memory usage
+        // is bounded the same way in both.
         let mut buf = Vec::new();
-        make_transfer(reader, chunked, content_length).read_to_end(&mut buf)?;
+        make_transfer(reader, chunked, content_length)
+            .take(MAX_FORM_SIZE as u64 + 1)
+            .read_to_end(&mut buf)?;
+        if buf.len() > MAX_FORM_SIZE {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "http: POST too large",
+            ));
+        }
         post_form = parse_query(&String::from_utf8_lossy(&buf));
         Body::Buffered(io::Cursor::new(Vec::new()))
     } else if !has_body {
@@ -1370,11 +1625,31 @@ fn read_request<'a>(
     }))
 }
 
-/// Handles built-in routes; returns true if the request was served.
+/// Handles built-in routes; returns true if the request was served (including
+/// requests rejected by the auth checks — the 401 response is the service).
 ///
-/// PORT NOTE: pprof, favicon bytes and auth (`-metricsAuthKey`,
-/// `-flagsAuthKey`, `-httpAuth.*`) are omitted.
+/// PORT NOTE: pprof (`/debug/pprof/*`, `-pprofAuthKey`) and the favicon bytes
+/// are omitted.
 fn builtin_routes(req: &mut Request, rw: &mut ResponseWriter) -> bool {
+    builtin_routes_with_auth(
+        req,
+        rw,
+        METRICS_AUTH_KEY.get(),
+        FLAGS_AUTH_KEY.get(),
+        check_basic_auth,
+    )
+}
+
+/// Core of [`builtin_routes`] with explicit auth-key flags and basic-auth
+/// checker, so tests can exercise the auth wiring without mutating global
+/// flags.
+fn builtin_routes_with_auth(
+    req: &mut Request,
+    rw: &mut ResponseWriter,
+    metrics_auth_key: &Password,
+    flags_auth_key: &Password,
+    basic_auth_check: fn(&mut ResponseWriter, &Request) -> bool,
+) -> bool {
     let path = req.path();
     if path.ends_with("/favicon.ico") {
         favicon_requests().inc();
@@ -1398,6 +1673,9 @@ fn builtin_routes(req: &mut Request, rw: &mut ResponseWriter) -> bool {
         }
         "/metrics" => {
             metrics_requests().inc();
+            if !check_auth_flag_with(rw, req, metrics_auth_key, basic_auth_check) {
+                return true;
+            }
             let start_time = std::time::Instant::now();
             rw.set_header("Content-Type", "text/plain; charset=utf-8");
             let mut body = String::new();
@@ -1407,6 +1685,9 @@ fn builtin_routes(req: &mut Request, rw: &mut ResponseWriter) -> bool {
             true
         }
         "/flags" => {
+            if !check_auth_flag_with(rw, req, flags_auth_key, basic_auth_check) {
+                return true;
+            }
             rw.set_header("Content-Type", "text/plain; charset=utf-8");
             let mut buf = Vec::new();
             crate::flagutil::write_flags(&mut buf);
@@ -1425,7 +1706,12 @@ fn builtin_routes(req: &mut Request, rw: &mut ResponseWriter) -> bool {
             rw.write_str("User-agent: *\nDisallow: /\n");
             true
         }
-        _ => false,
+        _ => {
+            if !is_protected_by_auth_flag(path) && !basic_auth_check(rw, req) {
+                return true;
+            }
+            false
+        }
     }
 }
 
@@ -1456,6 +1742,28 @@ fn favicon_requests() -> &'static Arc<crate::metrics::Counter> {
 fn requests_total_all() -> &'static Arc<crate::metrics::Counter> {
     static C: LazyLock<Arc<crate::metrics::Counter>> =
         LazyLock::new(|| crate::metrics::new_counter("esm_http_requests_all_total"));
+    &C
+}
+
+/// The `esm_http_request_errors_total{path="*", reason="wrong_basic_auth"}`
+/// counter (Go `authBasicRequestErrors`).
+fn auth_basic_request_errors() -> &'static Arc<crate::metrics::Counter> {
+    static C: LazyLock<Arc<crate::metrics::Counter>> = LazyLock::new(|| {
+        crate::metrics::new_counter(
+            r#"esm_http_request_errors_total{path="*", reason="wrong_basic_auth"}"#,
+        )
+    });
+    &C
+}
+
+/// The `esm_http_request_errors_total{path="*", reason="wrong_auth_key"}`
+/// counter (Go `authKeyRequestErrors`).
+fn auth_key_request_errors() -> &'static Arc<crate::metrics::Counter> {
+    static C: LazyLock<Arc<crate::metrics::Counter>> = LazyLock::new(|| {
+        crate::metrics::new_counter(
+            r#"esm_http_request_errors_total{path="*", reason="wrong_auth_key"}"#,
+        )
+    });
     &C
 }
 
@@ -2341,5 +2649,428 @@ mod tests {
             t0.elapsed() < Duration::from_secs(10),
             "graceful shutdown with TLS enabled must not wedge"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth (basic auth + authKey flags)
+    //
+    // PORT NOTE (test provenance): upstream's auth tests
+    // (TestBasicAuthMetrics / TestAuthKeyMetrics in VictoriaMetrics
+    // lib/httpserver/httpserver_test.go) are not present in the vendored
+    // sources (`vendor/` strips `_test.go`), so the tests below port their
+    // documented scenarios against the `*_with` cores, which take the auth
+    // configuration explicitly (global `Flag` statics cannot be mutated in
+    // tests).
+    // -----------------------------------------------------------------------
+
+    fn password(name: &str, value: &str) -> Password {
+        let mut p = Password::new(name);
+        p.set(value).unwrap();
+        p
+    }
+
+    fn basic_auth_req(creds: Option<&str>) -> Request<'static> {
+        match creds {
+            None => Request::new_test("GET", "/metrics", "1.2.3.4:5", &[]),
+            Some(c) => {
+                let auth = format!("Basic {}", base64_std_encode_test(c.as_bytes()));
+                Request::new_test("GET", "/metrics", "1.2.3.4:5", &[("Authorization", &auth)])
+            }
+        }
+    }
+
+    fn base64_std_encode_test(data: &[u8]) -> String {
+        const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(TBL[(n >> 18) as usize & 63] as char);
+            out.push(TBL[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                TBL[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                TBL[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// Denies every request like `check_basic_auth` with credentials
+    /// configured and absent/wrong credentials in the request.
+    fn deny_basic_auth(rw: &mut ResponseWriter, req: &Request) -> bool {
+        check_basic_auth_with(rw, req, "user", "pass")
+    }
+
+    /// Allows every request like `check_basic_auth` with no `-httpAuth.*`
+    /// configured.
+    fn allow_basic_auth(_rw: &mut ResponseWriter, _req: &Request) -> bool {
+        true
+    }
+
+    // Port of upstream `TestBasicAuthMetrics` scenarios.
+    #[test]
+    fn test_basic_auth_metrics() {
+        // Correct credentials are accepted.
+        let req = basic_auth_req(Some("user:pass"));
+        let mut rw = ResponseWriter::new();
+        assert!(check_basic_auth_with(&mut rw, &req, "user", "pass"));
+        assert_eq!(rw.status(), 200);
+
+        // Wrong password is rejected with 401 + WWW-Authenticate.
+        let req = basic_auth_req(Some("user:wrong"));
+        let mut rw = ResponseWriter::new();
+        assert!(!check_basic_auth_with(&mut rw, &req, "user", "pass"));
+        assert_eq!(rw.status(), 401);
+        let www = rw
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("WWW-Authenticate"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(www, Some("Basic realm=\"Softalink LLC\""));
+        assert_eq!(rw.body, b"\n");
+
+        // Wrong username is rejected.
+        let req = basic_auth_req(Some("intruder:pass"));
+        let mut rw = ResponseWriter::new();
+        assert!(!check_basic_auth_with(&mut rw, &req, "user", "pass"));
+        assert_eq!(rw.status(), 401);
+
+        // Missing credentials are rejected.
+        let req = basic_auth_req(None);
+        let mut rw = ResponseWriter::new();
+        assert!(!check_basic_auth_with(&mut rw, &req, "user", "pass"));
+        assert_eq!(rw.status(), 401);
+
+        // Auth disabled (empty -httpAuth.username): everything is allowed.
+        let req = basic_auth_req(None);
+        let mut rw = ResponseWriter::new();
+        assert!(check_basic_auth(&mut rw, &req));
+    }
+
+    // Port of upstream `TestAuthKeyMetrics` scenarios.
+    #[test]
+    fn test_auth_key_metrics() {
+        let key = password("metricsAuthKey", "top-secret");
+
+        // Correct authKey (query arg) is accepted.
+        let req = Request::new_test("GET", "/metrics?authKey=top-secret", "1.2.3.4:5", &[]);
+        let mut rw = ResponseWriter::new();
+        assert!(check_auth_flag_with(&mut rw, &req, &key, deny_basic_auth));
+
+        // Missing authKey is rejected with Go's exact message.
+        let req = Request::new_test("GET", "/metrics", "1.2.3.4:5", &[]);
+        let mut rw = ResponseWriter::new();
+        assert!(!check_auth_flag_with(&mut rw, &req, &key, allow_basic_auth));
+        assert_eq!(rw.status(), 401);
+        assert_eq!(
+            rw.body,
+            b"Expected to receive non-empty authKey when -metricsAuthKey is set\n"
+        );
+
+        // Wrong authKey is rejected with Go's exact message.
+        let req = Request::new_test("GET", "/metrics?authKey=wrong", "1.2.3.4:5", &[]);
+        let mut rw = ResponseWriter::new();
+        assert!(!check_auth_flag_with(&mut rw, &req, &key, allow_basic_auth));
+        assert_eq!(rw.status(), 401);
+        assert_eq!(
+            rw.body,
+            b"The provided authKey doesn't match -metricsAuthKey\n"
+        );
+
+        // authKey set overrides basic auth: valid basic credentials without
+        // the authKey are still rejected.
+        let auth = format!("Basic {}", base64_std_encode_test(b"user:pass"));
+        let req = Request::new_test("GET", "/metrics", "1.2.3.4:5", &[("Authorization", &auth)]);
+        let mut rw = ResponseWriter::new();
+        assert!(!check_auth_flag_with(&mut rw, &req, &key, deny_basic_auth));
+        assert_eq!(rw.status(), 401);
+
+        // Empty authKey flag falls back to basic auth.
+        let empty_key = Password::new("metricsAuthKey");
+        let req = basic_auth_req(Some("user:pass"));
+        let mut rw = ResponseWriter::new();
+        assert!(check_auth_flag_with(
+            &mut rw,
+            &req,
+            &empty_key,
+            deny_basic_auth
+        ));
+        let req = basic_auth_req(Some("user:wrong"));
+        let mut rw = ResponseWriter::new();
+        assert!(!check_auth_flag_with(
+            &mut rw,
+            &req,
+            &empty_key,
+            deny_basic_auth
+        ));
+        assert_eq!(rw.status(), 401);
+    }
+
+    #[test]
+    fn test_builtin_routes_auth_wiring() {
+        let metrics_key = password("metricsAuthKey", "mk");
+        let flags_key = password("flagsAuthKey", "fk");
+        let no_key = Password::new("");
+
+        // /metrics guarded by -metricsAuthKey.
+        let mut req = Request::new_test("GET", "/metrics", "1.2.3.4:5", &[]);
+        let mut rw = ResponseWriter::new();
+        assert!(builtin_routes_with_auth(
+            &mut req,
+            &mut rw,
+            &metrics_key,
+            &flags_key,
+            allow_basic_auth
+        ));
+        assert_eq!(rw.status(), 401);
+
+        let mut req = Request::new_test("GET", "/metrics?authKey=mk", "1.2.3.4:5", &[]);
+        let mut rw = ResponseWriter::new();
+        assert!(builtin_routes_with_auth(
+            &mut req,
+            &mut rw,
+            &metrics_key,
+            &flags_key,
+            allow_basic_auth
+        ));
+        assert_eq!(rw.status(), 200);
+
+        // /flags guarded by -flagsAuthKey.
+        let mut req = Request::new_test("GET", "/flags?authKey=bad", "1.2.3.4:5", &[]);
+        let mut rw = ResponseWriter::new();
+        assert!(builtin_routes_with_auth(
+            &mut req,
+            &mut rw,
+            &metrics_key,
+            &flags_key,
+            allow_basic_auth
+        ));
+        assert_eq!(rw.status(), 401);
+        assert_eq!(
+            rw.body,
+            b"The provided authKey doesn't match -flagsAuthKey\n"
+        );
+
+        // Handler paths are guarded by basic auth: the request is "served"
+        // with a 401 and the app handler is never reached.
+        let mut req = Request::new_test("POST", "/insert/jsonline", "1.2.3.4:5", &[]);
+        let mut rw = ResponseWriter::new();
+        assert!(builtin_routes_with_auth(
+            &mut req,
+            &mut rw,
+            &no_key,
+            &no_key,
+            deny_basic_auth
+        ));
+        assert_eq!(rw.status(), 401);
+
+        // With valid credentials the request falls through to the handler.
+        let auth = format!("Basic {}", base64_std_encode_test(b"user:pass"));
+        let mut req = Request::new_test(
+            "POST",
+            "/insert/jsonline",
+            "1.2.3.4:5",
+            &[("Authorization", &auth)],
+        );
+        let mut rw = ResponseWriter::new();
+        assert!(!builtin_routes_with_auth(
+            &mut req,
+            &mut rw,
+            &no_key,
+            &no_key,
+            deny_basic_auth
+        ));
+
+        // /health stays reachable without credentials (Go serves it before
+        // the auth checks).
+        let mut req = Request::new_test("GET", "/health", "1.2.3.4:5", &[]);
+        let mut rw = ResponseWriter::new();
+        assert!(builtin_routes_with_auth(
+            &mut req,
+            &mut rw,
+            &no_key,
+            &no_key,
+            deny_basic_auth
+        ));
+        assert_eq!(rw.status(), 200);
+        assert_eq!(rw.body, b"OK");
+
+        // Paths protected by their own authKey flag skip the global basic
+        // auth (their handler calls check_auth_flag itself).
+        let mut req = Request::new_test("GET", "/internal/force_merge", "1.2.3.4:5", &[]);
+        let mut rw = ResponseWriter::new();
+        assert!(!builtin_routes_with_auth(
+            &mut req,
+            &mut rw,
+            &no_key,
+            &no_key,
+            deny_basic_auth
+        ));
+    }
+
+    #[test]
+    fn test_is_protected_by_auth_flag() {
+        assert!(is_protected_by_auth_flag("/internal/force_merge"));
+        assert!(is_protected_by_auth_flag("/internal/force_flush"));
+        assert!(is_protected_by_auth_flag("/snapshot/create"));
+        assert!(is_protected_by_auth_flag("/prefix/snapshot"));
+        assert!(is_protected_by_auth_flag("/-/reload"));
+        assert!(!is_protected_by_auth_flag("/insert/jsonline"));
+        assert!(!is_protected_by_auth_flag("/select/logsql/query"));
+        assert!(!is_protected_by_auth_flag("/internal/log_new_streams"));
+    }
+
+    #[test]
+    fn test_basic_auth_header_parsing() {
+        // dXNlcjpwYXNz == base64("user:pass")
+        let req = Request::new_test(
+            "GET",
+            "/",
+            "1.2.3.4:5",
+            &[("Authorization", "Basic dXNlcjpwYXNz")],
+        );
+        assert_eq!(
+            basic_auth(&req),
+            Some(("user".to_string(), "pass".to_string()))
+        );
+
+        // The scheme prefix is case-insensitive (Go's r.BasicAuth).
+        let req = Request::new_test(
+            "GET",
+            "/",
+            "1.2.3.4:5",
+            &[("Authorization", "basic dXNlcjpwYXNz")],
+        );
+        assert!(basic_auth(&req).is_some());
+
+        // Missing colon, invalid base64 and non-Basic schemes are rejected.
+        let req = Request::new_test(
+            "GET",
+            "/",
+            "1.2.3.4:5",
+            &[("Authorization", "Basic dXNlcg==")],
+        );
+        assert_eq!(basic_auth(&req), None);
+        let req = Request::new_test("GET", "/", "1.2.3.4:5", &[("Authorization", "Basic !!!!")]);
+        assert_eq!(basic_auth(&req), None);
+        let req = Request::new_test("GET", "/", "1.2.3.4:5", &[("Authorization", "Bearer xyz")]);
+        assert_eq!(basic_auth(&req), None);
+        let req = Request::new_test("GET", "/", "1.2.3.4:5", &[]);
+        assert_eq!(basic_auth(&req), None);
+    }
+
+    #[test]
+    fn test_base64_std_decode() {
+        assert_eq!(base64_std_decode("dXNlcjpwYXNz").unwrap(), b"user:pass");
+        assert_eq!(base64_std_decode("").unwrap(), b"");
+        assert_eq!(base64_std_decode("Zg==").unwrap(), b"f");
+        assert_eq!(base64_std_decode("Zm8=").unwrap(), b"fo");
+        assert_eq!(base64_std_decode("Zm9v").unwrap(), b"foo");
+        // Unpadded, misplaced padding and invalid chars are rejected.
+        assert_eq!(base64_std_decode("Zg"), None);
+        assert_eq!(base64_std_decode("Z==="), None);
+        assert_eq!(base64_std_decode("Zg==Zg=="), None);
+        assert_eq!(base64_std_decode("Zm9!"), None);
+        // Round-trip against the encoder used by the tests.
+        for len in 0..32 {
+            let data: Vec<u8> = (0..len as u8).collect();
+            let enc = base64_std_encode_test(&data);
+            assert_eq!(base64_std_decode(&enc).unwrap(), data, "len={len}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Request-body size caps
+    // -----------------------------------------------------------------------
+
+    fn buffered_body_req(data: &[u8]) -> Request<'static> {
+        let mut req = Request::new_test("POST", "/insert", "1.2.3.4:5", &[]);
+        req.body = Body::Buffered(io::Cursor::new(data.to_vec()));
+        req
+    }
+
+    #[test]
+    fn test_read_full_body_limited() {
+        // Under the cap: full body returned.
+        let mut req = buffered_body_req(b"0123456789");
+        assert_eq!(
+            req.read_full_body_limited(10, "insert.maxRequestSize")
+                .unwrap(),
+            b"0123456789"
+        );
+
+        // Over the cap: Go's exact error wording, read stops at cap+1 bytes.
+        let mut req = buffered_body_req(&[b'x'; 100]);
+        let err = req
+            .read_full_body_limited(64, "insert.maxRequestSize")
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "too big data size exceeding -insert.maxRequestSize=64 bytes"
+        );
+    }
+
+    #[test]
+    fn test_decode_snappy_block_bomb_rejected() {
+        // A snappy block whose header claims ~4GB decompressed size must be
+        // rejected before any allocation happens.
+        let mut bomb = Vec::new();
+        // varint(0xF0000000) = 5-byte varint claiming a ~3.75GB block.
+        bomb.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x0F]);
+        bomb.extend_from_slice(&[0u8; 16]);
+        let err = decode_snappy_block(&bomb).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("cannot decode snappy-encoded data block: too big data size"),
+            "unexpected error: {err}"
+        );
+
+        // A legitimate block still round-trips.
+        let plain = b"snappy block payload".repeat(10);
+        let comp = snap::raw::Encoder::new().compress_vec(&plain).unwrap();
+        assert_eq!(decode_snappy_block(&comp).unwrap(), plain);
+    }
+
+    #[test]
+    fn test_post_form_too_large_rejected() {
+        // A urlencoded POST form beyond Go's 10MB ParseForm cap must not be
+        // buffered; the connection is closed with no response.
+        let srv = start_echo_server();
+        let addr = srv.local_addr();
+        let mut s = TcpStream::connect(addr).unwrap();
+        let body_len = MAX_FORM_SIZE + 2;
+        write!(
+            s,
+            "POST /x HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {body_len}\r\n\r\n"
+        )
+        .unwrap();
+        let chunk = vec![b'a'; 64 * 1024];
+        let mut sent = 0;
+        while sent < body_len {
+            let n = (body_len - sent).min(chunk.len());
+            if s.write_all(&chunk[..n]).is_err() {
+                break; // server already closed the connection — accepted
+            }
+            sent += n;
+        }
+        let _ = s.flush();
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        assert!(
+            buf.is_empty(),
+            "expected the connection to close without a response, got: {:?}",
+            String::from_utf8_lossy(&buf[..buf.len().min(120)])
+        );
+        srv.stop();
     }
 }

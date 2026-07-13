@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
 use std::panic::Location;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Once, OnceLock, mpsc};
 
 use crate::flagutil::{Flag, go_quote};
@@ -29,8 +29,10 @@ static LOGGER_OUTPUT: Flag<String> = Flag::new(
     "Output for the logs. Supported values: stderr, stdout",
     || "stderr".to_string(),
 );
-// PORT NOTE: Go supports arbitrary IANA timezones here; this port keeps UTC
-// only for now, so any other value fails in init().
+// PORT NOTE: Go loads any IANA timezone via time.LoadLocation (with embedded
+// tzdata); the port has no IANA tzdb dependency, so only "UTC" (also ""),
+// and "Local" are supported — named zones are a fatal init error like Go's
+// unknown-zone Fatalf. See init_timezone().
 static LOGGER_TIMEZONE: Flag<String> = Flag::new(
     "loggerTimezone",
     "Timezone to use for timestamps in logs. Timezone must be a valid IANA Time Zone. \
@@ -144,13 +146,28 @@ fn init_internal(log_flags: bool) {
     }
 }
 
+/// UTC offset of the `-loggerTimezone` zone in seconds, applied to log
+/// timestamps. Zero (UTC) until init_timezone() runs, like Go's
+/// `var timezone = time.UTC`.
+static TIMEZONE_OFFSET_SECS: AtomicI64 = AtomicI64::new(0);
+
 // PORT NOTE: Go loads the -loggerTimezone IANA timezone via time.LoadLocation
-// (with embedded tzdata). This port keeps UTC only for now.
+// (with embedded tzdata). The port has no IANA tzdb dependency, so it
+// supports "UTC" (and "", which LoadLocation also treats as UTC) and "Local".
+// "Local" uses the OS zone offset sampled at startup, so unlike Go a DST
+// transition during the process lifetime does not shift later timestamps.
+// Any other zone name is a fatal init error (Go fatals only on UNKNOWN
+// zones).
 fn init_timezone() {
-    let tz = LOGGER_TIMEZONE.get();
-    if tz != "UTC" {
-        panic!("cannot load timezone {tz:?}: only UTC is supported in this port");
-    }
+    let tz = LOGGER_TIMEZONE.get().as_str();
+    let offset_secs = match tz {
+        "UTC" | "" => 0,
+        "Local" => crate::timeutil::get_local_timezone_offset_nsecs() / 1_000_000_000,
+        _ => panic!(
+            "cannot load timezone {tz:?}: named IANA timezones need a tzdb, which this port does not bundle; supported values: UTC, Local"
+        ),
+    };
+    TIMEZONE_OFFSET_SECS.store(offset_secs, Ordering::Relaxed);
 }
 
 fn validate_logger_level() {
@@ -432,16 +449,32 @@ fn compose_log_msg(
 }
 
 /// Formats the current time like Go's "2006-01-02T15:04:05.000Z0700" layout
-/// in UTC.
+/// in the `-loggerTimezone` zone (see init_timezone()).
 fn now_timestamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    format!(
-        "{}.{:03}Z",
-        format_utc_timestamp(now.as_secs()),
-        now.subsec_millis()
+    timestamp_with_offset(
+        now.as_secs(),
+        now.subsec_millis(),
+        TIMEZONE_OFFSET_SECS.load(Ordering::Relaxed),
     )
+}
+
+/// Renders `secs`/`millis` since the epoch in Go's
+/// "2006-01-02T15:04:05.000Z0700" layout at the given UTC offset: `Z` for a
+/// zero offset, `+hhmm`/`-hhmm` otherwise, like Go's `Z0700` verb.
+fn timestamp_with_offset(secs: u64, millis: u32, offset_secs: i64) -> String {
+    let local_secs = (secs as i64 + offset_secs).max(0) as u64;
+    let mut out = format!("{}.{millis:03}", format_utc_timestamp(local_secs));
+    if offset_secs == 0 {
+        out.push('Z');
+    } else {
+        let mins = offset_secs / 60;
+        out.push(if mins < 0 { '-' } else { '+' });
+        out.push_str(&format!("{:02}{:02}", mins.abs() / 60, mins.abs() % 60));
+    }
+    out
 }
 
 /// Port of Go `logger.formatLogMessage`: renders `format` with `args`,
@@ -764,6 +797,24 @@ mod tests {
             &[&"abcde", &"foo bar baz", &"xx"],
             4,
             "foo: a..e, \"f..z\", xx",
+        );
+    }
+
+    #[test]
+    fn test_timestamp_with_offset() {
+        // Go's "2006-01-02T15:04:05.000Z0700" layout: "Z" at zero offset,
+        // ±hhmm otherwise (2021-01-02T03:04:05 UTC = 1609556645).
+        assert_eq!(
+            timestamp_with_offset(1_609_556_645, 7, 0),
+            "2021-01-02T03:04:05.007Z"
+        );
+        assert_eq!(
+            timestamp_with_offset(1_609_556_645, 7, 5 * 3600 + 30 * 60),
+            "2021-01-02T08:34:05.007+0530"
+        );
+        assert_eq!(
+            timestamp_with_offset(1_609_556_645, 7, -8 * 3600),
+            "2021-01-01T19:04:05.007-0800"
         );
     }
 

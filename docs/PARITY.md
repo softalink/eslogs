@@ -250,6 +250,32 @@ port can behave observably differently from upstream Go v1.51.0. Items marked
 *(verify)* are classified conservatively — they could not be proven identical
 and belong here until proven otherwise.
 
+> **Ledger-closure wave (2026-07-13).** A subsequent wave closed a large batch
+> of section-(a) items: HTTP basic-auth/`-*AuthKey` enforcement; per-protocol
+> ingestion size caps + `CanWriteData` low-disk rejection + the
+> write-concurrency limiter; `replace`/`replace_regexp` `if (...)`; the
+> `rate()`/`rate_sum()` step init; `stats switch(...)`; `hiddenFieldsFilter`;
+> And/Or/Not paren rendering (fixing the facets re-parse wrong-result case);
+> filter/join/union **subquery propagation** (`Query::visit_subqueries` +
+> `AddTimeFilter`/`AddExtraFilters` descent); the regexutil Unicode
+> fold/`\p{}`/`\b` gaps; `pattern.rs` `\x`≥0x80 + the full HTML-entity table;
+> repeated-flag semantics, negative durations, `$__interval`, `-loggerTimezone`
+> (UTC/Local), the `-memory.allowedBytes` size suffixes; the missing
+> `process_*`/`filestream`/`fs` metric series; the internalselect concurrency
+> limiter; and eslogscli Ctrl+C query cancellation. Each is annotated at its
+> site. **Three items landed only partially and remain open** (still section-(a)):
+> (1) **log deletion of stream-filtered rows** — the merge-time drop path is
+> ported and works for non-stream filters, but `DropFilterCtx` does not resolve
+> `{…}` stream filters against the partition indexdb, so stream-matched rows
+> survive a delete (`storage.rs`; the full Go delete test is `#[ignore]`d);
+> (2) **syslog idle-connection periodic flush** — `flush_if_idle` is ported but
+> not yet driven by a per-connection flusher thread (idle stream conns flush on
+> buffer-fill/disconnect only); (3) **iff-nested subquery propagation** — a
+> pipe's `if (...)` filter containing `in(subquery)` is not visited by
+> `visit_subqueries` (`filter_has_subqueries` is the ported-but-unwired guard).
+> A future audit should re-verify the remaining entries below against shifted
+> line numbers.
+
 ### (a) Observable behavioral divergences
 
 **Query semantics (esl-logstorage)**

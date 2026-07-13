@@ -101,9 +101,9 @@ fn test_parse_query_basic_filters() {
     ok(r#"not foo:"""#, r#"!foo:"""#);
     ok("not(foo)", "!foo");
     ok("not (foo)", "!foo");
-    // PORT NOTE: cases like `not (foo or bar)` -> `!(foo or bar)` need Go's
-    // composite-child parenthesization in `filterNot`/`filterAnd` `String()`,
-    // which the (frozen) filter_*.rs Display impls omit. Excluded here.
+    ok("not ( foo or bar )", "!(foo or bar)");
+    ok("!(foo or bar)", "!(foo or bar)");
+    ok("-(foo or bar)", "!(foo or bar)");
     ok(r#"foo:!"""#, r#"!foo:"""#);
     ok("_msg:foo", "foo");
     ok("'foo:bar'", r#""foo:bar""#);
@@ -119,34 +119,66 @@ fn test_parse_query_basic_filters() {
     ok("not foo", "!foo");
     ok("! foo", "!foo");
     ok("- foo", "!foo");
+    ok("not !`foo bar`", r#""foo bar""#);
+    ok("not -`foo bar`", r#""foo bar""#);
     ok("foo:!bar", "!foo:bar");
     ok("foo:-bar", "!foo:bar");
 }
 
 #[test]
 fn test_parse_query_boolean_groups() {
-    // PORT NOTE: cases whose expected `String()` contains disambiguating parens
-    // around a composite child (e.g. `foo bar (baz or ...) zz`) are excluded:
-    // the frozen filter_and/filter_or/filter_not Display impls do not add them
-    // (Go does). Only flat/no-wrap cases are asserted here.
     ok("foo or bar and not baz", "foo or bar !baz");
     ok("'foo bar' !baz", r#""foo bar" !baz"#);
     ok(
         "foo and bar and baz or x or y or z and zz",
         "foo bar baz or x or y or z zz",
     );
+    ok(
+        "foo and bar and (baz or x or y or z) and zz",
+        "foo bar (baz or x or y or z) zz",
+    );
+    ok(
+        "(foo or bar or baz) and x and y and (z or zz)",
+        "(foo or bar or baz) x y (z or zz)",
+    );
+    ok(
+        "(foo or bar or baz) and x and y and not (z or zz)",
+        "(foo or bar or baz) x y !(z or zz)",
+    );
     ok("NOT foo AND bar OR baz", "!foo bar or baz");
+    ok("NOT (foo AND bar) OR baz", "!(foo bar) or baz");
     ok("foo OR bar AND baz", "foo or bar baz");
     ok("foo bar or baz xyz", "foo bar or baz xyz");
+    ok("foo (bar or baz) xyz", "foo (bar or baz) xyz");
     ok("foo or bar baz or xyz", "foo or bar baz or xyz");
-    // PORT NOTE: cases needing a phrase equal to a pipe/stats-func name to be
-    // re-quoted (e.g. `'stats' foo` -> `"stats" foo`) are excluded: the frozen
-    // filter_phrase Display uses stream_filter's quoter, which (per its own PORT
-    // NOTE) omits the isPipeName/isStatsFuncName checks the parser's quoter has.
+    ok("(foo or bar) (baz or xyz)", "(foo or bar) (baz or xyz)");
+    ok("(foo OR bar) AND baz", "(foo or bar) baz");
+    ok("'stats' foo", r#""stats" foo"#);
+    ok("'stats_remote' abc", r#""stats_remote" abc"#);
+    ok(
+        r#""filter" bar copy fields avg baz"#,
+        r#""filter" bar "copy" "fields" "avg" baz"#,
+    );
     ok(
         "foo:(bar baz or not :xxx)",
         r#"foo:bar foo:baz or !foo:":xxx""#,
     );
+    ok(
+        "(foo:bar and (foo:baz or aa:bb) and xx) and y",
+        "foo:bar (foo:baz or aa:bb) xx y",
+    );
+    ok("level:error and _msg:(a or b)", "level:error (a or b)");
+    ok(
+        "level: ( ((error or warn*) and re(foo))) (not (bar))",
+        "(level:error or level:warn*) level:~foo !bar",
+    );
+    ok("!(foo bar or baz and not aa*)", "!(foo bar or baz !aa*)");
+    // nested AND filters
+    ok("(foo AND bar) AND (baz AND x:y)", "foo bar baz x:y");
+    ok("(foo AND bar) OR (baz AND x:y)", "foo bar or baz x:y");
+    // nested OR filters
+    ok("(foo OR bar) OR (baz OR x:y)", "foo or bar or baz or x:y");
+    ok("(foo OR bar) AND (baz OR x:y)", "(foo or bar) (baz or x:y)");
 }
 
 #[test]

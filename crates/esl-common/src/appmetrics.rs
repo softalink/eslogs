@@ -47,6 +47,12 @@ fn init_expose_metadata() {
 pub fn init_start_time() {
     LazyLock::force(&START_TIME);
     metrics::init_process_metrics();
+    // Register the series Go registers at package init (lib/cgroup,
+    // lib/memory, lib/filestream, lib/fs).
+    cgroup::register_metrics();
+    memory::register_metrics();
+    crate::filestream::register_metrics();
+    crate::fs::register_metrics();
 }
 
 static START_TIME: LazyLock<(Instant, u64)> = LazyLock::new(|| {
@@ -198,6 +204,15 @@ mod tests {
             "esm_app_start_timestamp ",
             "esm_app_uptime_seconds ",
             "esm_flag{name=\"metrics.exposeMetadata\", value=\"false\", is_set=\"false\"} 1",
+            // Registered by init_start_time (Go registers them at package
+            // init in lib/cgroup, lib/memory, lib/filestream, lib/fs).
+            "process_cpu_cores_available ",
+            "process_memory_limit_bytes ",
+            "esm_filestream_readers ",
+            "esm_filestream_writers ",
+            "esm_fs_readers ",
+            "esm_mmapped_files ",
+            "esm_nfs_pending_dirs_to_remove ",
         ] {
             assert!(bb.contains(needle), "missing {needle:?} in\n{bb}");
         }

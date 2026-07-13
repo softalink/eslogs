@@ -3,10 +3,12 @@
 //! Uses Welford's online algorithm (as in Go / ClickHouse). See
 //! [`crate::stats_min`] for the config-capture PORT NOTE.
 //!
-//! PORT NOTE — output format. Go writes the result with
-//! `strconv.AppendFloat(dst, stddev, 'f', -1, 64)` (never exponential). This
-//! port uses Rust's shortest round-trip `Display`, which agrees for normal
-//! magnitudes but may emit exponential form for very large/small values.
+//! Output format: Go writes the result with
+//! `strconv.AppendFloat(dst, stddev, 'f', -1, 64)` (shortest round-trip,
+//! never exponential). Rust's f64 `Display` produces digit-identical output
+//! for all finite values (verified against Go across extreme magnitudes,
+//! e.g. 1e±300); non-finite values are spelled via
+//! [`marshal_float64_string`] ("NaN"/"+Inf"/"-Inf", matching Go).
 
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
@@ -15,7 +17,7 @@ use crate::block_result::BlockResult;
 use crate::prefix_filter::Filter;
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::stats_min::{field_names_string, get_matching_columns};
-use crate::values_encoder::{marshal_float64, unmarshal_float64};
+use crate::values_encoder::{marshal_float64, marshal_float64_string, unmarshal_float64};
 
 /// Port of `statsStddev`.
 pub(crate) struct StatsStddev {
@@ -137,7 +139,7 @@ impl StatsProcessor for StatsStddevProcessor {
 
     fn finalize_stats(&self, _sf: &dyn StatsFunc, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
         let stddev = (self.q / self.count).sqrt();
-        dst.extend_from_slice(format!("{stddev}").as_bytes());
+        marshal_float64_string(dst, stddev);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -181,6 +183,38 @@ mod tests {
     fn test_stddev_zero() {
         let block = vec![vec![field("a", "5")], vec![field("a", "5")]];
         assert_eq!(run(&["a"], &block), "0");
+    }
+
+    /// Extreme magnitudes render like Go `strconv.AppendFloat(.., 'f', -1,
+    /// 64)`: full decimal digits (never exponent form), and Go's spellings
+    /// for non-finite results.
+    #[test]
+    fn test_stddev_extreme_magnitude_rendering() {
+        // Two samples 0 and 2^501 (exactly representable): stddev =
+        // sqrt((2^501 * 2^500) / 2) = 2^500, rendered in Go's `'f'` prec=-1
+        // shortest-round-trip form (17 significant digits + trailing zeros,
+        // NOT the exact 151-digit integer expansion).
+        let mut sp = StatsStddevProcessor {
+            field_filters: vec!["a".to_string()],
+            avg: 0.0,
+            q: 0.0,
+            count: 0.0,
+        };
+        sp.update_state(0.0);
+        sp.update_state((2.0f64).powi(501));
+        let sf = new_stats_stddev(vec!["a".to_string()]);
+        let mut dst = Vec::new();
+        sp.finalize_stats(&sf, &mut dst, None);
+        assert_eq!(
+            String::from_utf8(dst).unwrap(),
+            "3273390607896142000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        );
+
+        // Overflowed q → +Inf stddev, spelled like Go.
+        sp.q = f64::INFINITY;
+        let mut dst = Vec::new();
+        sp.finalize_stats(&sf, &mut dst, None);
+        assert_eq!(String::from_utf8(dst).unwrap(), "+Inf");
     }
 
     #[test]

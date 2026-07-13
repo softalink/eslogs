@@ -1,11 +1,12 @@
 //! Port of Softalink LLC `lib/fs/dir_remover.go`.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{is_path_exist, must_read_dir, must_sync_path};
+use crate::metrics::Counter;
 use crate::{errorf, fatalf, panicf};
 
 // directories with this filename are scheduled to be removed by must_remove_dir().
@@ -219,7 +220,7 @@ pub(crate) fn try_remove_dir(dir_path: &Path) -> bool {
         });
     }
     if must_retry.load(Ordering::SeqCst) {
-        NFS_DIR_REMOVE_FAILED_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        NFS_DIR_REMOVE_FAILED_ATTEMPTS.inc();
         return false;
     }
     // Make sure the deleted names are properly synced to the dir_path,
@@ -228,7 +229,7 @@ pub(crate) fn try_remove_dir(dir_path: &Path) -> bool {
 
     // New stale NFS files may have appeared since the loop
     if has_stale_nfs_files(dir_path) {
-        NFS_DIR_REMOVE_FAILED_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        NFS_DIR_REMOVE_FAILED_ATTEMPTS.inc();
         return false;
     }
 
@@ -262,7 +263,28 @@ static DIR_REMOVER: DirRemoverState = DirRemoverState {
     cv: Condvar::new(),
 };
 
-static NFS_DIR_REMOVE_FAILED_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+// The `vm_nfs_*` package-level metric vars from dir_remover.go, rebranded
+// `esm_nfs_*` (Go registers them at package init; the port registers them
+// from `appmetrics::init_start_time` or lazily on first use).
+static NFS_DIR_REMOVE_FAILED_ATTEMPTS: LazyLock<Arc<Counter>> =
+    LazyLock::new(|| crate::metrics::new_counter("esm_nfs_dir_remove_failed_attempts_total"));
+
+/// Registers the `esm_nfs_*` series in the default metrics set.
+pub(crate) fn register_metrics() {
+    LazyLock::force(&NFS_DIR_REMOVE_FAILED_ATTEMPTS);
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        crate::metrics::new_gauge(
+            "esm_nfs_pending_dirs_to_remove",
+            Some(Box::new(|| {
+                *DIR_REMOVER
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) as f64
+            })),
+        );
+    });
+}
 
 const REMOVE_DIR_QUEUE_LIMIT: usize = 1024;
 

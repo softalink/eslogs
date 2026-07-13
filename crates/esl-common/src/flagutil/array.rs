@@ -1,18 +1,43 @@
 //! Port of Softalink LLC `lib/flagutil/array.go`.
 //!
 //! Array-valued flags: comma-separated values with single-quote/double-quote/
-//! `{}`/`[]`/`()` aware splitting.
-//!
-//! PORT NOTE: Go array flags also append on repeated `-foo=...` occurrences;
-//! the raw-map parser in `flagutil` keeps only the last occurrence, so use
-//! comma-separated values or call `set()` multiple times.
+//! `{}`/`[]`/`()` aware splitting. Repeated `-foo=...` occurrences append,
+//! like Go (`set_flag_occurrences` calls `set()` once per occurrence, the
+//! same way Go's `flag.Parse` calls `flag.Value.Set`).
 
 use std::fmt;
 use std::time::Duration;
 
 use super::duration::{format_go_duration, parse_go_duration};
 use super::go_quote;
-use super::{Bytes, FlagValue};
+use super::{Bytes, FlagParseError, FlagValue};
+
+/// Implements `FlagValue` for an array-valued flag type: repeated
+/// command-line occurrences append via `set()`, like Go array flags.
+macro_rules! impl_array_flag_value {
+    ($t:ty) => {
+        impl FlagValue for $t {
+            fn parse_flag(s: &str) -> Result<Self, String> {
+                let mut a = <$t>::default();
+                a.set(s)?;
+                Ok(a)
+            }
+
+            fn set_flag_occurrences(
+                &mut self,
+                occurrences: &[String],
+            ) -> Result<(), FlagParseError> {
+                for s in occurrences {
+                    self.set(s).map_err(|err| FlagParseError {
+                        value: s.clone(),
+                        err,
+                    })?;
+                }
+                Ok(())
+            }
+        }
+    };
+}
 
 /// A flag that holds an array of strings.
 ///
@@ -71,13 +96,7 @@ impl fmt::Display for ArrayString {
     }
 }
 
-impl FlagValue for ArrayString {
-    fn parse_flag(s: &str) -> Result<Self, String> {
-        let mut a = ArrayString::default();
-        a.set(s)?;
-        Ok(a)
-    }
-}
+impl_array_flag_value!(ArrayString);
 
 pub(crate) fn parse_array_values(s: &str) -> Vec<String> {
     if s.is_empty() {
@@ -201,8 +220,13 @@ fn trailing_backslashes_count(s: &str) -> usize {
 
 /// Unquotes a double-quoted string like Go's `strconv.Unquote`.
 ///
-/// PORT NOTE: `\xHH` escapes are decoded to the corresponding Unicode scalar
-/// value instead of a raw byte, since Rust strings must stay valid UTF-8.
+/// PORT NOTE: `\xHH` and octal escapes with values >= 0x80 are decoded to the
+/// corresponding Unicode scalar instead of Go's raw byte, since Rust strings
+/// must stay valid UTF-8: Go `strconv.Unquote("\"a\\x80b\"")` yields the
+/// bytes `61 80 62` (invalid UTF-8), while this port yields `a\u{80}b`
+/// (`61 c2 80 62`). Matching Go exactly would require byte-valued flag
+/// strings (`Vec<u8>`) throughout the flag layer. Escapes < 0x80 are
+/// identical.
 pub(crate) fn go_unquote(s: &str) -> Result<String, ()> {
     let b = s.as_bytes();
     if b.len() < 2 || b[0] != b'"' || b[b.len() - 1] != b'"' {
@@ -317,13 +341,7 @@ impl fmt::Display for ArrayBool {
     }
 }
 
-impl FlagValue for ArrayBool {
-    fn parse_flag(s: &str) -> Result<Self, String> {
-        let mut a = ArrayBool::default();
-        a.set(s)?;
-        Ok(a)
-    }
-}
+impl_array_flag_value!(ArrayBool);
 
 /// A flag that holds an array of `time.Duration` values.
 ///
@@ -373,20 +391,26 @@ impl ArrayDuration {
     /// Returns the optional arg under the given `arg_idx`, or the default
     /// value if `arg_idx` is not found.
     ///
-    /// PORT NOTE: negative durations (allowed by Go `time.ParseDuration`) are
-    /// clamped to zero, since `std::time::Duration` is unsigned.
+    /// PORT NOTE: negative durations (allowed by Go `time.ParseDuration`,
+    /// e.g. `-foo=-5s`) are clamped to zero here, since `std::time::Duration`
+    /// is unsigned. Callers that need Go's signed `time.Duration` semantics
+    /// must use [`ArrayDuration::get_optional_arg_nanos`] instead.
     pub fn get_optional_arg(&self, arg_idx: usize) -> Duration {
+        Duration::from_nanos(self.get_optional_arg_nanos(arg_idx).max(0) as u64)
+    }
+
+    /// Returns the optional arg under the given `arg_idx` in nanoseconds
+    /// (signed, like Go `time.Duration`), or the default value if `arg_idx`
+    /// is not found. Exact port of Go `ArrayDuration.GetOptionalArg`.
+    pub fn get_optional_arg_nanos(&self, arg_idx: usize) -> i64 {
         let x = &self.a;
-        let nanos = if arg_idx >= x.len() {
+        if arg_idx >= x.len() {
             if x.len() == 1 {
-                x[0]
-            } else {
-                self.default_value_nanos
+                return x[0];
             }
-        } else {
-            x[arg_idx]
-        };
-        Duration::from_nanos(nanos.max(0) as u64)
+            return self.default_value_nanos;
+        }
+        x[arg_idx]
     }
 }
 
@@ -397,13 +421,7 @@ impl fmt::Display for ArrayDuration {
     }
 }
 
-impl FlagValue for ArrayDuration {
-    fn parse_flag(s: &str) -> Result<Self, String> {
-        let mut a = ArrayDuration::default();
-        a.set(s)?;
-        Ok(a)
-    }
-}
+impl_array_flag_value!(ArrayDuration);
 
 /// A flag that holds an array of ints.
 ///
@@ -467,13 +485,7 @@ impl fmt::Display for ArrayInt {
     }
 }
 
-impl FlagValue for ArrayInt {
-    fn parse_flag(s: &str) -> Result<Self, String> {
-        let mut a = ArrayInt::default();
-        a.set(s)?;
-        Ok(a)
-    }
-}
+impl_array_flag_value!(ArrayInt);
 
 /// A flag that holds an array of [`Bytes`].
 ///
@@ -541,13 +553,7 @@ impl fmt::Display for ArrayBytes {
     }
 }
 
-impl FlagValue for ArrayBytes {
-    fn parse_flag(s: &str) -> Result<Self, String> {
-        let mut a = ArrayBytes::default();
-        a.set(s)?;
-        Ok(a)
-    }
-}
+impl_array_flag_value!(ArrayBytes);
 
 #[cfg(test)]
 mod tests {
@@ -628,6 +634,71 @@ mod tests {
         // Special chars inside double quotes
         f(r#""foo,b\nar""#, r#""foo,b\nar""#);
         f(r#""foo\x23bar""#, "foo\u{23}bar");
+    }
+
+    #[test]
+    fn test_go_unquote_high_byte_escapes() {
+        // PORT NOTE divergence pin: Go strconv.Unquote emits the raw byte for
+        // \xHH/octal escapes >= 0x80 (here bytes 61 80 62); Rust strings must
+        // stay valid UTF-8, so the port yields the Unicode scalar U+0080
+        // (bytes 61 c2 80 62).
+        assert_eq!(go_unquote(r#""a\x80b""#), Ok("a\u{80}b".to_string()));
+        assert_eq!(go_unquote(r#""a\200b""#), Ok("a\u{80}b".to_string()));
+        // Escapes < 0x80 are byte-identical with Go.
+        assert_eq!(go_unquote(r#""a\x7fb""#), Ok("a\u{7f}b".to_string()));
+        assert_eq!(go_unquote(r#""a\101b""#), Ok("aAb".to_string()));
+    }
+
+    #[test]
+    fn test_array_flags_append_across_occurrences() {
+        // Go's flag.Parse calls Set once per `-foo=...` occurrence; array
+        // flags append. Mirrors TestArrayString/TestArrayDuration/... driving
+        // repeated os.Args entries through flag.Parse.
+        fn occ(list: &[&str]) -> Vec<String> {
+            list.iter().map(|s| s.to_string()).collect()
+        }
+
+        let mut a = ArrayString::default();
+        a.set_flag_occurrences(&occ(&["foo", "bar,baz"])).unwrap();
+        assert_eq!(
+            a.0,
+            vec!["foo".to_string(), "bar".to_string(), "baz".to_string()]
+        );
+
+        let mut d = ArrayDuration::with_default(Duration::from_secs(42));
+        d.set_flag_occurrences(&occ(&["10s", "5m,"])).unwrap();
+        assert_eq!(d.to_string(), "10s,5m0s,42s");
+
+        let mut b = ArrayBool::default();
+        b.set_flag_occurrences(&occ(&["true", "false,true"]))
+            .unwrap();
+        assert_eq!(b.0, vec![true, false, true]);
+
+        let mut i = ArrayInt::with_default(7);
+        i.set_flag_occurrences(&occ(&["1,2", "3"])).unwrap();
+        assert_eq!(i.values(), &[1, 2, 3]);
+
+        let mut y = ArrayBytes::with_default(42);
+        y.set_flag_occurrences(&occ(&["10MB", "23"])).unwrap();
+        assert_eq!(y.to_string(), "10MB,23");
+
+        // An invalid occurrence errors with the offending raw value, like Go.
+        let mut i = ArrayInt::with_default(7);
+        let err = i.set_flag_occurrences(&occ(&["1", "oops"])).unwrap_err();
+        assert_eq!(err.value, "oops");
+    }
+
+    #[test]
+    fn test_array_duration_negative_values() {
+        // Go time.ParseDuration accepts negative durations and
+        // GetOptionalArg returns them as-is; the Duration-returning
+        // convenience accessor clamps to zero (PORT NOTE at the site).
+        let mut a = ArrayDuration::with_default(Duration::from_secs(42));
+        a.set("-5s,1m").unwrap();
+        assert_eq!(a.get_optional_arg_nanos(0), -5_000_000_000);
+        assert_eq!(a.get_optional_arg_nanos(1), 60_000_000_000);
+        assert_eq!(a.get_optional_arg(0), Duration::ZERO);
+        assert_eq!(a.to_string(), "-5s,1m0s");
     }
 
     #[test]

@@ -3,34 +3,26 @@
 //!
 //! See <https://docs.victoriametrics.com/victorialogs/logsql/#replace-pipe>.
 //!
-//! PORT NOTE — `iff` (`ifFilter`): Go's `pipeReplace` carries an optional
-//! `if (...)` filter that gates which rows get updated. `ifFilter` is not ported
-//! yet, so the `if` clause is dropped: the processor applies the replacement to
-//! every row (identical to Go when `iff == nil`), `String()` omits the `if`
-//! part, and `update_needed_fields` is a no-op (Go's
-//! `updateNeededFieldsForUpdatePipe` is also a no-op when `iff == nil`).
-//!
-//! PORT NOTE — parser: `parsePipeReplace` depends on the query lexer, which is
-//! not ported. The `pub(crate)` [`PipeReplace::new`] constructor is exposed for
-//! a future parser to call; the lexer-driven parse is deferred.
-//!
-//! PORT NOTE — shared update processor: Go routes replacement through
-//! `newPipeUpdateProcessor` (`pipe_update.go`). That shared helper is not ported
-//! here; its per-row logic (with consecutive-duplicate caching) is inlined into
-//! [`PipeReplaceProcessor`].
+//! Like Go, row processing goes through the shared
+//! [`crate::pipe_update::new_pipe_update_processor`] machinery, which honors
+//! the optional `if (...)` clause (rows not matching the filter keep their
+//! original value). The lexer-driven parse lives in
+//! `parser::parse_pipe::parse_pipe_replace`.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::block_result::{BlockResult, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
+use crate::pipe_update::{
+    IfFilter, UpdateFunc, new_pipe_update_processor, update_needed_fields_for_update_pipe,
+};
 use crate::prefix_filter;
 use crate::stream_filter::quote_token_if_needed;
 
-/// `| replace (old, new) [at field] [limit N]` pipe.
+/// `| replace [if (...)] (old, new) [at field] [limit N]` pipe.
 ///
 /// Port of Go's `pipeReplace`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PipeReplace {
     /// The field whose value is rewritten (defaults to `_msg`).
     pub(crate) field: String,
@@ -40,6 +32,8 @@ pub(crate) struct PipeReplace {
     pub(crate) new_substr: String,
     /// Maximum number of replacements per value (0 = unlimited).
     pub(crate) limit: u64,
+    /// Optional `if (...)` filter for skipping the replace operation (Go `iff`).
+    pub(crate) iff: Option<Arc<IfFilter>>,
 }
 
 impl PipeReplace {
@@ -49,12 +43,14 @@ impl PipeReplace {
         old_substr: impl Into<String>,
         new_substr: impl Into<String>,
         limit: u64,
+        iff: Option<Arc<IfFilter>>,
     ) -> Self {
         Self {
             field: field.into(),
             old_substr: old_substr.into(),
             new_substr: new_substr.into(),
             limit,
+            iff,
         }
     }
 }
@@ -68,6 +64,10 @@ impl Pipe for PipeReplace {
 
     fn to_string(&self) -> String {
         let mut s = String::from("replace");
+        if let Some(iff) = &self.iff {
+            s.push(' ');
+            s.push_str(&iff.to_string());
+        }
         s.push_str(&format!(
             " ({}, {})",
             quote_token_if_needed(&self.old_substr),
@@ -82,24 +82,57 @@ impl Pipe for PipeReplace {
         s
     }
 
-    fn update_needed_fields(&self, _pf: &mut prefix_filter::Filter) {
-        // PORT NOTE: no-op — Go's updateNeededFieldsForUpdatePipe only mutates
-        // pf when iff != nil, and iff is deferred (see module docs).
+    fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
+        update_needed_fields_for_update_pipe(pf, &self.field, self.iff.as_deref());
+    }
+
+    /// Go `hasFilterInWithQuery` for this pipe: checks the `if (...)` filter.
+    fn has_filter_in_with_query(&self) -> bool {
+        self.iff
+            .as_ref()
+            .is_some_and(|iff| iff.has_filter_in_with_query())
+    }
+
+    /// Go `initFilterInValues` for this pipe: rewrites the `if (...)` filter.
+    fn init_filter_in_values(
+        &mut self,
+        get_values: &mut crate::storage_search::GetFieldValuesFn<'_>,
+        timestamp: i64,
+    ) -> Result<(), String> {
+        if let Some(iff) = &self.iff
+            && let Some(iff_new) = iff.init_filter_in_values(get_values, timestamp)?
+        {
+            self.iff = Some(Arc::new(iff_new));
+        }
+        Ok(())
     }
 
     fn new_pipe_processor(
         &self,
-        _concurrency: usize,
+        concurrency: usize,
         _stop: Arc<AtomicBool>,
         pp_next: Arc<dyn PipeProcessor>,
     ) -> Arc<dyn PipeProcessor> {
-        Arc::new(PipeReplaceProcessor {
-            field: self.field.clone(),
-            old_substr: self.old_substr.clone().into_bytes(),
-            new_substr: self.new_substr.clone().into_bytes(),
-            limit: self.limit,
+        // Port of Go's `updateFunc(a *arena, v string) string` which appends
+        // `appendReplace(a.b, v, ...)` to a pooled arena and returns the new
+        // suffix. The Rust port drops the arena and returns an owned String
+        // (see pipe_update.rs module docs).
+        let old_substr = self.old_substr.clone().into_bytes();
+        let new_substr = self.new_substr.clone().into_bytes();
+        let limit = self.limit;
+        let update_func: UpdateFunc = Arc::new(move |v: &str| {
+            let mut buf: Vec<u8> = Vec::new();
+            append_replace(&mut buf, v.as_bytes(), &old_substr, &new_substr, limit);
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        new_pipe_update_processor(
+            update_func,
             pp_next,
-        })
+            self.field.clone(),
+            self.iff.clone(),
+            concurrency,
+        )
     }
 
     fn can_live_tail(&self) -> bool {
@@ -108,56 +141,6 @@ impl Pipe for PipeReplace {
 
     fn can_return_last_n_results(&self) -> bool {
         true
-    }
-}
-
-/// Execution half of [`PipeReplace`].
-///
-/// PORT NOTE: stateless across blocks (no sharding needed) — each block is
-/// rewritten and forwarded immediately, and `flush` is a no-op.
-struct PipeReplaceProcessor {
-    field: String,
-    old_substr: Vec<u8>,
-    new_substr: Vec<u8>,
-    limit: u64,
-    pp_next: Arc<dyn PipeProcessor>,
-}
-
-impl PipeProcessor for PipeReplaceProcessor {
-    fn write_block(&self, worker_id: usize, br: &mut BlockResult) {
-        if br.rows_len() == 0 {
-            return;
-        }
-
-        let c = br.get_column_by_name(&self.field);
-        let values: Vec<Vec<u8>> = br.column_get_values(c).to_vec();
-
-        let mut rc = ResultColumn {
-            name: self.field.clone(),
-            values: Vec::with_capacity(values.len()),
-        };
-        let mut v_new: Vec<u8> = Vec::new();
-        for (i, v) in values.iter().enumerate() {
-            // Consecutive-duplicate caching, mirroring Go's needUpdates/vPrev.
-            if i == 0 || values[i - 1] != *v {
-                v_new = Vec::new();
-                append_replace(
-                    &mut v_new,
-                    v,
-                    &self.old_substr,
-                    &self.new_substr,
-                    self.limit,
-                );
-            }
-            rc.values.push(v_new.clone());
-        }
-
-        br.add_result_column(rc);
-        self.pp_next.write_block(worker_id, br);
-    }
-
-    fn flush(&self) -> Result<(), String> {
-        Ok(())
     }
 }
 
@@ -217,12 +200,12 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_result::BlockResult;
+    use crate::filter::Filter;
+    use crate::filter_phrase::new_filter_phrase;
+    use crate::pipe_update::test_utils::assert_needed_fields;
     use crate::rows::Field;
     use std::sync::Mutex;
-
-    // PORT NOTE: TestParsePipeReplaceSuccess/Failure and
-    // TestPipeReplaceUpdateNeededFields are skipped — they exercise the query
-    // lexer / needed-fields planner (parser + ifFilter), both deferred.
 
     fn ar(s: &str, old_substr: &str, new_substr: &str, limit: u64) -> String {
         let mut dst = Vec::new();
@@ -236,6 +219,7 @@ mod tests {
         String::from_utf8(dst).unwrap()
     }
 
+    // Go TestAppendReplace (pipe_replace_test.go).
     #[test]
     fn test_append_replace() {
         assert_eq!(ar("", "", "", 0), "");
@@ -247,6 +231,12 @@ mod tests {
         assert_eq!(ar("afoox", "foo", "bar", 0), "abarx");
         assert_eq!(ar("foo-bar-baz", "-", "_", 0), "foo_bar_baz");
         assert_eq!(ar("foo bar baz  ", " ", "", 1), "foobar baz  ");
+    }
+
+    /// Builds the `if (field:phrase)` filter used by the conditional Go tests.
+    fn phrase_iff(field: &str, phrase: &str) -> Arc<IfFilter> {
+        let f: Arc<dyn Filter> = Arc::new(new_filter_phrase(field, phrase));
+        Arc::new(IfFilter::new(f))
     }
 
     /// Capturing downstream processor that reconstructs emitted rows, dropping
@@ -305,11 +295,12 @@ mod tests {
             .collect()
     }
 
+    // Go TestPipeReplace "replace without limits at _msg".
     #[test]
     fn test_pipe_replace_msg() {
         // replace ("_", "-") at _msg, no limit
         let out = run(
-            PipeReplace::new("_msg", "_", "-", 0),
+            PipeReplace::new("_msg", "_", "-", 0, None),
             vec![
                 vec![f("_msg", "a_bc_def"), f("bar", "cde")],
                 vec![f("_msg", "a_bc_def")],
@@ -328,10 +319,11 @@ mod tests {
         );
     }
 
+    // Go TestPipeReplace "replace with limit 1 at foo".
     #[test]
     fn test_pipe_replace_limit_1() {
         let out = run(
-            PipeReplace::new("foo", "_", "-", 1),
+            PipeReplace::new("foo", "_", "-", 1, None),
             vec![
                 vec![f("foo", "a_bc_def"), f("bar", "cde")],
                 vec![f("foo", "1234")],
@@ -346,10 +338,11 @@ mod tests {
         );
     }
 
+    // Go TestPipeReplace "replace with limit 100 at foo".
     #[test]
     fn test_pipe_replace_limit_100() {
         let out = run(
-            PipeReplace::new("foo", "_", "-", 100),
+            PipeReplace::new("foo", "_", "-", 100, None),
             vec![
                 vec![f("foo", "a_bc_def"), f("bar", "cde")],
                 vec![f("foo", "1234")],
@@ -364,15 +357,86 @@ mod tests {
         );
     }
 
+    // Go TestPipeReplace "conditional replace at foo":
+    // `replace if (bar:abc) ("_", "") at foo`.
+    #[test]
+    fn test_pipe_replace_conditional() {
+        let out = run(
+            PipeReplace::new("foo", "_", "", 0, Some(phrase_iff("bar", "abc"))),
+            vec![
+                vec![f("foo", "a_bc_def"), f("bar", "cde")],
+                vec![f("foo", "123_456"), f("bar", "abc")],
+            ],
+        );
+        assert_eq!(
+            out,
+            expected(vec![
+                vec![f("foo", "a_bc_def"), f("bar", "cde")],
+                vec![f("foo", "123456"), f("bar", "abc")],
+            ])
+        );
+    }
+
+    // Go TestPipeReplaceUpdateNeededFields (pipe_replace_test.go).
+    #[test]
+    fn test_pipe_replace_update_needed_fields() {
+        let p = |iff: Option<(&str, &str)>, at: &str| {
+            PipeReplace::new(at, "a", "b", 0, iff.map(|(f, ph)| phrase_iff(f, ph)))
+        };
+
+        // all the needed fields
+        assert_needed_fields(&p(None, "x"), "*", "", "*", "");
+        assert_needed_fields(&p(Some(("f1", "q")), "x"), "*", "", "*", "");
+
+        // unneeded fields do not intersect with at field
+        assert_needed_fields(&p(None, "x"), "*", "f1,f2", "*", "f1,f2");
+        assert_needed_fields(&p(Some(("f3", "q")), "x"), "*", "f1,f2", "*", "f1,f2");
+        assert_needed_fields(&p(Some(("f2", "q")), "x"), "*", "f1,f2", "*", "f1");
+
+        // unneeded fields intersect with at field
+        assert_needed_fields(&p(None, "x"), "*", "x,y", "*", "x,y");
+        assert_needed_fields(&p(Some(("f1", "q")), "x"), "*", "x,y", "*", "x,y");
+        assert_needed_fields(&p(Some(("x", "q")), "x"), "*", "x,y", "*", "x,y");
+        assert_needed_fields(&p(Some(("y", "q")), "x"), "*", "x,y", "*", "x,y");
+
+        // needed fields do not intersect with at field
+        assert_needed_fields(&p(None, "x"), "f2,y", "", "f2,y", "");
+        assert_needed_fields(&p(Some(("f1", "q")), "x"), "f2,y", "", "f2,y", "");
+
+        // needed fields intersect with at field
+        assert_needed_fields(&p(None, "y"), "f2,y", "", "f2,y", "");
+        assert_needed_fields(&p(Some(("f1", "q")), "y"), "f2,y", "", "f1,f2,y", "");
+    }
+
+    // Go TestParsePipeReplaceSuccess (pipe_replace_test.go): parse + String()
+    // round-trip, matching Go's `expectParsePipeSuccess`.
+    #[test]
+    fn test_parse_pipe_replace_success() {
+        fn p(pipe_str: &str) {
+            let pipe = crate::pipe::must_parse_pipe(pipe_str, 0);
+            assert_eq!(pipe.to_string(), pipe_str, "round-trip mismatch");
+        }
+
+        p(r#"replace (foo, bar)"#);
+        p(r#"replace (" ", "") at x"#);
+        p(r#"replace if (x:y) ("-", ":") at a"#);
+        p(r#"replace (" ", "") at x limit 10"#);
+        p(r#"replace if (x:y) (" ", "") at foo limit 10"#);
+    }
+
     #[test]
     fn test_string() {
         assert_eq!(
-            PipeReplace::new("_msg", "a", "b", 0).to_string(),
+            PipeReplace::new("_msg", "a", "b", 0, None).to_string(),
             "replace (a, b)"
         );
         assert_eq!(
-            PipeReplace::new("x", " ", "", 10).to_string(),
+            PipeReplace::new("x", " ", "", 10, None).to_string(),
             r#"replace (" ", "") at x limit 10"#
+        );
+        assert_eq!(
+            PipeReplace::new("a", "-", ":", 0, Some(phrase_iff("x", "y"))).to_string(),
+            r#"replace if (x:y) ("-", ":") at a"#
         );
     }
 }

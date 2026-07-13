@@ -102,6 +102,22 @@ pub fn new_sighup_chan() -> Receiver<i32> {
     rx
 }
 
+/// Returns a channel, which is triggered on every SIGINT/SIGTERM (on Windows:
+/// Ctrl+C / Ctrl+Break) without terminating the process — the Rust equivalent
+/// of Go's `signal.Notify(ch, os.Interrupt, ...)` for interactive tools that
+/// must intercept Ctrl+C (see eslogscli's query cancellation).
+///
+/// Subscribing installs the process-wide signal handlers, so the default
+/// kill-on-signal disposition is replaced for the process lifetime; the
+/// subscriber decides whether to exit. Note the handlers cover SIGHUP too
+/// (swallowed unless a [`new_sighup_chan`] subscriber exists).
+pub fn new_term_chan() -> Receiver<i32> {
+    imp::init();
+    let (tx, rx) = sync_channel(1);
+    SUBSCRIBERS.lock().unwrap().term.push(tx);
+    rx
+}
+
 #[cfg(unix)]
 mod imp {
     use std::sync::Once;

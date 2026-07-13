@@ -187,6 +187,54 @@ pub trait Filter: Send + Sync {
     fn or_children(&self) -> Option<&[Box<dyn Filter>]> {
         None
     }
+
+    /// Go `visitSubqueriesInFilter` support: true when this filter *directly*
+    /// embeds a subquery (`in(<q>)`/`contains_any(<q>)`/`contains_all(<q>)`
+    /// via [`crate::in_values::InValues::q_text`], or `_stream_id:in(<q>)`).
+    /// Combined with [`visit_filter_recursive`] by [`filter_has_subqueries`].
+    ///
+    /// PORT NOTE: expresses the `*filterGeneric` / `*filterStreamID` type
+    /// switch of Go `visitSubqueriesInFilter`'s callback.
+    fn has_direct_subquery(&self) -> bool {
+        false
+    }
+
+    /// Port of Go `visitSubqueriesInFilter` (single filter node): calls
+    /// `visit` for every subquery embedded in this filter, recursively.
+    ///
+    /// PORT NOTE: Go visits the parsed `*Query` stored in the filter; the Rust
+    /// filters store subqueries as rendered text, so the implementations parse
+    /// that text at `timestamp`, run `Query::visit_subqueries` on the parsed
+    /// query (which may mutate it) and store the re-rendered text back. The
+    /// composite filters (`FilterAnd`/`FilterOr`/`FilterNot`) recurse into
+    /// their children; leaves keep the default no-op.
+    fn visit_subqueries_mut(
+        &mut self,
+        _timestamp: i64,
+        _visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+    }
+
+    /// Port of Go `updateFilterWithTimeOffset`'s copyFunc: shifts the time
+    /// bounds of `FilterTime` (`min/max -= offset`) and the offset of
+    /// `FilterDayRange`/`FilterWeekRange` (`offset -= -time_offset`), leaving
+    /// the string representation unchanged (Go keeps `stringRepr` as written).
+    /// The composite filters recurse into their children; leaves keep the
+    /// default no-op.
+    ///
+    /// PORT NOTE: Go rewrites via `copyFilter`, sharing unchanged nodes; the
+    /// Rust filter tree is single-owner, so the shift mutates in place.
+    fn update_with_time_offset(&mut self, _offset: i64) {}
+}
+
+/// Returns true when `f` (recursively) embeds a subquery — the guard for the
+/// render/re-parse rewrite of shared (`Arc`) filters in [`crate::if_filter`]
+/// and `pipe_filter`. Ported ahead of the shared-filter subquery-propagation
+/// wiring (an iff-nested `in(subquery)` sub-case that is still a ledger gap),
+/// so it has no caller yet.
+#[allow(dead_code)]
+pub(crate) fn filter_has_subqueries(f: &dyn Filter) -> bool {
+    visit_filter_recursive(f, &mut |f| f.has_direct_subquery())
 }
 
 /// `FieldFilter` implements filtering for log entries by a given `field_name`.
@@ -235,6 +283,15 @@ pub trait FieldFilter: Send + Sync {
     /// type-switch on `*filterIn`/`*filterContainsAny`/`*filterContainsAll`;
     /// the accessor lives on the trait with a `None` default.
     fn in_values(&self) -> Option<&crate::in_values::InValues> {
+        None
+    }
+
+    /// `FilterGeneric::visit_subqueries_mut` support: mutable access to the
+    /// [`crate::in_values::InValues`] of an `in`/`contains_any`/`contains_all`
+    /// field filter, so subquery propagation can rewrite the stored subquery
+    /// text (see [`Filter::visit_subqueries_mut`]); `None` for every other
+    /// field filter.
+    fn in_values_mut(&mut self) -> Option<&mut crate::in_values::InValues> {
         None
     }
 
@@ -292,7 +349,8 @@ pub fn visit_filters_recursive(
 // substitutes leaves via [`Filter::init_filter_in_values`] (the copyFunc leaf
 // arm). The `flattenFiltersAnd/Or` and `mergeFiltersStream` optimize passes
 // use the same hooks (see `parser::query`); the remaining copyFilter consumer
-// (time-offset shifting) stays deferred.
+// (time-offset shifting) is the in-place [`Filter::update_with_time_offset`]
+// hook above.
 
 // PORT NOTE: upstream `filter_test.go` (TestComplexFilters) is a full
 // filter-subsystem integration test (it builds `filterAnd`/`filterOr`/

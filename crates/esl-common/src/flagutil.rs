@@ -9,13 +9,14 @@
 //!
 //! PORT NOTE: Go registers flags in package `init()` before `flag.Parse()`.
 //! Rust has no pre-main init, so `parse_args` stores all raw `-name=value`
-//! pairs, and each `Flag<T>` static lazily resolves its value from that map on
-//! first access. Unknown-flag rejection is deferred to the app-layer port,
-//! where the full flag set is known.
+//! occurrences, and each `Flag<T>` static lazily resolves its value from that
+//! map on first access. Unknown-flag rejection is deferred to the app-layer
+//! port, where the full flag set is known.
 //!
-//! PORT NOTE: repeated flags (`-foo=a -foo=b`) collapse to the last value in
-//! the raw map, unlike Go where array-valued flags append. Use comma-separated
-//! values (`-foo=a,b`) instead.
+//! Repeated flags (`-foo=a -foo=b`) follow Go `flag.Parse` semantics: every
+//! occurrence is applied in order via [`FlagValue::set_flag_occurrences`]
+//! (Go calls `flag.Value.Set` once per occurrence), so scalar flags keep the
+//! last value while array-valued flags append.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -32,13 +33,14 @@ pub use dict::{DictInt, parse_json_map};
 pub use duration::{ExtendedDuration, RetentionDuration};
 pub use password::Password;
 
-static RAW_FLAGS: OnceLock<HashMap<String, String>> = OnceLock::new();
+static RAW_FLAGS: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
 
 /// Parses Go-style flags from `args` (without the program name):
 /// `-name=value`, `--name=value`, `-name value`, and bare `-name` for
 /// booleans. Parsing stops at `--` or the first non-flag argument, like Go.
+/// Every occurrence of a repeated flag is kept, in command-line order.
 pub fn parse_args(args: &[String]) {
-    let mut map = HashMap::new();
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -47,13 +49,17 @@ pub fn parse_args(args: &[String]) {
         }
         let name = arg.trim_start_matches('-');
         if let Some((k, v)) = name.split_once('=') {
-            map.insert(k.to_string(), v.to_string());
+            map.entry(k.to_string()).or_default().push(v.to_string());
         } else if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-            map.insert(name.to_string(), args[i + 1].clone());
+            map.entry(name.to_string())
+                .or_default()
+                .push(args[i + 1].clone());
             i += 1;
         } else {
             // Bare flag: boolean `true`, like Go.
-            map.insert(name.to_string(), "true".to_string());
+            map.entry(name.to_string())
+                .or_default()
+                .push("true".to_string());
         }
         i += 1;
     }
@@ -66,24 +72,42 @@ pub fn parse() {
     parse_args(&args);
 }
 
+/// Returns the last raw command-line value of `name`, i.e. Go's observable
+/// value for scalar flags.
 pub(crate) fn raw(name: &str) -> Option<&'static str> {
+    raw_occurrences(name).map(|v| v.last().unwrap().as_str())
+}
+
+/// Returns every raw command-line occurrence of `name`, in order. The
+/// returned slice is never empty.
+pub(crate) fn raw_occurrences(name: &str) -> Option<&'static [String]> {
     RAW_FLAGS
         .get()
         .and_then(|m| m.get(name))
-        .map(|s| s.as_str())
+        .map(|v| v.as_slice())
 }
 
-/// Calls `f(name, raw_value)` for every explicitly set command-line flag, in
+/// Calls `f(name, value)` for every explicitly set command-line flag, in
 /// lexicographical order of flag names, like Go's `flag.Visit`.
 ///
-/// PORT NOTE: values are the raw command-line strings, not the canonical
-/// `flag.Value.String()` form used by Go.
+/// Like Go, the value is the canonical `flag.Value.String()` form whenever
+/// the flag has been resolved via [`Flag::get`].
+///
+/// PORT NOTE: for set-but-never-resolved flags Go still knows the canonical
+/// form (flags register before `flag.Parse()`); the port falls back to the
+/// raw command-line occurrences joined with `,` for those.
 pub fn visit_set_flags(mut f: impl FnMut(&str, &str)) {
     let Some(m) = RAW_FLAGS.get() else { return };
+    // Snapshot the canonical values before invoking `f`, so `f` may resolve
+    // further flags (which locks the registry) without deadlocking.
+    let registry = flag_registry().lock().unwrap().clone();
     let mut names: Vec<&String> = m.keys().collect();
     names.sort();
     for name in names {
-        f(name, &m[name]);
+        match registry.get(name.as_str()) {
+            Some(v) => f(name, v),
+            None => f(name, &m[name].join(",")),
+        }
     }
 }
 
@@ -109,11 +133,16 @@ fn register_flag_value(name: &'static str, value: String) {
 /// order of flag names, like Go's `flag.VisitAll` (used by the `esm_flag`
 /// gauges on the `/metrics` page).
 ///
-/// PORT NOTE: Go visits every registered flag. The port visits the union of
-/// (a) flags resolved via `Flag::get` (canonical value strings, including
-/// default values) and (b) flags set on the command line but never resolved
-/// (raw command-line strings). Declared flags that are neither set nor read
-/// by the program are absent.
+/// PORT NOTE: Go visits every registered flag, because flags register in
+/// package `init()` before `flag.Parse()`. Rust statics are lazy and there is
+/// no life-before-main (enumerating declared-but-untouched `Flag` statics
+/// would need a distributed-slice registry, i.e. a `linkme`/`inventory`-style
+/// dependency), so the port visits the union of (a) flags resolved via
+/// `Flag::get` (canonical value strings, including default values) and
+/// (b) flags set on the command line but never resolved (raw command-line
+/// occurrences joined with `,`). Declared flags that are neither set nor read
+/// by the program are absent, so the `esm_flag` gauge series on `/metrics` is
+/// a subset of Go's `flag` series.
 pub fn visit_all_flags(mut f: impl FnMut(&str, &str, bool)) {
     // Snapshot the union before invoking `f`, so `f` may resolve further
     // flags (which locks the registry) without deadlocking.
@@ -122,9 +151,9 @@ pub fn visit_all_flags(mut f: impl FnMut(&str, &str, bool)) {
         all.insert(name.to_string(), (value.clone(), raw(name).is_some()));
     }
     if let Some(m) = RAW_FLAGS.get() {
-        for (name, value) in m {
+        for (name, occurrences) in m {
             all.entry(name.clone())
-                .or_insert_with(|| (value.clone(), true));
+                .or_insert_with(|| (occurrences.join(","), true));
         }
     }
     for (name, (value, is_set)) in &all {
@@ -235,33 +264,45 @@ impl<T: FlagValue> Flag<T> {
     /// Returns the parsed flag value (or the default when unset). Panics with
     /// the same wording as Go's flag package on an unparsable value.
     ///
+    /// Every command-line occurrence of the flag is applied in order, like
+    /// Go's `flag.Parse` calling `flag.Value.Set` once per occurrence:
+    /// scalar flags keep the last value, array-valued flags append.
+    ///
     /// The resolved value also enters the global flag registry used by
     /// [`visit_all_flags`] (Go registers flags in package `init()` instead;
     /// see the registry PORT NOTE).
     pub fn get(&self) -> &T {
         self.cell.get_or_init(|| {
-            let v = match raw(self.name) {
-                Some(s) => match T::parse_flag(s) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        crate::panicf!("invalid value \"{s}\" for flag -{}: {err}", self.name);
+            let v = match raw_occurrences(self.name) {
+                Some(occurrences) => {
+                    let mut v = (self.default)();
+                    if let Err(e) = v.set_flag_occurrences(occurrences) {
+                        crate::panicf!(
+                            "invalid value \"{}\" for flag -{}: {}",
+                            e.value,
+                            self.name,
+                            e.err
+                        );
                         unreachable!()
                     }
-                },
+                    v
+                }
                 // Port of `lib/envflag`: when `-envflag.enable` is set via
                 // `envflag::parse`, flags not set on the command line are read
                 // from the corresponding environment variable.
                 None => match crate::envflag::lookup_flag_env(self.name) {
-                    Some((value, env_name)) => match T::parse_flag(&value) {
-                        Ok(v) => v,
-                        Err(err) => {
+                    Some((value, env_name)) => {
+                        let mut v = (self.default)();
+                        if let Err(e) = v.set_flag_occurrences(std::slice::from_ref(&value)) {
                             crate::panicf!(
-                                "cannot set flag {} to {value:?}, which is read from env var {env_name:?}: {err}",
-                                self.name
+                                "cannot set flag {} to {value:?}, which is read from env var {env_name:?}: {}",
+                                self.name,
+                                e.err
                             );
                             unreachable!()
                         }
-                    },
+                        v
+                    }
                     None => (self.default)(),
                 },
             };
@@ -271,12 +312,43 @@ impl<T: FlagValue> Flag<T> {
     }
 }
 
+/// Error from applying a raw command-line value to a flag: the offending raw
+/// `value` and the parse error, so [`Flag::get`] can panic with Go's
+/// `invalid value "..." for flag -...` wording.
+#[derive(Debug)]
+pub struct FlagParseError {
+    pub value: String,
+    pub err: String,
+}
+
 /// Conversion from a raw flag string, mirroring Go's `strconv`/`flag` parsing.
 ///
 /// The `Display` bound mirrors Go's `flag.Value.String()`: it produces the
 /// canonical value string used by the flag registry ([`visit_all_flags`]).
 pub trait FlagValue: Sized + std::fmt::Display + 'static {
     fn parse_flag(s: &str) -> Result<Self, String>;
+
+    /// Applies every command-line occurrence of the flag to `self`, like Go's
+    /// `flag.Parse` calling `flag.Value.Set` once per occurrence.
+    ///
+    /// The default implementation mirrors Go's scalar flags: each occurrence
+    /// is parsed (so an invalid earlier occurrence still errors, like Go) and
+    /// overwrites the previous one, keeping the last value. Array-valued
+    /// flags override this to append (see `flagutil::array`).
+    fn set_flag_occurrences(&mut self, occurrences: &[String]) -> Result<(), FlagParseError> {
+        for s in occurrences {
+            match Self::parse_flag(s) {
+                Ok(v) => *self = v,
+                Err(err) => {
+                    return Err(FlagParseError {
+                        value: s.clone(),
+                        err,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl FlagValue for bool {
@@ -323,6 +395,10 @@ mod tests {
             "-boolFlag",
             "-c",
             "3",
+            "-repeatedScalar=x",
+            "-repeatedScalar=y",
+            "-repeatedArray=a,b",
+            "-repeatedArray=c",
             "--",
             "-ignored=x",
         ]));
@@ -331,6 +407,27 @@ mod tests {
         assert_eq!(raw("boolFlag"), Some("true"));
         assert_eq!(raw("c"), Some("3"));
         assert_eq!(raw("ignored"), None);
+
+        // Repeated flags: every occurrence is kept in order; `raw` (Go's
+        // scalar view) returns the last one.
+        assert_eq!(raw("repeatedScalar"), Some("y"));
+        assert_eq!(
+            raw_occurrences("repeatedScalar"),
+            Some(&["x".to_string(), "y".to_string()][..])
+        );
+
+        // Scalar flags keep the last occurrence, like Go.
+        static REPEATED_SCALAR: Flag<String> =
+            Flag::new("repeatedScalar", "", || "unset".to_string());
+        assert_eq!(REPEATED_SCALAR.get(), "y");
+
+        // Array-valued flags append across occurrences, like Go.
+        static REPEATED_ARRAY: Flag<crate::flagutil::ArrayString> =
+            Flag::new("repeatedArray", "", crate::flagutil::ArrayString::default);
+        assert_eq!(
+            REPEATED_ARRAY.get().0,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
 
         // visit_all_flags covers explicitly set flags even when they were
         // never resolved via `Flag::get` (raw values, is_set=true).
@@ -341,6 +438,21 @@ mod tests {
             }
         });
         assert_eq!(seen, Some(("two".to_string(), true)));
+
+        // visit_set_flags reports the canonical (resolved) value like Go's
+        // flag.Visit, and joins raw occurrences for unresolved flags.
+        let mut set_flags = std::collections::HashMap::new();
+        visit_set_flags(|name, value| {
+            set_flags.insert(name.to_string(), value.to_string());
+        });
+        assert_eq!(
+            set_flags.get("repeatedArray").map(String::as_str),
+            Some("a,b,c")
+        );
+        assert_eq!(
+            set_flags.get("repeatedScalar").map(String::as_str),
+            Some("y")
+        );
     }
 
     #[test]

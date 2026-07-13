@@ -400,6 +400,22 @@ impl Partition {
     pub(crate) fn must_force_merge(&self) {
         self.ddb().must_force_merge_all_parts();
     }
+
+    /// Deletes the rows matching sso (Go `partition.deleteRows`).
+    ///
+    /// Returns false if the deletion couldn't be fully performed at the
+    /// moment, so it must be repeated later.
+    pub(crate) fn delete_rows(
+        &self,
+        sso: &crate::storage_search::StorageSearchOptions<'_>,
+        stop_ch: &std::sync::atomic::AtomicBool,
+    ) -> bool {
+        // make recently ingested rows visible for search, so they could be deleted.
+        self.debug_flush();
+
+        let pso = crate::storage_search::partition_search_options(sso, self);
+        self.ddb().delete_rows(&pso, stop_ch)
+    }
 }
 
 /// Returns the day for the given partition name.

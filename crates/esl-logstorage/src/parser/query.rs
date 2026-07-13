@@ -123,6 +123,30 @@ impl Query {
         self.optimize_no_subqueries();
     }
 
+    /// Port of Go `(*Query).visitSubqueries`: calls `visit` for `self` and for
+    /// every subquery embedded (recursively) in the query's filters and pipes.
+    ///
+    /// PORT NOTE: Go stores subqueries as parsed `*Query`; the Rust filters and
+    /// the join/union pipes store them as rendered text, so the filter/pipe
+    /// `visit_subqueries_mut` impls re-parse that text at `self.timestamp`,
+    /// visit the parsed subquery, and store the re-rendered text back. Subquery
+    /// propagation into a pipe's `if (...)` filter (only reachable when the
+    /// `if` clause itself contains `in(subquery)`) is not wired — the
+    /// iff-holding pipes keep the trait no-op default (ledger item).
+    pub(crate) fn visit_subqueries(&mut self, visit: &mut dyn FnMut(&mut Query)) {
+        // Visit the query itself first (Go calls visitFunc(q) up front).
+        visit(self);
+
+        let timestamp = self.timestamp;
+        if let Some(gf) = self.opts.global_filter.as_mut() {
+            gf.visit_subqueries_mut(timestamp, visit);
+        }
+        self.f.visit_subqueries_mut(timestamp, visit);
+        for p in &mut self.pipes {
+            p.visit_subqueries_mut(timestamp, visit);
+        }
+    }
+
     /// Port of Go `(*Query).optimizeNoSubqueries`.
     ///
     /// PORT NOTE: Go type-switches on `*pipeFilter` for `optimizeFilterPipes`
@@ -929,6 +953,16 @@ pub fn ParseQuery(s: &str) -> Result<Query, String> {
     ParseQueryAtTimestamp(s, timestamp)
 }
 
+/// Parses `s` at `timestamp`, panicking on error (Go `mustParseQuery`).
+///
+/// Used to re-parse a subquery's own rendered text during subquery-value
+/// propagation (`visitSubqueries`): the text was produced by [`Query::to_string`],
+/// so a parse failure is a bug in the port, not bad input.
+pub(crate) fn must_parse_query(s: &str, timestamp: i64) -> Query {
+    ParseQueryAtTimestamp(s, timestamp)
+        .unwrap_or_else(|e| panic!("BUG: cannot parse re-rendered subquery [{s}]: {e}"))
+}
+
 /// Parses `s` in the context of `timestamp` (Go `ParseQueryAtTimestamp`).
 #[allow(non_snake_case)]
 pub fn ParseQueryAtTimestamp(s: &str, timestamp: i64) -> Result<Query, String> {
@@ -1172,6 +1206,23 @@ fn parse_query_options(dst_opts: &mut QueryOptions, lex: &mut Lexer) -> Result<(
 /// A parsed LogsQL filter (Go `Filter`).
 pub struct Filter {
     f: Option<Box<dyn FilterTrait>>,
+}
+
+impl Query {
+    /// Builds a pipe-less query from a parsed [`Filter`] at the given
+    /// timestamp context.
+    ///
+    /// PORT NOTE: Go's `processDeleteTask` constructs the
+    /// `&Query{f: f.f, timestamp: ...}` literal in place; `Filter::f` is
+    /// module-private here, so the literal is wrapped in this constructor.
+    pub(crate) fn from_filter_at_timestamp(f: Filter, timestamp: i64) -> Query {
+        Query {
+            opts: QueryOptions::default(),
+            f: f.f.expect("BUG: the Filter must contain a parsed filter"),
+            pipes: Vec::new(),
+            timestamp,
+        }
+    }
 }
 
 impl fmt::Display for Filter {

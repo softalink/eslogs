@@ -41,6 +41,7 @@ pub fn process_streams_request(storage: &Arc<Storage>, req: &Request, w: &mut Re
     let streams = match storage.get_streams(
         &ca.tenant_ids,
         &ca.q,
+        &ca.hidden_fields_filters,
         limit as u64,
         cancel.as_deref(),
         &ca.qs,
@@ -91,6 +92,7 @@ pub fn process_stream_ids_request(storage: &Arc<Storage>, req: &Request, w: &mut
     let stream_ids = match storage.get_stream_ids(
         &ca.tenant_ids,
         &ca.q,
+        &ca.hidden_fields_filters,
         limit as u64,
         cancel.as_deref(),
         &ca.qs,
@@ -141,6 +143,7 @@ pub fn process_stream_field_names_request(
     let names = match storage.get_stream_field_names(
         &ca.tenant_ids,
         &ca.q,
+        &ca.hidden_fields_filters,
         filter,
         cancel.as_deref(),
         &ca.qs,
@@ -210,6 +213,7 @@ pub fn process_stream_field_values_request(
     let values = match storage.get_stream_field_values(
         &ca.tenant_ids,
         &ca.q,
+        &ca.hidden_fields_filters,
         field_name,
         filter,
         limit as u64,

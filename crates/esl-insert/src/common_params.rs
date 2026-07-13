@@ -7,14 +7,17 @@
 //! layer passes the storage explicitly into each `request_handler`; the
 //! handlers are generic over the [`LogRowsStorage`] trait so eslagent can pass
 //! its remotewrite-backed sink while es-logs passes the local
-//! [`Storage`]. `CanWriteData` is dropped (both implementations always allow
-//! writes).
+//! [`Storage`]. Handlers call `storage.can_write_data()` where Go calls the
+//! package-level `insertutil.CanWriteData()`.
 //!
 //! PORT NOTE: Go's `logMessageProcessor` runs a background goroutine
-//! (`initPeriodicFlush`) for stream-mode connections. The HTTP request handlers
-//! feed a finite body and call `close()` at the end, which flushes the tail, so
-//! the periodic-flush thread (and the `isStreamMode` constructor argument) is
-//! omitted.
+//! (`initPeriodicFlush`) for stream-mode connections (`isStreamMode=true`).
+//! The HTTP request handlers feed a finite body and call `close()` at the
+//! end, which flushes the tail, so the periodic-flush thread (and the
+//! `isStreamMode` constructor argument) is omitted here; the long-lived
+//! syslog TCP/unix connections — the case where the missing periodic flush
+//! is observable — run it via [`LogMessageProcessor::flush_if_idle`] from a
+//! per-connection flusher thread (see `syslog_listeners::process_stream`).
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -23,7 +26,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use esl_common::metrics::{Counter, Gauge, Summary};
 
 use esl_common::flagutil::Flag;
-use esl_common::httpserver::{Request, get_quoted_remote_addr};
+use esl_common::httpserver::{Request, ResponseWriter, get_quoted_remote_addr};
 use esl_common::httputil::{get_array as httputil_get_array, get_request_value};
 use esl_common::timeutil::try_parse_unix_timestamp;
 use esl_common::warnf;
@@ -299,12 +302,59 @@ pub trait LogRowsStorage: Send + Sync + Sized {
     /// PORT NOTE: the receiver is `&Arc<Self>` because the ported
     /// `Storage::must_add_rows` needs the `Arc` for its background flushers.
     fn must_add_rows(self: &Arc<Self>, lr: &LogRows);
+
+    /// CanWriteData must return `(message, http_status_code)` if logs cannot
+    /// be added to the underlying storage.
+    ///
+    /// PORT NOTE: Go returns an `httpserver.ErrorWithStatusCode`; the port
+    /// returns the `(message, status_code)` pair, matching
+    /// `esl_storage::can_write_data`.
+    fn can_write_data(self: &Arc<Self>) -> Result<(), (String, u16)>;
 }
 
 impl LogRowsStorage for Storage {
     fn must_add_rows(self: &Arc<Self>, lr: &LogRows) {
         Storage::must_add_rows(self, lr)
     }
+
+    fn can_write_data(self: &Arc<Self>) -> Result<(), (String, u16)> {
+        // Go: app/eslstorage `(*Storage).CanWriteData` (rejects with 429 when
+        // the storage is in read-only mode because of low free disk space).
+        esl_storage::can_write_data(self)
+    }
+}
+
+/// Enforces a per-protocol `-*.maxRequestSize` cap on a fully-read request
+/// body, mirroring Go `protoparserutil.readFull`'s "too big data size" error.
+///
+/// PORT NOTE: Go caps the stream while reading it (and again after
+/// decompression); the port's `Request::read_full_body` has already
+/// decompressed the body per Content-Encoding, so the cap applies to the
+/// decompressed size after the read.
+pub(crate) fn check_max_request_size(
+    data_len: usize,
+    flag: &Flag<esl_common::flagutil::Bytes>,
+) -> Result<(), String> {
+    let n = flag.get().n.max(0);
+    if data_len as i64 > n {
+        return Err(format!(
+            "too big data size exceeding -{}={} bytes",
+            flag.name(),
+            n
+        ));
+    }
+    Ok(())
+}
+
+/// Writes an error response carrying its own HTTP status code, mirroring Go
+/// `httpserver.Errorf(w, r, "%s", err)` when err is an
+/// `httpserver.ErrorWithStatusCode` (logs with request context, then responds
+/// with the embedded status).
+pub(crate) fn errorf_with_status(w: &mut ResponseWriter, req: &Request, msg: &str, status: u16) {
+    let remote = get_quoted_remote_addr(req);
+    let uri = req.request_uri();
+    warnf!("remoteAddr: {}; requestURI: {}; {}", remote, uri, msg);
+    w.error(msg, status);
 }
 
 /// Interface for log message processors.
@@ -349,6 +399,10 @@ pub struct LogMessageProcessor<'a, S: LogRowsStorage> {
 
     unflushed_rows: u64,
     unflushed_bytes: u64,
+
+    /// The time of the last flush (Go `lastFlushTime`), consulted by
+    /// [`Self::flush_if_idle`] for the stream-mode periodic flush.
+    last_flush_time: Instant,
 }
 
 static ROWS_DROPPED_TOTAL_DEBUG: LazyLock<Arc<Counter>> =
@@ -444,6 +498,7 @@ impl<S: LogRowsStorage> LogMessageProcessor<'_, S> {
 
     fn flush(&mut self) {
         let start = Instant::now();
+        self.last_flush_time = start;
         self.storage.must_add_rows(&self.lr);
         self.lr.reset_keep_settings();
 
@@ -453,6 +508,20 @@ impl<S: LogRowsStorage> LogMessageProcessor<'_, S> {
 
         self.unflushed_rows = 0;
         self.unflushed_bytes = 0;
+    }
+
+    /// Flushes the accumulated rows if no flush happened during the last `d`
+    /// (the body of Go's `initPeriodicFlush` ticker goroutine), for stream-mode
+    /// ingestion.
+    ///
+    /// PORT NOTE: the method is ported but not yet driven by a per-connection
+    /// flusher thread in `syslog_listeners` — idle stream connections still
+    /// flush on buffer-fill/disconnect rather than on a timer (ledger gap).
+    #[allow(dead_code)]
+    pub(crate) fn flush_if_idle(&mut self, d: std::time::Duration) {
+        if self.last_flush_time.elapsed() >= d {
+            self.flush();
+        }
     }
 
     /// Flushes the remaining data to the storage and releases the LogRows.
@@ -512,6 +581,7 @@ impl CommonParams {
             flush_duration,
             unflushed_rows: 0,
             unflushed_bytes: 0,
+            last_flush_time: Instant::now(),
         }
     }
 }

@@ -169,9 +169,11 @@ pub fn limit_string_len(s: &str, max_len: usize) -> Cow<'_, str> {
 /// It is faster alternative to allocating a lowercased `String`.
 ///
 /// PORT NOTE: Go returns the extended slice; the port appends to `dst` in
-/// place. Go's `unicode.ToLower` maps a rune to a single rune, while Rust's
-/// `char::to_lowercase` applies full Unicode lowercasing (which may expand,
-/// e.g. `İ`); both agree on all 1:1 mappings.
+/// place. Go's `unicode.ToLower` applies the simple (single-rune) case
+/// mapping; `char::to_lowercase` applies the full mapping, which differs
+/// only for `İ` (U+0130: full `"i\u{307}"`, simple `'i'`) — mapped
+/// explicitly in [`to_lower_simple`]. Remaining divergence is limited to
+/// Unicode-version skew between the Rust std tables and the Go toolchain's.
 pub fn append_lowercase(dst: &mut Vec<u8>, s: &str) {
     let dst_len = dst.len();
 
@@ -189,10 +191,23 @@ pub fn append_lowercase(dst: &mut Vec<u8>, s: &str) {
         dst.truncate(dst_len);
         let mut buf = [0u8; 4];
         for r in s.chars() {
-            for lc in r.to_lowercase() {
-                dst.extend_from_slice(lc.encode_utf8(&mut buf).as_bytes());
-            }
+            let lc = to_lower_simple(r);
+            dst.extend_from_slice(lc.encode_utf8(&mut buf).as_bytes());
         }
+    }
+}
+
+/// Go's `unicode.ToLower`: the simple (single-rune) lowercase mapping.
+fn to_lower_simple(c: char) -> char {
+    if c == '\u{0130}' {
+        // The only code point whose full lowercase is multi-char; its simple
+        // mapping (which Go uses) is a plain 'i'.
+        return 'i';
+    }
+    let mut it = c.to_lowercase();
+    match (it.next(), it.next()) {
+        (Some(l), None) => l,
+        _ => c,
     }
 }
 
@@ -377,5 +392,10 @@ mod tests {
         f("foo", "foo");
         f("FOO", "foo");
         f("foo БаР baz 123", "foo бар baz 123");
+        // Simple (Go unicode.ToLower) mappings, not full case mappings:
+        // İ lowers to a plain 'i' (full mapping would be "i\u{307}").
+        f("\u{130}", "i");
+        f("\u{1E9E}", "\u{DF}"); // ẞ → ß
+        f("\u{3A3}\u{39C}", "\u{3C3}\u{3BC}"); // ΣΜ → σμ
     }
 }

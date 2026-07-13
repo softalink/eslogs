@@ -550,3 +550,152 @@ fn test_get_literals() {
     f("((foo|bar)baz xxx(?:yzabc)*)", &["baz xxx"]);
     f("((foo|bar)baz? xxx(?:yzabc)*)", &["ba", " xxx"]);
 }
+
+// The tests below are port-only (upstream regexutil tests have no `\p{...}`,
+// `\b` or Unicode-folding cases); expected values follow Go's
+// regexp/regexutil behavior at v1.51.0.
+
+#[test]
+fn test_unicode_class_regex() {
+    // Go resolves \p{...} via the unicode package tables; the port keeps the
+    // token opaque and lets the regex crate resolve it at compile time.
+    fn f(expr: &str, s: &str, result_expected: bool) {
+        let r = Regex::new(expr).expect("unexpected error");
+        let result = r.match_string(s);
+        assert_eq!(
+            result, result_expected,
+            "unexpected result when matching {expr:?} against {s:?}"
+        );
+    }
+
+    // Unanchored (contains) semantics, as in Go's Regex.MatchString.
+    f(r"\p{Han}", "a日b", true);
+    f(r"\p{Han}", "abc", false);
+    f(r"\P{Han}", "日", false);
+    f(r"\P{Han}", "日a", true);
+    f(r"\pL+", "123abc", true);
+    f(r"\pL", "123", false);
+    f(r"foo\p{Greek}", "fooα", true);
+    f(r"foo\p{Greek}", "fooa", false);
+    f(r"(?i)\p{Lu}", "abc", true); // folded: matches lowercase too
+    f(r"\p{Lu}", "abc", false);
+    f(r"\p{Lu}+bar", "ABCbar", true);
+    // Whole char classes containing a Unicode group stay opaque.
+    f(r"[\p{L}0]+", "a0б", true);
+    f(r"[\p{L}0]", "-;", false);
+    f(r"[^\p{L}]", "abc", false);
+    f(r"[^\p{L}]", "ab1", true);
+    // \p{^Han} is canonicalized to \P{Han} (Go treats them identically).
+    f(r"\p{^Han}", "日", false);
+    f(r"\p{^Han}", "a", true);
+    f(r"\P{^Han}", "日", true);
+}
+
+#[test]
+fn test_unicode_class_prom_regex() {
+    fn f(expr: &str, s: &str, result_expected: bool) {
+        let pr = PromRegex::new(expr).expect("unexpected error");
+        let result = pr.match_string(s);
+        assert_eq!(
+            result, result_expected,
+            "unexpected result when matching {expr:?} against {s:?}"
+        );
+    }
+
+    // Anchored semantics, as in Go's PromRegex.MatchString.
+    f(r"\p{Lu}+", "ABC", true);
+    f(r"\p{Lu}+", "ABc", false);
+    f(r"метрика\p{Nd}", "метрика5", true);
+    f(r"метрика\p{Nd}", "метрикаx", false);
+}
+
+#[test]
+fn test_unicode_class_failure() {
+    // Malformed tokens fail at parse time like Go (invalid char range);
+    // names unknown to the regex crate fail at matcher-compile time
+    // (PORT NOTE divergence: Go rejects unknown names at parse time).
+    for expr in [
+        r"\p",
+        r"\p{",
+        r"\p{}",
+        r"\p{^}",
+        r"[\p{]",
+        r"\p{NoSuchClassName}",
+    ] {
+        assert!(
+            Regex::new(expr).is_err(),
+            "expecting error when parsing {expr:?}"
+        );
+    }
+}
+
+#[test]
+fn test_regex_ascii_word_boundary() {
+    // Go's \b/\B are ASCII-only: 'é' is not an ASCII word char, so Go sees a
+    // word boundary between 'é' and 'f' in "caféfoo". The port rewrites \b
+    // to (?-u:\b) before compiling (the regex crate's bare \b is
+    // Unicode-aware and would disagree).
+    fn f(expr: &str, s: &str, result_expected: bool) {
+        let r = Regex::new(expr).expect("unexpected error");
+        let result = r.match_string(s);
+        assert_eq!(
+            result, result_expected,
+            "unexpected result when matching {expr:?} against {s:?}"
+        );
+    }
+
+    f(r"\bfoo\b", "foo", true);
+    f(r"\bfoo\b", "a foo b", true);
+    f(r"\bfoo\b", "xfoo", false);
+    f(r"\bfoo\b", "caféfoo", true);
+    f(r"\Bfoo", "xfoo", true);
+    f(r"\Bfoo", "caféfoo", false);
+    f(r"\Bfoo", " foo", false);
+    // Escaped backslash before 'b' is a literal backslash + 'b', not \b.
+    f(r"a\\b", "a\\b", true);
+}
+
+#[test]
+fn test_get_or_values_regex_unicode_fold() {
+    // Case folding during class parsing walks Go's SimpleFold orbits.
+    fn f(s: &str, values_expected: &[&str]) {
+        let values = get_or_values_regex(s);
+        assert_eq!(values, values_expected, "unexpected values for regex {s:?}");
+    }
+
+    // k folds through K, k, KELVIN SIGN (U+212A).
+    f("(?i)[k]", &["K", "k", "\u{212A}"]);
+    // s folds through S, s, LONG S (U+017F).
+    f("(?i)[s]", &["S", "s", "\u{17F}"]);
+    // İ (U+0130) folds only to itself.
+    f("(?i)[\u{130}]", &["\u{130}"]);
+    // ᾀ (U+1F80) folds to ᾈ (U+1F88) via the simple uppercase mapping; the
+    // two-element orbit turns the class into a case-insensitive literal,
+    // which yields no or-values (same as Go).
+    f("(?i)[\u{1F80}]", &[]);
+    // Unicode classes are never expanded into or-values (PORT NOTE: Go
+    // expands classes with <= 100 runes; \p{Han} is far larger, so Go also
+    // returns none here).
+    f(r"\p{Han}", &[]);
+}
+
+#[test]
+fn test_simplify_regex_unicode() {
+    fn f(s: &str, expected_prefix: &str, expected_suffix: &str) {
+        let (prefix, suffix) = simplify_regex(s);
+        assert_eq!(
+            (prefix.as_str(), suffix.as_str()),
+            (expected_prefix, expected_suffix),
+            "unexpected prefix/suffix for regex {s:?}"
+        );
+    }
+
+    // Opaque Unicode class tokens round-trip through simplification.
+    f(r"foo\p{Han}", "foo", r"\p{Han}");
+    f(r"foo(\p{Han}|\p{Latin})", "foo", r"\p{Han}|\p{Latin}");
+    f(r"\p{Han}+", "", r"\p{Han}+");
+    f(r"[\p{L}0]{2,3}", "", r"[\p{L}0][\p{L}0][\p{L}0]?");
+    // ᾀ folds with ᾈ (two-element orbit → case-insensitive literal), same
+    // as Go's SimplifyRegex output.
+    f("(?i)[\u{1F80}]", "", "(?i:\u{1F80})");
+}

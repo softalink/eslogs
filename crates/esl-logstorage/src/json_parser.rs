@@ -319,9 +319,15 @@ fn compose_field_name(name: &mut String, field_prefix: &str, prefix_buf: &[u8], 
     }
 }
 
-/// PORT NOTE: Go strings hold arbitrary bytes; Rust `String` requires valid
-/// UTF-8, so invalid sequences are replaced with U+FFFD (this never triggers
-/// for valid UTF-8 JSON input).
+/// PORT NOTE: Go views the raw key/value bytes as strings
+/// (`bytesutil.ToUnsafeString` in `appendLogField`), so JSON containing
+/// invalid UTF-8 inside string literals is ingested with those bytes kept
+/// verbatim in the stored field name/value. `Field` is a Rust `String`
+/// (crate-wide decision), which must hold valid UTF-8, so each invalid
+/// sequence is replaced with U+FFFD instead: input value bytes `b"a\xffb"`
+/// are stored by Go as `a\xffb` and by the port as `a\u{FFFD}b`. This never
+/// triggers for valid UTF-8 JSON input; closing it would require a
+/// String→bytes `Field` refactor.
 fn push_lossy(dst: &mut String, b: &[u8]) {
     // Fast path for valid UTF-8 (the overwhelmingly common case for log data):
     // `str::from_utf8` is SIMD-validated and borrows directly, avoiding the
@@ -1245,6 +1251,26 @@ mod tests {
         f("{foo");
         f("[1,2,3]");
         f("{\"foo\",}");
+    }
+
+    // PORT-ONLY TEST: upstream has no invalid-UTF-8 coverage. Pins the
+    // divergence documented on push_lossy: Go stores the raw bytes of an
+    // invalid-UTF-8 JSON key/value; the port U+FFFD-replaces each invalid
+    // sequence because Field is a String.
+    #[test]
+    fn test_json_parser_invalid_utf8_lossy() {
+        let mut p = get_json_parser();
+        // {"a\xffb":"x\xffy"} with a raw 0xFF byte in both key and value.
+        let data = b"{\"a\xffb\":\"x\xffy\"}";
+        p.parse_log_message(data, &[], "")
+            .unwrap_or_else(|e| panic!("unexpected error: {e}"));
+        assert_eq!(
+            p.fields(),
+            &[field("a\u{FFFD}b", "x\u{FFFD}y")],
+            "unexpected fields: {:?}",
+            p.fields()
+        );
+        put_json_parser(p);
     }
 
     #[test]

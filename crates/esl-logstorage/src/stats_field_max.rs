@@ -1,9 +1,15 @@
 //! Port of `stats_field_max.go`: the `field_max(src, field)` stats function,
 //! which tracks the value of `field` in the row holding the maximum `src`.
 //!
-//! See [`crate::stats_field_min`] for the mirror image and the `_time`-source
-//! PORT NOTE (Go reads the companion at the last row; this port reads it at the
-//! row holding the max timestamp).
+//! See [`crate::stats_field_min`] for the mirror image. Go's `_time`-source
+//! fast path is ported, including its quirk: the block's maximum timestamp
+//! comes from `getMaxTimestamp` and the companion field is read at the last
+//! row of the winning block — not at the row that actually holds the maximum
+//! timestamp.
+//!
+//! PORT NOTE: Go additionally gates the per-value scan on the column
+//! `valueType` (dict/uint/int/float/ipv4/iso8601 max-value pre-checks); those
+//! are perf-only — the plain scan below selects the same winner.
 
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
@@ -16,6 +22,9 @@ use crate::prefix_filter::Filter;
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::stats_min::less_string;
 use crate::stream_filter::quote_token_if_needed;
+use crate::values_encoder::{
+    marshal_timestamp_rfc3339_nano_string, try_parse_timestamp_rfc3339_nano,
+};
 
 /// Port of `statsFieldMax`.
 pub(crate) struct StatsFieldMax {
@@ -107,6 +116,26 @@ impl StatsProcessor for StatsFieldMaxProcessor {
     fn update_stats_for_all_rows(&mut self, _sf: &dyn StatsFunc, br: &mut BlockResult) -> i64 {
         let field_name = self.field_name.clone();
         let c_src = br.get_column_by_name(&self.src_field);
+        if br.column_is_const(c_src) {
+            let v = br.column_get_value_at_row(c_src, 0).to_owned();
+            return self.update_state(&v, br, &field_name, 0);
+        }
+        if br.column_is_time(c_src) {
+            // Go fast path: take the block maximum from `getMaxTimestamp` and
+            // read the companion field at the last row (Go's quirk — not the
+            // row holding the maximum).
+            let timestamp = try_parse_timestamp_rfc3339_nano(&self.max).unwrap_or(i64::MIN);
+            let max_timestamp = br.get_max_timestamp(timestamp);
+            if max_timestamp <= timestamp {
+                return 0;
+            }
+            let mut b = Vec::new();
+            marshal_timestamp_rfc3339_nano_string(&mut b, max_timestamp);
+            let v = to_unsafe_string(&b).to_owned();
+            let last_row = br.rows_len() - 1;
+            return self.update_state(&v, br, &field_name, last_row);
+        }
+
         let src_vals: Vec<Vec<u8>> = br.column_get_values(c_src).to_vec();
         let mut inc = 0i64;
         for (i, v) in src_vals.iter().enumerate() {

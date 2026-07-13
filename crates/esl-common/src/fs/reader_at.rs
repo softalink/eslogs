@@ -3,10 +3,11 @@
 
 use std::fs::File;
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::flagutil::Flag;
+use crate::metrics::Counter;
 use crate::panicf;
 
 static DISABLE_MMAP: Flag<bool> = Flag::new(
@@ -100,8 +101,8 @@ impl ReaderAt {
             self.read_calls.fetch_add(1, Ordering::SeqCst);
             self.read_bytes.fetch_add(p.len() as i64, Ordering::SeqCst);
         } else {
-            READ_CALLS.fetch_add(1, Ordering::SeqCst);
-            READ_BYTES.fetch_add(p.len() as i64, Ordering::SeqCst);
+            READ_CALLS.inc();
+            READ_BYTES.add(p.len() as u64);
         }
     }
 
@@ -144,8 +145,8 @@ impl ReaderAt {
         }
 
         if self.use_local_stats.load(Ordering::SeqCst) {
-            READ_CALLS.fetch_add(self.read_calls.load(Ordering::SeqCst), Ordering::SeqCst);
-            READ_BYTES.fetch_add(self.read_bytes.load(Ordering::SeqCst), Ordering::SeqCst);
+            READ_CALLS.add_i64(self.read_calls.load(Ordering::SeqCst));
+            READ_BYTES.add_i64(self.read_bytes.load(Ordering::SeqCst));
             self.read_calls.store(0, Ordering::SeqCst);
             self.read_bytes.store(0, Ordering::SeqCst);
             self.use_local_stats.store(false, Ordering::SeqCst);
@@ -191,9 +192,23 @@ impl MustReadAtCloser for ReaderAt {
     }
 }
 
-static READ_CALLS: AtomicI64 = AtomicI64::new(0);
-static READ_BYTES: AtomicI64 = AtomicI64::new(0);
-static READERS_COUNT: AtomicI64 = AtomicI64::new(0);
+// The `vm_fs_*` package-level metric vars from reader_at.go, rebranded
+// `esm_fs_*` (Go registers them at package init; the port registers them from
+// `appmetrics::init_start_time` or lazily on first use).
+static READ_CALLS: LazyLock<Arc<Counter>> =
+    LazyLock::new(|| crate::metrics::new_counter("esm_fs_read_calls_total"));
+static READ_BYTES: LazyLock<Arc<Counter>> =
+    LazyLock::new(|| crate::metrics::new_counter("esm_fs_read_bytes_total"));
+static READERS_COUNT: LazyLock<Arc<Counter>> =
+    LazyLock::new(|| crate::metrics::new_counter("esm_fs_readers"));
+
+/// Registers the `esm_fs_*` reader series in the default metrics set.
+pub(crate) fn register_metrics() {
+    LazyLock::force(&READ_CALLS);
+    LazyLock::force(&READ_BYTES);
+    LazyLock::force(&READERS_COUNT);
+    LazyLock::force(&MMAPPED_FILES);
+}
 
 /// Opens ReaderAt for reading from the file located at path.
 ///
@@ -279,7 +294,7 @@ impl MmapReader {
             mincore_bits = make_mincore_bits(size);
         }
 
-        READERS_COUNT.fetch_add(1, Ordering::SeqCst);
+        READERS_COUNT.inc();
         MmapReader {
             f,
             mmap,
@@ -293,9 +308,9 @@ impl MmapReader {
         // PORT NOTE: memmap2 unmaps on drop without an error channel; Go's
         // panic-on-munmap-failure cannot be reproduced.
         if self.mmap.is_some() {
-            MMAPPED_FILES.fetch_sub(1, Ordering::SeqCst);
+            MMAPPED_FILES.dec();
         }
-        READERS_COUNT.fetch_sub(1, Ordering::SeqCst);
+        READERS_COUNT.dec();
     }
 
     fn must_read_at_via_syscall(&self, p: &mut [u8], off: i64) {
@@ -471,18 +486,19 @@ fn mmap_file(f: &File, size: u64) -> Result<Option<memmap2::Mmap>, String> {
     // copies never read out of bounds, so memmap2 maps the exact file size.
     match unsafe { memmap2::MmapOptions::new().len(size as usize).map(f) } {
         Ok(m) => {
-            MMAPPED_FILES.fetch_add(1, Ordering::SeqCst);
+            MMAPPED_FILES.inc();
             Ok(Some(m))
         }
         Err(err) => Err(format!(
             "cannot mmap file with size {size} bytes; already memory mapped files: {}: {err}; \
 try increasing /proc/sys/vm/max_map_count or passing -fs.disableMmap command-line flag to the application",
-            MMAPPED_FILES.load(Ordering::SeqCst)
+            MMAPPED_FILES.get()
         )),
     }
 }
 
-static MMAPPED_FILES: AtomicI64 = AtomicI64::new(0);
+static MMAPPED_FILES: LazyLock<Arc<Counter>> =
+    LazyLock::new(|| crate::metrics::new_counter("esm_mmapped_files"));
 
 fn has_mincore() -> bool {
     supports_mincore() && !*DISABLE_MINCORE.get()

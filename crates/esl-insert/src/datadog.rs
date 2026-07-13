@@ -4,14 +4,11 @@
 //! POSTed to `/api/v2/logs` (or the `/insert/datadog/`-prefixed alias), with
 //! `ddtags`/`ddsource` handling and the `/api/v1/validate` probe.
 //!
-//! PORT NOTE: Go enforces `-datadog.maxRequestSize` (64MiB) via
-//! `protoparserutil.ReadUncompressedData`; the port reads the body in full
-//! without the explicit size cap. The gzip/deflate/zstd/snappy
-//! `Content-Encoding`s Go supports are decompressed transparently by
-//! [`Request::body_reader`] in `esl_common::httpserver`.
-//!
-//! PORT NOTE: Go's `CanWriteData()` check is omitted, matching the rest of
-//! the port (see `common_params.rs`).
+//! PORT NOTE: Go enforces `-datadog.maxRequestSize` via
+//! `protoparserutil.ReadUncompressedData` while streaming the body; the port
+//! checks the cap after reading the body in full. The
+//! gzip/deflate/zstd/snappy `Content-Encoding`s Go supports are decompressed
+//! transparently by [`Request::body_reader`] in `esl_common::httpserver`.
 //!
 //! PORT NOTE: Go parses JSON via the vendored `valyala/fastjson`. esl-insert
 //! only depends on `esl-common`/`esl-logstorage`, so a small dependency-free
@@ -21,15 +18,17 @@
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use esl_common::flagutil::{ArrayString, Flag};
+use esl_common::flagutil::{ArrayString, Bytes, Flag};
 use esl_common::httpserver::{Request, ResponseWriter};
 use esl_common::metrics::{Counter, Summary};
+use esl_common::writeconcurrencylimiter;
 
 use esl_logstorage::rows::Field;
 use esl_logstorage::stream_tags::check_stream_field_names;
 
 use crate::common_params::{
-    LogMessageProcessorTrait, LogRowsStorage, get_common_params, now_unix_nanos,
+    LogMessageProcessorTrait, LogRowsStorage, check_max_request_size, errorf_with_status,
+    get_common_params, now_unix_nanos,
 };
 
 static DATADOG_STREAM_FIELDS: Flag<ArrayString> = Flag::new(
@@ -43,6 +42,11 @@ static DATADOG_IGNORE_FIELDS: Flag<ArrayString> = Flag::new(
     "Comma-separated list of fields to ignore for logs ingested via DataDog protocol. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/datadog-agent/#dropping-fields",
     ArrayString::default,
+);
+static MAX_REQUEST_SIZE: Flag<Bytes> = Flag::new(
+    "datadog.maxRequestSize",
+    "The maximum size in bytes of a single DataDog request",
+    || Bytes::with_default(64 * 1024 * 1024),
 );
 
 /// RequestHandler processes Datadog insert requests. Returns true if the path
@@ -130,6 +134,27 @@ fn datadog_logs_ingestion<S: LogRowsStorage>(
         cp.ignore_fields = DATADOG_IGNORE_FIELDS.get().0.clone();
     }
 
+    if let Err((msg, status)) = storage.can_write_data() {
+        errorf_with_status(w, req, &msg, status);
+        return;
+    }
+
+    // Go streams the body via protoparserutil.ReadUncompressedData, which
+    // takes a writeconcurrencylimiter token for the read+parse and enforces
+    // -datadog.maxRequestSize while reading; the port takes the token here
+    // and checks the cap after the read.
+    let _concurrency_guard = match writeconcurrencylimiter::inc_concurrency_guard() {
+        Ok(g) => g,
+        Err(err) => {
+            errorf_with_status(
+                w,
+                req,
+                &format!("cannot read DataDog protocol data: {}", err.err),
+                err.status_code,
+            );
+            return;
+        }
+    };
     let data = match req.read_full_body() {
         Ok(d) => d,
         Err(err) => {
@@ -137,6 +162,10 @@ fn datadog_logs_ingestion<S: LogRowsStorage>(
             return;
         }
     };
+    if let Err(err) = check_max_request_size(data.len(), &MAX_REQUEST_SIZE) {
+        w.errorf(req, &format!("cannot read DataDog protocol data: {err}"));
+        return;
+    }
 
     let mut lmp = cp.new_log_message_processor(storage, "datadog");
     let res = read_logs_request(ts, &data, &mut lmp);

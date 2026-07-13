@@ -119,6 +119,27 @@ impl Filter for FilterStreamID {
         self.q_text.is_some()
     }
 
+    fn has_direct_subquery(&self) -> bool {
+        self.q_text.is_some()
+    }
+
+    /// Port of Go `visitSubqueriesInFilter`'s `*filterStreamID` arm
+    /// (`t.q.visitSubqueries(visitFunc)`). Go visits the parsed `t.q`; the
+    /// port parses the stored text at `timestamp`, visits the parsed query and
+    /// stores the re-rendered text back (see `Filter::visit_subqueries_mut`).
+    fn visit_subqueries_mut(
+        &mut self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+        let Some(q_text) = self.q_text.as_mut() else {
+            return;
+        };
+        let mut q = crate::parser::query::must_parse_query(q_text, timestamp);
+        q.visit_subqueries(visit);
+        *q_text = q.to_string();
+    }
+
     /// Go `getStreamIDsFromFilterOr`'s `*filterStreamID` arm.
     fn stream_ids(&self) -> Option<&[StreamID]> {
         Some(&self.stream_ids)

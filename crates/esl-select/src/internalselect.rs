@@ -4,29 +4,34 @@
 //!
 //! PORT NOTE — concurrency limiter: Go wraps `requestHandler` in a
 //! `concurrencyLimitCh` gate sized by `-internalselect.maxConcurrentRequests`
-//! (with `Init`/`Stop` lifecycle) and a `esl_concurrent_internalselect_requests_wait_duration`
-//! summary. The limiter is dropped (requests are served directly, bounded by
-//! the httpserver worker pool), so the wait-duration summary has nothing to
-//! measure and is not registered. The per-path `esl_http_requests_total` /
+//! and a `esl_concurrent_internalselect_requests_wait_duration` summary
+//! (`vl_*` upstream); both are ported ([`ConcurrencyLimiter`]). Go's
+//! `Init`/`Stop` lifecycle is replaced by lazy initialization on the first
+//! request (the flag registry convention used across the port). While queued,
+//! Go selects on `ctx.Done()`; the port polls the disconnect-watcher token
+//! every 10ms instead. The slot covers parsing + query execution into the
+//! response buffer; the buffered bytes are written to the socket by the
+//! httpserver after the slot is released (Go streams them inside the slot —
+//! see the response-streaming PORT NOTE below). The per-path `esl_http_requests_total` /
 //! `esl_http_errors_total` / `esl_http_request_duration_seconds` metrics are
 //! ported.
 //!
 //! PORT NOTE — `QueryContext`: Go bundles ctx cancellation, `QueryStats`,
 //! `AllowPartialResponse` and `HiddenFieldsFilters` into a
 //! `logstorage.QueryContext` passed to `eslstorage.RunQuery`/`Get*`. The ported
-//! surfaces take tenant_ids/query plus the shared per-request
+//! surfaces take tenant_ids/query/hidden_fields_filters plus the shared
+//! per-request
 //! `CommonParams::qs` (Go `qctx.QueryStats`) explicitly, so the trailing
 //! query-stats block carries the real execution counters plus the measured
 //! `QueryDurationNsecs`. Ctx cancellation IS ported: each query/Get* handler
 //! registers a disconnect-watcher token (`ResponseWriter::watch_disconnect`)
 //! that cancels the running query when the netselect client goes away, and
 //! canceled queries produce no response body (the dispatcher suppresses
-//! `errorf` for them). `allow_partial_response` and `hidden_fields_filters`
-//! are parsed and validated exactly like Go (their absence is an error) but are
-//! not consumed by the local query execution: `allow_partial_response` only
-//! affects multi-node fan-out (a client-side concern here) and
-//! `hidden_fields_filters` is not carried by the ported query surface (the
-//! netselect client always sends `null`).
+//! `errorf` for them). `hidden_fields_filters` is threaded into every
+//! query/Get* execution exactly like Go's `qctx.HiddenFieldsFilters`.
+//! `allow_partial_response` is parsed and validated exactly like Go (its
+//! absence is an error) but is not consumed by the local query execution: it
+//! only affects multi-node fan-out (a client-side concern here).
 //!
 //! PORT NOTE — response streaming: Go streams length-prefixed frames to the
 //! client as soon as a per-worker buffer exceeds 1MiB and aborts on write
@@ -39,12 +44,15 @@
 //! into the `esl_storage_per_query_*` histograms at handler end.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use esl_common::encoding as vlencoding;
 use esl_common::encoding::zstd;
+use esl_common::flagutil::Flag;
 use esl_common::httpserver::{Request, ResponseWriter};
+use esl_common::metrics::Summary;
 
 use esl_logstorage::delete_task::marshal_delete_tasks_to_json;
 use esl_logstorage::parser::{ParseFilter, ParseQueryAtTimestamp, Query};
@@ -66,6 +74,85 @@ use esl_storage::netselect::{
 /// (Go: `len(bb.B) < 1024*1024` fast path in `writeBlock`).
 const SEND_BUF_THRESHOLD: usize = 1024 * 1024;
 
+static MAX_CONCURRENT_REQUESTS: Flag<i64> = Flag::new(
+    "internalselect.maxConcurrentRequests",
+    "The limit on the number of concurrent requests to /internal/select/* endpoints; \
+     other requests are put into the wait queue; \
+     see https://docs.victoriametrics.com/victorialogs/cluster/",
+    || 8,
+);
+
+/// Go `concurrencyLimitCh`: a counting gate over the request handlers, sized
+/// by `-internalselect.maxConcurrentRequests` (created lazily instead of in
+/// Go's `Init`).
+static CONCURRENCY_LIMIT: LazyLock<ConcurrencyLimiter> = LazyLock::new(|| {
+    let max = *MAX_CONCURRENT_REQUESTS.get();
+    let max = usize::try_from(max)
+        .unwrap_or_else(|_| panic!("BUG: -internalselect.maxConcurrentRequests={max} is negative"));
+    ConcurrencyLimiter::new(max)
+});
+
+/// Go `concurrentRequestsWaitDuration`
+/// (`vl_concurrent_internalselect_requests_wait_duration`).
+static CONCURRENT_REQUESTS_WAIT_DURATION: LazyLock<Arc<Summary>> = LazyLock::new(|| {
+    esl_common::metrics::new_summary("esl_concurrent_internalselect_requests_wait_duration")
+});
+
+/// Port of Go's `concurrencyLimitCh` channel gate: at most `max` holders at a
+/// time; further `acquire`s queue until a slot frees up or the caller's
+/// disconnect token flips.
+struct ConcurrencyLimiter {
+    max: usize,
+    active: Mutex<usize>,
+    cond: Condvar,
+}
+
+impl ConcurrencyLimiter {
+    fn new(max: usize) -> ConcurrencyLimiter {
+        ConcurrencyLimiter {
+            max,
+            active: Mutex::new(0),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Blocks until a slot is free (returns `true`) or `cancel` flips
+    /// (returns `false`), mirroring Go's
+    /// `select { case concurrencyLimitCh <- struct{}{}: ...; case <-ctx.Done(): ... }`.
+    ///
+    /// PORT NOTE: Go wakes on `ctx.Done()`; the port polls the disconnect
+    /// token every 10ms while queued. When a free slot and a cancellation are
+    /// both observable, the port deterministically takes the slot (Go's
+    /// `select` picks pseudo-randomly among the ready cases).
+    fn acquire(&self, cancel: Option<&Arc<AtomicBool>>) -> bool {
+        let mut active = self.active.lock().unwrap();
+        loop {
+            if *active < self.max {
+                *active += 1;
+                return true;
+            }
+            if let Some(c) = cancel
+                && c.load(Ordering::SeqCst)
+            {
+                return false;
+            }
+            (active, _) = self
+                .cond
+                .wait_timeout(active, Duration::from_millis(10))
+                .unwrap();
+        }
+    }
+
+    /// Frees a slot taken by [`ConcurrencyLimiter::acquire`]
+    /// (Go `<-concurrencyLimitCh`).
+    fn release(&self) {
+        let mut active = self.active.lock().unwrap();
+        *active -= 1;
+        drop(active);
+        self.cond.notify_one();
+    }
+}
+
 /// Handles `/internal/select/*` and `/internal/delete/*` requests
 /// (Go `internalselect.RequestHandler`).
 ///
@@ -77,6 +164,35 @@ pub fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
         return false;
     }
 
+    let start_time = Instant::now();
+
+    let cancel = w.watch_disconnect();
+    if !CONCURRENCY_LIMIT.acquire(cancel.as_deref()) {
+        // Unconditionally measure the wait time until the the request is
+        // canceled by the client. There is nobody left to respond to.
+        CONCURRENT_REQUESTS_WAIT_DURATION.update_duration(start_time);
+        return true;
+    }
+    drop(cancel);
+    let waited = start_time.elapsed();
+    if waited > Duration::from_millis(100) {
+        // Measure the wait duration for requests, which hit the concurrency
+        // limit and waited for more than 100 milliseconds to be executed.
+        CONCURRENT_REQUESTS_WAIT_DURATION.update(waited.as_secs_f64());
+    }
+    request_handler_inner(storage, req, w, &path, start_time);
+    CONCURRENCY_LIMIT.release();
+    true
+}
+
+/// Port of Go `requestHandler` (the part inside the concurrency gate).
+fn request_handler_inner(
+    storage: &Arc<Storage>,
+    req: &mut Request,
+    w: &mut ResponseWriter,
+    path: &str,
+    start_time: Instant,
+) {
     // Parse request before obtaining the request args from it in order to
     // catch parse errors, which are silently skipped at r.FormValue() calls
     // inside the request handlers executed below.
@@ -98,9 +214,8 @@ pub fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
         }
     };
 
-    let start_time = Instant::now();
     let known_path = matches!(
-        path.as_str(),
+        path,
         "/internal/select/query"
             | "/internal/select/field_names"
             | "/internal/select/field_values"
@@ -120,7 +235,7 @@ pub fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
         .inc();
     }
 
-    let result = match path.as_str() {
+    let result = match path {
         "/internal/select/query" => process_query_request(storage, req, &form, w),
         "/internal/select/field_names" => process_field_names_request(storage, req, &form, w),
         "/internal/select/field_values" => process_field_values_request(storage, req, &form, w),
@@ -140,7 +255,7 @@ pub fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
 
         _ => {
             w.errorf(req, &format!("unsupported endpoint requested: {path}"));
-            return true;
+            return;
         }
     };
 
@@ -162,7 +277,6 @@ pub fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
         "esl_http_request_duration_seconds{{path={path:?}}}"
     ))
     .update_duration(start_time);
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -192,12 +306,18 @@ impl Form {
     }
 }
 
-/// Port of Go `parseRequest`.
+/// Port of Go `parseRequest`: `r.ParseMultipartForm(maxMemory)` with
+/// `maxMemory := int64(0.1 * float64(memory.Allowed()))`.
 ///
-/// PORT NOTE: Go bounds `ParseMultipartForm` by 10% of the allowed memory;
-/// the ported httpserver already buffers request bodies without that knob, so
-/// the limit is dropped.
+/// PORT NOTE: Go's `mime/multipart.Reader.ReadForm` bounds the total size of
+/// non-file form values by `maxMemory + 10MiB` and fails with
+/// `multipart: message too large` beyond that; the port enforces the same
+/// bound in [`parse_multipart_form`]. (Go additionally spills *file* parts
+/// beyond `maxMemory` to disk; the netselect protocol has no file parts, so
+/// there is nothing to spill.) The raw request body itself is buffered by the
+/// ported httpserver before this check, like Go's `http.Request` body read.
 fn parse_request(req: &mut Request) -> Result<Form, String> {
+    let max_memory = (0.1 * esl_common::memory::allowed() as f64) as i64;
     let ct = req.content_type().to_string();
     if !ct.starts_with("multipart/form-data;") {
         // Non-multipart args (urlencoded bodies and the URL query string) are
@@ -210,7 +330,7 @@ fn parse_request(req: &mut Request) -> Result<Form, String> {
     let body = req
         .read_full_body()
         .map_err(|err| format!("cannot parse multipart-encoded request args: {err}"))?;
-    let values = parse_multipart_form(&body, &boundary)
+    let values = parse_multipart_form(&body, &boundary, max_memory)
         .map_err(|err| format!("cannot parse multipart-encoded request args: {err}"))?;
     Ok(Form { values })
 }
@@ -237,9 +357,19 @@ fn get_multipart_boundary(content_type: &str) -> Option<String> {
 /// by `mime/multipart.Writer` (and the ported
 /// `esl_storage::http_client::new_multipart_request_body`): text parts with a
 /// `Content-Disposition: form-data; name="..."` header.
-fn parse_multipart_form(body: &[u8], boundary: &str) -> Result<HashMap<String, String>, String> {
+///
+/// The total size of the part values is bounded by `max_memory + 10MiB`, like
+/// Go `mime/multipart.Reader.ReadForm(maxMemory)` (its `maxValueBytes`).
+fn parse_multipart_form(
+    body: &[u8],
+    boundary: &str,
+    max_memory: i64,
+) -> Result<HashMap<String, String>, String> {
     let dash_boundary = format!("--{boundary}").into_bytes();
     let mut values = HashMap::new();
+    // Go multipart.Reader.ReadForm: "Reserve an additional 10 MB for non-file
+    // parts."; every value's bytes count against it, error once exhausted.
+    let mut max_value_bytes = max_memory + 10 * (1 << 20);
 
     let mut pos = find_subslice(body, &dash_boundary).ok_or("missing opening boundary")?
         + dash_boundary.len();
@@ -263,6 +393,11 @@ fn parse_multipart_form(body: &[u8], boundary: &str) -> Result<HashMap<String, S
         value_terminator.extend_from_slice(&dash_boundary);
         let value_len = find_subslice(&body[pos..], &value_terminator)
             .ok_or("missing closing boundary for part")?;
+        max_value_bytes -= value_len as i64;
+        if max_value_bytes < 0 {
+            // Go multipart.ErrMessageTooLarge.
+            return Err("multipart: message too large".to_string());
+        }
         let value = std::str::from_utf8(&body[pos..pos + value_len])
             .map_err(|_| format!("part {name:?} value is not valid UTF-8"))?;
         // Go FormValue returns the first value for duplicate keys.
@@ -370,6 +505,7 @@ fn process_query_request(
     storage.run_query_with_stats(
         &cp.tenant_ids,
         &cp.query,
+        &cp.hidden_fields_filters,
         write_block,
         cancel.as_deref(),
         &cp.qs,
@@ -432,7 +568,14 @@ fn process_field_names_request(
 
     let cancel = w.watch_disconnect();
     let field_names = storage
-        .get_field_names(&cp.tenant_ids, &cp.query, filter, cancel.as_deref(), &cp.qs)
+        .get_field_names(
+            &cp.tenant_ids,
+            &cp.query,
+            &cp.hidden_fields_filters,
+            filter,
+            cancel.as_deref(),
+            &cp.qs,
+        )
         .map_err(|err| format!("cannot obtain field names: {err}"))?;
     drop(cancel);
 
@@ -465,6 +608,7 @@ fn process_field_values_request(
         .get_field_values(
             &cp.tenant_ids,
             &cp.query,
+            &cp.hidden_fields_filters,
             field_name,
             filter,
             limit as u64,
@@ -497,7 +641,14 @@ fn process_stream_field_names_request(
 
     let cancel = w.watch_disconnect();
     let field_names = storage
-        .get_stream_field_names(&cp.tenant_ids, &cp.query, filter, cancel.as_deref(), &cp.qs)
+        .get_stream_field_names(
+            &cp.tenant_ids,
+            &cp.query,
+            &cp.hidden_fields_filters,
+            filter,
+            cancel.as_deref(),
+            &cp.qs,
+        )
         .map_err(|err| format!("cannot obtain stream field names: {err}"))?;
     drop(cancel);
 
@@ -530,6 +681,7 @@ fn process_stream_field_values_request(
         .get_stream_field_values(
             &cp.tenant_ids,
             &cp.query,
+            &cp.hidden_fields_filters,
             field_name,
             filter,
             limit as u64,
@@ -565,6 +717,7 @@ fn process_streams_request(
         .get_streams(
             &cp.tenant_ids,
             &cp.query,
+            &cp.hidden_fields_filters,
             limit as u64,
             cancel.as_deref(),
             &cp.qs,
@@ -598,6 +751,7 @@ fn process_stream_ids_request(
         .get_stream_ids(
             &cp.tenant_ids,
             &cp.query,
+            &cp.hidden_fields_filters,
             limit as u64,
             cancel.as_deref(),
             &cp.qs,
@@ -731,11 +885,8 @@ struct CommonParams {
     allow_partial_response: bool,
 
     /// Optional list of log fields or log field prefixes ending with `*`,
-    /// which must be hidden during query execution.
-    ///
-    /// PORT NOTE: parsed for protocol compatibility; unused locally (see the
-    /// module docs).
-    #[allow(dead_code)]
+    /// which must be hidden during query execution
+    /// (Go `commonParams.HiddenFieldsFilters`, threaded via `qctx()`).
     hidden_fields_filters: Vec<String>,
 }
 
@@ -1398,15 +1549,81 @@ mod tests {
         ];
         let (body, content_type) = esl_storage::http_client::new_multipart_request_body(&args);
         let boundary = get_multipart_boundary(&content_type).expect("boundary");
-        let values = parse_multipart_form(&body, &boundary).expect("parse");
+        let values = parse_multipart_form(&body, &boundary, 1 << 20).expect("parse");
         assert_eq!(values.len(), 2);
         assert_eq!(values["query"], "*");
         assert_eq!(values["na\"me"], "value1\r\nline2");
 
         // Truncated body → error.
-        assert!(parse_multipart_form(&body[..body.len() - 4], &boundary).is_err());
+        assert!(parse_multipart_form(&body[..body.len() - 4], &boundary, 1 << 20).is_err());
         // Wrong boundary → error.
-        assert!(parse_multipart_form(&body, "nope").is_err());
+        assert!(parse_multipart_form(&body, "nope", 1 << 20).is_err());
+    }
+
+    /// The `maxMemory + 10MiB` bound of Go `multipart.Reader.ReadForm`: value
+    /// bytes beyond it fail with Go's `ErrMessageTooLarge` message.
+    #[test]
+    fn test_parse_multipart_form_message_too_large() {
+        const RESERVE: i64 = 10 * (1 << 20); // Go's extra 10MB for non-file parts
+        let args = vec![("query".to_string(), "x".repeat(64))];
+        let (body, content_type) = esl_storage::http_client::new_multipart_request_body(&args);
+        let boundary = get_multipart_boundary(&content_type).expect("boundary");
+
+        // The 64-byte value exactly fits a 64-byte budget...
+        let values = parse_multipart_form(&body, &boundary, 64 - RESERVE).expect("parse");
+        assert_eq!(values["query"].len(), 64);
+        // ...and exceeds a 63-byte budget.
+        let err = parse_multipart_form(&body, &boundary, 63 - RESERVE).unwrap_err();
+        assert_eq!(err, "multipart: message too large");
+    }
+
+    /// Go `concurrencyLimitCh`: the N+1th request queues until a slot frees.
+    #[test]
+    fn test_concurrency_limiter_blocks_and_releases() {
+        let lim = Arc::new(ConcurrencyLimiter::new(2));
+        assert!(lim.acquire(None));
+        assert!(lim.acquire(None));
+
+        let lim2 = Arc::clone(&lim);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let ok = lim2.acquire(None);
+            tx.send(()).unwrap();
+            ok
+        });
+        // The third acquire must still be queued after a few poll intervals.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "acquire beyond the limit must queue"
+        );
+        lim.release();
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("queued acquire must obtain the freed slot");
+        assert!(h.join().unwrap());
+    }
+
+    /// Go `case <-ctx.Done()`: a client disconnect aborts a queued request.
+    #[test]
+    fn test_concurrency_limiter_cancel_aborts_wait() {
+        let lim = Arc::new(ConcurrencyLimiter::new(1));
+        assert!(lim.acquire(None));
+
+        // Already-canceled token with no free slot → immediate false.
+        let canceled = Arc::new(AtomicBool::new(true));
+        assert!(!lim.acquire(Some(&canceled)));
+
+        // Token flipped while queued → false.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel2 = Arc::clone(&cancel);
+        let lim2 = Arc::clone(&lim);
+        let h = std::thread::spawn(move || lim2.acquire(Some(&cancel2)));
+        std::thread::sleep(Duration::from_millis(50));
+        cancel.store(true, Ordering::SeqCst);
+        assert!(!h.join().unwrap(), "queued acquire must abort on cancel");
+
+        // The slot is still held exactly once.
+        lim.release();
+        assert!(lim.acquire(None));
     }
 
     #[test]

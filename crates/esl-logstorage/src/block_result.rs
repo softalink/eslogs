@@ -601,6 +601,60 @@ impl BlockResult {
         true
     }
 
+    // -- block_stats source info (Go `pipeBlockStatsProcessor.writeBlock`) ---
+
+    /// Returns `(_stream, part_path)` when this block is backed by a block
+    /// search (Go `br.bs != nil`: `bs.getStreamStr()` / `bs.partPath()`), or
+    /// `None` for in-memory blocks.
+    pub(crate) fn block_stats_stream_and_part_path(&mut self) -> Option<(String, String)> {
+        self.bs?;
+        // SAFETY: bs is valid for the lifetime of this block result.
+        let bs = self.bs_ptr();
+        unsafe { Some(((*bs).get_stream_str(), (*bs).part_path())) }
+    }
+
+    /// Returns the on-disk size of the block's timestamps
+    /// (Go `br.bs.bsw.bh.timestampsHeader.blockSize`), or 0 for in-memory
+    /// blocks.
+    pub(crate) fn block_stats_timestamps_block_size(&self) -> u64 {
+        if self.bs.is_none() {
+            return 0;
+        }
+        // SAFETY: bs is valid for the lifetime of this block result.
+        let bs = self.bs_ptr();
+        unsafe { (*bs).block_header().timestamps_header.block_size }
+    }
+
+    /// Returns `(values_size, bloom_filter_size, dict_items, dict_size)` for
+    /// the named column from its column header (Go
+    /// `br.bs.getColumnHeader(c.name)`); `is_dict` gates the dict-size sum
+    /// like Go's `c.valueType == valueTypeDict` check. Returns `None` for
+    /// in-memory blocks.
+    pub(crate) fn block_stats_column_header(
+        &mut self,
+        name: &str,
+        is_dict: bool,
+    ) -> Option<(u64, u64, u64, u64)> {
+        self.bs?;
+        // SAFETY: bs is valid for the lifetime of this block result.
+        let bs = self.bs_ptr();
+        unsafe {
+            let Some(ch) = (*bs).get_column_header(name) else {
+                // Unreachable for columns materialized from this block search
+                // (Go would nil-panic here); keep the row with zero sizes.
+                return Some((0, 0, 0, 0));
+            };
+            let dict_items = ch.values_dict.values.len() as u64;
+            let mut dict_size = 0u64;
+            if is_dict {
+                for v in &ch.values_dict.values {
+                    dict_size += v.len() as u64;
+                }
+            }
+            Some((ch.values_size, ch.bloom_filter_size, dict_items, dict_size))
+        }
+    }
+
     fn cs_init_fast(&mut self) {
         self.cs.clear();
         let n = self.cs_buf.len();
@@ -649,7 +703,7 @@ impl BlockResult {
             && max_timestamp >= self.get_min_timestamp(max_timestamp)
     }
 
-    fn get_min_timestamp(&mut self, mut min_timestamp: i64) -> i64 {
+    pub(crate) fn get_min_timestamp(&mut self, mut min_timestamp: i64) -> i64 {
         if self.bs.is_some() {
             // SAFETY: bs is valid for the lifetime of this block result.
             let bs = self.bs_ptr();
@@ -681,7 +735,7 @@ impl BlockResult {
         min_timestamp
     }
 
-    fn get_max_timestamp(&mut self, mut max_timestamp: i64) -> i64 {
+    pub(crate) fn get_max_timestamp(&mut self, mut max_timestamp: i64) -> i64 {
         if self.bs.is_some() {
             // SAFETY: bs is valid for the lifetime of this block result.
             let bs = self.bs_ptr();

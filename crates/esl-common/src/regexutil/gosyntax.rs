@@ -48,6 +48,12 @@ pub enum Op {
     Repeat,
     Concat,
     Alternate,
+    /// PORT NOTE: not a Go op. An opaque `\p{...}`/`\P{...}` Unicode class
+    /// token (or a whole `[...]` char class containing one), kept unresolved
+    /// because the Go `unicode` tables are not ported; the raw source text
+    /// lives in `Regexp::name` and is resolved by the regex crate when the
+    /// matcher is compiled. See `Parser::parse_unicode_class_token`.
+    UnicodeClass = 20,
     // Pseudo-ops for the parsing stack (Go `opPseudo` starts at 128).
     PseudoLeftParen = 128,
     PseudoVerticalBar = 129,
@@ -64,8 +70,8 @@ pub struct Regexp {
     pub rune: Vec<i32>,
     pub min: i32,
     pub max: i32,
-    // Kept for parity with Go's Regexp; only `name` is consulted when
-    // serializing captures.
+    // Kept for parity with Go's Regexp; `name` is consulted when serializing
+    // captures and holds the raw source text for `Op::UnicodeClass` nodes.
     #[allow(dead_code)]
     pub cap: i32,
     pub name: String,
@@ -120,10 +126,6 @@ pub enum ErrorCode {
     UnexpectedParen,
     NestingDepth,
     Large,
-    /// PORT NOTE: Go supports `\p{...}` Unicode classes via the `unicode`
-    /// package tables, which are not ported; such regexps are rejected with
-    /// this dedicated error instead.
-    UnsupportedUnicodeClass,
 }
 
 impl ErrorCode {
@@ -143,7 +145,6 @@ impl ErrorCode {
             ErrorCode::UnexpectedParen => "unexpected )",
             ErrorCode::NestingDepth => "expression nests too deeply",
             ErrorCode::Large => "expression too large",
-            ErrorCode::UnsupportedUnicodeClass => "unsupported Unicode character class",
         }
     }
 }
@@ -332,6 +333,15 @@ fn calc_flags(re: &Regexp, flags: &mut PrintFlagsMap) -> (u8, u8) {
             }
             (0, 0)
         }
+        Op::UnicodeClass => {
+            // Like a fold-sensitive literal: the class is opaque (its runes
+            // are unknown), so it must keep — or must not gain — (?i).
+            if re.flags & FOLD_CASE != 0 {
+                (FLAG_I, 0)
+            } else {
+                (0, FLAG_I)
+            }
+        }
         Op::AnyCharNotNL => (0, FLAG_S),            // (?-s).
         Op::AnyChar => (FLAG_S, 0),                 // (?s).
         Op::BeginLine | Op::EndLine => (FLAG_M, 0), // (?m)^ (?m)$
@@ -473,6 +483,7 @@ fn write_regexp(b: &mut String, re: &Regexp, f: u8, flags: &PrintFlagsMap) {
                 b.push(']');
             }
         }
+        Op::UnicodeClass => b.push_str(&re.name),
         Op::AnyCharNotNL | Op::AnyChar => b.push('.'),
         Op::BeginLine => b.push('^'),
         Op::EndLine => b.push('$'),
@@ -502,7 +513,11 @@ fn write_regexp(b: &mut String, re: &Regexp, f: u8, flags: &PrintFlagsMap) {
         }
         Op::Star | Op::Plus | Op::Quest | Op::Repeat => {
             let sub = &re.sub[0];
-            let p = if sub.op > Op::Capture || (sub.op == Op::Literal && sub.rune.len() > 1) {
+            // An opaque Unicode class token binds like a char class, so it
+            // needs no grouping parens under a repetition operator.
+            let p = if (sub.op > Op::Capture && sub.op != Op::UnicodeClass)
+                || (sub.op == Op::Literal && sub.rune.len() > 1)
+            {
                 FLAG_PREC
             } else {
                 0
@@ -606,9 +621,12 @@ fn escape(b: &mut String, r: i32, force: bool) {
 
 /// PORT NOTE: approximation of Go's `unicode.IsPrint` (categories L, M, N,
 /// P, S plus ASCII space). It is exact for Latin-1; above that it treats any
-/// assigned, non-control, non-whitespace code point as printable, so exotic
-/// code points (e.g. Cf format chars) serialize unescaped where Go would
-/// hex-escape them. Both forms compile to the same matcher.
+/// non-control (Cc), non-whitespace code point as printable, because Rust
+/// std exposes no general-category tables. Concretely: Cf format chars
+/// (e.g. U+200B ZERO WIDTH SPACE) and unassigned code points serialize raw
+/// where Go writes `\x{200b}`. This affects only the simplified-suffix TEXT
+/// (an internal intermediate); both forms parse back to the same tree and
+/// compile to the same matcher, so match results are unaffected.
 fn is_print(r: i32) -> bool {
     if r < 0 {
         return false;

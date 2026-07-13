@@ -1,17 +1,11 @@
 //! Port of EsLogs `lib/logstorage/block_stream_merger.go`.
 //!
-//! PORT NOTE: the `idb *indexdb` and `dropFilter *partitionSearchOptions`
-//! parameters (and the streamBuf/streamIDBuf/dropFilterFields state plus the
-//! needDropRows/getStreamAndStreamID drop paths) are NOT ported yet: indexdb
-//! and partitionSearchOptions belong to Layer 3 (indexdb.go /
-//! storage_search.go), and `rows.skipRowsByDropFilter` was likewise left for
-//! that layer by the rows.rs port. The Layer-3 porter must extend
-//! `must_merge_block_streams` with these parameters. All the Go callers pass
-//! them as nil in the currently-ported code (see inmemory_part_test.go).
-//!
-//! PORT NOTE: Go stores `bsw`/`bsrs` inside blockStreamMerger; the port
-//! passes them into the methods that need them instead, so the merger state
-//! can be pooled without carrying borrows.
+//! PORT NOTE: Go stores `bsw`/`bsrs`/`idb`/`dropFilter` inside
+//! blockStreamMerger; the port passes them into the methods that need them
+//! instead (`idb` and the borrowed `dropFilter` travel together as
+//! [`DropFilterCtx`]), so the merger state can be pooled without carrying
+//! borrows. The pooled state keeps only the owned drop-path scratch
+//! (`drop_filter_fields`, `stream_buf`, `stream_id_buf`).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,33 +15,53 @@ use esl_common::panicf;
 use crate::arena::Arena;
 use crate::block::uncompressed_rows_size_bytes;
 use crate::block_data::BlockData;
+use crate::block_search::PartitionSearchOptions;
 use crate::block_stream_reader::{BlockStreamReader, must_close_block_stream_readers};
 use crate::block_stream_writer::BlockStreamWriter;
 use crate::consts::MAX_UNCOMPRESSED_BLOCK_SIZE;
 use crate::encoding::{
     StringsBlockUnmarshaler, get_strings_block_unmarshaler, put_strings_block_unmarshaler,
 };
+use crate::indexdb::Indexdb;
 use crate::part_header::PartHeader;
+use crate::prefix_filter;
 use crate::rows::Rows;
 use crate::stream_id::StreamID;
 use crate::values_encoder::{ValuesDecoder, get_values_decoder, put_values_decoder};
 
+/// Bundles Go's `bsm.dropFilter` + `bsm.idb`: the optional filter for
+/// dropping matching rows during the merge, plus the partition indexdb used
+/// for materializing the `_stream` value of the current stream.
+pub(crate) struct DropFilterCtx<'a> {
+    /// The drop filter (Go `bsm.dropFilter`).
+    pub(crate) pso: &'a PartitionSearchOptions<'a>,
+
+    /// The indexdb for the merged partition (Go `bsm.idb`).
+    pub(crate) idb: &'a Indexdb,
+}
+
 /// Merges bsrs to bsw and updates ph accordingly.
+///
+/// If `drop_filter` is non-nil, then rows matching `drop_filter` are dropped
+/// during the merge.
 ///
 /// finalize() is guaranteed to be called on bsw before returning from the func.
 /// must_close() is guatanteed to be called on bsrs before returning from the func.
 ///
 /// PORT NOTE: `stop_ch` stands in for Go's `stopCh <-chan struct{}` (a closed
-/// channel signals stop); `needStop` lives in the unported datadb.go, so the
-/// check is inlined here.
-pub fn must_merge_block_streams(
+/// channel signals stop); `needStop` is checked via datadb-style inlined
+/// atomics here. Go passes `idb` and `dropFilter` separately and idb is only
+/// read by the drop path; the port bundles them (see [`DropFilterCtx`]) so a
+/// non-drop merge does not need the indexdb at all.
+pub(crate) fn must_merge_block_streams(
     ph: &mut PartHeader,
     bsw: &mut BlockStreamWriter<'_>,
     bsrs: &mut [BlockStreamReader<'_>],
+    drop_filter: Option<&DropFilterCtx<'_>>,
     stop_ch: Option<&AtomicBool>,
 ) {
     let mut bsm = get_block_stream_merger();
-    bsm.must_init(bsrs);
+    bsm.must_init(bsrs, drop_filter);
     while !bsm.readers_heap.is_empty() {
         if need_stop(stop_ch) {
             break;
@@ -55,7 +69,7 @@ pub fn must_merge_block_streams(
         let idx = bsm.readers_heap[0];
         {
             let bd = &bsrs[idx].block_data;
-            bsm.must_write_block(bd, bsw, bsrs);
+            bsm.must_write_block(bd, bsw, bsrs, drop_filter);
         }
         if bsrs[idx].next_block() {
             heap_fix(&mut bsm.readers_heap, 0, bsrs);
@@ -83,8 +97,21 @@ pub struct BlockStreamMerger {
     /// stores indexes into the bsrs slice passed to must_init().
     readers_heap: Vec<usize>,
 
+    /// dropFilterFields contains the list of fields needed by dropFilter.
+    drop_filter_fields: prefix_filter::Filter,
+
     /// streamID is the stream ID for the pending data.
     stream_id: StreamID,
+
+    /// streamBuf is `_stream` field value for the current stream.
+    ///
+    /// It is used when dropFilter is set.
+    stream_buf: Vec<u8>,
+
+    /// streamIDBuf is `_stream_id` field value for the current stream.
+    ///
+    /// It is used when dropFilter is set.
+    stream_id_buf: Vec<u8>,
 
     /// sbu is the unmarshaler for strings in rows and rowsTmp.
     sbu: Option<StringsBlockUnmarshaler>,
@@ -113,9 +140,13 @@ pub struct BlockStreamMerger {
 
 impl BlockStreamMerger {
     fn reset(&mut self) {
+        self.drop_filter_fields.reset();
+
         self.readers_heap.clear();
 
         self.stream_id.reset();
+        self.stream_buf.clear();
+        self.stream_id_buf.clear();
         self.reset_rows();
     }
 
@@ -165,8 +196,18 @@ impl BlockStreamMerger {
         }
     }
 
-    fn must_init(&mut self, bsrs: &mut [BlockStreamReader<'_>]) {
+    fn must_init(
+        &mut self,
+        bsrs: &mut [BlockStreamReader<'_>],
+        drop_filter: Option<&DropFilterCtx<'_>>,
+    ) {
         self.reset();
+
+        if let Some(drop) = drop_filter {
+            drop.pso
+                .filter
+                .update_needed_fields(&mut self.drop_filter_fields);
+        }
 
         for (i, bsr) in bsrs.iter_mut().enumerate() {
             if bsr.next_block() {
@@ -182,20 +223,21 @@ impl BlockStreamMerger {
         bd: &BlockData,
         bsw: &mut BlockStreamWriter<'_>,
         bsrs: &[BlockStreamReader<'_>],
+        drop_filter: Option<&DropFilterCtx<'_>>,
     ) {
         self.check_next_block(bd, bsrs);
         if !bd.stream_id.equal(&self.stream_id) {
             // The bd contains another streamID.
             // Write the bsm logs under the current streamID, then process the bd.
             self.must_flush_rows(bsw);
-            self.set_stream_id(bd.stream_id);
-            self.must_write_block_data(bd, bsw);
+            self.set_stream_id(bd.stream_id, drop_filter);
+            self.must_write_block_data(bd, bsw, bsrs, drop_filter);
         } else if self.uncompressed_rows_size_bytes == 0
             && self.bd.rows_count == 0
             && bd.uncompressed_size_bytes >= MAX_UNCOMPRESSED_BLOCK_SIZE as u64
         {
             // The bsm is empty and the bd is full. Just write db to the output without spending CPU time on re-compression.
-            self.must_write_block_data(bd, bsw);
+            self.must_write_block_data(bd, bsw, bsrs, drop_filter);
         } else if self.uncompressed_rows_size_bytes
             + self.bd.uncompressed_size_bytes
             + bd.uncompressed_size_bytes
@@ -204,11 +246,11 @@ impl BlockStreamMerger {
             // The bd cannot be merged with bsm, since the final block size will be too big.
             // Write the bsm logs, then process the bd.
             self.must_flush_rows(bsw);
-            self.must_write_block_data(bd, bsw);
+            self.must_write_block_data(bd, bsw, bsrs, drop_filter);
         } else {
             // The bd contains the same streamID and the summary size of bsm logs and bd doesn't exceed the maximum allowed.
             // Merge them.
-            self.must_merge_rows(bd, bsw, bsrs);
+            self.must_merge_rows(bd, bsw, bsrs, drop_filter);
         }
     }
 
@@ -263,8 +305,35 @@ impl BlockStreamMerger {
     }
 
     /// Writes bd to bsm.
-    fn must_write_block_data(&mut self, bd: &BlockData, bsw: &mut BlockStreamWriter<'_>) {
+    fn must_write_block_data(
+        &mut self,
+        bd: &BlockData,
+        bsw: &mut BlockStreamWriter<'_>,
+        bsrs: &[BlockStreamReader<'_>],
+        drop_filter: Option<&DropFilterCtx<'_>>,
+    ) {
         self.assert_no_rows();
+
+        let td = &bd.timestamps_data;
+        if self.need_drop_rows(
+            drop_filter,
+            &bd.stream_id,
+            td.min_timestamp,
+            td.max_timestamp,
+        ) {
+            // PORT NOTE: Go has a fast path here dropping the whole bd when
+            // dropFilter.filter is a bare filterNoop (a `{...}`-only delete
+            // filter: Go's getCommonStreamFilter strips the stream filter out
+            // of the search filter, leaving a noop). The port's
+            // get_common_stream_filter keeps the filter tree intact (see its
+            // PORT NOTE), so that shape never occurs and every drop goes
+            // through the row-level path below; `FilterStream::match_row`
+            // matches the `_stream` value per row, producing the same
+            // surviving rows.
+            // Slow path - unpack bd and drop the needed rows before the merge.
+            self.must_merge_rows(bd, bsw, bsrs, drop_filter);
+            return;
+        }
 
         if bd.uncompressed_size_bytes >= MAX_UNCOMPRESSED_BLOCK_SIZE as u64 {
             // Fast path - write full bd to the output without extracting log entries from it.
@@ -283,6 +352,7 @@ impl BlockStreamMerger {
         bd: &BlockData,
         bsw: &mut BlockStreamWriter<'_>,
         bsrs: &[BlockStreamReader<'_>],
+        drop_filter: Option<&DropFilterCtx<'_>>,
     ) {
         if self.bd.rows_count > 0 {
             // Unmarshal log entries from bsm.bd
@@ -290,7 +360,7 @@ impl BlockStreamMerger {
             // temporarily moves the pending bd out to satisfy the borrow
             // checker, then puts it back and resets it, keeping its buffers.
             let pending_bd = std::mem::take(&mut self.bd);
-            self.must_unmarshal_rows(&pending_bd, bsrs);
+            self.must_unmarshal_rows(&pending_bd, bsrs, drop_filter);
             self.bd = pending_bd;
             self.bd.reset();
             self.a.reset();
@@ -298,7 +368,7 @@ impl BlockStreamMerger {
 
         // Unmarshal log entries from bd
         let rows_len = self.rows.timestamps.len();
-        self.must_unmarshal_rows(bd, bsrs);
+        self.must_unmarshal_rows(bd, bsrs, drop_filter);
 
         // Merge unmarshaled log entries
         self.rows_tmp.merge_rows(
@@ -315,7 +385,12 @@ impl BlockStreamMerger {
         }
     }
 
-    fn must_unmarshal_rows(&mut self, bd: &BlockData, bsrs: &[BlockStreamReader<'_>]) {
+    fn must_unmarshal_rows(
+        &mut self,
+        bd: &BlockData,
+        bsrs: &[BlockStreamReader<'_>],
+        drop_filter: Option<&DropFilterCtx<'_>>,
+    ) {
         let rows_len = self.rows.timestamps.len();
 
         if self.sbu.is_none() {
@@ -334,12 +409,56 @@ impl BlockStreamMerger {
             );
         }
 
+        let td = &bd.timestamps_data;
+        if self.need_drop_rows(
+            drop_filter,
+            &bd.stream_id,
+            td.min_timestamp,
+            td.max_timestamp,
+        ) {
+            let drop = drop_filter.unwrap();
+            // getStreamAndStreamID: both buffers hold ASCII/UTF-8 renderings
+            // (the `{...}` stream string and the hex streamID).
+            let stream = std::str::from_utf8(&self.stream_buf)
+                .expect("BUG: _stream value must be valid UTF-8");
+            let stream_id = std::str::from_utf8(&self.stream_id_buf)
+                .expect("BUG: _stream_id value must be valid UTF-8");
+            self.rows.skip_rows_by_drop_filter(
+                drop.pso,
+                &self.drop_filter_fields,
+                rows_len,
+                stream,
+                stream_id,
+            );
+        }
+
         self.uncompressed_rows_size_bytes +=
             uncompressed_rows_size_bytes(&self.rows.rows[rows_len..]);
     }
 
-    fn set_stream_id(&mut self, sid: StreamID) {
+    fn need_drop_rows(
+        &self,
+        drop_filter: Option<&DropFilterCtx<'_>>,
+        sid: &StreamID,
+        min_timestamp: i64,
+        max_timestamp: i64,
+    ) -> bool {
+        drop_filter.is_some_and(|d| {
+            d.pso.match_stream_id(sid) && d.pso.match_time_range(min_timestamp, max_timestamp)
+        })
+    }
+
+    fn set_stream_id(&mut self, sid: StreamID, drop_filter: Option<&DropFilterCtx<'_>>) {
         self.stream_id = sid;
+
+        if self.need_drop_rows(drop_filter, &self.stream_id, i64::MIN, i64::MAX) {
+            let drop = drop_filter.unwrap();
+            self.stream_buf.clear();
+            drop.idb
+                .append_stream_string(&mut self.stream_buf, &self.stream_id);
+            self.stream_id_buf.clear();
+            sid.marshal_string(&mut self.stream_id_buf);
+        }
     }
 
     fn must_flush_rows(&mut self, bsw: &mut BlockStreamWriter<'_>) {

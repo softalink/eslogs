@@ -60,21 +60,27 @@ pub fn process_field_names_request(storage: &Arc<Storage>, req: &Request, w: &mu
     // (Go: the request context).
     let start_time = Instant::now();
     let cancel = w.watch_disconnect();
-    let field_names =
-        match storage.get_field_names(&ca.tenant_ids, &ca.q, filter, cancel.as_deref(), &ca.qs) {
-            Ok(v) => v,
-            Err(e) => {
-                if is_query_canceled_error(&e) {
-                    // The client disconnected: there is nobody to respond to.
-                    return;
-                }
-                w.errorf(
-                    req,
-                    &format!("cannot obtain field names with filter={filter:?}: {e}"),
-                );
+    let field_names = match storage.get_field_names(
+        &ca.tenant_ids,
+        &ca.q,
+        &ca.hidden_fields_filters,
+        filter,
+        cancel.as_deref(),
+        &ca.qs,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            if is_query_canceled_error(&e) {
+                // The client disconnected: there is nobody to respond to.
                 return;
             }
-        };
+            w.errorf(
+                req,
+                &format!("cannot obtain field names with filter={filter:?}: {e}"),
+            );
+            return;
+        }
+    };
 
     // Write response headers
     w.set_header("Content-Type", "application/json");
@@ -123,6 +129,7 @@ pub fn process_field_values_request(storage: &Arc<Storage>, req: &Request, w: &m
     let values = match storage.get_field_values(
         &ca.tenant_ids,
         &ca.q,
+        &ca.hidden_fields_filters,
         field_name,
         filter,
         limit as u64,

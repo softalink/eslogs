@@ -428,6 +428,22 @@ pub trait Pipe: Send + Sync {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    /// Port of Go `pipe.visitSubqueries`: calls `visit` for every subquery
+    /// embedded in this pipe (recursively). Overridden by the pipes that hold
+    /// a subquery (`pipe_join`, `pipe_union`); leaves keep the no-op default.
+    ///
+    /// PORT NOTE: Go visits the parsed `*Query`; the join/union pipes store it
+    /// as rendered text, so the overrides re-parse at `timestamp`, visit, and
+    /// re-render. `pipe_filter`'s `Arc<dyn Filter>` and the `if (...)` filters
+    /// of the iff-holding pipes are not visited — reachable only when the
+    /// filter itself contains `in(subquery)`, a deferred ledger sub-case.
+    fn visit_subqueries_mut(
+        &mut self,
+        _timestamp: i64,
+        _visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+    }
 }
 
 /// Parses a single pipe from `s` at the given `timestamp`, panicking on

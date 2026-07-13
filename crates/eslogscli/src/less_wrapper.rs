@@ -9,9 +9,10 @@ pub fn is_terminal() -> bool {
 /// Forwards `r` to the `less` pager (or straight to stdout when stdout isn't
 /// a terminal).
 ///
-/// PORT NOTE: Go ignores SIGINT in the current process while `less` runs so
-/// `less` can handle Ctrl+C itself; installing signal handlers needs libc and
-/// this crate is std-only, so Ctrl+C during paging terminates eslogscli too.
+/// Go ignores SIGINT in the current process while `less` runs so `less` can
+/// handle Ctrl+C itself (`ignoreSignals(os.Interrupt)`); the port suppresses
+/// the interrupt watcher's exit branch for the same scope via
+/// [`crate::interrupt::ignore_interrupts`].
 pub fn read_with_less(
     r: &mut dyn Read,
     disable_colors: bool,
@@ -45,6 +46,11 @@ fn read_with_less_terminal(
     wrap_long_lines: bool,
 ) -> Result<(), String> {
     use std::process::{Command, Stdio};
+
+    // Ignore Ctrl+C in the current process, so 'less' could handle it properly
+    // (it is delivered to 'less' directly as part of the foreground process
+    // group; the guard only stops eslogscli from exiting).
+    let _ignore = crate::interrupt::ignore_interrupts();
 
     // PORT NOTE: Go resolves the `less` binary via exec.LookPath; the port
     // honors $PAGER first and falls back to `less`.
@@ -102,6 +108,9 @@ fn read_with_less_terminal(
     _disable_colors: bool,
     _wrap_long_lines: bool,
 ) -> Result<(), String> {
+    // Keep Go's ignoreSignals scope: Ctrl+C while the response is displayed
+    // must not exit the CLI.
+    let _ignore = crate::interrupt::ignore_interrupts();
     copy_to_stdout(r)
 }
 

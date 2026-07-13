@@ -152,10 +152,13 @@ impl fmt::Display for Filter {
     }
 }
 
-// PORT NOTE: Go quotes via strconv.Quote; Rust's Debug formatting for strings
-// produces identical output for the ASCII strings used in filters.
+// Go `joinQuotedStrings`: quotes via strconv.Quote (`go_quote`), so
+// non-ASCII/control characters render exactly like Go.
 fn join_quoted_strings(a: &[String]) -> String {
-    let tmp: Vec<String> = a.iter().map(|s| format!("{s:?}")).collect();
+    let tmp: Vec<String> = a
+        .iter()
+        .map(|s| crate::stream_filter::go_quote(s))
+        .collect();
     tmp.join(",")
 }
 

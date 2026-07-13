@@ -8,11 +8,19 @@
 //! them verbatim). Actual matching is delegated to the `regex` crate.
 //!
 //! PORT NOTE (syntax gaps vs Go's regexp):
-//! - `\p{...}` / `\P{...}` Unicode classes are rejected (Go `unicode` tables
-//!   not ported); `(?i)` on such classes is unaffected since they are
-//!   rejected at parse time.
-//! - `\b` / `\B` in the compiled matcher use the regex crate's Unicode word
-//!   boundaries, while Go's are ASCII-only.
+//! - `\p{...}` / `\P{...}` Unicode classes are parsed as opaque tokens
+//!   (`Op::UnicodeClass`) and resolved by the regex crate when the matcher
+//!   is compiled. Match semantics therefore follow the regex crate's Unicode
+//!   tables (UTS#18 names) instead of Go's `unicode` package: the name sets
+//!   overlap on general categories and scripts, but a name unknown to the
+//!   regex crate fails at [`Regex::new`]/[`PromRegex::new`] with a
+//!   regex-crate error message where Go fails at parse time with
+//!   "invalid character class range"; and small classes are never expanded
+//!   into or-values the way Go expands classes with <= 100 runes (fast-path
+//!   only — match results are identical).
+//! - `\b` / `\B` are rewritten to `(?-u:\b)` / `(?-u:\B)` before compiling
+//!   the matcher (`ascii_word_boundaries`), matching Go's ASCII-only word
+//!   boundaries.
 //! - Lookarounds and backreferences are unsupported in both Go and Rust.
 
 mod goclass;
@@ -395,6 +403,37 @@ fn must_parse_regexp(expr: &str) -> Regexp {
     }
 }
 
+/// Rewrites `\b` / `\B` to `(?-u:\b)` / `(?-u:\B)` for the regex crate,
+/// which treats bare word boundaries as Unicode-aware while Go's are
+/// ASCII-only (e.g. Go sees a boundary between `é` and `f` in "caféfoo").
+///
+/// The input has already been validated by the ported Go-syntax parser, so
+/// `\b` cannot occur inside a character class (Go rejects it there) and a
+/// bare scan over escape pairs is sufficient.
+fn ascii_word_boundaries(expr: &str) -> std::borrow::Cow<'_, str> {
+    if !expr.contains(r"\b") && !expr.contains(r"\B") {
+        return std::borrow::Cow::Borrowed(expr);
+    }
+    let mut out = String::with_capacity(expr.len() + 16);
+    let mut chars = expr.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('b') => out.push_str(r"(?-u:\b)"),
+            Some('B') => out.push_str(r"(?-u:\B)"),
+            Some(e) => {
+                out.push('\\');
+                out.push(e);
+            }
+            None => out.push('\\'),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// PromRegex implements an optimized string matching for Prometheus-like regex.
 ///
 /// The following regexs are optimized:
@@ -459,10 +498,14 @@ impl PromRegex {
         // Anchor suffix to the beginning and the end of the matching string.
         //
         // PORT NOTE: Go uses regexp.MustCompile (compile failure = bug). The
-        // Rust regex crate has minor syntax gaps vs Go, so a compile failure
-        // is reported as an error instead of a panic.
+        // regex crate can still fail here on syntax Go accepts — in practice
+        // a `\p{...}` class name known to Go's unicode package but not to
+        // the regex crate — so the failure is reported as an error to the
+        // caller instead of a panic (the query still fails at the same
+        // user-visible point, with a different message).
         let suffix_expr = format!("^(?:{suffix})$");
-        let re_suffix = regex::Regex::new(&suffix_expr).map_err(|e| e.to_string())?;
+        let re_suffix =
+            regex::Regex::new(&ascii_word_boundaries(&suffix_expr)).map_err(|e| e.to_string())?;
         Ok(PromRegex {
             expr_str: expr.to_string(),
             prefix,
@@ -595,9 +638,13 @@ impl Regex {
         // The suffixAnchored must be properly compiled, since it has been already checked above.
         //
         // PORT NOTE: Go uses regexp.MustCompile (compile failure = bug). The
-        // Rust regex crate has minor syntax gaps vs Go, so a compile failure
-        // is reported as an error instead of a panic.
-        let suffix_re = regex::Regex::new(&suffix_anchored).map_err(|e| e.to_string())?;
+        // regex crate can still fail here on syntax Go accepts — in practice
+        // a `\p{...}` class name known to Go's unicode package but not to
+        // the regex crate — so the failure is reported as an error to the
+        // caller instead of a panic (the query still fails at the same
+        // user-visible point, with a different message).
+        let suffix_re = regex::Regex::new(&ascii_word_boundaries(&suffix_anchored))
+            .map_err(|e| e.to_string())?;
 
         Ok(Regex {
             expr_str: expr.to_string(),

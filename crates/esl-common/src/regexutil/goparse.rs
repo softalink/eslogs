@@ -5,8 +5,9 @@
 //! [`Regexp`] tree.
 //!
 //! PORT NOTE: `\p{...}` / `\P{...}` Unicode character classes require the Go
-//! `unicode` package tables, which are not ported; they are rejected with
-//! `ErrorCode::UnsupportedUnicodeClass`.
+//! `unicode` package tables, which are not ported; the tokens are kept
+//! opaque (`Op::UnicodeClass`) and resolved by the regex crate when the
+//! matcher is compiled. See `Parser::parse_unicode_class_token`.
 //!
 //! PORT NOTE: Go validates UTF-8 while parsing (`ErrInvalidUTF8`); Rust
 //! strings are always valid UTF-8, so those paths do not exist here.
@@ -70,6 +71,7 @@ impl Node {
             17 => Op::Repeat,
             18 => Op::Concat,
             19 => Op::Alternate,
+            20 => Op::UnicodeClass,
             128 => Op::PseudoLeftParen,
             _ => Op::PseudoVerticalBar,
         }
@@ -911,6 +913,11 @@ impl<'a> Parser<'a> {
             Op::Literal | Op::CharClass => {
                 return nx.flags & FOLD_CASE == ny.flags & FOLD_CASE && nx.rune == ny.rune;
             }
+            Op::UnicodeClass => {
+                // Opaque token: equal only for the same source text under
+                // the same fold flag.
+                return nx.flags & FOLD_CASE == ny.flags & FOLD_CASE && nx.name == ny.name;
+            }
             Op::Alternate | Op::Concat => {
                 return nx.sub.len() == ny.sub.len()
                     && nx
@@ -1451,24 +1458,172 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// PORT NOTE: Go's `parseUnicodeClass` resolves `\p{...}` via the
-    /// `unicode` package tables, which are not ported. If a Unicode class is
-    /// present (and UnicodeGroups is enabled), parsing fails with a
-    /// dedicated error instead of silently mis-parsing.
-    fn check_unicode_class(&self, s: &str) -> PResult<()> {
+    /// PORT NOTE: Go's `parseUnicodeClass` resolves `\p{...}` / `\P{...}`
+    /// via the `unicode` package tables and expands the class into rune
+    /// ranges. The tables are not ported; instead the token is validated
+    /// syntactically, kept opaque (`Op::UnicodeClass` holding the source
+    /// text) and passed through to the regex crate, which resolves the name
+    /// with its own Unicode tables when the matcher is compiled. Observable
+    /// differences vs Go:
+    /// - class-name resolution follows the regex crate (UTS#18 names and its
+    ///   Unicode version); the name sets overlap on general categories and
+    ///   scripts, but an unknown name fails later, at matcher-compile time
+    ///   (`Regex::new`/`PromRegex::new`), with a regex-crate error message
+    ///   instead of Go's parse-time "invalid character class range";
+    /// - `get_or_values` never expands a Unicode class into or-values, while
+    ///   Go expands classes with <= 100 runes (fast-path only; match results
+    ///   are identical);
+    /// - under `(?i)` the folding is applied by the regex crate at compile
+    ///   time instead of Go's parse-time `unicode.SimpleFold` expansion;
+    /// - the expanded runes are not counted toward the maxSize/maxRunes
+    ///   parse limits (an opaque token counts as size 1).
+    ///
+    /// `\p{^Name}` is canonicalized to `\P{Name}` (and `\P{^Name}` to
+    /// `\p{Name}`) — Go treats them identically and the regex crate does not
+    /// accept the caret form.
+    ///
+    /// Returns `Ok(None)` if `s` does not start with a Unicode class token.
+    fn parse_unicode_class_token(&self, s: &'a str) -> PResult<Option<(String, &'a str)>> {
         if self.flags & UNICODE_GROUPS == 0
             || s.len() < 2
             || s.as_bytes()[0] != b'\\'
             || (s.as_bytes()[1] != b'p' && s.as_bytes()[1] != b'P')
         {
-            return Ok(());
+            return Ok(None);
         }
-        Err(self.err(ErrorCode::UnsupportedUnicodeClass, s))
+        let mut negated = s.as_bytes()[1] == b'P';
+        let t = &s[2..];
+        if t.is_empty() {
+            // Go: the empty name resolves no unicode table → invalid range.
+            return Err(self.err(ErrorCode::InvalidCharRange, s));
+        }
+        let (name, rest, braced) = if t.as_bytes()[0] == b'{' {
+            // Name is in braces (Go searches the whole remainder for '}').
+            let Some(end) = s.find('}') else {
+                return Err(self.err(ErrorCode::InvalidCharRange, s));
+            };
+            (&s[3..end], &s[end + 1..], true)
+        } else {
+            // Single-letter name.
+            let c = t.chars().next().unwrap();
+            let n = c.len_utf8();
+            (&t[..n], &t[n..], false)
+        };
+        let mut name = name;
+        if let Some(stripped) = name.strip_prefix('^') {
+            negated = !negated;
+            name = stripped;
+        }
+        if name.is_empty() {
+            // Go: unicodeTable("") == nil → invalid char range for the seq.
+            let seq_len = s.len() - rest.len();
+            return Err(self.err(ErrorCode::InvalidCharRange, &s[..seq_len]));
+        }
+        let sign = if negated { 'P' } else { 'p' };
+        let tok = if braced {
+            format!("\\{sign}{{{name}}}")
+        } else {
+            format!("\\{sign}{name}")
+        };
+        Ok(Some((tok, rest)))
+    }
+
+    /// Scans the character class starting at `s` (which begins with `[`)
+    /// for an embedded `\p{...}` / `\P{...}` token.
+    ///
+    /// PORT NOTE: Go merges the resolved Unicode ranges into the containing
+    /// class; without the tables, the WHOLE class is kept opaque
+    /// (`Op::UnicodeClass` with the `[...]` source text, `\p{^..}`
+    /// canonicalized) and resolved by the regex crate at matcher-compile
+    /// time — see `parse_unicode_class_token` for the observable
+    /// differences. Returns `Ok(None)` when the class contains no Unicode
+    /// class token, so the regular (faithful) class parser handles it.
+    fn scan_unicode_char_class(&self, s: &'a str) -> PResult<Option<(String, &'a str)>> {
+        if self.flags & UNICODE_GROUPS == 0 {
+            return Ok(None);
+        }
+        let bytes = s.as_bytes();
+        let mut out = String::from("[");
+        let mut i = 1; // chop [
+        let mut first = true; // ] is a literal as the first char in the class
+        let mut has_unicode = false;
+        if i < bytes.len() && bytes[i] == b'^' {
+            out.push('^');
+            i += 1;
+        }
+        while i < bytes.len() {
+            match bytes[i] {
+                b']' if !first => {
+                    i += 1;
+                    if !has_unicode {
+                        return Ok(None);
+                    }
+                    out.push(']');
+                    return Ok(Some((out, &s[i..])));
+                }
+                b'\\' if i + 1 < bytes.len() && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P') => {
+                    let Some((tok, rest)) = self.parse_unicode_class_token(&s[i..])? else {
+                        unreachable!("guard checked UNICODE_GROUPS and the \\p prefix");
+                    };
+                    out.push_str(&tok);
+                    i = s.len() - rest.len();
+                    has_unicode = true;
+                }
+                b'\\' => {
+                    // Copy the escape pair verbatim (escaped char may be
+                    // multi-byte). A trailing lone backslash is left to the
+                    // regular class parser to report faithfully.
+                    out.push('\\');
+                    i += 1;
+                    if let Some(ch) = s[i..].chars().next() {
+                        out.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+                b'[' if i + 2 < bytes.len() && bytes[i + 1] == b':' => {
+                    // POSIX named class like [:alpha:] — copy it through the
+                    // closing ":]" (validated later by whoever parses it).
+                    match s[i + 2..].find(":]") {
+                        Some(j) => {
+                            out.push_str(&s[i..i + 2 + j + 2]);
+                            i += 2 + j + 2;
+                        }
+                        None => {
+                            out.push('[');
+                            i += 1;
+                        }
+                    }
+                }
+                _ => {
+                    let ch = s[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+            first = false;
+        }
+        if !has_unicode {
+            // Let the regular class parser report unterminated classes.
+            return Ok(None);
+        }
+        // Go reaches parseClassChar("") for an unterminated class and
+        // reports ErrMissingBracket with the whole class text.
+        Err(self.err(ErrorCode::MissingBracket, s))
     }
 
     /// Go `parseClass`: parses a character class at the beginning of `s`
     /// and pushes it onto the parse stack.
     fn parse_class(&mut self, s: &'a str) -> PResult<&'a str> {
+        // A class containing a `\p{...}` token cannot be expanded into rune
+        // ranges without the Go unicode tables; keep it opaque instead.
+        if let Some((tok, rest)) = self.scan_unicode_char_class(s)? {
+            let re = self.new_regexp(Op::UnicodeClass);
+            self.nodes[re].flags = self.flags;
+            self.nodes[re].name = tok;
+            self.push(re)?;
+            return Ok(rest);
+        }
+
         let mut t = &s[1..]; // chop [
         let re = self.new_regexp(Op::CharClass);
         self.nodes[re].flags = self.flags;
@@ -1512,10 +1667,9 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            // Look for Unicode character group like \p{Han}.
-            self.check_unicode_class(t)?;
-
             // Look for Perl character class symbols (extension).
+            // (Unicode groups like \p{Han} were handled by the whole-class
+            // scan above.)
             if let Some(nt) = self.parse_perl_class_escape(t, &mut class) {
                 t = nt;
                 continue;
@@ -1722,8 +1876,13 @@ pub fn parse(s: &str, flags: u16) -> Result<Regexp, Error> {
                     }
 
                     // Look for Unicode character group like \p{Han}
-                    if t.len() >= 2 && (t.as_bytes()[1] == b'p' || t.as_bytes()[1] == b'P') {
-                        p.check_unicode_class(t)?;
+                    if let Some((tok, rest)) = p.parse_unicode_class_token(t)? {
+                        let re = p.new_regexp(Op::UnicodeClass);
+                        p.nodes[re].flags = p.flags;
+                        p.nodes[re].name = tok;
+                        t = rest;
+                        p.push(re)?;
+                        break 'big_switch;
                     }
 
                     // Perl character class escape.

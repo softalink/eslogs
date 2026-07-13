@@ -53,6 +53,20 @@ pub(crate) fn new_pipe_union(
 }
 
 impl Pipe for PipeUnion {
+    /// Port of Go `pipeUnion.visitSubqueries`: visits the union subquery.
+    fn visit_subqueries_mut(
+        &mut self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+        let Some(q_text) = self.query_text.as_mut() else {
+            return;
+        };
+        let mut q = crate::parser::query::must_parse_query(q_text, timestamp);
+        q.visit_subqueries(visit);
+        *q_text = q.to_string();
+    }
+
     /// Port of Go `pipeUnion.splitToRemoteAndLocal`: the pipe (and
     /// everything after it) runs locally only.
     fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {

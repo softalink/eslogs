@@ -461,14 +461,14 @@ mod tests {
             //
             // PORT NOTE: bsw borrows mp_dst for its whole lifetime, so ph is
             // merged into a local and moved into mp_dst.ph after bsw is
-            // returned to the pool (Go passes &mpDst.ph directly). Go also
-            // passes nil idb and dropFilter arguments, which the port of
-            // must_merge_block_streams drops.
+            // returned to the pool (Go passes &mpDst.ph directly). Go passes
+            // nil idb and dropFilter, which the port folds into one `None`
+            // DropFilterCtx.
             let mut mp_dst = get_inmemory_part();
             let mut bsw = get_block_stream_writer();
             bsw.must_init_for_inmemory_part(&mut mp_dst);
             let mut ph = PartHeader::default();
-            must_merge_block_streams(&mut ph, &mut bsw, &mut bsrs, None);
+            must_merge_block_streams(&mut ph, &mut bsw, &mut bsrs, None, None);
             put_block_stream_writer(bsw);
             mp_dst.ph = ph;
 

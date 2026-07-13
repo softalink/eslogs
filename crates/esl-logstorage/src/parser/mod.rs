@@ -38,7 +38,7 @@ pub mod query;
 pub mod query_stats;
 
 pub use query::{
-    Filter, ParseFilter, ParseQuery, ParseQueryAtTimestamp, Query,
+    Filter, ParseFilter, ParseFilterAtTimestamp, ParseQuery, ParseQueryAtTimestamp, Query,
     can_apply_last_n_results_optimization,
 };
 
@@ -48,12 +48,10 @@ pub(crate) use crate::stream_filter::go_quote;
 // ---------------------------------------------------------------------------
 // Token quoting (Go `quoteTokenIfNeeded` / `needQuoteToken` / ...).
 //
-// PORT NOTE: `stream_filter.rs` hosts an earlier `quote_token_if_needed` whose
-// `need_quote_token` deliberately omits the `isPipeName`/`isStatsFuncName`
-// checks (pipes/stats were unported then). The parser needs the *complete*
-// version for faithful `String()` round-trips, so it is (re)defined here with
-// those checks. `filter_*`/`pipe_*` Display impls still use the stream_filter
-// copy; unifying them is a later cleanup.
+// This module hosts the complete port of Go `needQuoteToken` (including the
+// `isPipeName`/`isStatsFuncName` checks); `stream_filter.rs` hosts an earlier
+// `quote_token_if_needed` wrapper whose `need_quote_token` delegates here, so
+// the `filter_*`/`pipe_*` Display impls quote exactly like Go.
 // ---------------------------------------------------------------------------
 
 /// Port of Go `quoteTokenIfNeeded`.

@@ -83,6 +83,32 @@ impl Filter for FilterGeneric {
         self.f.in_values().is_some_and(|iv| iv.q_text.is_some())
     }
 
+    fn has_direct_subquery(&self) -> bool {
+        self.has_filter_in_with_query()
+    }
+
+    /// Port of Go `filterGeneric.visitSubqueries` (the type switch on
+    /// `*filterIn`/`*filterContainsAny`/`*filterContainsAll` is the
+    /// `FieldFilter::in_values_mut` hook). Go visits the parsed `t.values.q`;
+    /// the port parses the stored text at `timestamp`, visits the parsed query
+    /// and stores the re-rendered text back
+    /// (see `Filter::visit_subqueries_mut`).
+    fn visit_subqueries_mut(
+        &mut self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+        let Some(iv) = self.f.in_values_mut() else {
+            return;
+        };
+        let Some(q_text) = iv.q_text.as_mut() else {
+            return;
+        };
+        let mut q = crate::parser::query::must_parse_query(q_text, timestamp);
+        q.visit_subqueries(visit);
+        *q_text = q.to_string();
+    }
+
     /// Port of Go `filterGeneric.initFilterInValues` (the type switch on
     /// `*filterIn`/`*filterContainsAny`/`*filterContainsAll` is expressed via
     /// the `FieldFilter::in_values`/`new_with_values` hooks).

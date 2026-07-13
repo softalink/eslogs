@@ -2,9 +2,6 @@
 //! `parsePipeX`).
 //!
 //! PORT NOTES:
-//! * `replace` / `replace_regexp`: the Rust structs carry no `iff` field, so a
-//!   leading `if (...)` is parsed (to consume tokens) and dropped. Round-trip
-//!   `String()` omits the `if (...)` for these two pipes.
 //! * `join` / `union` subqueries are stored as query text (`query_text`), not an
 //!   executable `Query` (matches the pipe structs' deferred subquery seam).
 
@@ -792,8 +789,7 @@ fn parse_pipe_query_stats(lex: &mut Lexer) -> Result<BoxPipe, String> {
 fn parse_pipe_replace(lex: &mut Lexer) -> Result<BoxPipe, String> {
     expect_keyword(lex, &["replace"], "replace")?;
     lex.next_token();
-    // PORT NOTE: the `if (...)` clause is consumed but dropped (no iff field).
-    let _iff = parse_optional_if(lex)?;
+    let iff = parse_optional_if(lex)?;
     if !lex.is_keyword(&["("]) {
         return Err("missing '(' after 'replace'".to_string());
     }
@@ -832,14 +828,18 @@ fn parse_pipe_replace(lex: &mut Lexer) -> Result<BoxPipe, String> {
         limit = parse_limit(lex)?;
     }
     Ok(Box::new(crate::pipe_replace::PipeReplace::new(
-        field, old_substr, new_substr, limit,
+        field,
+        old_substr,
+        new_substr,
+        limit,
+        to_arc_update_iff(iff),
     )))
 }
 
 fn parse_pipe_replace_regexp(lex: &mut Lexer) -> Result<BoxPipe, String> {
     expect_keyword(lex, &["replace_regexp"], "replace_regexp")?;
     lex.next_token();
-    let _iff = parse_optional_if(lex)?;
+    let iff = parse_optional_if(lex)?;
     if !lex.is_keyword(&["("]) {
         return Err("missing '(' after 'replace_regexp'".to_string());
     }
@@ -884,7 +884,14 @@ fn parse_pipe_replace_regexp(lex: &mut Lexer) -> Result<BoxPipe, String> {
         limit = parse_limit(lex)?;
     }
     Ok(Box::new(
-        crate::pipe_replace_regexp::PipeReplaceRegexp::new(field, re, re_str, replacement, limit),
+        crate::pipe_replace_regexp::PipeReplaceRegexp::new(
+            field,
+            re,
+            re_str,
+            replacement,
+            limit,
+            to_arc_update_iff(iff),
+        ),
     ))
 }
 

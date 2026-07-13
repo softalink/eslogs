@@ -19,11 +19,17 @@ pub(crate) fn new_filter_not(f: Box<dyn Filter>) -> FilterNot {
 
 impl Filter for FilterNot {
     fn to_string(&self) -> String {
-        // PORT NOTE: Go renders `!(...)` when the child is a `filterAnd`/`filterOr`
-        // and `!...` otherwise. Distinguishing the child's concrete type needs a
-        // downcast hook on the (frozen) `Filter` trait — deferred with the parser
-        // port (its only consumer). The parenthesized form is not reproduced yet.
-        format!("!{}", self.f.to_string())
+        // Go renders `!(...)` when the child is a `filterAnd`/`filterOr` and
+        // `!...` otherwise.
+        //
+        // PORT NOTE: Go type-switches on `*filterAnd` / `*filterOr`; the port
+        // classifies through the `and_children` / `is_filter_or` trait hooks
+        // (only `FilterAnd` / `FilterOr` implement them).
+        let s = self.f.to_string();
+        if self.f.and_children().is_some() || self.f.is_filter_or() {
+            return format!("!({s})");
+        }
+        format!("!{s}")
     }
 
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
@@ -63,5 +69,17 @@ impl Filter for FilterNot {
             &mut self.f,
             Box::new(crate::filter_noop::new_filter_noop()),
         ))
+    }
+
+    fn visit_subqueries_mut(
+        &mut self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+        self.f.visit_subqueries_mut(timestamp, visit);
+    }
+
+    fn update_with_time_offset(&mut self, offset: i64) {
+        self.f.update_with_time_offset(offset);
     }
 }

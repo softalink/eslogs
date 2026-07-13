@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use esl_common::httpserver::{Request, ResponseWriter, get_quoted_remote_addr};
+use esl_common::writeconcurrencylimiter;
 
 use esl_logstorage::json_parser::{get_json_parser, put_json_parser};
 use esl_logstorage::rows::{Field, rename_field};
@@ -18,7 +19,7 @@ use esl_logstorage::values_encoder::try_parse_timestamp_rfc3339_nano;
 use esl_common::timeutil::try_parse_unix_timestamp;
 
 use crate::common_params::{
-    LogMessageProcessor, LogRowsStorage, get_common_params, now_unix_nanos,
+    LogMessageProcessor, LogRowsStorage, errorf_with_status, get_common_params, now_unix_nanos,
 };
 use crate::line_reader::LineReader;
 
@@ -78,6 +79,10 @@ pub fn request_handler<S: LogRowsStorage>(
                     return true;
                 }
             };
+            if let Err((msg, status)) = storage.can_write_data() {
+                errorf_with_status(w, req, &msg, status);
+                return true;
+            }
             let stream_name = format!(
                 "remoteAddr={}, requestURI={:?}",
                 get_quoted_remote_addr(req),
@@ -88,16 +93,44 @@ pub fn request_handler<S: LogRowsStorage>(
             let preserve_keys: Vec<&str> =
                 cp.preserve_json_keys.iter().map(String::as_str).collect();
 
-            let mut lmp = cp.new_log_message_processor(storage, "elasticsearch_bulk");
-            let (n, res) = read_bulk_request(
-                &stream_name,
-                req.body_reader(),
-                &time_fields,
-                &msg_fields,
-                &preserve_keys,
-                &mut lmp,
-            );
-            lmp.close();
+            // Precompute the error-report context from `req` before the
+            // limiter reader borrows it mutably (the reader's Drop otherwise
+            // keeps that borrow alive across a `req`-based error report — the
+            // Err arm below reports without touching `req`).
+            let err_remote = get_quoted_remote_addr(req);
+            let err_uri = req.request_uri();
+
+            let (n, res) = {
+                // PORT NOTE: Go obtains the writeconcurrencylimiter reader
+                // inside readBulkRequest; the port hoists it here so the
+                // limiter's HTTP status code survives the String-typed error
+                // plumbing (Go recovers it via errors.As in httpserver.Errorf).
+                let mut wcr = match writeconcurrencylimiter::get_reader(req.body_reader()) {
+                    Ok(wcr) => wcr,
+                    Err(err) => {
+                        let msg = format!(
+                            "cannot decode log message #0 in /_bulk request: {}, stream fields: {:?}",
+                            err.err, cp.stream_fields
+                        );
+                        esl_common::warnf!(
+                            "remoteAddr: {err_remote}; requestURI: {err_uri}; {msg}"
+                        );
+                        w.error(&msg, err.status_code);
+                        return true;
+                    }
+                };
+                let mut lmp = cp.new_log_message_processor(storage, "elasticsearch_bulk");
+                let (n, res) = read_bulk_request(
+                    &stream_name,
+                    &mut wcr,
+                    &time_fields,
+                    &msg_fields,
+                    &preserve_keys,
+                    &mut lmp,
+                );
+                lmp.close();
+                (n, res)
+            };
 
             if let Err(err) = res {
                 w.errorf(

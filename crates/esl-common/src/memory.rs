@@ -1,8 +1,9 @@
 //! Port of Softalink LLC `lib/memory`.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::flagutil::Flag;
+use crate::flagutil::{Bytes, Flag};
 
 static ALLOWED_PERCENT: Flag<f64> = Flag::new(
     "memory.allowedPercent",
@@ -10,13 +11,10 @@ static ALLOWED_PERCENT: Flag<f64> = Flag::new(
     || 60.0,
 );
 
-// PORT NOTE: Go declares this via flagutil.NewBytes, which accepts KB/MB/GB
-// (and KiB/MiB/GiB) suffixes. The Bytes flag type isn't ported to
-// esl_common::flagutil yet, so this parses a plain integer number of bytes.
-static ALLOWED_BYTES: Flag<i64> = Flag::new(
+static ALLOWED_BYTES: Flag<Bytes> = Flag::new(
     "memory.allowedBytes",
     "Allowed size of system memory Softalink LLC caches may occupy. This option overrides -memory.allowedPercent if set to a non-zero value. Too low a value may increase the cache miss rate usually resulting in higher CPU and disk IO usage. Too high a value may evict too much data from the OS page cache resulting in higher disk IO usage. The process may behave unexpectedly if this flag is set too small (e.g., 1 byte).",
-    || 0,
+    || Bytes::with_default(0),
 );
 
 struct MemLimits {
@@ -26,13 +24,34 @@ struct MemLimits {
 
 static LIMITS: OnceLock<MemLimits> = OnceLock::new();
 
-// PORT NOTE: the Go package panics when initOnce runs before flag.Parse and
-// exports a `process_memory_limit_bytes` gauge via lib/metrics. Rust flags
-// resolve lazily through flagutil (so there is no parsed-state to check) and
-// the metrics package isn't ported yet.
+// The detected system memory limit, exported via `process_memory_limit_bytes`.
+// Like the Go package-level `memoryLimit` var, it stays 0 until the first
+// allowed()/remaining() call runs init_once.
+static MEMORY_LIMIT: AtomicU64 = AtomicU64::new(0);
+
+/// Registers the `process_memory_limit_bytes` gauge, mirroring the Go
+/// package-level `metrics.NewGauge` var.
+///
+/// PORT NOTE: Go registers this at package init; the port registers it from
+/// `appmetrics::init_start_time` (the package-init stand-in). Like in Go, the
+/// gauge reports 0 until the first `allowed()`/`remaining()` call detects the
+/// memory limit.
+pub(crate) fn register_metrics() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        crate::metrics::new_gauge(
+            "process_memory_limit_bytes",
+            Some(Box::new(|| MEMORY_LIMIT.load(Ordering::Relaxed) as f64)),
+        );
+    });
+}
+
+// PORT NOTE: the Go package panics when initOnce runs before flag.Parse; Rust
+// flags resolve lazily through flagutil, so there is no parsed-state to check.
 fn init_once() -> MemLimits {
     let memory_limit = sys_total_memory() as i64;
-    let allowed_bytes = *ALLOWED_BYTES.get();
+    MEMORY_LIMIT.store(memory_limit as u64, Ordering::Relaxed);
+    let allowed_bytes = ALLOWED_BYTES.get().n;
     if allowed_bytes <= 0 {
         let allowed_percent = *ALLOWED_PERCENT.get();
         if !(1.0..=100.0).contains(&allowed_percent) {
@@ -56,7 +75,7 @@ fn init_once() -> MemLimits {
             remaining: remaining_memory as usize,
         }
     } else {
-        let allowed_memory = allowed_bytes;
+        let allowed_memory = ALLOWED_BYTES.get().int_n() as i64;
         if allowed_memory < 1024 * 1024 {
             // It's fair to print a hint if the allowedBytes is set to too small, typically by misconfiguration.
             crate::warnf!(
@@ -64,13 +83,14 @@ fn init_once() -> MemLimits {
             );
         }
         let remaining_memory = memory_limit - allowed_memory;
+        let allowed_bytes_str = ALLOWED_BYTES.get().to_string();
         if remaining_memory <= 0 {
             crate::fatalf!(
-                "FATAL: remaining memory {remaining_memory} bytes cannot be less than or equal to zero, detected system memory limit {memory_limit} bytes, -memory.allowedBytes={allowed_bytes}"
+                "FATAL: remaining memory {remaining_memory} bytes cannot be less than or equal to zero, detected system memory limit {memory_limit} bytes, -memory.allowedBytes={allowed_bytes_str}"
             );
         }
         crate::infof!(
-            "limiting caches to {allowed_memory} bytes, leaving {remaining_memory} bytes to the OS according to -memory.allowedBytes={allowed_bytes}, system memory limit {memory_limit} bytes"
+            "limiting caches to {allowed_memory} bytes, leaving {remaining_memory} bytes to the OS according to -memory.allowedBytes={allowed_bytes_str}, system memory limit {memory_limit} bytes"
         );
         MemLimits {
             allowed: allowed_memory as usize,
@@ -149,6 +169,26 @@ fn sys_total_memory() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The Go package has no tests; this pins that -memory.allowedBytes goes
+    // through flagutil.Bytes and accepts size suffixes like Go's
+    // flagutil.NewBytes (the flag itself cannot be set from a test, since
+    // flags read the process arguments).
+    #[test]
+    fn test_allowed_bytes_accepts_size_suffixes() {
+        use crate::flagutil::FlagValue as _;
+        for (value, want) in [
+            ("64MiB", 64i64 * 1024 * 1024),
+            ("1KiB", 1024),
+            ("1KB", 1000),
+            ("0.25GiB", 256 * 1024 * 1024),
+            ("123", 123),
+        ] {
+            let b = Bytes::parse_flag(value)
+                .unwrap_or_else(|err| panic!("cannot parse {value:?}: {err}"));
+            assert_eq!(b.n, want, "unexpected value for {value:?}");
+        }
+    }
 
     // The Go package has no tests; this sanity-checks the default
     // -memory.allowedPercent=60 split on the host.

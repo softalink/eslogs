@@ -283,6 +283,15 @@ impl LogRowsStorage for Storage {
     fn must_add_rows(self: &Arc<Self>, lr: &LogRows) {
         push_to_remote_storages(lr);
     }
+
+    /// CanWriteData implements the LogRowsStorage interface.
+    ///
+    /// PORT NOTE: eslagent forwards rows to remote storage nodes rather than
+    /// writing locally, so there is no local read-only/low-disk gate to apply
+    /// (Go's `remotewrite.Storage` has no CanWriteData rejection either).
+    fn can_write_data(self: &Arc<Self>) -> Result<(), (String, u16)> {
+        Ok(())
+    }
 }
 
 // PORT NOTE: the ported kubernetescollector carries its own Go-shaped
@@ -437,8 +446,7 @@ fn init_remote_write_ctxs(tmp_data_path: &Path, urls: &[String], queues: usize) 
             queues,
         ));
     }
-    // PORT NOTE: fs.RegisterPathFsMetrics(tmpDataPath) is not ported (no
-    // metrics crate).
+    esl_common::fs::register_path_fs_metrics(tmp_data_path);
 
     *RWCTXS_GLOBAL.write().unwrap() = rwctxs;
 }

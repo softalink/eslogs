@@ -9,6 +9,7 @@
 // is only exercised by the tests below and by sibling parser modules.
 #![allow(dead_code)]
 
+use crate::html_entities::{LONGEST_ENTITY_WITHOUT_SEMICOLON, lookup_entity, lookup_entity2};
 use crate::prefix_filter;
 
 /// Pattern represents text pattern in the form `some_text<some_field>other_text...`
@@ -370,10 +371,21 @@ fn go_unquote_inner(input: &str, unescape: bool) -> Result<(String, usize), ()> 
 
                 // Append the character if unescaping the input.
                 if unescape {
-                    // PORT NOTE: for non-multibyte values >= 0x80 (\x and
-                    // octal escapes) Go appends the raw byte, which may
-                    // produce invalid UTF-8; Rust strings must stay valid
-                    // UTF-8, so the rune is UTF-8 encoded instead.
+                    // PORT NOTE: Go appends `byte(r)` when !multibyte, so the
+                    // escapes `\x80`..`\xFF` and octal `\200`..`\377` inside
+                    // double-quoted values produce a raw (invalid-UTF-8) byte
+                    // in the unquoted Go string; Rust `String` must stay
+                    // valid UTF-8, so the port encodes the scalar instead
+                    // (e.g. `\x80` → 0xC2 0x80 vs Go's lone 0x80). This is
+                    // observable in extracted field values and cannot match
+                    // Go without a String→bytes refactor of field values
+                    // (crate-wide decision: Field values are `String`; this
+                    // helper is also shared by logfmt_parser, stream_tags,
+                    // storage_search and pattern_matcher). Values < 0x80 and
+                    // \u/\U escapes are byte-identical to Go. Go's own
+                    // single-quote path in `tryUnquoteString` uses
+                    // `utf8.AppendRune`, so the port matches Go exactly for
+                    // single-quoted values.
                     buf.push(r);
                 }
 
@@ -497,12 +509,9 @@ fn unhex(b: u8) -> Option<u32> {
 
 // ---------------------------------------------------------------------------
 // Port of Go `html.UnescapeString` used for unescaping pattern prefixes.
-//
-// PORT NOTE: Go supports the full HTML5 named-entity table (~2200 entries);
-// the port implements the identical algorithm (including numeric character
-// references and entities without a trailing semicolon) but only the named
-// entities relevant for LogsQL pattern escaping: lt, gt, amp, quot, apos,
-// nbsp. Extend `lookup_entity` if more are ever required.
+// The full HTML5 named-entity tables (Go's `entity`/`entity2` maps from
+// `html/entity.go`, incl. entities without a trailing semicolon and
+// two-codepoint entities) live in `crate::html_entities`.
 // ---------------------------------------------------------------------------
 
 fn html_unescape_string(s: &str) -> String {
@@ -624,6 +633,9 @@ fn unescape_entity(b: &mut [u8], dst: usize, src: usize) -> (usize, usize) {
         // No-op.
     } else if let Some(x) = lookup_entity(&b[src + 1..src + i]) {
         return (write_char(b, dst, x), src + i);
+    } else if let Some([x0, x1]) = lookup_entity2(&b[src + 1..src + i]) {
+        let dst1 = write_char(b, dst, x0);
+        return (write_char(b, dst1, x1), src + i);
     } else {
         let mut max_len = entity_len - 1;
         if max_len > LONGEST_ENTITY_WITHOUT_SEMICOLON {
@@ -649,23 +661,6 @@ fn write_char(b: &mut [u8], dst: usize, ch: char) -> usize {
     b[dst..dst + enc.len()].copy_from_slice(enc);
     dst + enc.len()
 }
-
-/// Named entities supported by the port; keys may include the trailing ';'
-/// (Go's entity map contains both forms where HTML5 defines them).
-fn lookup_entity(name: &[u8]) -> Option<char> {
-    let ch = match name {
-        b"lt;" | b"lt" => '<',
-        b"gt;" | b"gt" => '>',
-        b"amp;" | b"amp" => '&',
-        b"quot;" | b"quot" => '"',
-        b"apos;" => '\'',
-        b"nbsp;" | b"nbsp" => '\u{A0}',
-        _ => return None,
-    };
-    Some(ch)
-}
-
-const LONGEST_ENTITY_WITHOUT_SEMICOLON: usize = 6;
 
 /// Port of Go `html`'s replacementTable: Windows-1252 mappings for numeric
 /// references in the 0x80..=0x9F range.
@@ -861,5 +856,52 @@ mod tests {
         // missing >
         f("<foo");
         f("foo<bar");
+    }
+
+    /// Port of Go stdlib `html/escape_test.go` `TestUnescape` (drives the
+    /// `html.UnescapeString` port used for pattern prefixes).
+    #[test]
+    fn test_html_unescape_string() {
+        fn f(html: &str, unescaped: &str) {
+            let got = html_unescape_string(html);
+            assert_eq!(
+                got, unescaped,
+                "unexpected unescape result for {html:?}; got {got:?}; want {unescaped:?}"
+            );
+        }
+
+        // Handle no entities.
+        f("A\ttext\nstring", "A\ttext\nstring");
+        // Handle simple named entities.
+        f("&amp; &gt; &lt;", "& > <");
+        // Handle hitting the end of the string.
+        f("&amp &amp", "& &");
+        // Handle entities with two codepoints.
+        f("text &gesl; blah", "text \u{22db}\u{fe00} blah");
+        // Handle decimal numeric entities.
+        f("Delta = &#916; ", "Delta = \u{394} ");
+        // Handle hexadecimal numeric entities.
+        f("Lambda = &#x3bb; = &#X3Bb ", "Lambda = \u{3bb} = \u{3bb} ");
+        // Handle numeric early termination.
+        f(
+            "&# &#x &#128;43 &copy = &#169f = &#xa9",
+            "&# &#x \u{20ac}43 \u{a9} = \u{a9}f = \u{a9}",
+        );
+        // Handle numeric ISO-8859-1 entity replacements.
+        f("Footnote&#x87;", "Footnote\u{2021}");
+        // Handle single ampersand.
+        f("&", "&");
+        // Handle ampersand followed by non-entity.
+        f("text &test", "text &test");
+        // Handle "&#".
+        f("text &#", "text &#");
+
+        // Extra spot checks for the full named-entity table (not in the Go
+        // test file): longest-match truncation of a no-semicolon entity and
+        // an accented named entity.
+        f("&notit;", "\u{ac}it;");
+        f("a+acute=&aacute;", "a+acute=\u{e1}");
+        // Invalid numeric references collapse to U+FFFD like Go.
+        f("&#0; &#xD800; &#x110000;", "\u{fffd} \u{fffd} \u{fffd}");
     }
 }

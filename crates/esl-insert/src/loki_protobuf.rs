@@ -16,19 +16,16 @@ use esl_common::httpserver::{Request, ResponseWriter};
 use esl_logstorage::json_parser::{JSONParser, get_json_parser, put_json_parser};
 use esl_logstorage::rows::{Field, rename_field};
 
-use crate::common_params::{LogMessageProcessor, LogRowsStorage, now_unix_nanos};
-use crate::loki::{add_msg_field, get_loki_common_params};
+use esl_common::writeconcurrencylimiter;
+
+use crate::common_params::{
+    LogMessageProcessor, LogRowsStorage, check_max_request_size, errorf_with_status, now_unix_nanos,
+};
+use crate::loki::{MAX_REQUEST_SIZE, add_msg_field, get_loki_common_params};
 
 // ---------------------------------------------------------------------------
 // loki_protobuf.go
 // ---------------------------------------------------------------------------
-
-/// Maximum size of the decompressed Loki protobuf request body.
-///
-/// PORT NOTE: Go exposes this as the `-loki.maxRequestSize` flag (default
-/// 64MiB) enforced by `protoparserutil.ReadUncompressedData`; the port uses
-/// the default as a constant.
-const MAX_REQUEST_SIZE: usize = 64 * 1024 * 1024;
 
 pub(crate) fn handle_protobuf<S: LogRowsStorage>(
     storage: &Arc<S>,
@@ -45,11 +42,37 @@ pub(crate) fn handle_protobuf<S: LogRowsStorage>(
             return;
         }
     };
+    if let Err((msg, status)) = storage.can_write_data() {
+        errorf_with_status(w, req, &msg, status);
+        return;
+    }
+
+    // Go streams the body via protoparserutil.ReadUncompressedData, which
+    // waits for the first body byte, takes a writeconcurrencylimiter token
+    // for the read+parse and enforces -loki.maxRequestSize while reading;
+    // the port takes the token here and checks the cap after the read.
+    let _concurrency_guard = match writeconcurrencylimiter::inc_concurrency_guard() {
+        Ok(g) => g,
+        Err(err) => {
+            errorf_with_status(
+                w,
+                req,
+                &format!("cannot read Loki protobuf data: {}", err.err),
+                err.status_code,
+            );
+            return;
+        }
+    };
 
     // PORT NOTE: Go reads the body via `protoparserutil.ReadUncompressedData`
     // with the Content-Encoding value, defaulting to snappy. The Rust
     // httpserver already decompresses the body per Content-Encoding, so only
     // the "no Content-Encoding means snappy" Loki default is handled here.
+    // -loki.maxRequestSize caps the raw body in both cases (Go's readFull),
+    // and additionally the snappy-decompressed size (Go's limited
+    // snappy.Decode); for the other encodings the body reaching this point
+    // was already decompressed by the httpserver, so the raw cap applies to
+    // the decompressed size like Go's readFull-after-GetUncompressedReader.
     // See https://grafana.com/docs/loki/latest/reference/loki-http-api/#ingest-logs
     let encoding = req.content_encoding();
     let body = match req.read_full_body() {
@@ -59,6 +82,10 @@ pub(crate) fn handle_protobuf<S: LogRowsStorage>(
             return;
         }
     };
+    if let Err(err) = check_max_request_size(body.len(), &MAX_REQUEST_SIZE) {
+        w.errorf(req, &format!("cannot read Loki protobuf data: {err}"));
+        return;
+    }
     let data = if encoding.is_empty() {
         match snappy_decode_block(&body) {
             Ok(d) => d,
@@ -101,19 +128,22 @@ pub(crate) fn handle_protobuf<S: LogRowsStorage>(
     w.set_status(204);
 }
 
-/// Decodes a block-mode snappy body, enforcing [`MAX_REQUEST_SIZE`] on the
-/// decompressed size.
+/// Decodes a block-mode snappy body, enforcing `-loki.maxRequestSize` on the
+/// decompressed size (Go: `readUncompressedData` calling the limited
+/// `snappy.Decode`; error texts match `lib/encoding/snappy` wrapped with
+/// "cannot decompress data:").
 fn snappy_decode_block(data: &[u8]) -> Result<Vec<u8>, String> {
     let decoded_len = snap::raw::decompress_len(data)
-        .map_err(|err| format!("cannot decode snappy-encoded data block: {err}"))?;
-    if decoded_len > MAX_REQUEST_SIZE {
+        .map_err(|err| format!("cannot decompress data: cannot read snappy header: {err}"))?;
+    let max_request_size = MAX_REQUEST_SIZE.get().int_n().max(0) as usize;
+    if decoded_len > max_request_size {
         return Err(format!(
-            "too big decompressed request size: {decoded_len} bytes; it mustn't exceed {MAX_REQUEST_SIZE} bytes"
+            "cannot decompress data: too big data size {decoded_len} exceeding {max_request_size} bytes"
         ));
     }
     snap::raw::Decoder::new()
         .decompress_vec(data)
-        .map_err(|err| format!("cannot decode snappy-encoded data block: {err}"))
+        .map_err(|err| format!("cannot decompress data: {err}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -218,9 +248,13 @@ where
     // port uses a local Vec<Field> like the JSON path in loki.rs.
     let mut fs: Vec<Field> = Vec::new();
 
-    let labels = easyproto::get_string(src, 1)
+    // PORT NOTE: get_string_lossy mirrors Go's raw-byte GetString: invalid
+    // UTF-8 in the labels string is U+FFFD-replaced instead of rejecting the
+    // request (Go keeps the raw bytes; see easyproto::get_string_lossy).
+    let labels = easyproto::get_string_lossy(src, 1)
         .map_err(|err| format!("cannot read labels: {err}"))?
         .ok_or_else(|| "missing labels".to_string())?;
+    let labels = labels.as_ref();
     parse_prom_labels(&mut fs, labels)
         .map_err(|err| format!("cannot parse labels {labels:?}: {err}"))?;
     let stream_fields_len = fs.len();
@@ -256,7 +290,7 @@ where
     // }
 
     let mut timestamp: i64 = 0;
-    let mut line: &str = "";
+    let mut line: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed("");
 
     let stream_fields_len = fs.len();
 
@@ -275,7 +309,12 @@ where
                     .map_err(|err| format!("cannot unmarshal Timestamp: {err}"))?;
             }
             2 => {
-                line = fc.string().ok_or_else(|| "cannot read Line".to_string())?;
+                // PORT NOTE: string_lossy mirrors Go's raw-byte String():
+                // invalid UTF-8 in the log line is U+FFFD-replaced instead of
+                // rejecting the request (Go keeps the raw bytes).
+                line = fc
+                    .string_lossy()
+                    .ok_or_else(|| "cannot read Line".to_string())?;
             }
             3 => {
                 let data = fc
@@ -288,7 +327,7 @@ where
         }
     }
 
-    push_logs(timestamp, line, fs, stream_fields_len);
+    push_logs(timestamp, &line, fs, stream_fields_len);
 
     Ok(())
 }
@@ -299,11 +338,14 @@ fn decode_label_pair(src: &[u8], fs: &mut Vec<Field>) -> Result<(), String> {
     //   string value = 2;
     // }
 
-    let name = easyproto::get_string(src, 1)
+    // PORT NOTE: get_string_lossy mirrors Go's raw-byte GetString: invalid
+    // UTF-8 in a structured-metadata name/value is U+FFFD-replaced instead of
+    // rejecting the request (Go keeps the raw bytes).
+    let name = easyproto::get_string_lossy(src, 1)
         .map_err(|err| format!("cannot read name: {err}"))?
         .ok_or_else(|| "missing name".to_string())?;
 
-    let value = easyproto::get_string(src, 2)
+    let value = easyproto::get_string_lossy(src, 2)
         .map_err(|err| format!("cannot read value: {err}"))?
         .ok_or_else(|| "missing value".to_string())?;
 
@@ -411,69 +453,110 @@ fn parse_prom_labels(fs: &mut Vec<Field>, s: &str) -> Result<(), String> {
 ///
 /// PORT NOTE: replaces Go `strconv.QuotedPrefix` + `strconv.Unquote`. Only
 /// double-quoted strings are supported (Prometheus label values are always
-/// double-quoted). `\x`/`\u`/`\U`/octal escapes are decoded as Unicode scalar
-/// values; Go would emit raw bytes for `\x`/octal, which can produce non-UTF-8
-/// strings that a Rust `String` cannot represent.
+/// double-quoted). Escapes decode to raw bytes exactly like Go's
+/// `strconv.UnquoteChar` (`\xHH`/`\NNN` octal emit the single byte, `\u`/`\U`
+/// emit the rune's UTF-8), so any value whose decoded bytes are valid UTF-8 —
+/// including UTF-8 spelled via `\x` escapes like `\xc3\xa9` → `é` — matches
+/// Go byte-for-byte. Divergence (Field values are Rust `String`s, which must
+/// hold valid UTF-8): when the decoded bytes are NOT valid UTF-8, Go stores
+/// the raw bytes while the port U+FFFD-replaces each invalid sequence (e.g.
+/// `"\xff"` → Go `0xFF`, port `"\u{FFFD}"`). A String→bytes Field refactor
+/// would close this.
 fn unquote_prefix(s: &str) -> Result<(String, usize), String> {
-    let mut chars = s.char_indices();
-    match chars.next() {
-        Some((_, '"')) => {}
-        _ => return Err("invalid syntax".to_string()),
+    const ERR: &str = "invalid syntax";
+    let b = s.as_bytes();
+    if b.first() != Some(&b'"') {
+        return Err(ERR.to_string());
     }
-    let mut out = String::new();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '"' => return Ok((out, i + 1)),
-            '\n' => return Err("invalid syntax".to_string()),
-            '\\' => {
-                let (_, e) = chars.next().ok_or_else(|| "invalid syntax".to_string())?;
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                let out = String::from_utf8(out)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                return Ok((out, i + 1));
+            }
+            b'\n' => return Err(ERR.to_string()),
+            b'\\' => {
+                i += 1;
+                if i >= b.len() {
+                    return Err(ERR.to_string());
+                }
+                let e = b[i];
+                i += 1;
                 match e {
-                    'a' => out.push('\u{0007}'),
-                    'b' => out.push('\u{0008}'),
-                    'f' => out.push('\u{000C}'),
-                    'n' => out.push('\n'),
-                    'r' => out.push('\r'),
-                    't' => out.push('\t'),
-                    'v' => out.push('\u{000B}'),
-                    '\\' => out.push('\\'),
-                    '\'' => out.push('\''),
-                    '"' => out.push('"'),
-                    'x' => out.push(unquote_hex_escape(&mut chars, 2)?),
-                    'u' => out.push(unquote_hex_escape(&mut chars, 4)?),
-                    'U' => out.push(unquote_hex_escape(&mut chars, 8)?),
-                    '0'..='7' => {
-                        let mut v = e as u32 - '0' as u32;
-                        for _ in 0..2 {
-                            let (_, d) =
-                                chars.next().ok_or_else(|| "invalid syntax".to_string())?;
-                            let d = d.to_digit(8).ok_or_else(|| "invalid syntax".to_string())?;
-                            v = v * 8 + d;
-                        }
-                        out.push(char::from_u32(v).ok_or_else(|| "invalid syntax".to_string())?);
+                    b'a' => out.push(0x07),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0C),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'v' => out.push(0x0B),
+                    b'\\' => out.push(b'\\'),
+                    // Go's unquoteChar rejects \' inside double-quoted
+                    // strings (the escape is only valid for the quote char).
+                    b'"' => out.push(b'"'),
+                    b'x' => {
+                        // Go appends the raw byte, even if >= 0x80.
+                        let v = unquote_hex_escape(b, &mut i, 2)?;
+                        out.push(v as u8);
                     }
-                    _ => return Err("invalid syntax".to_string()),
+                    b'u' => {
+                        let v = unquote_hex_escape(b, &mut i, 4)?;
+                        let c = char::from_u32(v).ok_or_else(|| ERR.to_string())?;
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                    b'U' => {
+                        let v = unquote_hex_escape(b, &mut i, 8)?;
+                        let c = char::from_u32(v).ok_or_else(|| ERR.to_string())?;
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                    b'0'..=b'7' => {
+                        // Octal escape: exactly 3 digits, raw byte, <= 255
+                        // (Go errors on \400..\777).
+                        let mut v = u32::from(e - b'0');
+                        for _ in 0..2 {
+                            if i >= b.len() || !b[i].is_ascii_digit() || b[i] > b'7' {
+                                return Err(ERR.to_string());
+                            }
+                            v = v * 8 + u32::from(b[i] - b'0');
+                            i += 1;
+                        }
+                        if v > 255 {
+                            return Err(ERR.to_string());
+                        }
+                        out.push(v as u8);
+                    }
+                    _ => return Err(ERR.to_string()),
                 }
             }
-            _ => out.push(c),
+            c => {
+                // s is a &str, so unescaped bytes are already valid UTF-8;
+                // copy them through unchanged (Go copies runes the same way).
+                out.push(c);
+                i += 1;
+            }
         }
     }
-    Err("invalid syntax".to_string())
+    Err(ERR.to_string())
 }
 
-fn unquote_hex_escape(
-    chars: &mut std::str::CharIndices<'_>,
-    digits: usize,
-) -> Result<char, String> {
+fn unquote_hex_escape(b: &[u8], i: &mut usize, digits: usize) -> Result<u32, String> {
     let mut v: u32 = 0;
     for _ in 0..digits {
-        let (_, d) = chars.next().ok_or_else(|| "invalid syntax".to_string())?;
-        let d = d.to_digit(16).ok_or_else(|| "invalid syntax".to_string())?;
-        v = v
-            .checked_mul(16)
-            .and_then(|v| v.checked_add(d))
+        if *i >= b.len() {
+            return Err("invalid syntax".to_string());
+        }
+        let d = (b[*i] as char)
+            .to_digit(16)
             .ok_or_else(|| "invalid syntax".to_string())?;
+        v = v * 16 + d;
+        *i += 1;
     }
-    char::from_u32(v).ok_or_else(|| "invalid syntax".to_string())
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -662,6 +745,35 @@ mod tests {
         f(r#"{foo="bar" baz="aa"}"#);
         f(r#"foobar"#);
         f(r#"foo{bar="baz"}"#);
+    }
+
+    // PORT-ONLY TEST: pins the strconv.Unquote escape semantics of
+    // unquote_prefix. `\xHH`/octal escapes decode to raw bytes like Go, so
+    // UTF-8 spelled via `\x` matches Go byte-for-byte; decoded bytes that are
+    // NOT valid UTF-8 are U+FFFD-replaced where Go keeps the raw bytes (see
+    // the PORT NOTE on unquote_prefix).
+    #[test]
+    fn test_unquote_prefix_escapes() {
+        fn f(quoted: &str, want: &str) {
+            let (got, n) = unquote_prefix(quoted).unwrap();
+            assert_eq!(got, want, "unexpected unquoted value for {quoted:?}");
+            assert_eq!(n, quoted.len(), "unexpected consumed length");
+        }
+
+        // \x escapes composing valid UTF-8 match Go exactly.
+        f(r#""\xc3\xa9""#, "é");
+        // Octal escapes composing valid UTF-8 match Go exactly.
+        f(r#""\303\251""#, "é");
+        // \u/\U escapes.
+        f(r#""é \U0001F600""#, "é 😀");
+        // Lone invalid byte: Go stores raw 0xFF, the port replaces it.
+        f(r#""\xff""#, "\u{FFFD}");
+
+        // Go errors on octal values > 255, on surrogate \u escapes, and on
+        // \' inside double-quoted strings.
+        assert!(unquote_prefix(r#""\400""#).is_err());
+        assert!(unquote_prefix(r#""\ud800""#).is_err());
+        assert!(unquote_prefix(r#""don\'t""#).is_err());
     }
 
     /// Mirrors Go `TestParseProtobufRequest_Success`: marshal a pushRequest

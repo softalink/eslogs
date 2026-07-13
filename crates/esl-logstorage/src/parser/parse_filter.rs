@@ -284,10 +284,13 @@ fn parse_filter_parens(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, S
 
 fn parse_filter_not(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
     lex.next_token();
-    let f = parse_filter_generic(lex, field_name)?;
-    // Go collapses double-negation via a type switch on *filterNot; we cannot
-    // downcast `Box<dyn Filter>`, so wrap unconditionally.
-    // PORT NOTE: `!!foo` round-trips as `!!foo` here instead of `foo`.
+    let mut f = parse_filter_generic(lex, field_name)?;
+    // Go collapses double-negation via a type switch on *filterNot.
+    // PORT NOTE: the port collapses through the `take_not_child` trait hook
+    // (only `FilterNot` implements it).
+    if let Some(child) = f.take_not_child() {
+        return Ok(child);
+    }
     Ok(Box::new(new_filter_not(f)))
 }
 

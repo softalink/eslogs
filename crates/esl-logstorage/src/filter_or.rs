@@ -94,4 +94,20 @@ impl Filter for FilterOr {
     fn is_filter_or(&self) -> bool {
         true
     }
+
+    fn visit_subqueries_mut(
+        &mut self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+        for f in &mut self.filters {
+            f.visit_subqueries_mut(timestamp, visit);
+        }
+    }
+
+    fn update_with_time_offset(&mut self, offset: i64) {
+        for f in &mut self.filters {
+            f.update_with_time_offset(offset);
+        }
+    }
 }

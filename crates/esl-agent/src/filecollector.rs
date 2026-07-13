@@ -915,9 +915,13 @@ impl<S: LogRowsStorage + 'static> TailProcessor for Processor<S> {
             rename_field(parser.fields_mut(), &msg_fields, "_msg");
         }
         if !ok {
-            // PORT NOTE: Go aliases the line bytes via
-            // bytesutil.ToUnsafeString; the owned Field requires a copy
-            // (lossy for non-UTF-8 input).
+            // PORT NOTE: Go aliases the raw line bytes via
+            // bytesutil.ToUnsafeString, so a non-JSON log line containing
+            // invalid UTF-8 is stored verbatim as `_msg`. The Rust `Field`
+            // value is a `String` (crate-wide decision), so each invalid
+            // sequence is U+FFFD-replaced instead: line bytes `b"a\xffb"`
+            // are stored by Go as `a\xffb` and by the port as `a\u{FFFD}b`.
+            // Closing this would require a String→bytes `Field` refactor.
             parser.fields_mut().push(Field {
                 name: "_msg".to_string(),
                 value: String::from_utf8_lossy(line).into_owned(),
@@ -1165,8 +1169,10 @@ mod tests {
             });
         }
 
-        // PORT NOTE: Go's testLogRowsStorage also implements CanWriteData();
-        // the ported trait doesn't carry it (see the module-level PORT NOTE).
+        // Go's testLogRowsStorage always allows writes.
+        fn can_write_data(self: &Arc<Self>) -> Result<(), (String, u16)> {
+            Ok(())
+        }
     }
 
     // Port of Go TestProcessorParseContent.
@@ -1213,6 +1219,22 @@ mod tests {
                 r#"{"_msg":"bar","file":"test.log"}"#,
                 r#"{"_msg":"buz","file":"test.log"}"#,
             ],
+        );
+    }
+
+    // PORT-ONLY TEST: upstream has no invalid-UTF-8 coverage. Pins the
+    // divergence documented at the `_msg` Field construction site: Go stores
+    // the raw line bytes; the port U+FFFD-replaces invalid sequences.
+    #[test]
+    fn test_processor_parse_content_invalid_utf8() {
+        let storage = Arc::new(TestLogRowsStorage::default());
+        let mut proc = new_processor(0, "test.log", storage.clone());
+        proc.try_add_line(b"a\xffb");
+
+        let got = storage.log_rows.lock().unwrap().join("\n");
+        assert_eq!(
+            got, "{\"_msg\":\"a\u{FFFD}b\",\"file\":\"test.log\"}",
+            "unexpected result: {got}"
         );
     }
 

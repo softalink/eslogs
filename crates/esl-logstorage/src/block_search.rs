@@ -124,6 +124,23 @@ pub struct PartitionSearchOptions<'f> {
     pub hidden_fields_filter: prefix_filter::Filter,
 }
 
+impl PartitionSearchOptions<'_> {
+    /// Returns true if the pso matches the given streamID
+    /// (Go `partitionSearchOptions.matchStreamID`).
+    pub fn match_stream_id(&self, sid: &StreamID) -> bool {
+        if !self.tenant_ids.is_empty() {
+            return self.tenant_ids.contains(&sid.tenant_id);
+        }
+        self.stream_ids.contains(sid)
+    }
+
+    /// Returns true if `[min_timestamp, max_timestamp]` intersects the pso
+    /// time range (Go `partitionSearchOptions.matchTimeRange`).
+    pub fn match_time_range(&self, min_timestamp: i64, max_timestamp: i64) -> bool {
+        min_timestamp <= self.max_timestamp && max_timestamp >= self.min_timestamp
+    }
+}
+
 /// The actual work to perform on a single block.
 ///
 /// PORT NOTE: Go's `blockSearchWork` is pooled and holds raw pointers; the port

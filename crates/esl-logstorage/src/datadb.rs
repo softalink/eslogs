@@ -21,14 +21,9 @@
 //! - `wgPool` (pooled `sync.WaitGroup`s for merge fan-out) →
 //!   `std::thread::scope`.
 //!
-//! PORT NOTE: `datadb.deleteRows` is NOT ported yet: it depends on
-//! `partitionSearchOptions`, `ddb.getPartsForTimeRange` and
-//! `part.hasMatchingRows` from the unported `storage_search.go`.
-//! Consequently `mustMergePartsInternal` is ported without the `dropFilter`
-//! parameter, and `must_merge_block_streams` is called without the Go `idb` /
-//! `dropFilter` arguments (deferred by the block_stream_merger.rs port; `idb`
-//! is only used by the dropFilter path). The search-layer porter must extend
-//! both.
+//! PORT NOTE: `datadb.deleteRows` is ported below. Go's `part.hasMatchingRows`
+//! stays in `storage_search.rs` (its Go home file) as
+//! [`crate::storage_search::part_has_matching_rows`].
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -39,7 +34,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use esl_common::{cgroup, fs, infof, memory, panicf, warnf};
 
-use crate::block_stream_merger::must_merge_block_streams;
+use crate::block_search::PartitionSearchOptions;
+use crate::block_stream_merger::{DropFilterCtx, must_merge_block_streams};
 use crate::block_stream_reader::{
     BlockStreamReader, get_block_stream_reader, put_block_stream_reader,
 };
@@ -613,13 +609,14 @@ impl Datadb {
     /// All the parts inside pws must have isInMerge field set to true.
     /// The isInMerge field inside pws parts is set to false before returning from the function.
     fn must_merge_parts(self: &Arc<Self>, pws: Vec<Arc<PartWrapper>>, is_final: bool) {
-        let _ = self.must_merge_parts_internal(pws, is_final, Some(&self.stop));
+        let _ = self.must_merge_parts_internal(pws, is_final, None, Some(&self.stop));
     }
 
     /// mustMergePartsInternal merges pws to a single resulting part.
     ///
     /// if isFinal is set, then the resulting part is guaranteed to be saved to disk.
     /// if isFinal is set, then the merge process cannot be interrupted.
+    /// if dropFilter is non-nil, then rows matching this filter are dropped during the merge.
     ///
     /// The pws may remain unmerged after returning from the function in the following cases:
     /// - if stop_ch is set
@@ -629,13 +626,11 @@ impl Datadb {
     ///
     /// All the parts inside pws must have isInMerge field set to true.
     /// The isInMerge field inside pws parts is set to false before returning from the function.
-    ///
-    /// PORT NOTE: the Go `dropFilter *partitionSearchOptions` parameter is
-    /// deferred together with `deleteRows` (see the module PORT NOTE).
     fn must_merge_parts_internal(
         self: &Arc<Self>,
         pws: Vec<Arc<PartWrapper>>,
         is_final: bool,
+        drop_filter: Option<&PartitionSearchOptions<'_>>,
         stop_ch: Option<&AtomicBool>,
     ) -> bool {
         if pws.is_empty() {
@@ -735,7 +730,17 @@ impl Datadb {
         let mut ph = PartHeader::default();
         // The final merge shouldn't be stopped even if stop_ch is set.
         let stop_ch = if is_final { None } else { stop_ch };
-        must_merge_block_streams(&mut ph, &mut bsw, &mut bsrs, stop_ch);
+        // PORT NOTE: Go always passes ddb.pt.idb; the port only materializes
+        // the DropFilterCtx when a dropFilter is set (idb is unused otherwise).
+        let pt = self.pt.upgrade();
+        let drop_ctx = drop_filter.map(|pso| DropFilterCtx {
+            pso,
+            idb: &pt
+                .as_ref()
+                .expect("BUG: the partition must be alive during a dropFilter merge")
+                .idb,
+        });
+        must_merge_block_streams(&mut ph, &mut bsw, &mut bsrs, drop_ctx.as_ref(), stop_ch);
         put_block_stream_writer(bsw);
         for bsr in bsrs.drain(..) {
             put_block_stream_reader(bsr);
@@ -1143,6 +1148,57 @@ impl Datadb {
             pw.inc_ref();
         }
         pws
+    }
+
+    /// Deletes the rows matching pso (Go `datadb.deleteRows`).
+    ///
+    /// Returns false if the deletion couldn't be fully performed at the
+    /// moment, so it must be repeated later.
+    pub(crate) fn delete_rows(
+        self: &Arc<Self>,
+        pso: &PartitionSearchOptions<'_>,
+        stop_ch: &AtomicBool,
+    ) -> bool {
+        // Get all the parts and make sure they are kept open.
+        // PORT NOTE: Go's pwsDecRef closure is the explicit dec_ref loop at
+        // the end of this function.
+        let pws = self.get_parts_for_time_range(pso.min_timestamp, pso.max_timestamp);
+
+        // Search for parts, which contain logs matching pso for the deletion
+        // and which aren't in merge at the moment.
+        let mut pws_to_merge: Vec<Arc<PartWrapper>> = Vec::new();
+        let mut need_repeat = false;
+        for pw in &pws {
+            // SAFETY: `pw.part_ptr()` points at a part held referenced by the
+            // inc_ref() from get_parts_for_time_range() for the whole scope of
+            // `pws`; its refCount is > 0, so the part is not closed and its
+            // address is pinned.
+            let p: &Part = unsafe { &*pw.part_ptr() };
+            if !crate::storage_search::part_has_matching_rows(p, pso, stop_ch) {
+                continue;
+            }
+
+            let _ps = self.parts.lock().unwrap();
+            if !pw.is_in_merge.load(Ordering::SeqCst) {
+                pw.is_in_merge.store(true, Ordering::SeqCst);
+                pws_to_merge.push(Arc::clone(pw));
+            } else {
+                // The pw is in merge now, so it must be processed again for the rows' deletion in the future.
+                need_repeat = true;
+            }
+        }
+
+        // merge pwsToMerge while dropping logs matching pso.
+        let ok = self.must_merge_parts_internal(pws_to_merge, false, Some(pso), Some(stop_ch));
+
+        for pw in &pws {
+            pw.dec_ref();
+        }
+
+        if !ok {
+            return false;
+        }
+        !need_repeat
     }
 
     pub(crate) fn must_force_merge_all_parts(self: &Arc<Self>) {

@@ -357,9 +357,7 @@ fn init_local_storage() -> Arc<Storage> {
     infof!("opening storage at -storageDataPath={path}");
     let start_time = Instant::now();
     let strg = Storage::must_open_storage(Path::new(path), &cfg);
-    // PORT NOTE: Go additionally calls `fs.RegisterPathFsMetrics(path)`; the
-    // equivalent free/total disk space series are emitted directly by
-    // `write_storage_metrics`.
+    esl_common::fs::register_path_fs_metrics(path);
 
     let mut ss = StorageStats::default();
     strg.update_stats(&mut ss);
@@ -598,7 +596,11 @@ pub fn run_query_with_stats(
         );
     }
 
-    storage.run_query_with_stats(tenant_ids, q, write_block, cancel, qs)
+    // PORT NOTE: Go RunQuery receives the hidden-fields filters inside the
+    // `*QueryContext`; this wrapper is not on the logsql request path (see the
+    // PORT NOTE above), so no caller has hidden-fields filters to thread and
+    // an empty list is passed.
+    storage.run_query_with_stats(tenant_ids, q, &[], write_block, cancel, qs)
 }
 
 // PORT NOTE: the Go `GetFieldNames`/`GetFieldValues`/`GetStreamFieldNames`/
@@ -634,27 +636,11 @@ pub fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut Respon
     }
 }
 
-/// Port of Go `httpserver.CheckAuthFlag`, local to this crate.
-///
-/// PORT NOTE: when the auth-key flag is empty, Go falls back to
-/// `CheckBasicAuth` (`-httpAuth.*`), which is not ported and allows all
-/// requests by default; the port returns true directly.
+/// Go `httpserver.CheckAuthFlag`: checks the authKey and falls back to
+/// `CheckBasicAuth` (`-httpAuth.*`) when the auth-key flag is empty, with
+/// Go's distinct missing-vs-mismatching authKey error messages.
 fn check_auth_flag(w: &mut ResponseWriter, req: &Request, expected_flag: &Password) -> bool {
-    let expected_value = expected_flag.get();
-    if expected_value.is_empty() {
-        return true;
-    }
-    if req.form_value("authKey") != expected_value {
-        w.error(
-            &format!(
-                "The provided authKey doesn't match -{}",
-                expected_flag.name()
-            ),
-            401,
-        );
-        return false;
-    }
-    true
+    esl_common::httpserver::check_auth_flag(w, req, expected_flag)
 }
 
 /// Port of Go `processLogNewStreams`.

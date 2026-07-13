@@ -391,9 +391,14 @@ fn read_journald_log_entry(
 
         // is_valid_field_name guarantees the name is ASCII `A-Z0-9_`.
         let name = std::str::from_utf8(&fb.name).expect("validated ASCII field name");
-        // PORT NOTE: Go aliases the raw bytes as a string; the Rust `Field`
-        // value is a `String`, so invalid UTF-8 in a (binary) journald value
-        // is replaced lossily.
+        // PORT NOTE: Go aliases the raw value bytes as a string
+        // (`bytesutil.ToUnsafeString`), so a journald value containing
+        // invalid UTF-8 — possible both for plain `NAME=value` entries and
+        // for binary-encoded values — is stored verbatim. The Rust `Field`
+        // value is a `String` (crate-wide decision), so each invalid
+        // sequence is U+FFFD-replaced instead: value bytes `b"a\xffb"` are
+        // stored by Go as `a\xffb` and by the port as `a\u{FFFD}b`. Closing
+        // this would require a String→bytes `Field` refactor.
         let value: Cow<'_, str> = if is_binary_value {
             String::from_utf8_lossy(&fb.value[8..fb.value.len() - 1])
         } else {
@@ -689,6 +694,24 @@ mod tests {
             "",
             &[],
             "",
+        );
+
+        // PORT-ONLY CASES: upstream has no invalid-UTF-8 coverage. Pin the
+        // divergence documented at the Field construction site: Go stores
+        // the raw value bytes; the port U+FFFD-replaces invalid sequences.
+        // Plain `NAME=value` entry with a raw 0xFF byte in the value.
+        f(
+            b"__REALTIME_TIMESTAMP=91723819283\nMESSAGE=a\xffb\n\n",
+            "",
+            &[91723819283000],
+            "{\"_msg\":\"a\u{FFFD}b\"}",
+        );
+        // Binary-encoded value (8-byte LE size prefix) with a raw 0xFF byte.
+        f(
+            b"__REALTIME_TIMESTAMP=91723819283\nMESSAGE\n\x03\x00\x00\x00\x00\x00\x00\x00a\xffb\n\n",
+            "",
+            &[91723819283000],
+            "{\"_msg\":\"a\u{FFFD}b\"}",
         );
     }
 

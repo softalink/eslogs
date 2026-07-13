@@ -21,8 +21,13 @@ use crate::values_encoder::{
 /// The timezone is used for the rfc3164 format for setting the desired
 /// timezone.
 ///
-/// PORT NOTE: Go takes *time.Location; std Rust has no timezone database, so
-/// the port takes a fixed UTC offset in seconds instead (0 for UTC).
+/// PORT NOTE: Go takes *time.Location (any IANA zone; time.Date resolves the
+/// UTC offset at the timestamp's wall-clock date, i.e. DST-aware); std Rust
+/// has no timezone database, so the port takes a fixed UTC offset in seconds
+/// instead (0 for UTC). For every timezone the port's -syslog.timezone flag
+/// can express (UTC, Etc/GMT±N, fixed ±HH:MM) the result is identical to Go;
+/// the divergence is confined to DST-observing zones ("Local" in a DST zone,
+/// named IANA zones) — see esl-insert's parse_timezone_offset_secs.
 ///
 /// Return back the parser to the pool by calling put_syslog_parser when it is
 /// no longer needed.
@@ -568,8 +573,14 @@ impl SyslogParser {
             None => return false,
         };
 
-        // PORT NOTE: Go builds time.Date(currentYear, ...) in p.timezone; the
-        // port computes the unix time directly with the fixed timezone offset.
+        // PORT NOTE: Go builds time.Date(currentYear, ...) in p.timezone,
+        // resolving the UTC offset at that wall-clock date (DST-aware); the
+        // port computes the unix time directly with the fixed timezone
+        // offset. Identical to Go for fixed-offset timezones (the only kind
+        // the port's -syslog.timezone accepts); differs by the DST delta in
+        // DST-observing zones. Out-of-range days overflow into the next month
+        // (unix_from_civil), matching Go's time.Date normalization, and the
+        // uint64 wraparound below matches Go's `uint64(t.Unix())-24*3600`.
         let mut unix = unix_from_civil(self.current_year, month, day, hour, minute, second)
             - self.timezone_offset_secs;
         if (unix as u64).wrapping_sub(24 * 3600) > fasttime::unix_timestamp() {
@@ -1097,6 +1108,61 @@ mod tests {
         f(
             r#"<165>1 2011-12-20T12:38:06Z 10.10.0.1 process - example-event-1 @cee:{"pname":"auth","host":"system.example.com","time":"2011-12-20T12:38:05.123456-05:00"}"#,
             "priority=165 facility_keyword=local4 level=notice facility=20 severity=5 format=rfc5424 timestamp=2011-12-20T12:38:06Z hostname=10.10.0.1 app_name=process proc_id=- msg_id=example-event-1 pname=auth host=system.example.com time=2011-12-20T12:38:05.123456-05:00",
+        );
+    }
+
+    /// PORT-only test (no Go counterpart): TestSyslogParser passes
+    /// *time.Location but only ever uses time.UTC. This exercises the
+    /// fixed-offset timezone parameter, the previous-year adjustment for
+    /// timestamps more than 24h in the future, and Go's time.Date
+    /// normalization of out-of-range days.
+    #[test]
+    fn test_syslog_parser_rfc3164_timezone_offset_and_year_inference() {
+        fn f(current_year: i64, timezone_offset_secs: i64, s: &str, expected: &str) {
+            let mut p = get_syslog_parser(current_year, timezone_offset_secs);
+
+            p.parse(s);
+            let mut result = Vec::new();
+            marshal_fields_to_logfmt(&mut result, &p.fields);
+            assert_eq!(
+                bytesutil::to_unsafe_string(&result),
+                expected,
+                "unexpected result when parsing [{s}]"
+            );
+
+            put_syslog_parser(p);
+        }
+
+        // Fixed +01:00 offset: wall-clock 12:08:33 is 11:08:33 UTC
+        // (Go: time.Date(2024, June, 3, 12, 8, 33, 0, fixedZone(3600))).
+        f(
+            2024,
+            3600,
+            "Jun  3 12:08:33 abcd systemd[1]: foo",
+            "format=rfc3164 timestamp=2024-06-03T11:08:33Z hostname=abcd app_name=systemd proc_id=1 message=foo",
+        );
+        // Fixed -04:30 offset.
+        f(
+            2024,
+            -(4 * 3600 + 1800),
+            "Jun  3 12:08:33 abcd systemd[1]: foo",
+            "format=rfc3164 timestamp=2024-06-03T16:38:33Z hostname=abcd app_name=systemd proc_id=1 message=foo",
+        );
+        // A timestamp more than 24h in the future is moved to the previous
+        // year (deterministic as long as the test runs before the year 2100).
+        f(
+            2100,
+            0,
+            "Jun  3 12:08:33 abcd systemd[1]: foo",
+            "format=rfc3164 timestamp=2099-06-03T12:08:33Z hostname=abcd app_name=systemd proc_id=1 message=foo",
+        );
+        // Feb 29 passes time.Parse (year 0 is a leap year) and then
+        // normalizes to Mar 1 in a non-leap currentYear, like Go's time.Date.
+        f(
+            2023,
+            0,
+            "Feb 29 12:00:00 abcd systemd[1]: foo",
+            "format=rfc3164 timestamp=2023-03-01T12:00:00Z hostname=abcd app_name=systemd proc_id=1 message=foo",
         );
     }
 }

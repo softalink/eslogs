@@ -20,8 +20,6 @@ pub fn available_cpus() -> usize {
 // is clamped to the cgroup quota. On systems without cgroups (e.g. Windows)
 // every cgroup file read fails, the quota stays unset and the plain CPU count
 // is returned — exactly like the Go build on windows.
-// PORT NOTE: the `process_cpu_cores_available` gauge registered by the Go
-// init() is not ported, since the metrics package isn't ported yet.
 fn compute_available_cpus() -> usize {
     let num_cpu = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -54,6 +52,31 @@ fn compute_available_cpus() -> usize {
         gomaxprocs = num_cpu;
     }
     gomaxprocs
+}
+
+/// Registers the `process_cpu_cores_available` gauge, mirroring the Go
+/// package `init()` (cpu.go): the number of CPU cores clamped down to the
+/// cgroup CPU quota (unlike [`available_cpus`], the `GOMAXPROCS` environment
+/// variable is not consulted).
+///
+/// PORT NOTE: Go registers this at package init; the port registers it from
+/// `appmetrics::init_start_time` (the package-init stand-in), so the series
+/// is absent when an app never starts the metrics surface.
+pub(crate) fn register_metrics() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let cpu_quota = get_cpu_quota();
+        let mut cpu_cores_available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1) as f64;
+        if cpu_quota > 0.0 && cpu_cores_available > cpu_quota {
+            cpu_cores_available = cpu_quota;
+        }
+        crate::metrics::new_gauge(
+            "process_cpu_cores_available",
+            Some(Box::new(move || cpu_cores_available)),
+        );
+    });
 }
 
 static GOGC: AtomicI32 = AtomicI32::new(0);

@@ -326,11 +326,117 @@ impl Rows {
         }
     }
 
-    // PORT NOTE: rows.skipRowsByDropFilter and the addFieldIfNeeded helper
-    // are not ported yet: they depend on partitionSearchOptions
-    // (storage_search.go), getCanonicalColumnName (log_rows.go) and
-    // marshalTimestampRFC3339NanoString (values_encoder.go), which belong to
-    // later layers. Port them together with storage_search.rs.
+    /// Drops the rows at `[offset..]` matching `drop_filter` (Go
+    /// `rows.skipRowsByDropFilter`). `stream`/`stream_id` carry the `_stream`
+    /// and `_stream_id` values shared by all the rows.
+    ///
+    /// PORT NOTE: Go compacts the shared backing slices in place and nils the
+    /// tail for the GC; the port compacts `timestamps`/`rows` in place with a
+    /// write cursor and truncates. Go's pooled `bbPool` buffer for the
+    /// rendered `_time` value is a plain local `Vec<u8>` here.
+    pub(crate) fn skip_rows_by_drop_filter(
+        &mut self,
+        drop_filter: &crate::block_search::PartitionSearchOptions<'_>,
+        drop_filter_fields: &crate::prefix_filter::Filter,
+        offset: usize,
+        stream: &str,
+        stream_id: &str,
+    ) {
+        let mut tmp_fields = get_fields();
+
+        add_field_if_needed(
+            &mut tmp_fields.fields,
+            drop_filter_fields,
+            "_stream",
+            stream,
+        );
+        add_field_if_needed(
+            &mut tmp_fields.fields,
+            drop_filter_fields,
+            "_stream_id",
+            stream_id,
+        );
+        let tmp_fields_base_len = tmp_fields.fields.len();
+
+        let needs_time = drop_filter_fields.match_string("_time");
+        let mut bb: Vec<u8> = Vec::new();
+        let mut w = offset;
+        for i in 0..self.timestamps.len() - offset {
+            let src_timestamp = self.timestamps[offset + i];
+
+            if src_timestamp < drop_filter.min_timestamp
+                || src_timestamp > drop_filter.max_timestamp
+            {
+                // Fast path - keep row outsize the dropFilter time range
+                self.timestamps[w] = src_timestamp;
+                self.rows.swap(w, offset + i);
+                w += 1;
+                continue;
+            }
+
+            if needs_time {
+                bb.clear();
+                crate::values_encoder::marshal_timestamp_rfc3339_nano_string(
+                    &mut bb,
+                    src_timestamp,
+                );
+                tmp_fields.add("_time", std::str::from_utf8(&bb).unwrap());
+            }
+
+            for f in &self.rows[offset + i] {
+                add_field_if_needed(
+                    &mut tmp_fields.fields,
+                    drop_filter_fields,
+                    &f.name,
+                    &f.value,
+                );
+            }
+
+            if !drop_filter.filter.match_row(&tmp_fields.fields) {
+                self.timestamps[w] = src_timestamp;
+                self.rows.swap(w, offset + i);
+                w += 1;
+            } else if i == 0 {
+                // The first row with the minimum timestamp is deleted.
+                // Replace it with an empty row with the original timestamp in order to keep valid the assumptions
+                // that blocks for the same log stream are sorted by their first (minimum) timestamps.
+                // Violating these assumptions leads to data loss during background merge
+                // when obtaining the next block to merge via blockStreamReadersHeap.Less.
+                //
+                // It is safe to use an empty row here, since it is treated as non-existing row
+                // during filtering because of VictoraLogs data model - https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model
+                //
+                // See https://github.com/VictoriaMetrics/VictoriaLogs/issues/825
+                self.timestamps[w] = src_timestamp;
+                self.rows[w] = Vec::new();
+                w += 1;
+            }
+
+            tmp_fields.fields.truncate(tmp_fields_base_len);
+        }
+
+        self.timestamps.truncate(w);
+        self.rows.truncate(w);
+
+        put_fields(tmp_fields);
+    }
+}
+
+/// Appends `(name, value)` to dst when the canonicalized name matches pf
+/// (Go `addFieldIfNeeded`).
+fn add_field_if_needed(
+    dst: &mut Vec<Field>,
+    pf: &crate::prefix_filter::Filter,
+    name: &str,
+    value: &str,
+) {
+    let name = crate::log_rows::get_canonical_field_name(name);
+    if pf.match_string(name) {
+        dst.push(Field {
+            name: name.to_string(),
+            value: value.to_string(),
+        });
+    }
 }
 
 pub fn sort_fields_by_name(fields: &mut [Field]) {

@@ -93,6 +93,15 @@ impl Filter for FilterTime {
         Some((self.min_timestamp, self.max_timestamp))
     }
 
+    fn update_with_time_offset(&mut self, offset: i64) {
+        // Go `updateFilterWithTimeOffset`'s `*filterTime` arm: shift the
+        // matching bounds, keep `string_repr` as written.
+        self.min_timestamp =
+            crate::values_encoder::sub_int64_no_overflow(self.min_timestamp, offset);
+        self.max_timestamp =
+            crate::values_encoder::sub_int64_no_overflow(self.max_timestamp, offset);
+    }
+
     fn apply_to_block_search(&self, bs: &mut BlockSearch<'_>, bm: &mut Bitmap) {
         let min_timestamp = self.min_timestamp;
         let max_timestamp = self.max_timestamp;

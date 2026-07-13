@@ -366,7 +366,10 @@ fn spawn_worker(name: String, f: impl FnOnce() + Send + 'static) -> JoinHandle<(
 // Go: globalCurrentYear atomic.Int64 / globalTimezone *time.Location.
 //
 // PORT NOTE: std Rust has no IANA timezone database, so the timezone is kept
-// as a fixed UTC offset in seconds (see `syslog_parser::get_syslog_parser`).
+// as a fixed UTC offset in seconds, resolved once at startup (see
+// `parse_timezone_offset_secs` below for the exact -syslog.timezone
+// divergence from Go's DST-aware time.LoadLocation, and
+// `syslog_parser::get_syslog_parser` for the parser-side contract).
 static GLOBAL_CURRENT_YEAR: AtomicI64 = AtomicI64::new(0);
 static GLOBAL_TIMEZONE_OFFSET_SECS: AtomicI64 = AtomicI64::new(0);
 
@@ -1655,10 +1658,22 @@ fn normalize_listen_addr(addr: &str) -> String {
 
 /// Resolves `-syslog.timezone` to a fixed UTC offset in seconds.
 ///
-/// PORT NOTE: Go resolves any IANA name via `time.LoadLocation`; std Rust has
-/// no timezone database, so the port supports "Local" (the default), "UTC",
-/// "Etc/GMT±N" (POSIX-inverted sign, like IANA) and fixed "±HH:MM" offsets.
-/// Anything else is a fatal startup error.
+/// PORT NOTE: Go resolves the flag via `time.LoadLocation`, which reads the
+/// OS IANA tzdb and yields a DST-aware *time.Location (time.Date then
+/// resolves the offset at each RFC3164 timestamp's wall-clock date).
+/// Matching that would need a tzdb dependency (or a hand-rolled TZif
+/// reader), so the port supports only zones expressible as one fixed offset:
+/// - "" and "Local" (the default): the machine-local offset, resolved once
+///   at startup. Divergence: in a DST-observing local zone, Go resolves the
+///   offset per-timestamp, so timestamps falling in the other DST phase
+///   differ from Go by the DST delta (typically 1h).
+/// - "UTC"/"Etc/UTC"/"Etc/GMT" and "Etc/GMT±N" (POSIX-inverted sign, like
+///   IANA): identical to Go.
+/// - Fixed "±HH:MM" offsets: a port extension — Go's LoadLocation rejects
+///   these (Go users write Etc/GMT±N instead).
+///
+/// Any other name (e.g. "America/New_York") is a fatal startup error here,
+/// where Go parses it DST-correctly.
 fn parse_timezone_offset_secs(tz: &str) -> Result<i64, String> {
     if tz.is_empty() || tz == "Local" {
         return Ok(get_local_timezone_offset_nsecs() / 1_000_000_000);
@@ -1793,6 +1808,34 @@ mod tests {
         TEST_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// PORT-only test (no Go counterpart): Go resolves -syslog.timezone via
+    /// time.LoadLocation (OS IANA tzdb); see the PORT NOTE at
+    /// parse_timezone_offset_secs for the supported subset.
+    #[test]
+    fn test_parse_timezone_offset_secs() {
+        assert_eq!(parse_timezone_offset_secs("UTC"), Ok(0));
+        assert_eq!(parse_timezone_offset_secs("Etc/UTC"), Ok(0));
+        assert_eq!(parse_timezone_offset_secs("Etc/GMT"), Ok(0));
+        // IANA Etc/GMT+3 is UTC-3 (POSIX-inverted sign).
+        assert_eq!(parse_timezone_offset_secs("Etc/GMT+3"), Ok(-3 * 3600));
+        assert_eq!(parse_timezone_offset_secs("Etc/GMT-14"), Ok(14 * 3600));
+        // Fixed ±HH:MM offsets are a port extension (Go's LoadLocation
+        // rejects them).
+        assert_eq!(parse_timezone_offset_secs("+05:30"), Ok(5 * 3600 + 30 * 60));
+        assert_eq!(parse_timezone_offset_secs("-08:00"), Ok(-8 * 3600));
+        // "" and "Local" both resolve to the machine-local offset
+        // (Go: "" bypasses LoadLocation; LoadLocation("Local") == time.Local).
+        assert_eq!(
+            parse_timezone_offset_secs(""),
+            parse_timezone_offset_secs("Local")
+        );
+        // Named IANA zones are a fatal startup error in the port; Go loads
+        // them from the OS tzdb.
+        assert!(parse_timezone_offset_secs("America/New_York").is_err());
+        assert!(parse_timezone_offset_secs("Etc/GMT+15").is_err());
+        assert!(parse_timezone_offset_secs("+5:30").is_err());
     }
 
     /// Port of `insertutil.TestLogMessageProcessor`.

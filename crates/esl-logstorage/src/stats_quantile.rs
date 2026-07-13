@@ -4,11 +4,14 @@
 //!
 //! See [`crate::stats_min`] for the config-capture and decoded-scan PORT NOTEs.
 //!
-//! PORT NOTE — RNG. Go's histogram uses `fastrand.RNG` for reservoir sampling
-//! once more than `MAX_HISTOGRAM_SAMPLES` (10_000) values are seen. This port
-//! uses a small deterministic xorshift RNG instead; the two disagree on which
-//! samples are evicted beyond 10_000 items, which only affects approximate
-//! quantiles on very large groups and is not asserted by any ported test.
+//! PORT NOTE — RNG. Go's histogram uses `valyala/fastrand.RNG` for reservoir
+//! sampling once more than `MAX_HISTOGRAM_SAMPLES` (10_000) values are seen.
+//! [`Rng`] is an exact port of that generator (xorshift32 with shifts 13/17/5
+//! plus the Lemire `Uint32n` reduction), including its lazy seeding from the
+//! wall clock. Which samples survive the reservoir is therefore
+//! nondeterministic across runs — in Go too (its zero-value RNG seeds from
+//! `time.Now().UnixNano()` on first use), so runs differ from each other by
+//! the seed only, never by the algorithm.
 //!
 //! PORT NOTE — `finalize_stats` is `&self`, but Go's `histogram.quantile` sorts
 //! `h.a` in place via a pointer receiver. This port sorts a clone so the
@@ -32,35 +35,47 @@ const MAX_HISTOGRAM_SAMPLES: usize = 10_000;
 // Histogram (shared with stats_median)
 // ---------------------------------------------------------------------------
 
-/// Deterministic xorshift RNG standing in for Go's `fastrand.RNG`.
+/// Port of `valyala/fastrand.RNG` — the reservoir RNG used by Go's
+/// `histogram` (see the module PORT NOTE on seeding).
+#[derive(Default)]
 struct Rng {
-    state: u64,
-}
-
-impl Default for Rng {
-    fn default() -> Self {
-        Rng {
-            state: 0x9E37_79B9_7F4A_7C15,
-        }
-    }
+    x: u32,
 }
 
 impl Rng {
+    /// Go `RNG.Uint32`: xorshift32, lazily seeded from the wall clock.
     fn uint32(&mut self) -> u32 {
-        let mut x = self.state;
+        while self.x == 0 {
+            self.x = get_random_uint32();
+        }
+        let mut x = self.x;
         x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        (x >> 32) as u32
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.x = x;
+        x
     }
 
-    fn uint32n(&mut self, n: u32) -> u32 {
-        if n == 0 {
-            return 0;
-        }
-        ((u64::from(self.uint32()) * u64::from(n)) >> 32) as u32
+    /// Go `RNG.Uint32n`: the Lemire multiply-shift reduction to `[0..max_n)`.
+    fn uint32n(&mut self, max_n: u32) -> u32 {
+        let x = self.uint32();
+        ((u64::from(x) * u64::from(max_n)) >> 32) as u32
     }
+
+    /// Go `RNG.Seed`.
+    #[cfg(test)]
+    fn seed(&mut self, n: u32) {
+        self.x = n;
+    }
+}
+
+/// Go `fastrand.getRandomUint32`: folds the current UnixNano timestamp.
+fn get_random_uint32() -> u32 {
+    let x = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or_default();
+    ((x >> 32) ^ x) as u32
 }
 
 /// Port of Go's `histogram`.
@@ -411,6 +426,38 @@ mod tests {
     fn test_quantile_single_value() {
         let block = vec![vec![field("a", "42")]];
         assert_eq!(run_quantile("0.9", &["a"], &block), "42");
+    }
+
+    /// Pins [`Rng`] to `valyala/fastrand.RNG`'s exact xorshift32 sequence
+    /// (shifts 13/17/5) and Lemire reduction, seeded like Go `RNG.Seed(1)`.
+    #[test]
+    fn test_rng_matches_go_fastrand() {
+        let mut rng = Rng::default();
+        rng.seed(1);
+        let seq: Vec<u32> = (0..5).map(|_| rng.uint32()).collect();
+        assert_eq!(
+            seq,
+            vec![270369, 67634689, 2647435461, 307599695, 2398689233]
+        );
+
+        let mut rng = Rng::default();
+        rng.seed(1);
+        let seq_n: Vec<u32> = (0..5).map(|_| rng.uint32n(10)).collect();
+        assert_eq!(seq_n, vec![0, 0, 6, 0, 5]);
+    }
+
+    /// The reservoir stops growing at `MAX_HISTOGRAM_SAMPLES` while `count`
+    /// keeps increasing (Go `histogram.update`).
+    #[test]
+    fn test_histogram_reservoir_caps_at_max_samples() {
+        let mut h = Histogram::default();
+        for i in 0..(MAX_HISTOGRAM_SAMPLES + 100) {
+            h.update(&format!("v{i:06}"));
+        }
+        assert_eq!(h.a.len(), MAX_HISTOGRAM_SAMPLES);
+        assert_eq!(h.count, (MAX_HISTOGRAM_SAMPLES + 100) as u64);
+        assert_eq!(h.min, "v000000");
+        assert_eq!(h.max, format!("v{:06}", MAX_HISTOGRAM_SAMPLES + 99));
     }
 
     #[test]

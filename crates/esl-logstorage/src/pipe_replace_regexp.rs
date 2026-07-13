@@ -4,13 +4,11 @@
 //!
 //! See <https://docs.victoriametrics.com/victorialogs/logsql/#replace_regexp-pipe>.
 //!
-//! PORT NOTE — `iff` (`ifFilter`): as in [`crate::pipe_replace`], the optional
-//! `if (...)` clause is dropped because `ifFilter` is not ported; the processor
-//! rewrites every row (matches Go when `iff == nil`).
-//!
-//! PORT NOTE — parser: `parsePipeReplaceRegexp` needs the query lexer; deferred.
-//! The `pub(crate)` [`PipeReplaceRegexp::new`] constructor takes an already
-//! compiled [`regex::Regex`] (build it with [`regexp_compile`]).
+//! Like Go, row processing goes through the shared
+//! [`crate::pipe_update::new_pipe_update_processor`] machinery, which honors
+//! the optional `if (...)` clause (rows not matching the filter keep their
+//! original value). The lexer-driven parse lives in
+//! `parser::parse_pipe::parse_pipe_replace_regexp`.
 //!
 //! PORT NOTE — regexp expansion: Go uses `regexp.Regexp.ExpandString` with
 //! `$1` / `${1}` / `$0` templates. Rust's `regex` crate uses the identical
@@ -24,15 +22,17 @@ use std::sync::atomic::AtomicBool;
 
 use regex::Regex;
 
-use crate::block_result::{BlockResult, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
+use crate::pipe_update::{
+    IfFilter, UpdateFunc, new_pipe_update_processor, update_needed_fields_for_update_pipe,
+};
 use crate::prefix_filter;
 use crate::stream_filter::quote_token_if_needed;
 
-/// `| replace_regexp (re, replacement) [at field] [limit N]` pipe.
+/// `| replace_regexp [if (...)] (re, replacement) [at field] [limit N]` pipe.
 ///
 /// Port of Go's `pipeReplaceRegexp`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PipeReplaceRegexp {
     /// The field whose value is rewritten (defaults to `_msg`).
     pub(crate) field: String,
@@ -44,6 +44,9 @@ pub(crate) struct PipeReplaceRegexp {
     pub(crate) replacement: String,
     /// Maximum number of replacements per value (0 = unlimited).
     pub(crate) limit: u64,
+    /// Optional `if (...)` filter for skipping the replace_regexp operation
+    /// (Go `iff`).
+    pub(crate) iff: Option<Arc<IfFilter>>,
 }
 
 impl PipeReplaceRegexp {
@@ -54,6 +57,7 @@ impl PipeReplaceRegexp {
         re_str: impl Into<String>,
         replacement: impl Into<String>,
         limit: u64,
+        iff: Option<Arc<IfFilter>>,
     ) -> Self {
         Self {
             field: field.into(),
@@ -61,6 +65,7 @@ impl PipeReplaceRegexp {
             re_str: re_str.into(),
             replacement: replacement.into(),
             limit,
+            iff,
         }
     }
 }
@@ -74,6 +79,10 @@ impl Pipe for PipeReplaceRegexp {
 
     fn to_string(&self) -> String {
         let mut s = String::from("replace_regexp");
+        if let Some(iff) = &self.iff {
+            s.push(' ');
+            s.push_str(&iff.to_string());
+        }
         s.push_str(&format!(
             " ({}, {})",
             quote_token_if_needed(&self.re_str),
@@ -88,23 +97,57 @@ impl Pipe for PipeReplaceRegexp {
         s
     }
 
-    fn update_needed_fields(&self, _pf: &mut prefix_filter::Filter) {
-        // PORT NOTE: no-op — iff deferred (see module docs).
+    fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
+        update_needed_fields_for_update_pipe(pf, &self.field, self.iff.as_deref());
+    }
+
+    /// Go `hasFilterInWithQuery` for this pipe: checks the `if (...)` filter.
+    fn has_filter_in_with_query(&self) -> bool {
+        self.iff
+            .as_ref()
+            .is_some_and(|iff| iff.has_filter_in_with_query())
+    }
+
+    /// Go `initFilterInValues` for this pipe: rewrites the `if (...)` filter.
+    fn init_filter_in_values(
+        &mut self,
+        get_values: &mut crate::storage_search::GetFieldValuesFn<'_>,
+        timestamp: i64,
+    ) -> Result<(), String> {
+        if let Some(iff) = &self.iff
+            && let Some(iff_new) = iff.init_filter_in_values(get_values, timestamp)?
+        {
+            self.iff = Some(Arc::new(iff_new));
+        }
+        Ok(())
     }
 
     fn new_pipe_processor(
         &self,
-        _concurrency: usize,
+        concurrency: usize,
         _stop: Arc<AtomicBool>,
         pp_next: Arc<dyn PipeProcessor>,
     ) -> Arc<dyn PipeProcessor> {
-        Arc::new(PipeReplaceRegexpProcessor {
-            field: self.field.clone(),
-            re: self.re.clone(),
-            replacement: self.replacement.clone(),
-            limit: self.limit,
+        // Port of Go's `updateFunc(a *arena, v string) string` which appends
+        // `appendReplaceRegexp(a.b, v, ...)` to a pooled arena and returns the
+        // new suffix. The Rust port drops the arena and returns an owned String
+        // (see pipe_update.rs module docs).
+        let re = self.re.clone();
+        let replacement = self.replacement.clone();
+        let limit = self.limit;
+        let update_func: UpdateFunc = Arc::new(move |v: &str| {
+            let mut buf: Vec<u8> = Vec::new();
+            append_replace_regexp(&mut buf, v, &re, &replacement, limit);
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        new_pipe_update_processor(
+            update_func,
             pp_next,
-        })
+            self.field.clone(),
+            self.iff.clone(),
+            concurrency,
+        )
     }
 
     fn can_live_tail(&self) -> bool {
@@ -113,47 +156,6 @@ impl Pipe for PipeReplaceRegexp {
 
     fn can_return_last_n_results(&self) -> bool {
         true
-    }
-}
-
-/// Execution half of [`PipeReplaceRegexp`]. Stateless across blocks.
-struct PipeReplaceRegexpProcessor {
-    field: String,
-    re: Regex,
-    replacement: String,
-    limit: u64,
-    pp_next: Arc<dyn PipeProcessor>,
-}
-
-impl PipeProcessor for PipeReplaceRegexpProcessor {
-    fn write_block(&self, worker_id: usize, br: &mut BlockResult) {
-        if br.rows_len() == 0 {
-            return;
-        }
-
-        let c = br.get_column_by_name(&self.field);
-        let values: Vec<Vec<u8>> = br.column_get_values(c).to_vec();
-
-        let mut rc = ResultColumn {
-            name: self.field.clone(),
-            values: Vec::with_capacity(values.len()),
-        };
-        let mut v_new: Vec<u8> = Vec::new();
-        for (i, v) in values.iter().enumerate() {
-            if i == 0 || values[i - 1] != *v {
-                v_new = Vec::new();
-                let s = String::from_utf8_lossy(v);
-                append_replace_regexp(&mut v_new, &s, &self.re, &self.replacement, self.limit);
-            }
-            rc.values.push(v_new.clone());
-        }
-
-        br.add_result_column(rc);
-        self.pp_next.write_block(worker_id, br);
-    }
-
-    fn flush(&self) -> Result<(), String> {
-        Ok(())
     }
 }
 
@@ -206,12 +208,12 @@ pub(crate) fn append_replace_regexp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_result::BlockResult;
+    use crate::filter::Filter;
+    use crate::filter_phrase::new_filter_phrase;
+    use crate::pipe_update::test_utils::assert_needed_fields;
     use crate::rows::Field;
     use std::sync::Mutex;
-
-    // PORT NOTE: TestParsePipeReplaceRegexpSuccess/Failure and
-    // TestPipeReplaceRegexpUpdateNeededFields are skipped — lexer / needed-fields
-    // planner (parser + ifFilter), both deferred.
 
     fn arr(s: &str, re: &str, replacement: &str, limit: u64) -> String {
         let re = regexp_compile(re).unwrap();
@@ -220,6 +222,8 @@ mod tests {
         String::from_utf8(dst).unwrap()
     }
 
+    // Go TestAppendReplaceRegexp (pipe_replace_regexp_test.go), plus the '.'
+    // vs newline cases from Go TestPipeReplaceRegexp.
     #[test]
     fn test_append_replace_regexp() {
         // capture-group expansion
@@ -245,6 +249,12 @@ mod tests {
         );
         // no match returns input unchanged
         assert_eq!(arr("1234", "[_/]", "-", 0), "1234");
+    }
+
+    /// Builds the `if (field:phrase)` filter used by the conditional Go tests.
+    fn phrase_iff(field: &str, phrase: &str) -> Arc<IfFilter> {
+        let f: Arc<dyn Filter> = Arc::new(new_filter_phrase(field, phrase));
+        Arc::new(IfFilter::new(f))
     }
 
     struct Capture(Mutex<Vec<Vec<Field>>>);
@@ -301,11 +311,12 @@ mod tests {
             .collect()
     }
 
+    // Go TestPipeReplaceRegexp "replace_regexp with placeholders".
     #[test]
     fn test_pipe_replace_regexp_placeholders() {
         let re = regexp_compile("foo(.+?)bar").unwrap();
         let out = run(
-            PipeReplaceRegexp::new("_msg", re, "foo(.+?)bar", "q-$1-x", 0),
+            PipeReplaceRegexp::new("_msg", re, "foo(.+?)bar", "q-$1-x", 0, None),
             vec![
                 vec![f("_msg", "abc foo a bar foobar foo b bar"), f("bar", "cde")],
                 vec![f("_msg", "1234")],
@@ -320,11 +331,12 @@ mod tests {
         );
     }
 
+    // Go TestPipeReplaceRegexp "replace_regexp with limit 1 at foo".
     #[test]
     fn test_pipe_replace_regexp_limit() {
         let re = regexp_compile("[_/]").unwrap();
         let out = run(
-            PipeReplaceRegexp::new("foo", re, "[_/]", "-", 1),
+            PipeReplaceRegexp::new("foo", re, "[_/]", "-", 1, None),
             vec![
                 vec![f("foo", "a_bc_d/ef"), f("bar", "cde")],
                 vec![f("foo", "1234")],
@@ -339,12 +351,87 @@ mod tests {
         );
     }
 
+    // Go TestPipeReplaceRegexp "conditional replace_regexp at foo":
+    // `replace_regexp if (bar:abc) ("[_/]", "") at foo`.
+    #[test]
+    fn test_pipe_replace_regexp_conditional() {
+        let re = regexp_compile("[_/]").unwrap();
+        let out = run(
+            PipeReplaceRegexp::new("foo", re, "[_/]", "", 0, Some(phrase_iff("bar", "abc"))),
+            vec![
+                vec![f("foo", "a_bc_d/ef"), f("bar", "cde")],
+                vec![f("foo", "123_45/6"), f("bar", "abc")],
+            ],
+        );
+        assert_eq!(
+            out,
+            expected(vec![
+                vec![f("foo", "a_bc_d/ef"), f("bar", "cde")],
+                vec![f("foo", "123456"), f("bar", "abc")],
+            ])
+        );
+    }
+
+    // Go TestPipeReplaceRegexpUpdateNeededFields (pipe_replace_regexp_test.go).
+    #[test]
+    fn test_pipe_replace_regexp_update_needed_fields() {
+        let p = |iff: Option<(&str, &str)>, at: &str| {
+            let re = regexp_compile("a").unwrap();
+            PipeReplaceRegexp::new(at, re, "a", "b", 0, iff.map(|(f, ph)| phrase_iff(f, ph)))
+        };
+
+        // all the needed fields
+        assert_needed_fields(&p(None, "x"), "*", "", "*", "");
+        assert_needed_fields(&p(Some(("f1", "q")), "x"), "*", "", "*", "");
+
+        // unneeded fields do not intersect with at field
+        assert_needed_fields(&p(None, "x"), "*", "f1,f2", "*", "f1,f2");
+        assert_needed_fields(&p(Some(("f3", "q")), "x"), "*", "f1,f2", "*", "f1,f2");
+        assert_needed_fields(&p(Some(("f2", "q")), "x"), "*", "f1,f2", "*", "f1");
+
+        // unneeded fields intersect with at field
+        assert_needed_fields(&p(None, "x"), "*", "x,y", "*", "x,y");
+        assert_needed_fields(&p(Some(("f1", "q")), "x"), "*", "x,y", "*", "x,y");
+        assert_needed_fields(&p(Some(("x", "q")), "x"), "*", "x,y", "*", "x,y");
+        assert_needed_fields(&p(Some(("y", "q")), "x"), "*", "x,y", "*", "x,y");
+
+        // needed fields do not intersect with at field
+        assert_needed_fields(&p(None, "x"), "f2,y", "", "f2,y", "");
+        assert_needed_fields(&p(Some(("f1", "q")), "x"), "f2,y", "", "f2,y", "");
+
+        // needed fields intersect with at field
+        assert_needed_fields(&p(None, "y"), "f2,y", "", "f2,y", "");
+        assert_needed_fields(&p(Some(("f1", "q")), "y"), "f2,y", "", "f1,f2,y", "");
+    }
+
+    // Go TestParsePipeReplaceRegexpSuccess (pipe_replace_regexp_test.go):
+    // parse + String() round-trip, matching Go's `expectParsePipeSuccess`.
+    #[test]
+    fn test_parse_pipe_replace_regexp_success() {
+        fn p(pipe_str: &str) {
+            let pipe = crate::pipe::must_parse_pipe(pipe_str, 0);
+            assert_eq!(pipe.to_string(), pipe_str, "round-trip mismatch");
+        }
+
+        p(r#"replace_regexp (foo, bar)"#);
+        p(r#"replace_regexp ("foo[^ ]+bar|baz", "bar${1}x$0")"#);
+        p(r#"replace_regexp (" ", "") at x"#);
+        p(r#"replace_regexp if (x:y) ("-", ":") at a"#);
+        p(r#"replace_regexp (" ", "") at x limit 10"#);
+        p(r#"replace_regexp if (x:y) (" ", "") at foo limit 10"#);
+    }
+
     #[test]
     fn test_string() {
         let re = regexp_compile(" ").unwrap();
         assert_eq!(
-            PipeReplaceRegexp::new("x", re, " ", "", 10).to_string(),
+            PipeReplaceRegexp::new("x", re, " ", "", 10, None).to_string(),
             r#"replace_regexp (" ", "") at x limit 10"#
+        );
+        let re = regexp_compile("-").unwrap();
+        assert_eq!(
+            PipeReplaceRegexp::new("a", re, "-", ":", 0, Some(phrase_iff("x", "y"))).to_string(),
+            r#"replace_regexp if (x:y) ("-", ":") at a"#
         );
     }
 }

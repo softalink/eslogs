@@ -150,6 +150,20 @@ pub(crate) fn marshal_rows(dst: &mut Vec<u8>, rows: &[Vec<Field>]) {
 }
 
 impl Pipe for PipeJoin {
+    /// Port of Go `pipeJoin.visitSubqueries`: visits the join subquery.
+    fn visit_subqueries_mut(
+        &mut self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+        let Some(q_text) = self.query_text.as_mut() else {
+            return;
+        };
+        let mut q = crate::parser::query::must_parse_query(q_text, timestamp);
+        q.visit_subqueries(visit);
+        *q_text = q.to_string();
+    }
+
     /// Port of Go `pipeJoin.splitToRemoteAndLocal`: the pipe (and
     /// everything after it) runs locally only.
     fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {

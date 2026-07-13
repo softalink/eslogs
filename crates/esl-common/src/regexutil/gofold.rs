@@ -4,9 +4,14 @@
 //! `caseOrbit` table plus simple case mappings. The `caseOrbit` exceptions
 //! are ported verbatim below; the fallback uses Rust std's
 //! `char::to_lowercase`/`to_uppercase` restricted to single-char results,
-//! which coincides with Go's simple case mappings for all code points except
-//! a handful whose full mapping is multi-char (e.g. `İ` U+0130); those fold
-//! to themselves here.
+//! plus explicit fixups for the Greek iota-subscript letters, whose FULL
+//! uppercase is multi-char (hiding the single-rune SIMPLE mapping Go uses,
+//! e.g. `ᾀ` U+1F80 ↔ `ᾈ` U+1F88). The code points with multi-char full
+//! mappings and no simple mapping (`ß`, `İ`, `ı`, `ſ`, ligatures, …) are
+//! covered by the `caseOrbit` table or map to themselves in Go as well, so
+//! [`simple_fold`] matches `unicode.SimpleFold` exactly, modulo
+//! Unicode-version skew between the Rust std tables and the Go toolchain's
+//! (case pairs added in a newer Unicode version fold on one side only).
 
 /// Minimum rune involved in case folding (Go `minFold`).
 pub const MIN_FOLD: i32 = 0x0041;
@@ -117,6 +122,18 @@ fn to_lower_simple(c: char) -> char {
 }
 
 fn to_upper_simple(c: char) -> char {
+    // Greek letters with iota subscript (ypogegrammeni): their full uppercase
+    // is multi-char (e.g. ᾀ → ἈΙ), which would hide the single-rune simple
+    // uppercase mapping Go's unicode.ToUpper applies (ᾀ → ᾈ). Restore it.
+    match c as u32 {
+        0x1F80..=0x1F87 | 0x1F90..=0x1F97 | 0x1FA0..=0x1FA7 => {
+            return char::from_u32(c as u32 + 8).unwrap();
+        }
+        0x1FB3 => return '\u{1FBC}',
+        0x1FC3 => return '\u{1FCC}',
+        0x1FF3 => return '\u{1FFC}',
+        _ => {}
+    }
     let mut it = c.to_uppercase();
     match (it.next(), it.next()) {
         (Some(u), None) => u,
@@ -147,4 +164,86 @@ pub fn simple_fold(r: i32) -> i32 {
         return l as i32;
     }
     to_upper_simple(c) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::simple_fold;
+
+    /// Pins `simple_fold` against Go's `unicode.SimpleFold` outputs for the
+    /// code points where the Rust-std fallback is known to be tricky
+    /// (multi-char full mappings, caseOrbit exceptions, high-plane pairs).
+    #[test]
+    fn test_simple_fold_matches_go() {
+        fn f(r: char, want: char) {
+            let got = simple_fold(r as i32);
+            assert_eq!(
+                got, want as i32,
+                "simple_fold({r:?}) = U+{got:04X}; want {want:?}"
+            );
+        }
+
+        // ASCII and non-cased runes.
+        f('A', 'a');
+        f('a', 'A');
+        f('1', '1');
+        f('日', '日');
+        // k / K / KELVIN SIGN orbit.
+        f('K', 'k');
+        f('k', '\u{212A}');
+        f('\u{212A}', 'K');
+        // s / S / LATIN SMALL LETTER LONG S orbit.
+        f('S', 's');
+        f('s', '\u{17F}');
+        f('\u{17F}', 'S');
+        // Turkish dotted/dotless I fold only to themselves.
+        f('\u{130}', '\u{130}');
+        f('\u{131}', '\u{131}');
+        // ß / ẞ orbit.
+        f('\u{DF}', '\u{1E9E}');
+        f('\u{1E9E}', '\u{DF}');
+        // µ / Μ / μ orbit.
+        f('\u{B5}', '\u{39C}');
+        f('\u{39C}', '\u{3BC}');
+        f('\u{3BC}', '\u{B5}');
+        // Σ / ς / σ orbit.
+        f('\u{3A3}', '\u{3C2}');
+        f('\u{3C2}', '\u{3C3}');
+        f('\u{3C3}', '\u{3A3}');
+        // Greek iota-subscript letters: the simple uppercase mapping is
+        // hidden behind a multi-char full uppercase in Rust std.
+        f('\u{1F80}', '\u{1F88}');
+        f('\u{1F88}', '\u{1F80}');
+        f('\u{1F97}', '\u{1F9F}');
+        f('\u{1F9F}', '\u{1F97}');
+        f('\u{1FA0}', '\u{1FA8}');
+        f('\u{1FB3}', '\u{1FBC}');
+        f('\u{1FBC}', '\u{1FB3}');
+        f('\u{1FC3}', '\u{1FCC}');
+        f('\u{1FF3}', '\u{1FFC}');
+        // Cherokee pair (fold crosses into the supplementary block).
+        f('\u{13A0}', '\u{AB70}');
+        f('\u{AB70}', '\u{13A0}');
+        // Adlam — the top of Go's fold range (maxFold = U+1E943).
+        f('\u{1E900}', '\u{1E922}');
+        f('\u{1E922}', '\u{1E900}');
+    }
+}
+
+#[cfg(test)]
+mod dumpfold {
+    // Temporary one-off dump for cross-checking against Go; removed after use.
+    #[test]
+    #[ignore]
+    fn dump() {
+        use std::io::Write as _;
+        let path = std::env::var("FOLD_DUMP_PATH").unwrap();
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        for r in 0i32..=0x10FFFF {
+            let f = super::simple_fold(r);
+            if f != r {
+                writeln!(w, "{r:x} {f:x}").unwrap();
+            }
+        }
+    }
 }
