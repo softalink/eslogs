@@ -2051,14 +2051,10 @@ mod tests {
         s.debug_flush();
     }
 
-    // PORT NOTE: delete execution is ported (delete_rows -> merge with a
-    // drop-filter through block_stream_merger), and non-stream-filter deletes
-    // work. This full port of Go's TestStorageRunQueryProcessDeleteTask is
-    // #[ignore]d because it also exercises deletes whose filter contains a
-    // stream filter (`{host=~...}`): the merge-time `DropFilterCtx` does not
-    // resolve streamIDs against the partition indexdb yet, so stream-matched
-    // rows survive the delete. Tracked as a category-(a) ledger item.
-    #[ignore = "stream-filter deletes not yet dropped at merge time (ledger gap)"]
+    // Full port of Go's TestStorageRunQueryProcessDeleteTask: delete execution
+    // through the block_stream_merger drop-filter path, including deletes whose
+    // filter contains a stream filter (`{host=~...}`) — the merge materializes
+    // `_stream` from the partition indexdb and evaluates the filter per row.
     #[test]
     fn test_storage_process_delete_task() {
         let path = unique_path("process-delete-task");

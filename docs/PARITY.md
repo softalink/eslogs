@@ -264,10 +264,10 @@ and belong here until proven otherwise.
 > `process_*`/`filestream`/`fs` metric series; the internalselect concurrency
 > limiter; and eslogscli Ctrl+C query cancellation. Each is annotated at its
 > site. **Three items landed only partially and remain open** (still section-(a)):
-> (1) **log deletion of stream-filtered rows** — the merge-time drop path is
-> ported and works for non-stream filters, but `DropFilterCtx` does not resolve
-> `{…}` stream filters against the partition indexdb, so stream-matched rows
-> survive a delete (`storage.rs`; the full Go delete test is `#[ignore]`d);
+> (1) **CLOSED** — log deletion including stream-filtered rows now works (the
+> drop path's `add_field_if_needed` used the wrong canonicalizer so `_msg` was
+> never materialized; fixed to `get_canonical_column_name`, full Go delete test
+> passes);
 > (2) **syslog idle-connection periodic flush** — `flush_if_idle` is ported but
 > not yet driven by a per-connection flusher thread (idle stream conns flush on
 > buffer-fill/disconnect only); (3) **iff-nested subquery propagation** — a

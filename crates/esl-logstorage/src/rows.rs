@@ -430,7 +430,7 @@ fn add_field_if_needed(
     name: &str,
     value: &str,
 ) {
-    let name = crate::log_rows::get_canonical_field_name(name);
+    let name = crate::log_rows::get_canonical_column_name(name);
     if pf.match_string(name) {
         dst.push(Field {
             name: name.to_string(),
