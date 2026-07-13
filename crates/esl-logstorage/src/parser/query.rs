@@ -24,6 +24,32 @@ use crate::values_encoder::{
 /// Go `nsecsPerSecond` (consts.go).
 const NSECS_PER_SECOND: i64 = 1_000_000_000;
 
+/// Snapshot of the inheritable scalar [`QueryOptions`] a parent query passes to
+/// its subqueries (Go copies the parent `queryOptions` via the lexer options
+/// stack). `global_filter` is excluded — it is not `Clone` and is already
+/// propagated into subquery text separately (see `apply_global_filter`).
+struct InheritedOptions {
+    concurrency: u32,
+    parallel_readers: u32,
+    ignore_global_time_filter: Option<bool>,
+    allow_partial_response: Option<bool>,
+    time_offset: i64,
+    time_offset_str: String,
+}
+
+impl From<&QueryOptions> for InheritedOptions {
+    fn from(o: &QueryOptions) -> Self {
+        Self {
+            concurrency: o.concurrency,
+            parallel_readers: o.parallel_readers,
+            ignore_global_time_filter: o.ignore_global_time_filter,
+            allow_partial_response: o.allow_partial_response,
+            time_offset: o.time_offset,
+            time_offset_str: o.time_offset_str.clone(),
+        }
+    }
+}
+
 /// Query options set via `options(...)` (Go `queryOptions`).
 #[derive(Default)]
 pub struct QueryOptions {
@@ -138,12 +164,64 @@ impl Query {
         visit(self);
 
         let timestamp = self.timestamp;
+        // Go copies the parent query's options into every subquery via the lexer
+        // options stack (`parseQueryOptions`: `*dstOpts = *defaultOpts`, then the
+        // subquery's own `options(...)` override, with `needPrint` reset so the
+        // inherited options are not re-printed). The port re-parses subqueries
+        // from rendered text that does not carry those inherited options, so
+        // inherit them here: wrap `visit` so each subquery takes this query's
+        // options for the fields it did not set itself, before the visit runs.
+        // The subquery re-wraps with its own (now-inherited) options for its own
+        // children, so inheritance cascades like Go's option stack.
+        let inherited = InheritedOptions::from(&self.opts);
+        let mut inherit_then_visit = |q: &mut Query| {
+            q.inherit_options_from_parent(&inherited);
+            visit(q);
+        };
         if let Some(gf) = self.opts.global_filter.as_mut() {
-            gf.visit_subqueries_mut(timestamp, visit);
+            gf.visit_subqueries_mut(timestamp, &mut inherit_then_visit);
         }
-        self.f.visit_subqueries_mut(timestamp, visit);
+        self.f
+            .visit_subqueries_mut(timestamp, &mut inherit_then_visit);
         for p in &mut self.pipes {
-            p.visit_subqueries_mut(timestamp, visit);
+            p.visit_subqueries_mut(timestamp, &mut inherit_then_visit);
+        }
+    }
+
+    /// Inherit the parent query's scalar options for the fields this query did
+    /// not set itself (Go `parseQueryOptions` copies the parent opts, then the
+    /// subquery's own options override). `need_print` is left unchanged, so an
+    /// inherited option renders exactly when Go's would — only when this query
+    /// has its own printable options (Go gates the whole `options(...)` block on
+    /// `needPrint` too).
+    ///
+    /// PORT NOTE: unlike Go (which parses each subquery *with* the inherited
+    /// options in scope), the value is inherited after the subquery has already
+    /// been re-parsed, so a newly-inherited non-zero `time_offset` is NOT
+    /// re-applied to a literal `_time`/`day_range`/`week_range` filter already
+    /// inside the subquery text (re-applying it would double-shift across the
+    /// parse-time and `add_time_filter` visits, since `need_print` gates the
+    /// option out of the re-rendered text). The offset value itself IS inherited
+    /// (so the added global `_time` filter and rate-step normalization use it);
+    /// only a subquery's own literal time filter under a parent `time_offset`
+    /// keeps its unshifted bounds — an ultra-narrow residual.
+    fn inherit_options_from_parent(&mut self, parent: &InheritedOptions) {
+        let o = &mut self.opts;
+        if o.concurrency == 0 {
+            o.concurrency = parent.concurrency;
+        }
+        if o.parallel_readers == 0 {
+            o.parallel_readers = parent.parallel_readers;
+        }
+        if o.ignore_global_time_filter.is_none() {
+            o.ignore_global_time_filter = parent.ignore_global_time_filter;
+        }
+        if o.allow_partial_response.is_none() {
+            o.allow_partial_response = parent.allow_partial_response;
+        }
+        if o.time_offset_str.is_empty() && !parent.time_offset_str.is_empty() {
+            o.time_offset = parent.time_offset;
+            o.time_offset_str = parent.time_offset_str.clone();
         }
     }
 

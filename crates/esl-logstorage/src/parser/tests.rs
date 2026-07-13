@@ -1454,6 +1454,21 @@ fn test_query_add_time_filter_propagates_to_subqueries() {
         1,
         "subquery opts must suppress the time filter there: {s}"
     );
+
+    // The subquery INHERITS the parent's options(ignore_global_time_filter=true)
+    // (Go copies parent opts into subqueries), so the propagated time filter is
+    // suppressed both at the top level and in the subquery even though the
+    // subquery does not set the option itself.
+    let mut q =
+        ParseQuery("options(ignore_global_time_filter=true) foo or bar:in(baz | fields bar)")
+            .unwrap();
+    q.add_time_filter(start, end);
+    let s = q.to_string();
+    assert_eq!(
+        s.matches("_time:[").count(),
+        0,
+        "parent ignore_global_time_filter must be inherited by the subquery: {s}"
+    );
 }
 
 /// `options(time_offset=...)` shifts the `_time` filter's matching bounds

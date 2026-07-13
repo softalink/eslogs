@@ -231,11 +231,11 @@ splitter (`NewNetQueryRunner`/`splitToRemoteAndLocal`), wired through
   `net_query_runner::init_subqueries_net`, with a PORT NOTE divergence:
   local-half `union` subqueries are also resolved eagerly (inlined as
   `union rows(...)`) instead of Go's lazy flush-time wiring, because the
-  runner borrows the caller's run-net-query callback. Still deferred:
-  `visitSubqueries`-based propagation (`AddTimeFilter`/`AddExtraFilters` do
-  not descend into subqueries) and `stream_context` runQuery wiring on the
-  NetQueryRunner local-pipes path (the local `Storage::run_query` path IS
-  wired).
+  runner borrows the caller's run-net-query callback. `visitSubqueries`-based
+  propagation is wired: `AddTimeFilter`/`AddExtraFilters` descend into
+  subqueries and subqueries inherit the parent's scalar query options. Still
+  deferred: `stream_context` runQuery wiring on the NetQueryRunner local-pipes
+  path (the local `Storage::run_query` path IS wired).
 - filter_and/not Display omit parens; filter_phrase Display incomplete quoter.
 
 ## Parity ledger (v1.51.0)
@@ -312,16 +312,19 @@ what remains in section (a) is confirmed-present divergence.
   re-renders with the filter inlined rather than as `options(global_filter=...)`
   (Go keeps the option and ANDs it per-search), and a subquery that sets its
   *own* `global_filter` is not composed (only the top-level option is).
-- `parser/query.rs:982`, `parser/query.rs:1033` — query options are not
-  inherited into nested subqueries (Go pushes the options stack); subqueries
-  run with default options. Because the subquery-propagation of
-  `AddTimeFilter` re-parses each subquery from its rendered text (which does
-  not render inherited options), a subquery whose *parent* set
-  `options(ignore_global_time_filter=true)` but which does not set it itself
-  still receives the propagated `_time` filter, where Go's inherited option
-  suppresses it. (A faithful fix needs the option stack threaded through the
-  `visit_subqueries` re-parse — a change across all 24 `visit_subqueries_mut`
-  impls, deferred.)
+- `parser/query.rs` `visit_subqueries` — scalar query options ARE now inherited
+  into nested subqueries (Go copies the parent `queryOptions` via the lexer
+  options stack): `visit_subqueries` wraps the visit closure so each subquery
+  takes the parent's `concurrency`/`parallel_readers`/`ignore_global_time_filter`/
+  `allow_partial_response`/`time_offset` for the fields it did not set itself,
+  cascading through the recursion. So a subquery whose *parent* set
+  `options(ignore_global_time_filter=true)` now suppresses the propagated
+  `_time` filter like Go. One ultra-narrow residual: the value is inherited
+  *after* the subquery is re-parsed, so a literal `_time`/`day_range`/
+  `week_range` filter already inside a subquery is not shifted by an inherited
+  parent `time_offset` (re-applying it would double-shift across the parse-time
+  and `add_time_filter` visits); the inherited offset value still shifts the
+  added global `_time` filter and rate-step normalization.
 - `parser/parse_stats.rs` — `stats switch(...)` is now accepted and executed,
   but because the port's `Box<dyn StatsFunc>` is not `Clone`, it is expanded at
   parse time into the equivalent `if`-guarded funcs (each case, plus a `default`
