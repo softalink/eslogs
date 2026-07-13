@@ -1455,6 +1455,36 @@ fn test_query_add_time_filter_propagates_to_subqueries() {
     );
 }
 
+/// `options(time_offset=...)` shifts the `_time` filter's matching bounds
+/// (Go `updateFilterWithTimeOffset`).
+#[test]
+fn test_options_time_offset_shifts_time_filter() {
+    use crate::rows::Field;
+
+    // `_time:[12:00, 12:00]` with a 1h offset shifts the matching bounds back by
+    // 1h, so a row at 11:00 matches and one at 12:00 does not.
+    let q =
+        ParseQuery("options(time_offset=1h) _time:[2024-06-01T12:00:00Z, 2024-06-01T12:00:00Z]")
+            .unwrap();
+    let f = q.get_final_filter();
+    let row_11 = [Field {
+        name: "_time".to_string(),
+        value: "2024-06-01T11:00:00Z".to_string(),
+    }];
+    let row_12 = [Field {
+        name: "_time".to_string(),
+        value: "2024-06-01T12:00:00Z".to_string(),
+    }];
+    assert!(
+        f.match_row(&row_11),
+        "time_offset should shift the filter to match T-1h"
+    );
+    assert!(
+        !f.match_row(&row_12),
+        "time_offset-shifted filter should not match T"
+    );
+}
+
 /// Port of Go `TestQuery_AddExtraFilters`.
 #[test]
 fn test_query_add_extra_filters() {

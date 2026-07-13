@@ -319,9 +319,6 @@ what remains in section (a) is confirmed-present divergence.
   suppresses it. (A faithful fix needs the option stack threaded through the
   `visit_subqueries` re-parse — a change across all 24 `visit_subqueries_mut`
   impls, deferred.)
-- `parser/query.rs:1011` — `options(time_offset=...)` does not shift
-  `filterTime`/`filterDayRange`/`filterWeekRange` bounds
-  (`update_filter_with_time_offset` is a no-op).
 - `parser/parse_stats.rs:240` — `stats switch(...)` is rejected (`not
   supported by this port`); Go accepts it.
 - `pipe_sort.rs:26/:536` — the sort state-size budget charges the copied

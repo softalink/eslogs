@@ -1086,16 +1086,20 @@ pub(crate) fn parse_query(lex: &mut Lexer) -> Result<Query, String> {
     Ok(q)
 }
 
-/// Port of Go `updateFilterWithTimeOffset`.
+/// Port of Go `updateFilterWithTimeOffset`: shifts the `_time` bounds of the
+/// query filter by `time_offset` (reachable via `options(time_offset=...)`).
 ///
-/// PORT NOTE: the `time_offset != 0` branch requires `copyFilter` to walk the
-/// filter tree and shift `filterTime`/`filterDayRange`/`filterWeekRange`
-/// bounds; that downcast machinery is deferred, so a non-zero offset leaves the
-/// filter unchanged (only reachable via `options(time_offset=...)`).
+/// PORT NOTE: Go rewrites the tree via `copyFilter`; the port walks it in place
+/// through the `Filter::update_with_time_offset` object-safe hook (composite
+/// filters recurse, the `filterTime`/`filterDayRange`/`filterWeekRange` leaves
+/// shift their bounds).
 fn update_filter_with_time_offset(
-    f: Box<dyn FilterTrait>,
-    _time_offset: i64,
+    mut f: Box<dyn FilterTrait>,
+    time_offset: i64,
 ) -> Box<dyn FilterTrait> {
+    if time_offset != 0 {
+        f.update_with_time_offset(time_offset);
+    }
     f
 }
 
