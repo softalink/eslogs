@@ -157,43 +157,72 @@ fn read_password_from_file_or_http(path: &str) -> Result<String, String> {
     Ok(data.trim_end().to_string())
 }
 
-/// Returns 64 random bytes.
+/// Returns 64 cryptographically secure random bytes, like Go's `crypto/rand`.
 ///
-/// Uses `/dev/urandom` on Unix. PORT NOTE: on other platforms (and if
-/// `/dev/urandom` is unavailable) it falls back to a hash-based generator
-/// seeded from the clock, which is not cryptographically secure like Go's
-/// `crypto/rand`.
+/// Uses `/dev/urandom` on Unix and `BCryptGenRandom` (system-preferred RNG) on
+/// Windows. Like Go's `crypto/rand` (which panics on failure), a read failure
+/// panics rather than degrading to a weak generator. Exotic targets that are
+/// neither Unix nor Windows fall back to a clock-seeded hash (not
+/// cryptographically secure); the port only builds for Linux and Windows.
 fn random_bytes_64() -> [u8; 64] {
     #[cfg(unix)]
     {
         use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let mut buf = [0u8; 64];
-            if f.read_exact(&mut buf).is_ok() {
-                return buf;
-            }
+        let mut buf = [0u8; 64];
+        match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
+            Ok(()) => buf,
+            Err(err) => panic!("cannot read /dev/urandom for secure random bytes: {err}"),
         }
     }
-    fallback_random_bytes_64()
-}
-
-fn fallback_random_bytes_64() -> [u8; 64] {
-    use std::hash::{BuildHasher, Hasher, RandomState};
-
-    let mut buf = [0u8; 64];
-    let mut hasher = RandomState::new().build_hasher();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    hasher.write_u32(nanos);
-    hasher.write_u32(std::process::id());
-    for chunk in buf.chunks_mut(8) {
-        hasher.write_u64(hasher.finish());
-        let h = hasher.finish().to_le_bytes();
-        chunk.copy_from_slice(&h[..chunk.len()]);
+    #[cfg(windows)]
+    {
+        // SAFETY: BCryptGenRandom fills `buf` (a valid 64-byte buffer) with
+        // cryptographically secure bytes from the OS RNG; a null algorithm
+        // handle with BCRYPT_USE_SYSTEM_PREFERRED_RNG selects the system RNG.
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(
+                h_algorithm: *mut core::ffi::c_void,
+                pb_buffer: *mut u8,
+                cb_buffer: u32,
+                dw_flags: u32,
+            ) -> i32;
+        }
+        const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+        let mut buf = [0u8; 64];
+        let status = unsafe {
+            BCryptGenRandom(
+                core::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        // BCryptGenRandom returns an NTSTATUS; non-negative means success.
+        if status < 0 {
+            panic!("BCryptGenRandom failed with NTSTATUS {status:#x}");
+        }
+        buf
     }
-    buf
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::hash::{BuildHasher, Hasher, RandomState};
+
+        let mut buf = [0u8; 64];
+        let mut hasher = RandomState::new().build_hasher();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        hasher.write_u32(nanos);
+        hasher.write_u32(std::process::id());
+        for chunk in buf.chunks_mut(8) {
+            hasher.write_u64(hasher.finish());
+            let h = hasher.finish().to_le_bytes();
+            chunk.copy_from_slice(&h[..chunk.len()]);
+        }
+        buf
+    }
 }
 
 #[cfg(test)]

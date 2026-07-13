@@ -418,10 +418,12 @@ what remains in section (a) is confirmed-present divergence.
   `vm_*`→`esm_*`. (The previously-missing `process_cpu_cores_available`,
   `process_memory_limit_bytes`, `*_filestream_*`, and fs/nfs/mmapped series
   are now registered.)
-- `flagutil/password.rs:19/:150` — `http(s)://` password sources are not
-  fetched; and the non-Unix fallback password uses a non-crypto RNG
-  (SipHash/clock-seeded) where Go always reads `crypto/rand` and panics on
-  failure.
+- `flagutil/password.rs:19` — `http(s)://` password sources are not fetched
+  (the flag layer has no HTTP client dependency); such a source falls back to
+  the stored random value. (The generated random password now uses a
+  cryptographically secure RNG on both platforms — `/dev/urandom` on Unix,
+  `BCryptGenRandom` on Windows — and panics on read failure like Go's
+  `crypto/rand`, instead of the previous non-crypto Windows fallback.)
 - `logger.rs:147` — arbitrary IANA `-loggerTimezone` values panic (`UTC` and
   `Local` are handled); `:311/:500/:640` — per-arg length truncation,
   multi-byte truncation (lossy `U+FFFD` vs Go's raw byte slice), and the
