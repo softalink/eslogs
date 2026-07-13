@@ -9,9 +9,9 @@
 //! [`crate::flagutil::visit_all_flags`], which covers resolved flags plus
 //! explicitly set ones — see its PORT NOTE for the coverage difference.
 //!
-//! PORT NOTE: `vm_os_info` release detection uses `RtlGetVersion` on Windows
-//! upstream; the port reports `os="windows"` without a release to avoid
-//! depending on ntdll. On Linux the release comes from `uname(2)` like Go.
+//! PORT NOTE: `esm_os_info` release detection mirrors Go — `RtlGetVersion`
+//! (ntdll) formatted as `major.minor.build` on Windows, and `uname(2)` on
+//! Linux.
 
 use std::fmt::Write;
 use std::sync::{LazyLock, Mutex, Once};
@@ -174,7 +174,41 @@ fn os_info() -> (&'static str, String) {
 
 #[cfg(windows)]
 fn os_info() -> (&'static str, String) {
-    ("windows", String::new())
+    // Go's osmetrics_windows.go: `windows.RtlGetVersion()` then
+    // `fmt.Sprintf("%d.%d.%d", Major, Minor, Build)`. RtlGetVersion (ntdll,
+    // always present) reports the true OS version even under app-compat
+    // shimming, unlike the deprecated GetVersionEx.
+    // Fields past the ones we read are part of the C ABI layout (struct size).
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct OsVersionInfoW {
+        dw_os_version_info_size: u32,
+        dw_major_version: u32,
+        dw_minor_version: u32,
+        dw_build_number: u32,
+        dw_platform_id: u32,
+        sz_csd_version: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(lp_version_information: *mut OsVersionInfoW) -> i32;
+    }
+    // SAFETY: RtlGetVersion fills the caller-owned, zero-initialized struct
+    // after its size field is set; it writes only within the struct and
+    // returns an NTSTATUS (0 == STATUS_SUCCESS).
+    let release = unsafe {
+        let mut info: OsVersionInfoW = core::mem::zeroed();
+        info.dw_os_version_info_size = core::mem::size_of::<OsVersionInfoW>() as u32;
+        if RtlGetVersion(&mut info) == 0 {
+            format!(
+                "{}.{}.{}",
+                info.dw_major_version, info.dw_minor_version, info.dw_build_number
+            )
+        } else {
+            String::new()
+        }
+    };
+    ("windows", release)
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]

@@ -439,10 +439,12 @@ what remains in section (a) is confirmed-present divergence.
   0777-vs-0755 divergence is closed: `must_mkdir` now sets mode `0o755`
   explicitly via `DirBuilderExt`, matching Go's `os.MkdirAll(path, 0755)`
   under any umask.)
-- `appmetrics.rs:12`, `metrics/process_metrics_linux.rs:319` — the
-  `vm_os_info`-equivalent lacks the Windows release label (Linux uname is at
-  parity); `process_start_time_seconds` is derived from the exact kernel start
-  (`/proc` btime+starttime) vs Go's package-init `time.Now()` approximation.
+- `metrics/process_metrics_linux.rs:319` *(deliberate — more accurate)* —
+  `process_start_time_seconds` is derived from the exact kernel start (`/proc`
+  btime+starttime), which is *more* accurate than Go's package-init `time.Now()`
+  approximation. (The `esm_os_info` Windows release label now matches Go: it
+  reports `major.minor.build` from `RtlGetVersion`, like Linux uname already
+  did.)
 - `tlsutil.rs:9/:65` *(deliberate — rustls-imposed)* — TLS 1.0/1.1
   unsupported (min version clamps to 1.2); CBC/static-RSA cipher-suite names
   rejected; trust roots come from bundled webpki-roots rather than the OS
