@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use esl_common::{cgroup, fs, infof, memory, panicf, warnf};
+use esl_common::{cgroup, fs, infof, memory, panicf};
 
 use super::PARTS_FILENAME;
 use super::PrepareBlockCallback;
@@ -112,6 +112,10 @@ fn raw_items_shards_per_table() -> usize {
 const MAX_BLOCKS_PER_SHARD: usize = 256;
 
 static TOO_LONG_ITEMS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Throttles the "too long item" log to once per 5s (Go
+/// `logger.WithThrottler("tooLongItem", 5*time.Second)`).
+static TOO_LONG_ITEM_LOGGER: LazyLock<&'static esl_common::logger::LogThrottler> =
+    LazyLock::new(|| esl_common::logger::with_throttler("tooLongItem", Duration::from_secs(5)));
 
 static INMEMORY_PARTS_CONCURRENCY_CH: LazyLock<ConcurrencyCh> =
     LazyLock::new(|| ConcurrencyCh::new(get_inmemory_parts_concurrency()));
@@ -437,14 +441,13 @@ impl RawItemsShard {
             // Skip too long item
             let item_prefix = &item[..item.len().min(128)];
             TOO_LONG_ITEMS_TOTAL.fetch_add(1, Ordering::SeqCst);
-            // PORT NOTE: Go throttles this log message to once per 5 seconds;
-            // the port logs every occurrence.
-            warnf!(
+            // Go `tooLongItemLogger.Errorf`, throttled to once per 5s.
+            TOO_LONG_ITEM_LOGGER.errorf(format_args!(
                 "skipping adding too long item to indexdb: len(item)={}; it shouldn't exceed {} bytes; item prefix={:?}",
                 item.len(),
                 MAX_INMEMORY_BLOCK_SIZE,
                 item_prefix
-            );
+            ));
         }
         drop(ibs);
 

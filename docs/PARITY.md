@@ -376,8 +376,6 @@ what remains in section (a) is confirmed-present divergence.
 
 - `indexdb/mergeset/table.rs:1438` — `DataBlocksCache*`/`IndexBlocksCache*`
   metrics are absent/zero (the global mergeset block caches are omitted).
-- `indexdb/mergeset/table.rs:440` — "skipping too long item" is logged
-  unthrottled vs Go's 5s throttle.
 - `encoding.rs:405` — zstd frames are produced by libzstd, not klauspost's
   pure-Go encoder (used by `CGO_ENABLED=0` release binaries), with different
   level bucketing: fully interoperable (both emit standard zstd frames and
