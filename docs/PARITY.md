@@ -274,10 +274,7 @@ what remains in section (a) is confirmed-present divergence.
 > **Corrections to the prior (over-optimistic) closure note** — these were
 > claimed closed but the audit found them still OPEN, so they remain in
 > section (a): `stats switch(...)`
-> (still rejected); filter/join/union `AddTimeFilter`/`AddExtraFilters`
-> **subquery propagation** (still top-level only — the *iff-nested `in()`*
-> propagation via `visit_subqueries` did land, but the time/extra-filter descent
-> did not); `pattern.rs` `\x`≥0x80 (still UTF-8-encoded).
+> (still rejected); `pattern.rs` `\x`≥0x80 (still UTF-8-encoded).
 >
 > **Items closed this session** (with tests / gate-verified): (1) log deletion
 > including stream-filtered rows (drop path used the wrong `_msg` canonicalizer;
@@ -298,7 +295,12 @@ what remains in section (a) is confirmed-present divergence.
 > `initStatsRateFuncSteps` → `pipeStats.initRateFuncs`, wired through
 > object-safe `Pipe`/`StatsFunc` hooks and applied for both parse-time `_time`
 > filters and HTTP `AddTimeFilter`), so their computed values are normalized
-> like Go instead of skipping the divide.
+> like Go instead of skipping the divide; (8) `AddTimeFilter` and
+> `AddExtraFilters` now propagate into `in(...)`/`join`/`union` subqueries via
+> `visit_subqueries` (Go `AddTimeFilter`/`AddExtraFilters`), so subqueries no
+> longer scan an unbounded time range or bypass extra/security filters — the
+> extra filter is rendered once and re-parsed per subquery (single-owner
+> filters), honoring each subquery's own `ignore_global_time_filter`/`time_offset`.
 
 ### (a) Observable behavioral divergences
 
@@ -307,11 +309,6 @@ what remains in section (a) is confirmed-present divergence.
 - `parser/query.rs:205` — `options(global_filter=...)` parses but is never
   ANDed into the search filter (`get_final_filter` returns `q.f` only);
   queries that set it get unfiltered results.
-- `parser/query.rs:367`, `parser/query.rs:386`, `pipe.rs:29` — Go's
-  `visitSubqueries` propagation is not ported: `AddTimeFilter` (the HTTP
-  start/end range) and `AddExtraFilters` are applied to the top-level query
-  only, not to `in(...)`/`join`/`union` subqueries. Subqueries scan their own
-  (unbounded) time range and ignore extra/security filters.
 - `parser/query.rs:982`, `parser/query.rs:1033` — query options are not
   inherited into nested subqueries (Go pushes the options stack); subqueries
   run with default options.

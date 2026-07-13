@@ -1411,11 +1411,51 @@ fn test_query_get_stats_labels_failure() {
     f("* | by (x) count() y | format 'foo' as y");
 }
 
-/// Port of Go `TestQuery_AddExtraFilters`.
+/// Port of Go `TestQuery_AddTimeFilter` (subquery-propagation subset).
 ///
-/// PORT NOTE: the "extra filters must be unconditionally propagated into
-/// subqueries" cases are omitted — subquery propagation (`visitSubqueries`)
-/// is deferred.
+/// Uses occurrence counts rather than pinning the rendered timestamp text so
+/// the assertions stay robust; the exact `_time:[...]` format is covered by the
+/// storage-level tests.
+#[test]
+fn test_query_add_time_filter_propagates_to_subqueries() {
+    let start = 1_700_000_000_000_000_000i64;
+    let end = 1_700_000_001_000_000_000i64;
+
+    // union subquery inherits the global time filter.
+    let mut q = ParseQuery("foo | union (bar)").unwrap();
+    q.add_time_filter(start, end);
+    let s = q.to_string();
+    assert_eq!(
+        s.matches("_time:[").count(),
+        2,
+        "time filter must reach the union subquery: {s}"
+    );
+
+    // in(...) subquery inherits the global time filter.
+    let mut q = ParseQuery("foo or bar:in(baz | fields bar)").unwrap();
+    q.add_time_filter(start, end);
+    let s = q.to_string();
+    assert_eq!(
+        s.matches("_time:[").count(),
+        2,
+        "time filter must reach the in() subquery: {s}"
+    );
+
+    // A subquery with options(ignore_global_time_filter=true) suppresses the
+    // propagated filter for itself but not for the parent.
+    let mut q =
+        ParseQuery("foo or bar:in(options(ignore_global_time_filter=true) baz | fields bar)")
+            .unwrap();
+    q.add_time_filter(start, end);
+    let s = q.to_string();
+    assert_eq!(
+        s.matches("_time:[").count(),
+        1,
+        "subquery opts must suppress the time filter there: {s}"
+    );
+}
+
+/// Port of Go `TestQuery_AddExtraFilters`.
 #[test]
 fn test_query_add_extra_filters() {
     #[track_caller]
@@ -1458,6 +1498,20 @@ fn test_query_add_extra_filters() {
         "c",
         r#"{foo="bar",baz!="x"} a:~b"#,
         r#"{foo="bar",baz!="x"} a:~b c"#,
+    );
+
+    // extra filters must be unconditionally propagated into subqueries
+    // (`in(...)`, `union`, and `if(...)` filters) — the tenant/security filter
+    // reaches every scanned subquery.
+    f(
+        "foo x:in(bar | keep x)",
+        "tenant:=123",
+        "tenant:=123 foo x:in(tenant:=123 bar | fields x)",
+    );
+    f(
+        r#"foo x:in(bar | union (baz) | keep x) | count() if (a:in(b | keep a)) z"#,
+        "tenant:=123",
+        r#"tenant:=123 foo x:in(tenant:=123 bar | union (tenant:=123 baz) | fields x) | stats count(*) if (a:in(tenant:=123 b | fields a)) as z"#,
     );
 }
 

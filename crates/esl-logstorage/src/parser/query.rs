@@ -412,15 +412,16 @@ impl Query {
         Some((q_copy, offset, limit))
     }
 
-    /// Adds global filter `_time:[start ... end]` to q (Go `AddTimeFilter`).
-    ///
-    /// PORT NOTE: Go applies the filter to subqueries too (`visitSubqueries`
-    /// over `join`/`union`/`in(...)` subqueries); the Rust subqueries are
-    /// stored as rendered text and `visitSubqueries`-based propagation is
-    /// deferred, so only the top-level query is updated (Go
-    /// `addTimeFilterNoSubqueries`) — subqueries keep their own `_time`
-    /// filters, without inheriting the global one.
+    /// Adds global filter `_time:[start ... end]` to q and all of its
+    /// `in(...)`/`join`/`union` subqueries (Go `AddTimeFilter`).
     pub fn add_time_filter(&mut self, start: i64, end: i64) {
+        self.visit_subqueries(&mut |q| q.add_time_filter_no_subqueries(start, end));
+    }
+
+    /// Adds the `_time` filter to this query only (Go
+    /// `addTimeFilterNoSubqueries`); the [`Self::add_time_filter`] wrapper
+    /// applies it to subqueries via [`Self::visit_subqueries`].
+    fn add_time_filter_no_subqueries(&mut self, start: i64, end: i64) {
         if self.opts.ignore_global_time_filter == Some(true) {
             return;
         }
@@ -428,21 +429,38 @@ impl Query {
         let f = std::mem::replace(&mut self.f, Box::new(crate::filter_noop::new_filter_noop()));
         self.f = add_time_filter(f, start, end, self.opts.time_offset);
 
-        // Go `addTimeFilterNoSubqueries` recomputes the rate step from the
-        // newly-added `_time` range for this query's own pipes.
+        // Go recomputes the rate step from the newly-added `_time` range.
         self.init_stats_rate_func_steps_no_subqueries();
     }
 
-    /// Adds `extra_filters` to q (Go `AddExtraFilters`).
+    /// Adds `extra_filters` to q and all of its `in(...)`/`join`/`union`
+    /// subqueries (Go `AddExtraFilters`).
     ///
-    /// PORT NOTE: Go takes `*Filter` and shares the filter across
-    /// `visitSubqueries`; Rust filters are single-owner trait objects, so the
-    /// method consumes the [`Filter`]. Subquery propagation
-    /// (`visitSubqueries` over `join`/`union`/`in(...)` pipes) is deferred
-    /// (see `add_time_filter`), so only the top-level query is updated
-    /// (Go `addExtraFiltersNoSubqueries`).
+    /// PORT NOTE: Go shares one `*Filter` across `visitSubqueries`; the port's
+    /// filters are single-owner, so the extra filter is rendered to text once
+    /// and re-parsed into a fresh owned filter for each (sub)query — the
+    /// established render/re-parse mechanism (`Query::clone`, subqueries).
     pub fn add_extra_filters(&mut self, extra_filters: Filter) {
         let Some(ef) = extra_filters.f else {
+            return;
+        };
+        let ef_str = ef.to_string();
+        self.visit_subqueries(&mut |q| q.add_extra_filters_no_subqueries(&ef_str));
+    }
+
+    /// Prepends the extra filter (given as rendered text) to this query only
+    /// (Go `addExtraFiltersNoSubqueries`); the [`Self::add_extra_filters`]
+    /// wrapper applies it to subqueries via [`Self::visit_subqueries`].
+    fn add_extra_filters_no_subqueries(&mut self, ef_str: &str) {
+        let timestamp = self.timestamp;
+        let ef = match ParseFilterAtTimestamp(ef_str, timestamp) {
+            Ok(parsed) => parsed.f,
+            Err(err) => {
+                esl_common::panicf!("BUG: cannot re-parse extra filter {ef_str:?}: {err}");
+                unreachable!()
+            }
+        };
+        let Some(ef) = ef else {
             return;
         };
 
