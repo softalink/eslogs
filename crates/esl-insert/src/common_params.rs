@@ -324,28 +324,6 @@ impl LogRowsStorage for Storage {
     }
 }
 
-/// Enforces a per-protocol `-*.maxRequestSize` cap on a fully-read request
-/// body, mirroring Go `protoparserutil.readFull`'s "too big data size" error.
-///
-/// PORT NOTE: Go caps the stream while reading it (and again after
-/// decompression); the port's `Request::read_full_body` has already
-/// decompressed the body per Content-Encoding, so the cap applies to the
-/// decompressed size after the read.
-pub(crate) fn check_max_request_size(
-    data_len: usize,
-    flag: &Flag<esl_common::flagutil::Bytes>,
-) -> Result<(), String> {
-    let n = flag.get().n.max(0);
-    if data_len as i64 > n {
-        return Err(format!(
-            "too big data size exceeding -{}={} bytes",
-            flag.name(),
-            n
-        ));
-    }
-    Ok(())
-}
-
 /// Writes an error response carrying its own HTTP status code, mirroring Go
 /// `httpserver.Errorf(w, r, "%s", err)` when err is an
 /// `httpserver.ErrorWithStatusCode` (logs with request context, then responds

@@ -75,29 +75,21 @@ pub fn request_handler<S: LogRowsStorage>(
 
     reset_unsupported_common_params(&mut cp, "/internal/insert");
 
-    // PORT NOTE: Go streams the body through
-    // `protoparserutil.ReadUncompressedData`, which caps the *decompressed*
-    // size at -internalinsert.maxRequestSize; the port's
-    // `Request::body_reader` already decompresses per Content-Encoding, so the
-    // cap is checked after reading the body in full.
-    let data = match req.read_full_body() {
+    // Go streams the body through `protoparserutil.ReadUncompressedData`, which
+    // caps the *decompressed* size at -internalinsert.maxRequestSize during the
+    // read; `read_full_body_limited` decompresses per Content-Encoding and
+    // applies the cap while reading, so a decompression bomb cannot fully
+    // materialize.
+    let data = match req.read_full_body_limited(
+        MAX_REQUEST_SIZE.get().int_n() as i64,
+        MAX_REQUEST_SIZE.name(),
+    ) {
         Ok(d) => d,
         Err(err) => {
             w.errorf(req, &format!("cannot read internal insert request: {err}"));
             return;
         }
     };
-    let max_request_size = MAX_REQUEST_SIZE.get().int_n().max(0) as usize;
-    if data.len() > max_request_size {
-        w.errorf(
-            req,
-            &format!(
-                "cannot read internal insert request: request size ({} bytes) exceeds -internalinsert.maxRequestSize={max_request_size}",
-                data.len()
-            ),
-        );
-        return;
-    }
 
     let mut lmp = cp.new_log_message_processor(storage, "internalinsert");
     // PORT NOTE: Go duplicates `parseData` in each package; the port reuses

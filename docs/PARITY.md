@@ -289,7 +289,11 @@ what remains in section (a) is confirmed-present divergence.
 > `CanWriteData()` now gates every ingest path — the six that were missing it
 > (splunk, native-insert, OTLP, journald, syslog, internal-insert) now call it
 > like Go; (5) the OTLP ingest path now enforces `-opentelemetry.maxRequestSize`
-> (64MiB) like its Loki/DataDog siblings.
+> (64MiB) like its Loki/DataDog siblings; (6) every bulk insert handler
+> (Loki/DataDog/OTLP/Splunk/native/internal) now reads through
+> `read_full_body_limited`, which caps the decompressed size *during* the read
+> like Go's `ReadUncompressedData` — closing the decompression-bomb exposure
+> where the body was fully materialized before the size check.
 
 ### (a) Observable behavioral divergences
 
@@ -398,11 +402,6 @@ what remains in section (a) is confirmed-present divergence.
   `esl-storage/src/lib.rs:639`); what remains unported is `/debug/pprof` +
   `-pprofAuthKey`, gzip **response** compression, and connection-deadline
   jitter.
-- `httpserver.rs:479-620` — request-body gzip/zstd/deflate is decompressed
-  into memory without a cap before the handler-level size check (Go caps
-  during the read via `GetLimitedReader`); the capped `read_full_body_limited`
-  exists but no production insert handler uses it — decompression-bomb
-  exposure on the Loki/DataDog/OTLP/Splunk/native insert paths.
 - `httpserver.rs:128` (+ `es-logs/src/main.rs:34`,
   `esl-agent/src/main.rs:8`) — `-httpListenAddr` accepts a single address;
   Go supports multiple listeners (+ `useProxyProtocol` per listener).

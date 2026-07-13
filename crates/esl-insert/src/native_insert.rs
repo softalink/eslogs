@@ -203,30 +203,21 @@ pub(crate) fn reset_unsupported_common_params(cp: &mut CommonParams, endpoint: &
 /// Reads the full (already-decompressed) request body and enforces
 /// `-nativeinsert.maxRequestSize`.
 ///
-/// PORT NOTE: Go streams the body through
-/// `protoparserutil.ReadUncompressedData`, which caps the *decompressed* size;
-/// the port's `Request::body_reader` already decompresses per
-/// Content-Encoding, so the cap is checked after reading the body in full.
+/// Go streams the body through `protoparserutil.ReadUncompressedData`, which
+/// caps the *decompressed* size at `-nativeinsert.maxRequestSize` during the
+/// read; `read_full_body_limited` decompresses per Content-Encoding and applies
+/// the cap while reading, so a decompression bomb cannot fully materialize.
 fn read_capped_body(req: &mut Request, w: &mut ResponseWriter, what: &str) -> Option<Vec<u8>> {
-    let data = match req.read_full_body() {
-        Ok(d) => d,
+    match req.read_full_body_limited(
+        MAX_REQUEST_SIZE.get().int_n() as i64,
+        MAX_REQUEST_SIZE.name(),
+    ) {
+        Ok(d) => Some(d),
         Err(err) => {
             w.errorf(req, &format!("cannot read {what}: {err}"));
-            return None;
+            None
         }
-    };
-    let max_request_size = MAX_REQUEST_SIZE.get().int_n().max(0) as usize;
-    if data.len() > max_request_size {
-        w.errorf(
-            req,
-            &format!(
-                "cannot read {what}: request size ({} bytes) exceeds -nativeinsert.maxRequestSize={max_request_size}",
-                data.len()
-            ),
-        );
-        return None;
     }
-    Some(data)
 }
 
 /// Parses marshaled InsertRows from data, overriding each row's tenantID with

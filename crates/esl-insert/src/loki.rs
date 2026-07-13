@@ -24,8 +24,8 @@ use esl_logstorage::tenant_id::parse_tenant_id;
 use esl_common::timeutil::try_parse_unix_timestamp;
 
 use crate::common_params::{
-    CommonParams, LogMessageProcessor, LogRowsStorage, check_max_request_size, errorf_with_status,
-    get_common_params, is_json_content_type, now_unix_nanos,
+    CommonParams, LogMessageProcessor, LogRowsStorage, errorf_with_status, get_common_params,
+    is_json_content_type, now_unix_nanos,
 };
 
 /// The maximum size of a single Loki request (shared by the JSON and protobuf
@@ -142,8 +142,8 @@ fn handle_json<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &mut R
     // Go streams the body via protoparserutil.ReadUncompressedData, which
     // waits for the first body byte, takes a writeconcurrencylimiter token
     // for the read+parse and enforces -loki.maxRequestSize while reading;
-    // the port's read_full_body has already decompressed the body, so the
-    // token is taken here and the cap is checked after the read.
+    // the port takes the token here and caps the decompressed size during the
+    // read via read_full_body_limited.
     let _concurrency_guard = match writeconcurrencylimiter::inc_concurrency_guard() {
         Ok(g) => g,
         Err(err) => {
@@ -156,17 +156,16 @@ fn handle_json<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &mut R
             return;
         }
     };
-    let data = match req.read_full_body() {
+    let data = match req.read_full_body_limited(
+        MAX_REQUEST_SIZE.get().int_n() as i64,
+        MAX_REQUEST_SIZE.name(),
+    ) {
         Ok(d) => d,
         Err(err) => {
             w.errorf(req, &format!("cannot read Loki json data: {err}"));
             return;
         }
     };
-    if let Err(err) = check_max_request_size(data.len(), &MAX_REQUEST_SIZE) {
-        w.errorf(req, &format!("cannot read Loki json data: {err}"));
-        return;
-    }
 
     let use_default_stream_fields = cp.cp.stream_fields.is_empty();
     let msg_fields: Vec<&str> = cp.cp.msg_fields.iter().map(String::as_str).collect();

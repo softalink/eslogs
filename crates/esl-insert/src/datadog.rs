@@ -4,11 +4,12 @@
 //! POSTed to `/api/v2/logs` (or the `/insert/datadog/`-prefixed alias), with
 //! `ddtags`/`ddsource` handling and the `/api/v1/validate` probe.
 //!
-//! PORT NOTE: Go enforces `-datadog.maxRequestSize` via
+//! Go enforces `-datadog.maxRequestSize` via
 //! `protoparserutil.ReadUncompressedData` while streaming the body; the port
-//! checks the cap after reading the body in full. The
-//! gzip/deflate/zstd/snappy `Content-Encoding`s Go supports are decompressed
-//! transparently by [`Request::body_reader`] in `esl_common::httpserver`.
+//! uses [`Request::read_full_body_limited`], which caps the decompressed size
+//! during the read. The gzip/deflate/zstd/snappy `Content-Encoding`s Go
+//! supports are decompressed transparently by [`Request::body_reader`] in
+//! `esl_common::httpserver`.
 //!
 //! PORT NOTE: Go parses JSON via the vendored `valyala/fastjson`. esl-insert
 //! only depends on `esl-common`/`esl-logstorage`, so a small dependency-free
@@ -27,8 +28,7 @@ use esl_logstorage::rows::Field;
 use esl_logstorage::stream_tags::check_stream_field_names;
 
 use crate::common_params::{
-    LogMessageProcessorTrait, LogRowsStorage, check_max_request_size, errorf_with_status,
-    get_common_params, now_unix_nanos,
+    LogMessageProcessorTrait, LogRowsStorage, errorf_with_status, get_common_params, now_unix_nanos,
 };
 
 static DATADOG_STREAM_FIELDS: Flag<ArrayString> = Flag::new(
@@ -141,8 +141,8 @@ fn datadog_logs_ingestion<S: LogRowsStorage>(
 
     // Go streams the body via protoparserutil.ReadUncompressedData, which
     // takes a writeconcurrencylimiter token for the read+parse and enforces
-    // -datadog.maxRequestSize while reading; the port takes the token here
-    // and checks the cap after the read.
+    // -datadog.maxRequestSize while reading; the port takes the token here and
+    // caps the decompressed size during the read via read_full_body_limited.
     let _concurrency_guard = match writeconcurrencylimiter::inc_concurrency_guard() {
         Ok(g) => g,
         Err(err) => {
@@ -155,17 +155,16 @@ fn datadog_logs_ingestion<S: LogRowsStorage>(
             return;
         }
     };
-    let data = match req.read_full_body() {
+    let data = match req.read_full_body_limited(
+        MAX_REQUEST_SIZE.get().int_n() as i64,
+        MAX_REQUEST_SIZE.name(),
+    ) {
         Ok(d) => d,
         Err(err) => {
             w.errorf(req, &format!("cannot read DataDog protocol data: {err}"));
             return;
         }
     };
-    if let Err(err) = check_max_request_size(data.len(), &MAX_REQUEST_SIZE) {
-        w.errorf(req, &format!("cannot read DataDog protocol data: {err}"));
-        return;
-    }
 
     let mut lmp = cp.new_log_message_processor(storage, "datadog");
     let res = read_logs_request(ts, &data, &mut lmp);

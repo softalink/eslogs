@@ -24,8 +24,8 @@ use esl_common::stringsutil::json_string;
 use esl_logstorage::rows::{Field, Fields, get_fields, put_fields, rename_field};
 
 use crate::common_params::{
-    LogMessageProcessor, LogRowsStorage, check_max_request_size, errorf_with_status,
-    get_common_params, is_json_content_type, now_unix_nanos,
+    LogMessageProcessor, LogRowsStorage, errorf_with_status, get_common_params,
+    is_json_content_type, now_unix_nanos,
 };
 
 // ---------------------------------------------------------------------------
@@ -101,12 +101,16 @@ fn handle_protobuf<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &m
         }
     };
 
-    // PORT NOTE: Go reads the body via protoparserutil.ReadUncompressedData,
-    // which honors the Content-Encoding header and caps the *decompressed*
-    // size at -opentelemetry.maxRequestSize (64MiB). The port's
-    // `Request::read_full_body` already decompresses gzip/zstd bodies per
-    // Content-Encoding, so the cap is checked after reading the body in full.
-    let data = match req.read_full_body() {
+    // Go reads the body via protoparserutil.ReadUncompressedData, which honors
+    // the Content-Encoding header and caps the *decompressed* size at
+    // -opentelemetry.maxRequestSize (64MiB) during the read;
+    // `read_full_body_limited` decompresses per Content-Encoding and applies
+    // the same cap while reading, so a decompression bomb cannot fully
+    // materialize.
+    let data = match req.read_full_body_limited(
+        MAX_REQUEST_SIZE.get().int_n() as i64,
+        MAX_REQUEST_SIZE.name(),
+    ) {
         Ok(d) => d,
         Err(err) => {
             w.errorf(
@@ -116,10 +120,6 @@ fn handle_protobuf<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &m
             return;
         }
     };
-    if let Err(err) = check_max_request_size(data.len(), &MAX_REQUEST_SIZE) {
-        w.errorf(req, &err);
-        return;
-    }
 
     let use_default_stream_fields = cp.stream_fields.is_empty();
     let msg_fields: Vec<&str> = cp.msg_fields.iter().map(String::as_str).collect();

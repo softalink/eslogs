@@ -209,29 +209,20 @@ fn handle_collector_event<S: LogRowsStorage>(
         return;
     }
 
-    // PORT NOTE: Go streams the body through
-    // `protoparserutil.ReadUncompressedData`, which caps the *decompressed*
-    // size at -splunk.maxRequestSize; the port's `Request::body_reader`
-    // already decompresses per Content-Encoding, so the cap is checked after
-    // reading the body in full.
-    let data = match req.read_full_body() {
+    // Go streams the body through `protoparserutil.ReadUncompressedData`, which
+    // caps the *decompressed* size at -splunk.maxRequestSize during the read;
+    // `read_full_body_limited` decompresses per Content-Encoding and applies the
+    // cap while reading, so a decompression bomb cannot fully materialize.
+    let data = match req.read_full_body_limited(
+        SPLUNK_MAX_REQUEST_SIZE.get().int_n() as i64,
+        SPLUNK_MAX_REQUEST_SIZE.name(),
+    ) {
         Ok(d) => d,
         Err(err) => {
             w.errorf(req, &format!("cannot read Splunk request: {err}"));
             return;
         }
     };
-    let max_request_size = SPLUNK_MAX_REQUEST_SIZE.get().int_n().max(0) as usize;
-    if data.len() > max_request_size {
-        w.errorf(
-            req,
-            &format!(
-                "cannot read Splunk request: request size ({} bytes) exceeds -splunk.maxRequestSize={max_request_size}",
-                data.len()
-            ),
-        );
-        return;
-    }
 
     let time_fields: Vec<&str> = cp.time_fields.iter().map(String::as_str).collect();
     let msg_fields: Vec<&str> = cp.msg_fields.iter().map(String::as_str).collect();

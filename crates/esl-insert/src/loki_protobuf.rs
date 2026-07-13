@@ -19,7 +19,7 @@ use esl_logstorage::rows::{Field, rename_field};
 use esl_common::writeconcurrencylimiter;
 
 use crate::common_params::{
-    LogMessageProcessor, LogRowsStorage, check_max_request_size, errorf_with_status, now_unix_nanos,
+    LogMessageProcessor, LogRowsStorage, errorf_with_status, now_unix_nanos,
 };
 use crate::loki::{MAX_REQUEST_SIZE, add_msg_field, get_loki_common_params};
 
@@ -50,7 +50,8 @@ pub(crate) fn handle_protobuf<S: LogRowsStorage>(
     // Go streams the body via protoparserutil.ReadUncompressedData, which
     // waits for the first body byte, takes a writeconcurrencylimiter token
     // for the read+parse and enforces -loki.maxRequestSize while reading;
-    // the port takes the token here and checks the cap after the read.
+    // the port takes the token here and caps the raw body during the read via
+    // read_full_body_limited.
     let _concurrency_guard = match writeconcurrencylimiter::inc_concurrency_guard() {
         Ok(g) => g,
         Err(err) => {
@@ -75,17 +76,16 @@ pub(crate) fn handle_protobuf<S: LogRowsStorage>(
     // the decompressed size like Go's readFull-after-GetUncompressedReader.
     // See https://grafana.com/docs/loki/latest/reference/loki-http-api/#ingest-logs
     let encoding = req.content_encoding();
-    let body = match req.read_full_body() {
+    let body = match req.read_full_body_limited(
+        MAX_REQUEST_SIZE.get().int_n() as i64,
+        MAX_REQUEST_SIZE.name(),
+    ) {
         Ok(b) => b,
         Err(err) => {
             w.errorf(req, &format!("cannot read Loki protobuf data: {err}"));
             return;
         }
     };
-    if let Err(err) = check_max_request_size(body.len(), &MAX_REQUEST_SIZE) {
-        w.errorf(req, &format!("cannot read Loki protobuf data: {err}"));
-        return;
-    }
     let data = if encoding.is_empty() {
         match snappy_decode_block(&body) {
             Ok(d) => d,
