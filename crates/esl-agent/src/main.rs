@@ -6,8 +6,8 @@
 //! persistent queues and ships them to every `-remoteWrite.url`.
 //!
 //! PORT NOTE: `-httpListenAddr` is an ArrayString (Go), so several listeners
-//! can be started, each with its own indexed `-tls*` config. Go's per-listener
-//! `-httpListenAddr.useProxyProtocol` is not ported.
+//! can be started, each with its own indexed `-tls*` and
+//! `-httpListenAddr.useProxyProtocol` config.
 //!
 use std::sync::Arc;
 use std::time::Instant;

@@ -32,10 +32,8 @@ use esl_common::{
 use esl_logstorage::storage::Storage;
 
 // `-httpListenAddr` is an `ArrayString` (Go), so several listeners can be
-// started, each with its own indexed `-tls*` config (via
-// `httpserver::serve_listener`).
-//
-// PORT NOTE: Go's per-listener `-httpListenAddr.useProxyProtocol` is not ported.
+// started, each with its own indexed `-tls*` and
+// `-httpListenAddr.useProxyProtocol` config (via `httpserver::serve_listener`).
 static HTTP_LISTEN_ADDR: Flag<ArrayString> = Flag::new(
     "httpListenAddr",
     "TCP address to listen for incoming http requests. See also -httpListenAddr.useProxyProtocol",

@@ -153,6 +153,14 @@ static TLS_ENABLE: Flag<ArrayBool> = Flag::new(
      -tlsCertFile and -tlsKeyFile must be set if -tls is set. See also -mtls",
     ArrayBool::default,
 );
+static USE_PROXY_PROTOCOL: Flag<ArrayBool> = Flag::new(
+    "httpListenAddr.useProxyProtocol",
+    "Whether to use proxy protocol for connections accepted at the given -httpListenAddr . \
+     See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt . \
+     With enabled proxy protocol http server cannot serve regular /metrics endpoint. \
+     Use -pushmetrics.url for metrics pushing",
+    ArrayBool::default,
+);
 static TLS_CERT_FILE: Flag<ArrayString> = Flag::new(
     "tlsCertFile",
     "Path to file with TLS certificate for the corresponding -httpListenAddr if -tls is set. \
@@ -1365,7 +1373,8 @@ where
     } else {
         None
     };
-    serve_with_tls(addr, tls_cfg, handler)
+    let use_proxy_protocol = USE_PROXY_PROTOCOL.get().get_optional_arg(listener_index);
+    serve_with_tls(addr, tls_cfg, use_proxy_protocol, handler)
 }
 
 /// [`serve`] with an explicit TLS server config (`None` = plain HTTP). Split
@@ -1374,6 +1383,7 @@ where
 fn serve_with_tls<H>(
     addr: &str,
     tls_cfg: Option<Arc<ServerConfig>>,
+    use_proxy_protocol: bool,
     handler: H,
 ) -> io::Result<ServerHandle>
 where
@@ -1431,7 +1441,13 @@ where
                                 break;
                             }
                             let _ = stream.set_nonblocking(false);
-                            handle_connection(stream, &*handler, &stop_w, tls_cfg.as_ref());
+                            handle_connection(
+                                stream,
+                                &*handler,
+                                &stop_w,
+                                tls_cfg.as_ref(),
+                                use_proxy_protocol,
+                            );
                         }
                         Err(_) => {
                             if stop_w.load(Ordering::SeqCst) {
@@ -1454,20 +1470,132 @@ where
     })
 }
 
+/// The 12-byte PROXY protocol v2 signature (`\r\n\r\n\0\r\nQUIT\n`).
+const PROXY_V2_SIGNATURE: [u8; 12] = [
+    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+];
+
+/// Reads a PROXY protocol v2 header from `r` and returns the real client
+/// `host:port`, or `None` for a LOCAL/UNSPEC header (keep the socket peer).
+/// Mirrors Go `netutil.readProxyProto` (v2 only; v1 is rejected).
+fn read_proxy_protocol_v2(r: &mut impl Read) -> Result<Option<String>, String> {
+    let mut hdr = [0u8; 16];
+    r.read_exact(&mut hdr)
+        .map_err(|e| format!("cannot read proxy protocol header: {e}"))?;
+    if hdr[..12] != PROXY_V2_SIGNATURE {
+        return Err("unexpected proxy protocol header signature".to_string());
+    }
+    let version = hdr[12] >> 4;
+    let command = hdr[12] & 0x0f;
+    let family = hdr[13] >> 4;
+    let proto = hdr[13] & 0x0f;
+    if version != 2 {
+        return Err(format!(
+            "unsupported proxy protocol version {version}; only v2 is supported"
+        ));
+    }
+    match (proto, command) {
+        (0, 0) => {} // UNSPEC + LOCAL (e.g. a load-balancer health check)
+        (1, _) => {} // TCP (STREAM)
+        _ => {
+            return Err(format!(
+                "unsupported proxy protocol proto {proto} / command {command}; \
+                 expecting proto 1, or proto 0 with command 0"
+            ));
+        }
+    }
+    let block_len = u16::from_be_bytes([hdr[14], hdr[15]]) as usize;
+    if block_len > 2048 {
+        return Err(format!(
+            "too big proxy protocol block length {block_len}; it must not exceed 2048 bytes"
+        ));
+    }
+    let mut block = vec![0u8; block_len];
+    r.read_exact(&mut block)
+        .map_err(|e| format!("cannot read proxy protocol block of {block_len} bytes: {e}"))?;
+    parse_proxy_v2_addr(command, family, &block)
+}
+
+/// Parses the address block of a PROXY v2 header into `host:port` (pure, for
+/// testing). Command 0 (LOCAL) yields `None`; the caller keeps the socket peer.
+fn parse_proxy_v2_addr(command: u8, family: u8, block: &[u8]) -> Result<Option<String>, String> {
+    match command {
+        // LOCAL: ignore the block, use the real sender address.
+        0 => Ok(None),
+        1 => match family {
+            1 => {
+                // IPv4 (AF_INET): src[4] dst[4] sport[2] dport[2].
+                if block.len() < 12 {
+                    return Err(format!(
+                        "cannot read ipv4 address from proxy protocol block of {} bytes; want >= 12",
+                        block.len()
+                    ));
+                }
+                let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    block[0], block[1], block[2], block[3],
+                ));
+                let port = u16::from_be_bytes([block[8], block[9]]);
+                Ok(Some(std::net::SocketAddr::new(ip, port).to_string()))
+            }
+            2 => {
+                // IPv6 (AF_INET6): src[16] dst[16] sport[2] dport[2].
+                if block.len() < 36 {
+                    return Err(format!(
+                        "cannot read ipv6 address from proxy protocol block of {} bytes; want >= 36",
+                        block.len()
+                    ));
+                }
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&block[..16]);
+                let ip = std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets));
+                let port = u16::from_be_bytes([block[32], block[33]]);
+                Ok(Some(std::net::SocketAddr::new(ip, port).to_string()))
+            }
+            _ => Err(format!(
+                "unsupported proxy protocol family {family}; supported: 1 (ipv4), 2 (ipv6)"
+            )),
+        },
+        _ => Err(format!(
+            "unsupported proxy protocol command {command}; supported: 0, 1"
+        )),
+    }
+}
+
 fn handle_connection<H>(
     stream: TcpStream,
     handler: &H,
     stop: &Arc<AtomicBool>,
     tls_cfg: Option<&Arc<ServerConfig>>,
+    use_proxy_protocol: bool,
 ) where
     H: Fn(&mut Request, &mut ResponseWriter),
 {
     let _ = stream.set_nodelay(true);
 
-    let remote_addr = stream
+    let mut remote_addr = stream
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
+
+    // PROXY protocol v2: the L4 proxy prepends a header carrying the real client
+    // address ahead of the TLS/HTTP bytes (Go netutil.newProxyProtocolConn, v2
+    // only). Read and strip it before the TLS/plain split; a LOCAL header (e.g.
+    // a health check) keeps the socket peer address. Bounded by a read timeout
+    // so a client that connects and never sends the header releases the worker.
+    if use_proxy_protocol {
+        let _ = stream.set_read_timeout(Some(TLS_HANDSHAKE_TIMEOUT));
+        match read_proxy_protocol_v2(&mut &stream) {
+            Ok(Some(client_addr)) => remote_addr = client_addr,
+            Ok(None) => {}
+            Err(err) => {
+                if !err.contains("unexpected end of file") {
+                    crate::warnf!("cannot read proxy protocol header from {remote_addr}: {err}");
+                }
+                return;
+            }
+        }
+        let _ = stream.set_read_timeout(None);
+    }
 
     let (conn_reader, conn_writer, chunk_stream) = match tls_cfg {
         None => {
@@ -2148,6 +2276,50 @@ mod tests {
     use std::net::TcpStream;
 
     #[test]
+    fn test_parse_proxy_v2_addr() {
+        // IPv4 PROXY command: src 1.2.3.4:4660 (0x1234), dst ignored.
+        let block = [1, 2, 3, 4, 5, 6, 7, 8, 0x12, 0x34, 0, 0];
+        assert_eq!(
+            parse_proxy_v2_addr(1, 1, &block).unwrap(),
+            Some("1.2.3.4:4660".to_string())
+        );
+        // LOCAL command (0) -> None regardless of the block.
+        assert_eq!(parse_proxy_v2_addr(0, 1, &block).unwrap(), None);
+        // A short IPv4 block is an error.
+        assert!(parse_proxy_v2_addr(1, 1, &block[..5]).is_err());
+        // Unknown family / command are errors.
+        assert!(parse_proxy_v2_addr(1, 9, &block).is_err());
+        assert!(parse_proxy_v2_addr(7, 1, &block).is_err());
+    }
+
+    #[test]
+    fn test_read_proxy_protocol_v2() {
+        // v2 PROXY over TCP/IPv4: src 10.0.0.7:8080.
+        let mut buf = PROXY_V2_SIGNATURE.to_vec();
+        buf.push(0x21); // version 2, command PROXY
+        buf.push(0x11); // AF_INET, STREAM
+        buf.extend_from_slice(&12u16.to_be_bytes());
+        buf.extend_from_slice(&[10, 0, 0, 7, 10, 0, 0, 1, 0x1F, 0x90, 0, 80]);
+        let mut cur = Cursor::new(buf);
+        assert_eq!(
+            read_proxy_protocol_v2(&mut cur).unwrap(),
+            Some("10.0.0.7:8080".to_string())
+        );
+
+        // v2 LOCAL header (health check) -> None (keep the socket peer).
+        let mut buf = PROXY_V2_SIGNATURE.to_vec();
+        buf.push(0x20); // version 2, command LOCAL
+        buf.push(0x00); // UNSPEC
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        let mut cur = Cursor::new(buf);
+        assert_eq!(read_proxy_protocol_v2(&mut cur).unwrap(), None);
+
+        // A bad signature is rejected (v1 is not supported).
+        let mut cur = Cursor::new(b"PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r\n".to_vec());
+        assert!(read_proxy_protocol_v2(&mut cur).is_err());
+    }
+
+    #[test]
     fn test_conn_timeout_with_jitter_bounds() {
         for _ in 0..200 {
             let d = conn_timeout_with_jitter();
@@ -2701,7 +2873,7 @@ mod tests {
     {
         let cfg =
             crate::tlsutil::get_server_tls_config(&fx.cert_path, &fx.key_path, "", &[]).unwrap();
-        serve_with_tls("127.0.0.1:0", Some(cfg), handler).unwrap()
+        serve_with_tls("127.0.0.1:0", Some(cfg), false, handler).unwrap()
     }
 
     /// Connects a TLS client (via tlsutil, trusting the fixture cert as CA)

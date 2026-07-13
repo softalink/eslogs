@@ -407,11 +407,12 @@ what remains in section (a) is confirmed-present divergence.
   content-type filter, `Vary`/`Content-Encoding`), and the per-connection
   timeout + jitter (`CONN_TIMEOUT`, `esm_http_conn_timeout_closed_conns_total`)
   is ported.
-- `es-logs/src/main.rs`, `esl-agent/src/main.rs` — `-httpListenAddr` now
-  accepts multiple addresses (an `ArrayString`), each started via
-  `httpserver::serve_listener` with its own indexed `-tls*` config. Only Go's
-  per-listener `-httpListenAddr.useProxyProtocol` (PROXY-protocol parsing on the
-  listener) remains unported.
+- `es-logs/src/main.rs`, `esl-agent/src/main.rs` — `-httpListenAddr` accepts
+  multiple addresses (an `ArrayString`), each started via
+  `httpserver::serve_listener` with its own indexed `-tls*` config and
+  `-httpListenAddr.useProxyProtocol` (PROXY protocol v2 is read and stripped
+  before the TLS/HTTP bytes, recovering the real client address; v1 is rejected,
+  matching Go's v2-only `netutil` implementation).
 - `httpserver.rs:644` — responses are buffered and sent with Content-Length
   instead of Go's streaming/flushing writer (except `/tail`'s `flush_chunk`);
   no mid-response abort. Same pattern at `esl-select/src/internalselect.rs:31`
