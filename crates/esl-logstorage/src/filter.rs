@@ -231,8 +231,7 @@ pub trait Filter: Send + Sync {
 /// render/re-parse rewrite of shared (`Arc`) filters in [`crate::if_filter`]
 /// and `pipe_filter`. Ported ahead of the shared-filter subquery-propagation
 /// wiring (an iff-nested `in(subquery)` sub-case that is still a ledger gap),
-/// so it has no caller yet.
-#[allow(dead_code)]
+/// the guard for pipe_filter's subquery propagation.
 pub(crate) fn filter_has_subqueries(f: &dyn Filter) -> bool {
     visit_filter_recursive(f, &mut |f| f.has_direct_subquery())
 }
