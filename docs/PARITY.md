@@ -246,40 +246,48 @@ file-by-file on 2026-07-12, after the final parity sweep closed
 `math`/`eval` parse grammar, `initStreamContextPipes` wiring on the local
 run-query path, and the shared `tryParseNumber` "inf" handling). "Full
 parity" is measured against section (a): every entry there is a way the Rust
-port can behave observably differently from upstream Go v1.51.0. Items marked
-*(verify)* are classified conservatively — they could not be proven identical
-and belong here until proven otherwise.
+port can behave observably differently from upstream Go v1.51.0. As of the
+2026-07-13 verification audit (below) every entry has been confirmed against
+the pinned Go checkout, so the earlier conservative *(verify)* tags are gone —
+what remains in section (a) is confirmed-present divergence.
 
-> **Ledger-closure wave (2026-07-13).** A subsequent wave closed a large batch
-> of section-(a) items: HTTP basic-auth/`-*AuthKey` enforcement; per-protocol
-> ingestion size caps + `CanWriteData` low-disk rejection + the
-> write-concurrency limiter; `replace`/`replace_regexp` `if (...)`; the
-> `rate()`/`rate_sum()` step init; `stats switch(...)`; `hiddenFieldsFilter`;
-> And/Or/Not paren rendering (fixing the facets re-parse wrong-result case);
-> filter/join/union **subquery propagation** (`Query::visit_subqueries` +
-> `AddTimeFilter`/`AddExtraFilters` descent); the regexutil Unicode
-> fold/`\p{}`/`\b` gaps; `pattern.rs` `\x`≥0x80 + the full HTML-entity table;
-> repeated-flag semantics, negative durations, `$__interval`, `-loggerTimezone`
-> (UTC/Local), the `-memory.allowedBytes` size suffixes; the missing
-> `process_*`/`filestream`/`fs` metric series; the internalselect concurrency
-> limiter; and eslogscli Ctrl+C query cancellation. Each is annotated at its
-> site. **Three items that had landed only partially are now all CLOSED**
-> (moved out of section-(a)):
-> (1) **CLOSED** — log deletion including stream-filtered rows now works (the
-> drop path's `add_field_if_needed` used the wrong canonicalizer so `_msg` was
-> never materialized; fixed to `get_canonical_column_name`, full Go delete test
-> passes);
-> (2) **CLOSED** — syslog idle-connection periodic flush now runs: the
-> stream-mode syslog path (`syslog_listeners::process_stream`) drives
-> `flush_if_idle` from a per-connection flusher thread (a `thread::scope`d
-> `AddJitterToDuration(1s)` ticker over an `mpsc` stopCh, mirroring Go's
-> `logMessageProcessor.initPeriodicFlush` for `isStreamMode=true`), so idle
-> stream connections flush on a timer instead of only on buffer-fill/disconnect;
-> (3) **CLOSED** — iff-nested subquery propagation now works: a pipe's
-> `if (...)` filter containing `in(subquery)` is visited by `visit_subqueries`
-> via `visit_subqueries_in_shared_filter` (`filter_has_subqueries` wired in
-> `pipe_filter`). A future audit should re-verify the remaining entries below
-> against shifted line numbers.
+> **Verification audit (2026-07-13).** Every remaining section-(a) bullet —
+> the 34 `*(verify)*` entries plus the untagged ones — was re-checked
+> file-by-file against the pinned Go v1.51.0 checkout. Section (a) below now
+> reflects only divergences confirmed to still exist in the current code; each
+> retained `*(verify)*` tag was resolved (kept as a confirmed divergence or
+> struck as at-parity), so the tag no longer appears.
+>
+> **Genuinely closed and struck** (code now matches Go): basic-auth/`-*AuthKey`
+> enforcement; `replace`/`replace_regexp` `if (...)`; `hiddenFieldsFilter`;
+> `!!foo` collapse; And/Or/Not paren rendering + pipe/stats-name token quoting
+> (fixing the facets re-parse case); the full HTML-entity table; `stats switch`
+> was *not* closed (see below); `block_stats` on-disk reporting; `min`/`max`
+> companion-field fast path; `quantile` fastrand port; `stddev` `Display`;
+> `uc`/`lc` simple case mapping; regexutil `\p{}`/`\b`; repeated-flag/negative-
+> duration/`$__interval` semantics; `-loggerTimezone` UTC/Local; `-memory.allowedBytes`
+> suffixes; the previously-missing `process_*`/`filestream`/`fs` metric series;
+> the internalselect concurrency limiter + its 10%-memory multipart bound;
+> storage-side httpAuth fallback; mergeset `isReadOnly` (Go never sets it);
+> `query_stats.writeToPipeProcessor`; and eslogscli Ctrl+C query cancellation.
+>
+> **Corrections to the prior (over-optimistic) closure note** — these were
+> claimed closed but the audit found them still OPEN, so they remain in
+> section (a): `rate()`/`rate_sum()` step init (still a stub); `stats switch(...)`
+> (still rejected); filter/join/union `AddTimeFilter`/`AddExtraFilters`
+> **subquery propagation** (still top-level only — the *iff-nested `in()`*
+> propagation via `visit_subqueries` did land, but the time/extra-filter descent
+> did not); per-protocol ingestion size caps (OTLP still uncapped);
+> `CanWriteData` (still missing on 6 ingest paths); `pattern.rs` `\x`≥0x80 (still
+> UTF-8-encoded).
+>
+> **Three items closed this session** (with tests): (1) log deletion including
+> stream-filtered rows (drop path used the wrong `_msg` canonicalizer; full Go
+> delete test passes); (2) syslog idle-connection periodic flush
+> (`syslog_listeners::process_stream` now drives `flush_if_idle` from a
+> `thread::scope`d `AddJitterToDuration(1s)` flusher over an `mpsc` stopCh,
+> mirroring Go's `initPeriodicFlush` for `isStreamMode=true`); (3) iff-nested
+> `in(subquery)` propagation via `visit_subqueries_in_shared_filter`.
 
 ### (a) Observable behavioral divergences
 
@@ -300,87 +308,57 @@ and belong here until proven otherwise.
   `filterTime`/`filterDayRange`/`filterWeekRange` bounds
   (`update_filter_with_time_offset` is a no-op).
 - `parser/query.rs:194` + `parser/query_stats.rs:127` —
-  `initStatsRateFuncSteps` is a stub; `rate()`/`rate_sum()` step
-  initialization is skipped, changing their computed values.
-- `parser/parse_pipe.rs:4` (+ `pipe_replace.rs:6`, `pipe_replace_regexp.rs:7`)
-  — `replace`/`replace_regexp` parse a leading `if (...)` and drop it: the
-  replacement runs unconditionally on every row and the `if` is omitted from
-  the rendered query.
-- `parser/parse_stats.rs:5` — `stats switch(...)` is rejected; Go accepts it.
-- `parser/parse_filter.rs:290` — `!!foo` is not collapsed to `foo` by
-  optimize (rendering + re-parse grouping differ).
-- `storage_search.rs:458` / `:619` — the `hiddenFieldsFilter` pass is unwired
-  (always empty): fields Go hides via `HiddenFieldsFilters` are returned.
-  Mirrored at the HTTP layer (`esl-select/src/logsql.rs:595/:760/:967`,
-  where `hidden_fields_filters` is parsed but unused).
-- `pipe_stream_context.rs` / `net_query_runner.rs` — `stream_context` is
-  wired only on the local `Storage::run_query` path; on the `NetQueryRunner`
-  local-pipes path (cluster seam, unreachable in the shipped single-node
-  binary) it errors instead of fetching surrounding logs.
+  `initStatsRateFuncSteps` is a stub (empty body; `step_seconds` stays 0.0);
+  `rate()`/`rate_sum()` skip the per-step divide, changing their values.
+- `parser/parse_stats.rs:240` — `stats switch(...)` is rejected (`not
+  supported by this port`); Go accepts it.
 - `pipe_stream_context.rs:190` — the surrounding-log fetch has no
   `stateSizeBudget`; Go errors when the fetch exceeds ~20% of memory, the
   port never does.
 - `pipe_stats.rs:28` — stats `stateSizeBudget`/cancel is dropped: at extreme
   group cardinality Go stops with a state-size error while the port keeps
   accumulating (fuller results or OOM).
-- `pipe_sort.rs:26/:536` *(verify)* — the sort OOM budget is charged per
-  block, not per value; borderline-memory sorts may error in one
-  implementation and not the other.
-- `pipe_union.rs:204` *(verify)* — a union subquery is not cancelled when the
-  downstream pipeline stops early (Go cancels via context).
-- `pipe_block_stats.rs:7/:101` — for persisted (file) parts, `block_stats`
-  reports `part_path`/`stream`/`column_type` as `"inmemory"` and zero
-  values/bloom/dict sizes; Go reports the real per-column on-disk data.
-- `stats_field_min.rs:7`, `stats_field_max.rs:4` — for a `_time` source
-  column the companion field is read at the true min/max row; Go reads it at
-  row 0 / the last row (Go's fast-path quirk). Companion values can differ.
-- `stats_quantile.rs:7` — reservoir sampling uses a different RNG than Go's
-  `fastrand`; approximate quantiles over >10,000 samples select different
-  survivors.
-- `stats_stddev.rs:6` — stddev renders via Rust shortest-round-trip `Display`
-  and may use exponent form at extreme magnitudes where Go's `'f'` format
-  never does.
-- `pipe_format.rs:333/:345` — `uc`/`lc` use full Unicode case mapping vs
-  Go's per-rune simple mapping (e.g. `ß` → `SS`).
+- `pipe_sort.rs:26/:536` — the sort state-size budget charges the copied
+  per-value byte lengths where Go charges the cloned block's buffer
+  capacities (and shares value bytes in the `byFields` path), so the port
+  accounts more memory per block and can cross the identical 20% threshold on
+  smaller input — a borderline sort errors in the port but not in Go.
+- `pipe_union.rs:204` — a union subquery is not cancelled when the downstream
+  pipeline stops early: the `RunUnionQueryFn` type carries no context/cancel
+  and the `stop` flag is dropped, so the subquery keeps running (Go cancels
+  via `contextutil.NewStopChanContext`).
 
 **LogsQL text rendering / round-trip (esl-logstorage)**
 
-- `filter_not.rs:22` (+ `parser/tests.rs:104/:128`) — `filterNot`/`filterAnd`/
-  `filterOr` `String()` omit Go's disambiguating parens; `!(foo or bar)` and
-  `a (b or c)` render without grouping. Because `Query::clone` and the pipe
-  clones round-trip through rendered text, this is not only cosmetic: e.g.
-  the facets pipeline re-parses the ungrouped text and can produce wrong
-  results (`esl-select/src/logsql_facets.rs:131`).
-- `parser/mod.rs:51` (+ `parser/tests.rs:142`) — the Display quoter omits
-  Go's `isPipeName`/`isStatsFuncName` checks; a phrase equal to a pipe or
-  stats-func name renders unquoted where Go quotes it.
-- `prefix_filter.rs:155` *(verify)* — quoted-list rendering uses Rust `{:?}`
-  instead of Go `strconv.Quote` (differs for non-ASCII/control chars).
-- `json_parser.rs:1147` *(verify)* — re-quoted object keys keep non-printable
-  non-ASCII runes raw where Go `\uXXXX`-escapes them.
-- `parser/mod.rs:194` *(verify)* — `string_range` upper-bound sentinel is
-  `U+10FFFF`×4 vs Go's `0xFF`×4 (edge-case inclusion difference).
-- `stream_filter.rs:339` *(verify)* — stream tag names equal to pipe/stats
-  names are not quoted in Display.
-- `stream_filter.rs:762/:843` *(verify)* — `is_go_print` approximates
-  `unicode.IsPrint`, and `\xNN` (≥0x80) decodes to a Unicode scalar instead
-  of Go's raw byte.
+- `json_parser.rs:1147` — re-quoted JSON object keys on the slow escape path
+  keep non-printable non-ASCII runes raw where Go's `strconv.AppendQuote`
+  `\uXXXX`-escapes them (reachable when a key both needs escaping and holds a
+  non-printable non-ASCII rune).
+- `stream_filter.rs:762/:843` — `is_go_print` approximates `unicode.IsPrint`
+  (format/surrogate/private-use/unassigned code points render raw where Go
+  escapes them), and `\xNN` (≥0x80) decodes to a Unicode scalar instead of
+  Go's raw byte.
 
 **Input handling edge cases (esl-logstorage)**
 
-- `json_parser.rs:322` *(verify)* — invalid UTF-8 in ingested JSON becomes
-  `U+FFFD` instead of Go's raw bytes. The same raw-byte-vs-lossy divergence
-  recurs across the ingestion surface: `arena.rs:67` (non-UTF-8 field value
-  panics — verify), `esl-insert/src/journald.rs:394`,
-  `esl-insert/src/loki_protobuf.rs:412`,
+- `json_parser.rs:322` — invalid UTF-8 in ingested data becomes `U+FFFD`
+  (Rust `from_utf8_lossy`) where Go preserves the raw bytes
+  (`bytesutil.ToUnsafeString`). The same raw-byte-vs-lossy divergence recurs
+  across the ingestion surface: `arena.rs:67` (lossy — does **not** panic, and
+  never triggers in-tree since all callers pass a valid `&str`),
+  `esl-insert/src/journald.rs:394`, `esl-insert/src/loki_protobuf.rs`
+  (`get_string_lossy`/`unquote_prefix` at :254/:316/:344/:477),
   `esl-agent/src/filecollector.rs:918`,
-  `esl-agent/src/kubernetescollector.rs:2336/:2434/:2654`,
-  `esl-common/src/easyproto.rs:314/:588` (protobuf strings with invalid
-  UTF-8 are rejected where Go accepts them).
+  `esl-agent/src/kubernetescollector.rs:2346/:2449/:2748`,
+  `esl-common/src/easyproto.rs` (`string()` :314 / `get_string` :610 **reject**
+  invalid UTF-8 where Go accepts it — reachable via the OTLP ingest path;
+  `string_lossy`/`get_string_lossy`/`bytes` are the opt-in raw alternatives).
 - `pattern.rs:373` — `extract` pattern `\x`/octal escapes ≥0x80 are
   UTF-8-encoded instead of emitting the raw byte.
-- `pattern.rs:501` — HTML-entity unescaping knows 6 named entities vs Go's
-  full (~2200-entry) table.
+- `parser/query.rs` `string_range` — the upper-bound sentinel is `U+10FFFF`×4
+  vs Go's `0xFF`×4, so a `string_range` filter's *matching* differs for stored
+  byte values in `0xF5..0xFF` (rendering is unaffected — the sentinel never
+  appears in `String()`).
 - `syslog_parser.rs:24/:571` — RFC3164 timestamps use a fixed UTC offset;
   DST/IANA zone rules are not applied. Related:
   `esl-insert/src/syslog_listeners.rs:368/:1658` — named IANA timezones are
@@ -388,126 +366,139 @@ and belong here until proven otherwise.
 
 **Storage engine (esl-logstorage)**
 
-- `datadb.rs:24` (+ `:633`, `block_stream_merger.rs:3`, `rows.rs:329`,
-  `storage.rs:523/:742/:179`) — **log deletion is not executed**: delete
-  tasks register and persist, but the `runDeleteTasksWatcher`/
-  `processDeleteTask` merge path that drops matching rows is deferred, so
-  deleted rows remain searchable.
-- `indexdb/mergeset/table.rs:23` *(verify)* — read-only mode / low-disk
-  parking (`isReadOnly`) is not ported for the mergeset table.
 - `indexdb/mergeset/table.rs:1438` — `DataBlocksCache*`/`IndexBlocksCache*`
   metrics are absent/zero (the global mergeset block caches are omitted).
 - `indexdb/mergeset/table.rs:440` — "skipping too long item" is logged
   unthrottled vs Go's 5s throttle.
-- `query_stats.rs:109` *(verify)* — `QueryStats.writeToPipeProcessor`
-  surface pending (per-query stats emission differences).
-- `encoding.rs:405` *(verify)* — zstd frames are produced by libzstd, not
-  klauspost/gozstd: fully interoperable, but stored bytes/sizes differ from
-  a Go-written directory (also `esl-common/src/encoding/zstd.rs:10/:53`).
-- `delete_task.rs:101` *(verify)* — an empty delete-task list serializes as
-  `[]` where Go writes `null` (on-disk JSON bytes differ; both readable).
-- `part_header.rs:139` *(verify)* — `metadata.json` parsing rejects unknown
-  members containing nested arrays/objects that Go skips.
-- `rows.rs:337` *(verify)* — duplicate field names sorted with a different
-  stability guarantee; tie order can differ.
+- `encoding.rs:405` — zstd frames are produced by libzstd, not klauspost's
+  pure-Go encoder (used by `CGO_ENABLED=0` release binaries), with different
+  level bucketing: fully interoperable (both emit standard zstd frames and
+  decode each other), but stored compressed bytes and part
+  `CompressedSizeBytes` differ from a Go-written directory (also
+  `esl-common/src/encoding/zstd.rs:10/:53`).
+- `delete_task.rs:101` — a genuinely nil delete-task list serializes as `[]`
+  where Go's `json.Marshal` writes `null` (on-disk bytes differ, both
+  readable; an empty-but-non-nil list is `[]` on both sides).
+- `part_header.rs:139` — `metadata.json` parsing rejects unknown members
+  containing nested arrays/objects that Go's `json.Unmarshal` skips
+  (forward-compat / hand-edited-file concern; unreachable via self-written
+  files, which hold only the known scalar fields).
+- `rows.rs:442` — duplicate field names are sorted stably (`sort_by`) where
+  Go uses unstable `sort.Slice`, so tie order can differ; Go's tie order is
+  unspecified, so this is a valid instance of Go's contract surfaced only by
+  a byte-exact differential over duplicate-name input.
 
 **HTTP server, TLS, flags, logging (esl-common)**
 
-- `httpserver.rs:41/:1375` — **HTTP auth is not enforced**: basic auth,
-  `-*AuthKey` (including `-metricsAuthKey`/`-flagsAuthKey`) and
-  `/debug/pprof` are omitted; all requests are allowed. gzip response
-  compression and connection-deadline jitter are also absent. Mirrored at
-  `esl-storage/src/lib.rs:639` (httpAuth fallback unported).
-- `httpserver.rs:479-620` *(verify)* — request-body gzip/zstd/deflate is
-  decompressed into memory without a cap before handler-level size checks
-  (Go caps during the read) — decompression-bomb exposure on insert paths.
+- `httpserver.rs:1375` — basic auth and the `-*AuthKey` flags
+  (`-metricsAuthKey`/`-flagsAuthKey`) ARE enforced (`check_basic_auth`/
+  `check_auth_flag`, with the storage-side fallback at
+  `esl-storage/src/lib.rs:639`); what remains unported is `/debug/pprof` +
+  `-pprofAuthKey`, gzip **response** compression, and connection-deadline
+  jitter.
+- `httpserver.rs:479-620` — request-body gzip/zstd/deflate is decompressed
+  into memory without a cap before the handler-level size check (Go caps
+  during the read via `GetLimitedReader`); the capped `read_full_body_limited`
+  exists but no production insert handler uses it — decompression-bomb
+  exposure on the Loki/DataDog/OTLP/Splunk/native insert paths.
 - `httpserver.rs:128` (+ `es-logs/src/main.rs:34`,
   `esl-agent/src/main.rs:8`) — `-httpListenAddr` accepts a single address;
   Go supports multiple listeners (+ `useProxyProtocol` per listener).
-- `httpserver.rs:644` *(verify)* — responses are buffered and sent with
-  Content-Length instead of Go's streaming writer (except `/tail`); no
-  mid-response abort. Same pattern at `esl-select/src/internalselect.rs:31`
+- `httpserver.rs:644` — responses are buffered and sent with Content-Length
+  instead of Go's streaming/flushing writer (except `/tail`'s `flush_chunk`);
+  no mid-response abort. Same pattern at `esl-select/src/internalselect.rs:31`
   and `esl-select/src/logsql.rs:998`.
-- `httpserver.rs:109` — extra 10s TLS-handshake timeout Go does not have.
-- `tlsutil.rs:9/:65` — TLS 1.0/1.1 unsupported (min version silently clamps
-  to 1.2); CBC/static-RSA cipher-suite names rejected; trust roots come from
-  bundled webpki-roots rather than the OS store.
-- `cgroup.rs:23`, `memory.rs:29`, `filestream.rs:4`, `fs/mod.rs:4` — several
-  Go-emitted metric series are missing (`process_cpu_cores_available`,
-  `process_memory_limit_bytes`, `*_filestream_*`, fs/nfs/mmapped series);
-  `flagutil.rs:112` — flag gauges cover only read/set flags, not all
-  declared flags. The whole namespace is intentionally rebranded
-  `vm_*`→`esm_*`.
-- `memory.rs:13` — `-memory.allowedBytes` rejects KB/MB/GiB suffixes.
-- `flagutil.rs:16` — repeated scalar flags keep the last value where Go
-  array flags append; `flagutil/array.rs:204/:376` — `\xHH` decode and
-  negative-duration clamping differ; `flagutil/duration.rs:233` — Grafana
-  `$__interval` pseudo-durations unsupported.
-- `flagutil/password.rs:19/:150/:162` — `http(s)://` password sources are
-  not fetched; Windows fallback password uses a non-crypto RNG *(verify)*.
-- `logger.rs:32/:147` — only UTC `-loggerTimezone` supported (others panic);
-  `:311/:500/:640` *(verify)* — arg-length truncation, multi-byte
-  truncation and error-writer caller location differ.
-- `stringsutil.rs:171` + `regexutil/gofold.rs:3` *(verify)* — Unicode
-  case-insensitive matching diverges from Go's simple folding for a handful
-  of code points (e.g. `İ`).
-- `regexutil.rs:10` (+ `goparse.rs:7`, `gosyntax.rs:123`) — `\p{...}`
-  classes are rejected (Go accepts); `\b` is Unicode-aware vs Go's ASCII;
-  `regexutil.rs:461/:597` — `MustCompile` returns an error instead of
-  panicking on those gaps; `gosyntax.rs:607` *(verify)* — simplified-regex
-  `String()` may differ for exotic code points.
-- `metrics/push.rs:444` *(verify)* — push-URL userinfo is not
-  percent-decoded before basic auth.
-- `fs/mod.rs:11` + `filestream.rs:152/:321` *(verify)* — file-close errors
-  are swallowed where Go panics; `fs/mod.rs:175` *(verify)* — directory
-  modes 0777&umask vs Go's 0755&umask.
-- `buildinfo.rs:40` *(verify)* — version line not prepended to `-help`
-  (also `es-logs/src/main.rs:199`, `eslogscli/src/main.rs:902`).
-- `appmetrics.rs:12`, `metrics/process_metrics_linux.rs:319` *(verify)* —
-  `vm_os_info`-equivalent lacks the Windows release label;
-  `process_start_time_seconds` derivation differs slightly.
+- `httpserver.rs:109` — extra 10s TLS-handshake timeout Go does not have
+  (imposed by the fixed worker pool).
+- `flagutil.rs:112` — flag gauges cover only read/set flags, not all declared
+  flags (Go's `VisitAll`). The metric namespace is intentionally rebranded
+  `vm_*`→`esm_*`. (The previously-missing `process_cpu_cores_available`,
+  `process_memory_limit_bytes`, `*_filestream_*`, and fs/nfs/mmapped series
+  are now registered.)
+- `flagutil/password.rs:19/:150` — `http(s)://` password sources are not
+  fetched; and the non-Unix fallback password uses a non-crypto RNG
+  (SipHash/clock-seeded) where Go always reads `crypto/rand` and panics on
+  failure.
+- `logger.rs:147` — arbitrary IANA `-loggerTimezone` values panic (`UTC` and
+  `Local` are handled); `:311/:500/:640` — per-arg length truncation,
+  multi-byte truncation (lossy `U+FFFD` vs Go's raw byte slice), and the
+  error-writer caller location differ.
+- `regexutil/gosyntax.rs:607` — the simplified-regex `String()` escapes via a
+  looser `is_print` than Go's `unicode.IsPrint`, so the serialized (internal)
+  suffix text differs for format/exotic code points; matches are unaffected —
+  both re-parse to the same matcher. `regexutil.rs:461/:597` — `MustCompile`
+  returns an error instead of panicking (deliberate: no `expect`-panic API).
+  (`\p{...}` classes are now accepted and `\b` is ASCII like Go.)
+- `metrics/push.rs:444` — push-URL userinfo is base64'd raw, not
+  percent-decoded first, so `%`-escaped credentials produce a different basic
+  auth header than Go's `url.Parse`.
+- `fs/mod.rs:11` + `filestream.rs:215/:389` — file-close errors are swallowed
+  (file closed on `Drop`) where Go's `MustClose` panics; `fs/mod.rs:243` —
+  `create_dir_all` uses `0777&umask` vs Go's explicit `0755&umask` (identical
+  under the default umask 022; differs under a permissive umask).
+- `buildinfo.rs:40` — the version line is not prepended to `-help`/usage
+  output (also `es-logs/src/main.rs:203`, `eslogscli/src/main.rs:1073`).
+- `appmetrics.rs:12`, `metrics/process_metrics_linux.rs:319` — the
+  `vm_os_info`-equivalent lacks the Windows release label (Linux uname is at
+  parity); `process_start_time_seconds` is derived from the exact kernel start
+  (`/proc` btime+starttime) vs Go's package-init `time.Now()` approximation.
+- `tlsutil.rs:9/:65` *(deliberate — rustls-imposed)* — TLS 1.0/1.1
+  unsupported (min version clamps to 1.2); CBC/static-RSA cipher-suite names
+  rejected; trust roots come from bundled webpki-roots rather than the OS
+  store.
 
 **Ingestion protections (esl-insert)**
 
-- `common_params.rs:5` (+ `datadog.rs:13`, `journald.rs:13`, `otel.rs:77`,
-  `syslog_listeners.rs:11/:1083`) — Go's `CanWriteData()` gate is never
-  called: ingestion does not reject when storage is read-only/out of disk.
-- `loki.rs:127`, `datadog.rs:7`, `otel.rs:93`, `loki_protobuf.rs:28/:104` —
-  `-*.maxRequestSize` caps are missing (Loki JSON, DataDog, OTLP) or only
-  enforced on the snappy path (Loki protobuf).
-- `journald.rs:13`, `syslog_listeners.rs:30/:1112` — the
-  `writeconcurrencylimiter` backpressure/queueing layer is not ported.
-- `syslog_listeners.rs:25/:445/:539/:806` *(verify)* — unix-socket listeners
-  are `cfg(unix)`-only, UDP4/TCP6 network selection flags are not honored,
-  and unrecoverable accept errors back off instead of `Fatalf`.
+- `common_params.rs:312` — the `can_write_data()` (read-only / out-of-disk)
+  gate is called on the Elasticsearch/Loki/jsonline/DataDog/Loki-protobuf
+  paths but is still MISSING on splunk, native-insert, OTLP, journald, syslog,
+  and internal-insert (Go calls it on every ingest path).
+- `otel.rs:93` — the OTLP ingest path has no `-*.maxRequestSize` cap (Loki
+  JSON, DataDog, and both Loki-protobuf paths now enforce
+  `check_max_request_size`).
+- `journald.rs:13` — the journald HTTP ingest omits the otherwise-ported
+  `writeconcurrencylimiter` backpressure layer Go applies; the syslog stream
+  path also omits it but is at parity there (ingestion is bounded by the
+  listener/reader thread pool instead).
+- `syslog_listeners.rs:25/:445/:539/:806` — unix-socket listeners are
+  `cfg(unix)`-only, UDP4/TCP6 network-selection flags (`-enableTCP6`) are not
+  honored (the stack is derived from the bind address), and unrecoverable
+  accept errors back off instead of `Fatalf`.
 
 **Query serving, agent, tools (esl-select / esl-storage / esl-agent / CLIs)**
 
-- `esl-select/src/internalselect.rs:5` —
-  `-internalselect.maxConcurrentRequests` limiter and its wait-summary
-  metric are dropped.
-- `esl-select/src/internalselect.rs:197` *(verify)* — multipart form parsing
-  lacks Go's 10%-of-memory bound.
-- `esl-select/src/logsql.rs:673/:760` *(verify)* —
-  `-search.maxQueryTimeRange` cannot be enabled (flag unported).
-- `esl-select/src/esmui_assets.rs:10/:117` *(verify, low)* — esmui static
-  serving lacks ETag/Last-Modified/ranges; redirect keeps the raw query
-  string.
-- `esl-storage/src/lib.rs:783` *(verify)* — snapshots created for a
-  disconnected client are kept (Go deletes them).
-- `esl-agent/src/remotewrite.rs:225/:750/:147/:22` — `-remoteWrite.oauth2.*`
-  and `-remoteWrite.proxyURL` are unsupported (fatal when set);
-  `tlsHandshakeTimeout` folds into `sendTimeout` *(verify)*; shutdown grace
-  differs *(verify)*.
-- `esl-agent/src/filecollector.rs:330` *(verify)* — stricter glob validation
-  than doublestar.
-- `esl-agent/src/kubernetescollector.rs:18` *(verify)* — kubeconfig parsed
-  with a minimal YAML subset.
-- `eslogscli/src/main.rs:263/:169/:829`, `less_wrapper.rs:12/:97` — Ctrl+C
-  kills the process instead of cancelling the in-flight query / returning to
-  the prompt; no raw-mode line editing; Windows prints without paging.
-- `eslogsgenerator/src/main.rs:600` *(verify)* — generator pushes over
-  http:// only; query params not canonically encoded.
+- `esl-select/src/logsql.rs:673/:760` — `-search.maxQueryTimeRange` cannot be
+  enabled (the flag is unported); default behavior matches (disabled), but the
+  configuration capability is missing.
+- `esl-select/src/esmui_assets.rs:10/:117` *(low)* — esmui static serving
+  answers a `Range:` request with a full 200 instead of 206, and the vmui
+  redirect appends the raw query string rather than Go's sorted/percent-encoded
+  `Form.Encode()`. (The ETag/Last-Modified sub-claim is moot — Go's embedded
+  `FileServer` emits neither.)
+- `esl-storage/src/lib.rs:783` — snapshots created for a client that has
+  already disconnected are kept; Go checks `r.Context().Err()` and deletes
+  them (the port has no client-disconnect signal on this path).
+- `esl-agent/src/remotewrite.rs:759/:1054` — `-remoteWrite.oauth2.*` (Err
+  "not supported") and `-remoteWrite.proxyURL` (`fatalf!`) are unsupported;
+  `-remoteWrite.tlsHandshakeTimeout` folds into `sendTimeout` (one connection
+  per request, no separate handshake timeout); and shutdown abandons an
+  in-flight request after the full `sendTimeout` rather than Go's fixed 5s
+  grace.
+- `esl-agent/src/filecollector.rs:330` — pattern validation always scans the
+  whole glob, so malformed patterns that Go's `doublestar.PathMatch` accepts
+  (early-segment short-circuit) are rejected as `ErrBadPattern` (malformed
+  configs only).
+- `esl-agent/src/kubernetescollector.rs:18` — kubeconfig is parsed with a
+  hand-written minimal block-style YAML subset; files using flow-style,
+  anchors/aliases, or quoted/multiline scalars parse in Go but fail here
+  (plain block-style files parse identically).
+- `eslogscli/src/main.rs` (`less_wrapper.rs:103`) — no raw-mode line editing,
+  and Windows prints without paging. (Ctrl+C now cancels the in-flight query
+  and returns to the prompt instead of killing the process.)
+- `eslogsgenerator/src/main.rs:600` — the generator pushes over `http://` only
+  (rejects `https://`) and keeps the original query order/encoding instead of
+  Go's sorted `url.Values.Encode()` (e.g. a literal comma in
+  `_stream_fields`).
 
 ### (b) Mechanism divergences (identical observable behavior)
 
