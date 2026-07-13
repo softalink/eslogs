@@ -311,7 +311,14 @@ what remains in section (a) is confirmed-present divergence.
   queries that set it get unfiltered results.
 - `parser/query.rs:982`, `parser/query.rs:1033` — query options are not
   inherited into nested subqueries (Go pushes the options stack); subqueries
-  run with default options.
+  run with default options. Because the subquery-propagation of
+  `AddTimeFilter` re-parses each subquery from its rendered text (which does
+  not render inherited options), a subquery whose *parent* set
+  `options(ignore_global_time_filter=true)` but which does not set it itself
+  still receives the propagated `_time` filter, where Go's inherited option
+  suppresses it. (A faithful fix needs the option stack threaded through the
+  `visit_subqueries` re-parse — a change across all 24 `visit_subqueries_mut`
+  impls, deferred.)
 - `parser/query.rs:1011` — `options(time_offset=...)` does not shift
   `filterTime`/`filterDayRange`/`filterWeekRange` bounds
   (`update_filter_with_time_offset` is a no-op).
