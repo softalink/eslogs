@@ -52,6 +52,10 @@ impl StatsFunc for StatsRateSum {
             step_seconds: self.step_seconds,
         })
     }
+
+    fn set_rate_step_seconds(&mut self, step_seconds: f64) {
+        self.step_seconds = step_seconds;
+    }
 }
 
 #[derive(Default, Debug)]

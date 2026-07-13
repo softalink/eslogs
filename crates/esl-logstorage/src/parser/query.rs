@@ -217,7 +217,33 @@ impl Query {
 
     /// PORT NOTE: Go `initStatsRateFuncSteps` requires downcasting pipes to
     /// `pipeStats`; deferred (execution-only, does not affect `String()`).
-    fn init_stats_rate_func_steps(&mut self) {}
+    /// Initializes the `rate()`/`rate_sum()` per-second step for this query and
+    /// all of its subqueries (Go `Query.initStatsRateFuncSteps`).
+    fn init_stats_rate_func_steps(&mut self) {
+        self.visit_subqueries(&mut |q| q.init_stats_rate_func_steps_no_subqueries());
+    }
+
+    /// Computes the rate step from this query's `_time` filter range and applies
+    /// it to each `| stats ...` pipe (Go
+    /// `Query.initStatsRateFuncStepsNoSubqueries`).
+    fn init_stats_rate_func_steps_no_subqueries(&mut self) {
+        let (start, end) = self.get_filter_time_range();
+        let mut step: i64 = 0;
+        if start != i64::MIN && end != i64::MAX {
+            // The HTTP layer already turned the exclusive end into end-1 and the
+            // `_time` filter is inclusive, so (end - start) is 1ns short of the
+            // real window; `+ 1` adds that nanosecond back (Go's `step++`).
+            //
+            // Go computes this in wrapping int64 arithmetic; a range wide enough
+            // to overflow wraps to a non-positive `step`, which `init_rate_funcs`
+            // then ignores (its `step <= 0` guard), so no rate normalization is
+            // applied — matching Go rather than panicking in debug builds.
+            step = end.wrapping_sub(start).wrapping_add(1);
+        }
+        for p in &mut self.pipes {
+            p.init_stats_rate_funcs(step);
+        }
+    }
 
     /// Returns the parsed pipe chain (Go accesses `q.pipes` directly).
     pub fn pipes(&self) -> &[Box<dyn Pipe>] {
@@ -402,7 +428,9 @@ impl Query {
         let f = std::mem::replace(&mut self.f, Box::new(crate::filter_noop::new_filter_noop()));
         self.f = add_time_filter(f, start, end, self.opts.time_offset);
 
-        self.init_stats_rate_func_steps();
+        // Go `addTimeFilterNoSubqueries` recomputes the rate step from the
+        // newly-added `_time` range for this query's own pipes.
+        self.init_stats_rate_func_steps_no_subqueries();
     }
 
     /// Adds `extra_filters` to q (Go `AddExtraFilters`).

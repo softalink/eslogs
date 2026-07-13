@@ -343,6 +343,13 @@ pub trait Pipe: Send + Sync {
     /// a `| stats ...` pipe. Default: no-op for all other pipes.
     fn stats_add_by_time_field(&mut self, _step: i64, _offset: i64) {}
 
+    /// `Query::init_stats_rate_func_steps` support (Go
+    /// `pipeStats.initRateFuncs`/`initRateFuncsFromTimeBucket`): sets the
+    /// per-second step on the `rate()`/`rate_sum()` funcs of a `| stats ...`
+    /// pipe, preferring an explicit `_time` bucket over the query time range.
+    /// Default: no-op for all other pipes.
+    fn init_stats_rate_funcs(&mut self, _step: i64) {}
+
     /// `Query::get_stats_labels*` support (Go `Query.addPartitionByTime`):
     /// adds `partition by (_time)` to `sort` / `first` / `last` pipes.
     /// Default: no-op for all other pipes.

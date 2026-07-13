@@ -62,6 +62,11 @@ pub trait StatsFunc: Send + Sync {
     fn is_row_label(&self) -> bool {
         false
     }
+
+    /// Sets the per-second step used to normalize `rate()`/`rate_sum()`
+    /// (Go `pipeStats.initRateFuncs`'s `case *statsRate/*statsRateSum:
+    /// t.stepSeconds = ...`). Default: no-op for all other stats functions.
+    fn set_rate_step_seconds(&mut self, _step_seconds: f64) {}
 }
 
 /// Accumulates the running state for one [`StatsFunc`] over one group of rows.

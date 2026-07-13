@@ -121,6 +121,44 @@ impl PipeStats {
     pub(crate) fn set_mode(&mut self, mode: PipeStatsMode) {
         self.mode = mode;
     }
+
+    /// Sets the per-second step (`step / 1e9`) on every `rate()`/`rate_sum()`
+    /// func of this pipe (Go `pipeStats.initRateFuncs`).
+    ///
+    /// PORT NOTE: called from `Query::init_stats_rate_func_steps` right after
+    /// parse, before the `funcs` Arc is shared into processor shards, so it is
+    /// uniquely owned and `Arc::get_mut` succeeds — matching Go's in-place
+    /// mutation of `ps.funcs`.
+    fn init_rate_funcs(&mut self, step: i64) {
+        if step <= 0 {
+            return;
+        }
+        let step_seconds = step as f64 / 1e9;
+        if let Some(funcs) = Arc::get_mut(&mut self.funcs) {
+            for f in funcs.iter_mut() {
+                f.f.set_rate_step_seconds(step_seconds);
+            }
+        }
+    }
+
+    /// If a `_time` by-field has an explicit bucket size, uses it as the rate
+    /// step and returns true (Go `pipeStats.initRateFuncsFromTimeBucket`).
+    fn init_rate_funcs_from_time_bucket(&mut self) -> bool {
+        let bucket = self.by_fields.iter().find_map(|bf| {
+            if bf.name == "_time" && bf.bucket_size > 0.0 {
+                Some(bf.bucket_size as i64)
+            } else {
+                None
+            }
+        });
+        match bucket {
+            Some(b) => {
+                self.init_rate_funcs(b);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Builds a [`ByStatsField`] with no bucket configuration (the common
@@ -402,6 +440,12 @@ impl Pipe for PipeStats {
         }
 
         self.by_fields = Arc::new(dst_fields);
+    }
+
+    fn init_stats_rate_funcs(&mut self, step: i64) {
+        if !self.init_rate_funcs_from_time_bucket() {
+            self.init_rate_funcs(step);
+        }
     }
 
     /// Port of Go `pipeStats.resultFields`.
@@ -1025,6 +1069,66 @@ mod tests {
         assert_eq!(out[0].len(), 1);
         assert_eq!(out[0][0].name, "rows");
         assert_eq!(out[0][0].value, "3");
+    }
+
+    // `init_stats_rate_funcs` propagates the per-second step to rate() funcs so
+    // the processor normalizes the row count (Go `initRateFuncs`). step = 3s in
+    // nanos over 3 rows -> rate = 3 / 3 = 1.
+    #[test]
+    fn test_stats_rate_step_applied() {
+        let mut ps = new_pipe_stats(
+            vec![],
+            vec![new_pipe_stats_func(
+                Box::new(crate::stats_rate::new_stats_rate()),
+                None,
+                "r".to_string(),
+            )],
+        )
+        .unwrap();
+        ps.init_stats_rate_funcs(3_000_000_000);
+        let blocks = vec![vec![
+            vec![field("a", "1")],
+            vec![field("a", "2")],
+            vec![field("a", "3")],
+        ]];
+        let out = run(&ps, blocks);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0][0].name, "r");
+        assert_eq!(out[0][0].value, "1");
+    }
+
+    // An explicit `_time` bucket wins over the query-range step
+    // (Go `initRateFuncsFromTimeBucket`): a 2s `_time` bucket over 4 rows
+    // yields rate = 4 / 2 = 2, ignoring the passed 4s step.
+    #[test]
+    fn test_stats_rate_step_from_time_bucket() {
+        let mut time_bucket = new_by_stats_field("_time");
+        time_bucket.bucket_size_str = "2000000000".to_string();
+        time_bucket.bucket_size = 2_000_000_000.0;
+        let mut ps = new_pipe_stats(
+            vec![time_bucket],
+            vec![new_pipe_stats_func(
+                Box::new(crate::stats_rate::new_stats_rate()),
+                None,
+                "r".to_string(),
+            )],
+        )
+        .unwrap();
+        // Passed step is 4s, but the 2s _time bucket takes precedence.
+        ps.init_stats_rate_funcs(4_000_000_000);
+        let blocks = vec![vec![
+            vec![field("_time", "1000000000")],
+            vec![field("_time", "1000000001")],
+            vec![field("_time", "1000000002")],
+            vec![field("_time", "1000000003")],
+        ]];
+        let out = run(&ps, blocks);
+        // One group (the single 2s bucket): rate = 4 / 2 = 2.
+        let r = out
+            .iter()
+            .find_map(|row| row.iter().find(|f| f.name == "r"))
+            .expect("rate column present");
+        assert_eq!(r.value, "2");
     }
 
     // Global count over zero rows must still emit a single `0` row.

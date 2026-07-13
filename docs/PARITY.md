@@ -273,7 +273,7 @@ what remains in section (a) is confirmed-present divergence.
 >
 > **Corrections to the prior (over-optimistic) closure note** — these were
 > claimed closed but the audit found them still OPEN, so they remain in
-> section (a): `rate()`/`rate_sum()` step init (still a stub); `stats switch(...)`
+> section (a): `stats switch(...)`
 > (still rejected); filter/join/union `AddTimeFilter`/`AddExtraFilters`
 > **subquery propagation** (still top-level only — the *iff-nested `in()`*
 > propagation via `visit_subqueries` did land, but the time/extra-filter descent
@@ -293,7 +293,12 @@ what remains in section (a) is confirmed-present divergence.
 > (Loki/DataDog/OTLP/Splunk/native/internal) now reads through
 > `read_full_body_limited`, which caps the decompressed size *during* the read
 > like Go's `ReadUncompressedData` — closing the decompression-bomb exposure
-> where the body was fully materialized before the size check.
+> where the body was fully materialized before the size check; (7)
+> `rate()`/`rate_sum()` now receive their per-second step (Go
+> `initStatsRateFuncSteps` → `pipeStats.initRateFuncs`, wired through
+> object-safe `Pipe`/`StatsFunc` hooks and applied for both parse-time `_time`
+> filters and HTTP `AddTimeFilter`), so their computed values are normalized
+> like Go instead of skipping the divide.
 
 ### (a) Observable behavioral divergences
 
@@ -313,9 +318,6 @@ what remains in section (a) is confirmed-present divergence.
 - `parser/query.rs:1011` — `options(time_offset=...)` does not shift
   `filterTime`/`filterDayRange`/`filterWeekRange` bounds
   (`update_filter_with_time_offset` is a no-op).
-- `parser/query.rs:194` + `parser/query_stats.rs:127` —
-  `initStatsRateFuncSteps` is a stub (empty body; `step_seconds` stays 0.0);
-  `rate()`/`rate_sum()` skip the per-step divide, changing their values.
 - `parser/parse_stats.rs:240` — `stats switch(...)` is rejected (`not
   supported by this port`); Go accepts it.
 - `pipe_stream_context.rs:190` — the surrounding-log fetch has no
