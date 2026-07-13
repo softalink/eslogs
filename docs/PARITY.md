@@ -391,8 +391,9 @@ what remains in section (a) is confirmed-present divergence.
   (`-metricsAuthKey`/`-flagsAuthKey`) ARE enforced (`check_basic_auth`/
   `check_auth_flag`, with the storage-side fallback at
   `esl-storage/src/lib.rs:639`); what remains unported is `/debug/pprof` +
-  `-pprofAuthKey`, gzip **response** compression, and connection-deadline
-  jitter.
+  `-pprofAuthKey` and connection-deadline jitter. (gzip **response**
+  compression now matches Go's gzhttp wrapper — 1024-byte min, content-type
+  filter, `Vary`/`Content-Encoding` on the buffered `finish` path.)
 - `httpserver.rs:128` (+ `es-logs/src/main.rs:34`,
   `esl-agent/src/main.rs:8`) — `-httpListenAddr` accepts a single address;
   Go supports multiple listeners (+ `useProxyProtocol` per listener).

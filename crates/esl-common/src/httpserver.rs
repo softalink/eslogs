@@ -892,6 +892,55 @@ fn wrap_body<'a>(t: Transfer<'a>, encoding: &str) -> io::Result<Body<'a>> {
 /// hook needed by long-lived endpoints (`/select/logsql/tail`): it switches the
 /// response to `Transfer-Encoding: chunked` and pushes the buffered body to the
 /// client mid-handler (mirroring Go's `http.Flusher`).
+/// gzhttp `DefaultMinSize`: responses smaller than this are not gzipped.
+const GZIP_MIN_SIZE: usize = 1024;
+
+/// True when `Accept-Encoding` allows gzip (a `gzip`/`*` token with a non-zero
+/// q-value), mirroring Go's gzhttp `acceptsGzip`.
+fn accept_encoding_allows_gzip(accept_encoding: &str) -> bool {
+    for part in accept_encoding.split(',') {
+        let part = part.trim();
+        let (coding, q) = match part.split_once(';') {
+            Some((c, params)) => (c.trim(), parse_encoding_q(params)),
+            None => (part, 1.0f64),
+        };
+        if (coding.eq_ignore_ascii_case("gzip") || coding == "*") && q > 0.0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parses the `q=` weight from `Accept-Encoding` params (defaults to 1.0).
+fn parse_encoding_q(params: &str) -> f64 {
+    for p in params.split(';') {
+        if let Some(qv) = p.trim().strip_prefix("q=") {
+            return qv.trim().parse::<f64>().unwrap_or(1.0);
+        }
+    }
+    1.0
+}
+
+/// Port of gzhttp `DefaultContentTypeFilter`: compress unless the content type
+/// names an already-compressed audio/video/archive format.
+fn gzip_content_type_allowed(content_type: &str) -> bool {
+    let ct = content_type.trim().to_ascii_lowercase();
+    if ct.is_empty() {
+        return true;
+    }
+    const EXCLUDE_CONTAINS: [&str; 8] = [
+        "compress", "zip", "snappy", "lzma", "xz", "zstd", "brotli", "stuffit",
+    ];
+    const EXCLUDE_PREFIX: [&str; 3] = ["video/", "audio/", "image/jp"];
+    if EXCLUDE_CONTAINS.iter().any(|s| ct.contains(s)) {
+        return false;
+    }
+    if EXCLUDE_PREFIX.iter().any(|p| ct.starts_with(p)) {
+        return false;
+    }
+    true
+}
+
 pub struct ResponseWriter {
     status: u16,
     headers: Vec<(String, String)>,
@@ -903,6 +952,10 @@ pub struct ResponseWriter {
     stream: Option<ChunkStream>,
     stop: Option<Arc<AtomicBool>>,
     streaming_started: bool,
+    /// True when the request's `Accept-Encoding` allows gzip; set by the server
+    /// connection loop so [`Self::finish`] can gzip the buffered response (Go
+    /// lib/httpserver's gzhttp wrapper).
+    accept_gzip: bool,
 }
 
 impl Default for ResponseWriter {
@@ -920,6 +973,7 @@ impl ResponseWriter {
             stream: None,
             stop: None,
             streaming_started: false,
+            accept_gzip: false,
         }
     }
 
@@ -1099,6 +1153,31 @@ impl ResponseWriter {
             stream.write_all(&tail)?;
             return stream.flush();
         }
+        // gzip the buffered body when the client accepts it and gzhttp's policy
+        // applies (min size, content-type filter, no pre-existing
+        // Content-Encoding) — Go lib/httpserver's gzhttp wrapper.
+        let content_type = self
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let has_content_encoding = self
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"));
+        let gzip = self.accept_gzip
+            && !has_content_encoding
+            && self.body.len() >= GZIP_MIN_SIZE
+            && gzip_content_type_allowed(content_type);
+        let body: std::borrow::Cow<'_, [u8]> = if gzip {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
+            enc.write_all(&self.body)?;
+            std::borrow::Cow::Owned(enc.finish()?)
+        } else {
+            std::borrow::Cow::Borrowed(&self.body)
+        };
+
         write!(
             w,
             "HTTP/1.1 {} {}\r\n",
@@ -1109,13 +1188,23 @@ impl ResponseWriter {
             if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("connection") {
                 continue;
             }
+            // The gzip branch writes its own Content-Encoding/Vary below.
+            if gzip
+                && (k.eq_ignore_ascii_case("content-encoding") || k.eq_ignore_ascii_case("vary"))
+            {
+                continue;
+            }
             write!(w, "{k}: {v}\r\n")?;
         }
-        write!(w, "Content-Length: {}\r\n", self.body.len())?;
+        if gzip {
+            write!(w, "Content-Encoding: gzip\r\n")?;
+            write!(w, "Vary: Accept-Encoding\r\n")?;
+        }
+        write!(w, "Content-Length: {}\r\n", body.len())?;
         let conn = if keep_alive { "keep-alive" } else { "close" };
         write!(w, "Connection: {conn}\r\n")?;
         w.write_all(b"\r\n")?;
-        w.write_all(&self.body)?;
+        w.write_all(&body)?;
         Ok(())
     }
 }
@@ -1427,6 +1516,7 @@ fn handle_connection<H>(
             rw.stream = Some(cs.clone());
             rw.stop = Some(Arc::clone(stop));
         }
+        rw.accept_gzip = accept_encoding_allows_gzip(req.header("Accept-Encoding"));
 
         if req.method() == "OPTIONS" {
             enable_cors(&mut rw);
@@ -1968,6 +2058,81 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::net::TcpStream;
+
+    #[test]
+    fn test_accept_encoding_allows_gzip() {
+        assert!(accept_encoding_allows_gzip("gzip"));
+        assert!(accept_encoding_allows_gzip("gzip, deflate"));
+        assert!(accept_encoding_allows_gzip("deflate, gzip;q=0.8"));
+        assert!(accept_encoding_allows_gzip("*"));
+        assert!(!accept_encoding_allows_gzip(""));
+        assert!(!accept_encoding_allows_gzip("deflate"));
+        assert!(!accept_encoding_allows_gzip("gzip;q=0"));
+    }
+
+    #[test]
+    fn test_gzip_content_type_allowed() {
+        assert!(gzip_content_type_allowed(""));
+        assert!(gzip_content_type_allowed("application/json"));
+        assert!(gzip_content_type_allowed("text/plain; charset=utf-8"));
+        assert!(!gzip_content_type_allowed("image/jpeg"));
+        assert!(!gzip_content_type_allowed("video/mp4"));
+        assert!(!gzip_content_type_allowed("application/zip"));
+        assert!(!gzip_content_type_allowed("application/zstd"));
+    }
+
+    #[test]
+    fn test_finish_gzips_large_response() {
+        let mut rw = ResponseWriter::new();
+        rw.accept_gzip = true;
+        rw.set_header("Content-Type", "application/json");
+        rw.write_all(&vec![b'a'; 2048]).unwrap();
+        let mut out = Vec::new();
+        rw.finish(&mut out, false).unwrap();
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(
+            out_str.contains("Content-Encoding: gzip"),
+            "expected gzip header"
+        );
+        assert!(out_str.contains("Vary: Accept-Encoding"));
+        // The body after the header separator starts with the gzip magic bytes.
+        let sep = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(
+            &out[sep..sep + 2],
+            &[0x1f, 0x8b],
+            "body must be gzip-framed"
+        );
+    }
+
+    #[test]
+    fn test_finish_no_gzip_for_small_or_excluded() {
+        // Below the 1024-byte minimum: not gzipped.
+        let mut rw = ResponseWriter::new();
+        rw.accept_gzip = true;
+        rw.set_header("Content-Type", "application/json");
+        rw.write_all(b"small").unwrap();
+        let mut out = Vec::new();
+        rw.finish(&mut out, false).unwrap();
+        assert!(!String::from_utf8_lossy(&out).contains("Content-Encoding: gzip"));
+
+        // Excluded content type: not gzipped even when large.
+        let mut rw = ResponseWriter::new();
+        rw.accept_gzip = true;
+        rw.set_header("Content-Type", "image/jpeg");
+        rw.write_all(&vec![b'a'; 2048]).unwrap();
+        let mut out = Vec::new();
+        rw.finish(&mut out, false).unwrap();
+        assert!(!String::from_utf8_lossy(&out).contains("Content-Encoding: gzip"));
+
+        // Client does not accept gzip: not gzipped.
+        let mut rw = ResponseWriter::new();
+        rw.accept_gzip = false;
+        rw.set_header("Content-Type", "application/json");
+        rw.write_all(&vec![b'a'; 2048]).unwrap();
+        let mut out = Vec::new();
+        rw.finish(&mut out, false).unwrap();
+        assert!(!String::from_utf8_lossy(&out).contains("Content-Encoding: gzip"));
+    }
 
     // --- httputil helpers over Request -------------------------------------
 
