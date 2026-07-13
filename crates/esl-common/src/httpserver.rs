@@ -598,6 +598,29 @@ impl<'a> Request<'a> {
         out
     }
 
+    /// Serializes the parsed form the way Go `url.Values.Encode()` does on
+    /// `Request.Form`: every key (POST-body and URL-query keys combined),
+    /// sorted, with each of its values (POST body before URL query — see
+    /// [`Self::form_values`]) emitted as `escape(key)=escape(value)` and joined
+    /// with `&`. Keys and values are percent-escaped like Go `url.QueryEscape`.
+    pub fn form_encoded(&self) -> String {
+        let mut keys: Vec<&str> = self
+            .post_form
+            .keys()
+            .chain(self.query.keys())
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut parts: Vec<String> = Vec::new();
+        for k in keys {
+            for v in self.form_values(k) {
+                parts.push(format!("{}={}", query_escape(k), query_escape(v)));
+            }
+        }
+        parts.join("&")
+    }
+
     /// The request URI (`path` or `path?query`), used for error logging.
     pub fn request_uri(&self) -> String {
         if self.raw_query.is_empty() {
@@ -2004,6 +2027,28 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Percent-escapes `s` like Go `url.QueryEscape` (the `encodeQueryComponent`
+/// mode): unreserved bytes pass through, space becomes `+`, everything else is
+/// `%XX` with uppercase hex.
+fn query_escape(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
 /// Percent-decodes `s`; when `plus_as_space` is set, `+` becomes a space.
 pub(crate) fn percent_decode(s: &str, plus_as_space: bool) -> String {
     let bytes = s.as_bytes();
@@ -2210,6 +2255,22 @@ mod tests {
             crate::httputil::get_request_value(&r, "_msg_field", "ESL-Msg-Field"),
             "bar"
         );
+    }
+
+    #[test]
+    fn test_form_encoded_sorts_and_escapes() {
+        // Keys are sorted; values percent-escaped like Go's url.Values.Encode
+        // (comma -> %2C, space -> +).
+        let r = Request::new_test(
+            "GET",
+            "/select/esmui?query=a,b&g=1m+2m&filter=x",
+            "1.2.3.4:5",
+            &[],
+        );
+        assert_eq!(r.form_encoded(), "filter=x&g=1m+2m&query=a%2Cb");
+
+        let empty = Request::new_test("GET", "/select/esmui", "1.2.3.4:5", &[]);
+        assert_eq!(empty.form_encoded(), "");
     }
 
     #[test]

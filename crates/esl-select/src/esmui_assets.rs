@@ -114,10 +114,9 @@ pub fn request_handler(req: &Request, w: &mut ResponseWriter) -> bool {
         // and path prefix may be incorrect if EsLogs is hidden behind
         // vmauth or similar proxy.
         //
-        // PORT NOTE: Go redirects to `"esmui/?" + r.Form.Encode()` (re-encoded,
-        // key-sorted); the port appends the raw query string as-is.
-        // Go `httpserver.Redirect` uses a relative Location and 302 (Found).
-        let new_url = format!("esmui/?{}", req.raw_query());
+        // Go redirects to `"esmui/?" + r.Form.Encode()` (key-sorted, re-encoded)
+        // via `httpserver.Redirect` (relative Location, 302 Found).
+        let new_url = format!("esmui/?{}", req.form_encoded());
         w.set_header("Location", &new_url);
         w.set_status(302);
         return true;

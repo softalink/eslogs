@@ -462,11 +462,12 @@ what remains in section (a) is confirmed-present divergence.
 
 **Query serving, agent, tools (esl-select / esl-storage / esl-agent / CLIs)**
 
-- `esl-select/src/esmui_assets.rs:10/:117` *(low)* — esmui static serving
-  answers a `Range:` request with a full 200 instead of 206, and the vmui
-  redirect appends the raw query string rather than Go's sorted/percent-encoded
-  `Form.Encode()`. (The ETag/Last-Modified sub-claim is moot — Go's embedded
-  `FileServer` emits neither.)
+- `esl-select/src/esmui_assets.rs:10` *(low, deliberate)* — esmui static serving
+  answers a `Range:` request with a full 200 instead of 206 (Go's `FileServer`
+  supports ranges; the port's reduced server does not — this never triggers for
+  the small esmui JS/CSS/HTML/image assets, which browsers do not range-request).
+  The `/select/esmui` redirect now re-encodes the query like Go's `Form.Encode()`
+  (`Request::form_encoded`: keys sorted, keys/values percent-escaped).
 - `esl-storage/src/lib.rs:783` — snapshots created for a client that has
   already disconnected are kept; Go checks `r.Context().Err()` and deletes
   them (the port has no client-disconnect signal on this path).
