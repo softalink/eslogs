@@ -38,12 +38,12 @@
 //! reads are bounded by a read timeout). [`ServerHandle::stop`] sets the flag,
 //! wakes each blocked accept with a self-connect, and joins all threads.
 //!
-//! PORT NOTE: pprof, path-prefix and per-connection deadline jitter from the
-//! Go source are intentionally omitted, so the pprof request counters have
-//! nothing to count and are not registered, and
-//! `esm_http_conn_timeout_closed_conns_total` is omitted with the deadline
-//! jitter. Response compression (`gzhttp`) is also omitted; responses are
-//! small. Basic auth (`-httpAuth.username`/`-httpAuth.password`) and the
+//! PORT NOTE: pprof and path-prefix from the Go source are intentionally
+//! omitted, so the pprof request counters have nothing to count and are not
+//! registered. The per-connection timeout + jitter IS ported (`CONN_TIMEOUT` /
+//! `esm_http_conn_timeout_closed_conns_total`), and so is gzip response
+//! compression (the `gzhttp` wrapper, see [`ResponseWriter::finish`]). Basic
+//! auth (`-httpAuth.username`/`-httpAuth.password`) and the
 //! `-metricsAuthKey`/`-flagsAuthKey` auth keys ARE ported — see
 //! [`check_auth_flag`]/[`check_basic_auth`] below. `-pprofAuthKey` is omitted
 //! together with pprof.
@@ -111,6 +111,21 @@ const ACCEPT_POLL: Duration = Duration::from_millis(20);
 // needed here because a stuck handshake would pin one of the fixed pool of
 // worker threads.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Incoming keep-alive connections are closed after this timeout (plus jitter)
+// to rebalance load across the cluster (Go's `-http.connTimeout`, default 2m).
+//
+// PORT NOTE: Go exposes this as a flag; the port keeps it a const like the
+// other connection timeouts above.
+const CONN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Returns [`CONN_TIMEOUT`] extended by up to 10% random jitter, spreading out
+/// simultaneous reconnects (Go adds `fastrand.Uint32n(timeoutSec/10)` seconds
+/// to prevent a thundering herd).
+fn conn_timeout_with_jitter() -> Duration {
+    let n = crate::timeutil::add_jitter_to_duration(CONN_TIMEOUT.as_nanos() as i64);
+    Duration::from_nanos(n.max(0) as u64)
+}
 
 // Mirrors protoparserutil line-reader limits.
 const MAX_LINE_SIZE: usize = 256 * 1024;
@@ -1488,6 +1503,9 @@ fn handle_connection<H>(
     // Perf diagnostic (ESL_HTTP_TIMING=1): per-request read/handle/flush split.
     let timing = std::env::var_os("ESL_HTTP_TIMING").is_some();
 
+    // Close this connection once it outlives the (jittered) connection timeout.
+    let conn_deadline = std::time::Instant::now() + conn_timeout_with_jitter();
+
     // Idly await each request, polling so `stop` is honored promptly. A `Close`
     // result (EOF, idle timeout, error, or stop) ends the connection.
     while let WaitResult::Ready = wait_for_request(&mut reader, stop) {
@@ -1530,7 +1548,13 @@ fn handle_connection<H>(
         drop(req); // release the borrow of `reader` for the next iteration.
 
         // A streamed (chunked) response was sent with `Connection: close`.
-        let keep_alive = keep_alive_req && drained && !rw.streaming_started;
+        let mut keep_alive = keep_alive_req && drained && !rw.streaming_started;
+        // Close long-lived keep-alive connections past the connection timeout to
+        // rebalance load (Go's connTimeout handling).
+        if keep_alive && std::time::Instant::now() >= conn_deadline {
+            conn_timeout_closed_conns().inc();
+            keep_alive = false;
+        }
         let t_handle = t0.elapsed();
         if rw.finish(&mut writer, keep_alive).is_err() {
             break;
@@ -1835,6 +1859,14 @@ fn requests_total_all() -> &'static Arc<crate::metrics::Counter> {
     &C
 }
 
+/// Counts connections closed because they exceeded [`CONN_TIMEOUT`] (Go
+/// `vm_http_conn_timeout_closed_conns_total`).
+fn conn_timeout_closed_conns() -> &'static Arc<crate::metrics::Counter> {
+    static C: LazyLock<Arc<crate::metrics::Counter>> =
+        LazyLock::new(|| crate::metrics::new_counter("esm_http_conn_timeout_closed_conns_total"));
+    &C
+}
+
 /// The `esm_http_request_errors_total{path="*", reason="wrong_basic_auth"}`
 /// counter (Go `authBasicRequestErrors`).
 fn auth_basic_request_errors() -> &'static Arc<crate::metrics::Counter> {
@@ -2058,6 +2090,21 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::net::TcpStream;
+
+    #[test]
+    fn test_conn_timeout_with_jitter_bounds() {
+        for _ in 0..200 {
+            let d = conn_timeout_with_jitter();
+            assert!(
+                d >= CONN_TIMEOUT,
+                "jitter must not shorten the timeout: {d:?}"
+            );
+            assert!(
+                d <= CONN_TIMEOUT + CONN_TIMEOUT / 10,
+                "jitter must stay within 10%: {d:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_accept_encoding_allows_gzip() {
