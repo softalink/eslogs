@@ -458,9 +458,6 @@ what remains in section (a) is confirmed-present divergence.
 
 **Query serving, agent, tools (esl-select / esl-storage / esl-agent / CLIs)**
 
-- `esl-select/src/logsql.rs:673/:760` — `-search.maxQueryTimeRange` cannot be
-  enabled (the flag is unported); default behavior matches (disabled), but the
-  configuration capability is missing.
 - `esl-select/src/esmui_assets.rs:10/:117` *(low)* — esmui static serving
   answers a `Range:` request with a full 200 instead of 206, and the vmui
   redirect appends the raw query string rather than Go's sorted/percent-encoded

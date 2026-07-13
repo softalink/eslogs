@@ -11,8 +11,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use esl_common::flagutil::{ExtendedDuration, Flag};
 use esl_common::httpserver::{Request, ResponseWriter, get_quoted_remote_addr};
-use esl_common::timeutil::parse_time_at;
+use esl_common::timeutil::{format_go_duration, parse_time_at};
 use esl_logstorage::parser::{Filter, ParseFilter, Query};
 use esl_logstorage::query_stats::QueryStats;
 use esl_logstorage::storage::Storage;
@@ -28,6 +29,21 @@ pub(crate) use crate::logsql_hits::process_hits_request;
 
 /// Maximum query length in bytes (Go `-search.maxQueryLen`, default 16*1024).
 const MAX_QUERY_LEN: usize = 16 * 1024;
+
+/// Go `-search.maxQueryTimeRange` (default "0" = disabled): queries whose
+/// `[start, end]` filter time range exceeds this duration are rejected.
+static MAX_QUERY_TIME_RANGE: Flag<ExtendedDuration> = Flag::new(
+    "search.maxQueryTimeRange",
+    "The maximum time range, which can be set in the query sent to querying APIs. \
+     Queries with bigger time ranges are rejected. \
+     See https://docs.victoriametrics.com/victorialogs/querying/#resource-usage-limits",
+    || {
+        let mut d = ExtendedDuration::default();
+        d.set("0")
+            .expect("BUG: cannot parse default maxQueryTimeRange");
+        d
+    },
+);
 
 /// Current wall-clock time in nanoseconds since the Unix epoch.
 pub(crate) fn now_nsec() -> i64 {
@@ -676,13 +692,11 @@ pub(crate) fn parse_common_args(req: &Request) -> Result<CommonArgs, String> {
 
 /// Go `parseCommonArgsWithConfig`.
 ///
-/// PORT NOTE: `-search.maxQueryTimeRange` defaults to `0` (check disabled) and
-/// command-line flags are not ported, so `skip_max_range_check` is accepted for
-/// signature parity (Go passes `true` for live tailing) but the check is a
-/// no-op either way.
+/// `skip_max_range_check` disables the `-search.maxQueryTimeRange` check (Go
+/// passes `true` for live tailing).
 pub(crate) fn parse_common_args_with_config(
     req: &Request,
-    _skip_max_range_check: bool,
+    skip_max_range_check: bool,
 ) -> Result<CommonArgs, String> {
     // Extract tenantID
     let tenant_id = get_tenant_id_from_request(req.header("AccountID"), req.header("ProjectID"))
@@ -763,9 +777,14 @@ pub(crate) fn parse_common_args_with_config(
         }
     }
 
-    // PORT NOTE: Go checks q.GetFilterTimeRange() against
-    // -search.maxQueryTimeRange here; the flag defaults to 0 (disabled) and
-    // flags are not ported, so the check is omitted.
+    // Reject queries whose filter time range exceeds -search.maxQueryTimeRange
+    // (Go parseCommonArgsWithConfig). The flag defaults to 0 (disabled); guard
+    // the get_filter_time_range fetch like Go so the common path is unaffected.
+    let max_range_nanos = MAX_QUERY_TIME_RANGE.get().milliseconds() * 1_000_000;
+    if max_range_nanos > 0 && !skip_max_range_check {
+        let (start, end) = q.get_filter_time_range();
+        check_query_time_range(max_range_nanos, start, end)?;
+    }
 
     // allow_partial_response: validate the arg like Go (invalid values are
     // user-visible errors), then drop it (see the CommonArgs PORT NOTE).
@@ -783,6 +802,27 @@ pub(crate) fn parse_common_args_with_config(
         start_aligned,
         end_aligned,
     })
+}
+
+/// Go parseCommonArgsWithConfig's `-search.maxQueryTimeRange` guard body.
+///
+/// Assumes the caller has already checked `maxRange > 0 && !skipMaxRangeCheck`.
+/// The `< 0` branch mirrors Go's overflow catch on the int64 subtraction.
+fn check_query_time_range(max_range_nanos: i64, start: i64, end: i64) -> Result<(), String> {
+    if end > start {
+        let query_time_range = end.wrapping_sub(start);
+        if query_time_range < 0 || query_time_range > max_range_nanos {
+            return Err(format!(
+                "too big time range selected: [{}, {}]; it cannot exceed \
+                 -search.maxQueryTimeRange={}; \
+                 see https://docs.victoriametrics.com/victorialogs/querying/#resource-usage-limits",
+                timestamp_to_string(start),
+                timestamp_to_string(end),
+                format_go_duration(max_range_nanos),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Go `parseQueryFromRequest`.
@@ -1195,6 +1235,23 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_check_query_time_range() {
+        let hour = 3_600_000_000_000i64; // 1h in nanoseconds
+        // Range within the limit is accepted.
+        assert!(check_query_time_range(hour, 1_000, 1_000 + hour).is_ok());
+        // Zero-width and inverted ranges are always accepted (Go: end > start).
+        assert!(check_query_time_range(hour, 5_000, 5_000).is_ok());
+        assert!(check_query_time_range(hour, 5_000, 1_000).is_ok());
+        // Range exceeding the limit is rejected with Go's message wording.
+        let err = check_query_time_range(hour, 0, 2 * hour).unwrap_err();
+        assert!(
+            err.contains("too big time range selected")
+                && err.contains("-search.maxQueryTimeRange=1h0m0s"),
+            "unexpected error: {err}"
+        );
+    }
 
     // Port of Go TestParseExtraFilters_Success.
     #[test]
