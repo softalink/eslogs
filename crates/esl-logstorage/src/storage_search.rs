@@ -1376,6 +1376,29 @@ pub(crate) fn init_filter_in_values_for_filter(
 /// tree is re-parsed from its rendered text at the query `timestamp` (the
 /// established `Query::clone` render/re-parse divergence) and the owned tree
 /// is rewritten.
+/// Runs subquery propagation (`Query::visit_subqueries`) over the subqueries
+/// embedded in a shared (`Arc`) filter, returning a replacement filter when it
+/// held any subquery. Mirrors [`init_filter_in_values_for_shared_filter`]: the
+/// `Arc`-shared filter is rendered to text, re-parsed to an owned filter that
+/// is visited/mutated, and returned as a fresh `Arc`.
+pub(crate) fn visit_subqueries_in_shared_filter(
+    f: &Arc<dyn crate::filter::Filter>,
+    timestamp: i64,
+    visit: &mut dyn FnMut(&mut crate::parser::Query),
+) -> Option<Arc<dyn crate::filter::Filter>> {
+    if !crate::filter::filter_has_subqueries(f.as_ref()) {
+        return None;
+    }
+    let text = f.to_string();
+    let q = crate::parser::ParseQueryAtTimestamp(&text, timestamp).unwrap_or_else(|e| {
+        esl_common::panicf!("BUG: cannot re-parse filter [{text}]: {e}");
+        unreachable!()
+    });
+    let mut f_new = q.f;
+    f_new.visit_subqueries_mut(timestamp, visit);
+    Some(Arc::from(f_new))
+}
+
 pub(crate) fn init_filter_in_values_for_shared_filter(
     f: &Arc<dyn crate::filter::Filter>,
     get_values: &mut GetFieldValuesFn<'_>,

@@ -79,6 +79,20 @@ impl Pipe for PipeFilter {
         Ok(())
     }
 
+    /// Port of Go `pipeFilter.visitSubqueries`: visits the subqueries embedded
+    /// in the filter (e.g. `| filter x:in(subquery)`).
+    fn visit_subqueries_mut(
+        &mut self,
+        timestamp: i64,
+        visit: &mut dyn FnMut(&mut crate::parser::Query),
+    ) {
+        if let Some(f_new) =
+            crate::storage_search::visit_subqueries_in_shared_filter(&self.f, timestamp, visit)
+        {
+            self.f = f_new;
+        }
+    }
+
     fn new_pipe_processor(
         &self,
         concurrency: usize,
