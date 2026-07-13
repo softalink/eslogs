@@ -306,9 +306,12 @@ what remains in section (a) is confirmed-present divergence.
 
 **Query semantics (esl-logstorage)**
 
-- `parser/query.rs:205` — `options(global_filter=...)` parses but is never
-  ANDed into the search filter (`get_final_filter` returns `q.f` only);
-  queries that set it get unfiltered results.
+- `parser/query.rs` — `options(global_filter=...)` is now ANDed before the
+  query filter (and propagated into subqueries) at parse time, matching Go's
+  `getFinalFilter`, so results are correct. Two residual differences: it
+  re-renders with the filter inlined rather than as `options(global_filter=...)`
+  (Go keeps the option and ANDs it per-search), and a subquery that sets its
+  *own* `global_filter` is not composed (only the top-level option is).
 - `parser/query.rs:982`, `parser/query.rs:1033` — query options are not
   inherited into nested subqueries (Go pushes the options stack); subqueries
   run with default options. Because the subquery-propagation of

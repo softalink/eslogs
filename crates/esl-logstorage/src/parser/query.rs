@@ -252,11 +252,10 @@ impl Query {
 
     /// Returns the query's top-level filter (Go `getFinalFilter`).
     ///
-    /// PORT NOTE: Go combines `opts.globalFilter` with `q.f` via
-    /// `newFilterAnd(...)` + `optimizeFilters`. Composing an owned filter needs
-    /// the deferred `copyFilter`/downcast machinery, so this returns `q.f`
-    /// directly. This is correct whenever `options(global_filter=...)` is unused
-    /// (the common case); when a global filter is set it is simply not ANDed in.
+    /// PORT NOTE: Go combines `opts.globalFilter` with `q.f` here per-search;
+    /// the port instead composes `global_filter` into `q.f` once at parse
+    /// (see [`Self::apply_global_filter`]) and clears the option, so by the time
+    /// this is called the global filter is already ANDed in and `q.f` is final.
     pub(crate) fn get_final_filter(&self) -> &dyn FilterTrait {
         self.f.as_ref()
     }
@@ -446,6 +445,25 @@ impl Query {
         };
         let ef_str = ef.to_string();
         self.visit_subqueries(&mut |q| q.add_extra_filters_no_subqueries(&ef_str));
+    }
+
+    /// Applies `options(global_filter=...)` by ANDing the global filter before
+    /// the query's own filter (and its `in(...)`/`join`/`union` subqueries),
+    /// matching Go's `getFinalFilter`, which combines `opts.globalFilter` with
+    /// `q.f`.
+    ///
+    /// PORT NOTE: Go keeps the filter in `opts` (rendering
+    /// `options(global_filter=...)`) and ANDs it in per-search; the port
+    /// composes it into the filter tree once here — reusing the extra-filter
+    /// propagation — and clears the option, so the query computes identical
+    /// results but re-renders with the filter inlined rather than as
+    /// `options(global_filter=...)`. A subquery that sets its *own*
+    /// `global_filter` is a niche case still deferred (only the top-level option
+    /// is composed).
+    fn apply_global_filter(&mut self) {
+        if let Some(gf) = self.opts.global_filter.take() {
+            self.add_extra_filters(Filter { f: Some(gf) });
+        }
     }
 
     /// Prepends the extra filter (given as rendered text) to this query only
@@ -1024,6 +1042,7 @@ pub fn ParseQueryAtTimestamp(s: &str, timestamp: i64) -> Result<Query, String> {
     }
     q.optimize();
     q.init_stats_rate_func_steps();
+    q.apply_global_filter();
     Ok(q)
 }
 

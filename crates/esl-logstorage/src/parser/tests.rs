@@ -490,11 +490,12 @@ fn test_parse_query_subqueries() {
         "* | join by (x) (y) | stats count(*) if (a:in(a b c d e | fields a)) as z",
     );
 
-    // options round-trips with subqueries (incl. global_filter and option
-    // printing inside the subquery)
+    // `options(global_filter=...)` is applied (ANDed before the query filter)
+    // and propagated into the subquery, then re-renders inlined rather than as
+    // `options(global_filter=...)` (see `test_options_global_filter_applied`).
     ok(
         r#"options(global_filter=(_time:5m {host="abc"})) _time:1h foo:in(_time:3m | keep foo)"#,
-        r#"options(global_filter=(_time:5m {host="abc"})) _time:1h foo:in(_time:3m | fields foo)"#,
+        r#"{host="abc"} _time:5m _time:1h foo:in({host="abc"} _time:5m _time:3m | fields foo)"#,
     );
     ok(
         "options (concurrency=2) foo bar:in(a:b | uniq(bar)) | union (abc) | join on (x) (y)",
@@ -1530,6 +1531,39 @@ fn test_parse_stats_switch() {
         };
         assert!(err.contains(want_err), "for [{q_str}] got error: {err}");
     }
+}
+
+/// `options(global_filter=...)` is ANDed before the query filter (Go
+/// `getFinalFilter`), so only rows matching both pass; the option is inlined
+/// into the rendered filter rather than kept as `options(...)`.
+#[test]
+fn test_options_global_filter_applied() {
+    use crate::rows::Field;
+
+    let q = ParseQuery("options(global_filter=(host:web)) error").unwrap();
+    let f = q.get_final_filter();
+
+    let field = |n: &str, v: &str| Field {
+        name: n.to_string(),
+        value: v.to_string(),
+    };
+    let matching = [field("host", "web"), field("_msg", "error")];
+    let wrong_host = [field("host", "db"), field("_msg", "error")];
+    let no_error = [field("host", "web"), field("_msg", "info")];
+
+    assert!(f.match_row(&matching), "host:web + error must match");
+    assert!(
+        !f.match_row(&wrong_host),
+        "global_filter host:web must exclude host:db"
+    );
+    assert!(
+        !f.match_row(&no_error),
+        "query filter 'error' must exclude 'info'"
+    );
+    assert!(
+        !q.to_string().contains("global_filter"),
+        "global_filter should be inlined, not rendered as options: {q}"
+    );
 }
 
 /// Port of Go `TestQuery_AddExtraFilters`.
