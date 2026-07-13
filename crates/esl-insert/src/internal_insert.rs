@@ -18,7 +18,7 @@ use esl_common::logger::{LogThrottler, with_throttler};
 
 use esl_logstorage::tenant_id::TenantID;
 
-use crate::common_params::{LogRowsStorage, get_common_params};
+use crate::common_params::{LogRowsStorage, errorf_with_status, get_common_params};
 use crate::native_insert::{
     PROTOCOL_VERSION, parse_data_multitenant, reset_unsupported_common_params,
 };
@@ -58,6 +58,11 @@ pub fn request_handler<S: LogRowsStorage>(
             return;
         }
     };
+
+    if let Err((msg, status)) = storage.can_write_data() {
+        errorf_with_status(w, req, &msg, status);
+        return;
+    }
 
     if cp.tenant_id.account_id != 0 || cp.tenant_id.project_id != 0 {
         UNSUPPORTED_OPTIONS_LOGGER.warnf(format_args!(

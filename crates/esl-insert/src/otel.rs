@@ -16,6 +16,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use esl_common::easyproto;
+use esl_common::flagutil::{Bytes, Flag};
 use esl_common::httpserver::{Request, ResponseWriter};
 use esl_common::metrics::{Counter, Summary};
 use esl_common::stringsutil::json_string;
@@ -23,7 +24,8 @@ use esl_common::stringsutil::json_string;
 use esl_logstorage::rows::{Field, Fields, get_fields, put_fields, rename_field};
 
 use crate::common_params::{
-    LogMessageProcessor, LogRowsStorage, get_common_params, is_json_content_type, now_unix_nanos,
+    LogMessageProcessor, LogRowsStorage, check_max_request_size, errorf_with_status,
+    get_common_params, is_json_content_type, now_unix_nanos,
 };
 
 // ---------------------------------------------------------------------------
@@ -32,6 +34,12 @@ use crate::common_params::{
 
 /// RequestHandler processes Opentelemetry insert requests. Returns true if the
 /// path was handled.
+static MAX_REQUEST_SIZE: Flag<Bytes> = Flag::new(
+    "opentelemetry.maxRequestSize",
+    "The maximum size in bytes of a single OpenTelemetry request",
+    || Bytes::with_default(64 * 1024 * 1024),
+);
+
 pub fn request_handler<S: LogRowsStorage>(
     storage: &Arc<S>,
     path: &str,
@@ -74,10 +82,13 @@ static REQUEST_PROTOBUF_DURATION: LazyLock<Arc<Summary>> = LazyLock::new(|| {
 });
 
 fn handle_protobuf<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &mut ResponseWriter) {
-    // PORT NOTE: Go's insertutil.CanWriteData() check is omitted in the port
-    // (see common_params.rs).
     let start_time = Instant::now();
     REQUESTS_PROTOBUF_TOTAL.inc();
+
+    if let Err((msg, status)) = storage.can_write_data() {
+        errorf_with_status(w, req, &msg, status);
+        return;
+    }
 
     let cp = match get_common_params(req) {
         Ok(cp) => cp,
@@ -91,10 +102,10 @@ fn handle_protobuf<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &m
     };
 
     // PORT NOTE: Go reads the body via protoparserutil.ReadUncompressedData,
-    // which honors the Content-Encoding header and the
-    // -opentelemetry.maxRequestSize flag (64MiB). The port's
+    // which honors the Content-Encoding header and caps the *decompressed*
+    // size at -opentelemetry.maxRequestSize (64MiB). The port's
     // `Request::read_full_body` already decompresses gzip/zstd bodies per
-    // Content-Encoding; the explicit size cap is not enforced.
+    // Content-Encoding, so the cap is checked after reading the body in full.
     let data = match req.read_full_body() {
         Ok(d) => d,
         Err(err) => {
@@ -105,6 +116,10 @@ fn handle_protobuf<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &m
             return;
         }
     };
+    if let Err(err) = check_max_request_size(data.len(), &MAX_REQUEST_SIZE) {
+        w.errorf(req, &err);
+        return;
+    }
 
     let use_default_stream_fields = cp.stream_fields.is_empty();
     let msg_fields: Vec<&str> = cp.msg_fields.iter().map(String::as_str).collect();

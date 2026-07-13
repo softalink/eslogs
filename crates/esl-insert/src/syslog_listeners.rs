@@ -1102,6 +1102,12 @@ fn process_stream<S: LogRowsStorage + 'static>(
     cp: &CommonParams,
     storage: &Arc<S>,
 ) -> Result<(), String> {
+    // Go calls `insertutil.CanWriteData()` at the top of `processStream`;
+    // reject the stream when the storage is read-only / out of disk.
+    if let Err((msg, _status)) = storage.can_write_data() {
+        return Err(msg);
+    }
+
     // Stream-mode ingestion: mirror Go's `logMessageProcessor.initPeriodicFlush`
     // (only started when `isStreamMode=true`, i.e. syslog TCP/unix). The
     // processor is shared with a background flusher thread through a `Mutex`

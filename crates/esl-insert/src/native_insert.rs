@@ -21,7 +21,9 @@ use esl_logstorage::log_rows::{get_insert_row, put_insert_row};
 use esl_logstorage::rows::marshal_fields_to_json;
 use esl_logstorage::tenant_id::TenantID;
 
-use crate::common_params::{CommonParams, InsertRowProcessor, LogRowsStorage, get_common_params};
+use crate::common_params::{
+    CommonParams, InsertRowProcessor, LogRowsStorage, errorf_with_status, get_common_params,
+};
 
 /// ProtocolVersion is the version of the data ingestion protocol.
 ///
@@ -77,6 +79,11 @@ pub fn request_handler<S: LogRowsStorage>(
         }
     };
 
+    if let Err((msg, status)) = storage.can_write_data() {
+        errorf_with_status(w, req, &msg, status);
+        return;
+    }
+
     reset_unsupported_common_params(&mut cp, "/insert/native");
 
     let data = match read_capped_body(req, w, "native insert") {
@@ -119,6 +126,11 @@ pub fn multitenant_request_handler<S: LogRowsStorage>(
             return;
         }
     };
+
+    if let Err((msg, status)) = storage.can_write_data() {
+        errorf_with_status(w, req, &msg, status);
+        return;
+    }
 
     if cp.tenant_id.account_id != 0 || cp.tenant_id.project_id != 0 {
         UNSUPPORTED_OPTIONS_LOGGER.warnf(format_args!(

@@ -31,7 +31,7 @@ use esl_logstorage::stream_tags::check_stream_field_names;
 use esl_logstorage::tenant_id::{TenantID, parse_tenant_id};
 
 use crate::common_params::{
-    CommonParams, LogMessageProcessorTrait, LogRowsStorage,
+    CommonParams, LogMessageProcessorTrait, LogRowsStorage, errorf_with_status,
     get_common_params as insertutil_get_common_params, now_unix_nanos,
 };
 use crate::line_reader::LineReader;
@@ -189,6 +189,12 @@ fn handle_journald<S: LogRowsStorage>(storage: &Arc<S>, req: &mut Request, w: &m
             return;
         }
     };
+
+    if let Err((msg, status)) = storage.can_write_data() {
+        ERRORS_TOTAL.inc();
+        errorf_with_status(w, req, &msg, status);
+        return;
+    }
 
     let stream_name = format!(
         "remoteAddr={}, requestURI={:?}",

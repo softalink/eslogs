@@ -277,17 +277,19 @@ what remains in section (a) is confirmed-present divergence.
 > (still rejected); filter/join/union `AddTimeFilter`/`AddExtraFilters`
 > **subquery propagation** (still top-level only — the *iff-nested `in()`*
 > propagation via `visit_subqueries` did land, but the time/extra-filter descent
-> did not); per-protocol ingestion size caps (OTLP still uncapped);
-> `CanWriteData` (still missing on 6 ingest paths); `pattern.rs` `\x`≥0x80 (still
-> UTF-8-encoded).
+> did not); `pattern.rs` `\x`≥0x80 (still UTF-8-encoded).
 >
-> **Three items closed this session** (with tests): (1) log deletion including
-> stream-filtered rows (drop path used the wrong `_msg` canonicalizer; full Go
-> delete test passes); (2) syslog idle-connection periodic flush
+> **Items closed this session** (with tests / gate-verified): (1) log deletion
+> including stream-filtered rows (drop path used the wrong `_msg` canonicalizer;
+> full Go delete test passes); (2) syslog idle-connection periodic flush
 > (`syslog_listeners::process_stream` now drives `flush_if_idle` from a
 > `thread::scope`d `AddJitterToDuration(1s)` flusher over an `mpsc` stopCh,
 > mirroring Go's `initPeriodicFlush` for `isStreamMode=true`); (3) iff-nested
-> `in(subquery)` propagation via `visit_subqueries_in_shared_filter`.
+> `in(subquery)` propagation via `visit_subqueries_in_shared_filter`; (4)
+> `CanWriteData()` now gates every ingest path — the six that were missing it
+> (splunk, native-insert, OTLP, journald, syslog, internal-insert) now call it
+> like Go; (5) the OTLP ingest path now enforces `-opentelemetry.maxRequestSize`
+> (64MiB) like its Loki/DataDog siblings.
 
 ### (a) Observable behavioral divergences
 
@@ -449,13 +451,6 @@ what remains in section (a) is confirmed-present divergence.
 
 **Ingestion protections (esl-insert)**
 
-- `common_params.rs:312` — the `can_write_data()` (read-only / out-of-disk)
-  gate is called on the Elasticsearch/Loki/jsonline/DataDog/Loki-protobuf
-  paths but is still MISSING on splunk, native-insert, OTLP, journald, syslog,
-  and internal-insert (Go calls it on every ingest path).
-- `otel.rs:93` — the OTLP ingest path has no `-*.maxRequestSize` cap (Loki
-  JSON, DataDog, and both Loki-protobuf paths now enforce
-  `check_max_request_size`).
 - `journald.rs:13` — the journald HTTP ingest omits the otherwise-ported
   `writeconcurrencylimiter` backpressure layer Go applies; the syslog stream
   path also omits it but is at parity there (ingestion is bounded by the

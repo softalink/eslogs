@@ -21,8 +21,8 @@ use esl_logstorage::stream_tags::check_stream_field_names;
 use esl_logstorage::tenant_id::{TenantID, parse_tenant_id};
 
 use crate::common_params::{
-    CommonParams, LogMessageProcessorTrait, LogRowsStorage, extract_timestamp_from_fields,
-    get_common_params as insertutil_get_common_params,
+    CommonParams, LogMessageProcessorTrait, LogRowsStorage, errorf_with_status,
+    extract_timestamp_from_fields, get_common_params as insertutil_get_common_params,
 };
 
 static SPLUNK_STREAM_FIELDS: Flag<ArrayString> = Flag::new(
@@ -203,6 +203,11 @@ fn handle_collector_event<S: LogRowsStorage>(
             return;
         }
     };
+
+    if let Err((msg, status)) = storage.can_write_data() {
+        errorf_with_status(w, req, &msg, status);
+        return;
+    }
 
     // PORT NOTE: Go streams the body through
     // `protoparserutil.ReadUncompressedData`, which caps the *decompressed*
