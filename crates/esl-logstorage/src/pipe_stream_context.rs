@@ -21,13 +21,18 @@
 //!   pipe chain does not wire it — see PARITY.md), `flush` returns a
 //!   descriptive error instead of producing output.
 //! * The `stateSizeBudget` memory guard (Go `memory.Allowed()` /
-//!   `stateSizeBudgetChunk`) is dropped; the `maxStreams` / `maxRowsPerStream`
-//!   count guards are kept.
+//!   `stateSizeBudgetChunk`) is ported: `write_block` charges the buffered
+//!   matching rows against a ~20%-of-memory budget (chunked per-shard steal
+//!   like `pipe_sort`), and `flush` bounds the surrounding-log fetch with the
+//!   remaining budget, erroring when it is exhausted. The `maxStreams` /
+//!   `maxRowsPerStream` count guards are also kept.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
+
+use esl_common::memory;
 
 use crate::block_result::{BlockResult, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
@@ -44,6 +49,10 @@ const PIPE_STREAM_CONTEXT_DEFAULT_TIME_WINDOW: i64 = NSECS_PER_HOUR;
 // surrounding logs for a huge number of streams or rows-per-stream.
 const PIPE_STREAM_CONTEXT_MAX_STREAMS: usize = 100;
 const PIPE_STREAM_CONTEXT_MAX_ROWS_PER_STREAM: usize = 1000;
+
+/// Chunk of the global state-size budget a shard steals at a time (Go
+/// `stateSizeBudgetChunk`).
+const STATE_SIZE_BUDGET_CHUNK: i64 = 1 << 20;
 
 /// Receives every result [`BlockResult`] of a re-executed subquery.
 ///
@@ -168,6 +177,7 @@ impl Pipe for PipeStreamContext {
         let shards = (0..concurrency.max(1))
             .map(|_| Mutex::new(PipeStreamContextProcessorShard::default()))
             .collect();
+        let max_state_size = (memory::allowed() as f64 * 0.2) as i64;
         Arc::new(PipeStreamContextProcessor {
             lines_before: self.lines_before,
             lines_after: self.lines_after,
@@ -177,6 +187,9 @@ impl Pipe for PipeStreamContext {
             pp_next,
             shards,
             stop,
+            max_state_size,
+            state_size_budget: AtomicI64::new(max_state_size),
+            pc_str: self.to_string(),
         })
     }
 }
@@ -193,6 +206,20 @@ impl Pipe for PipeStreamContext {
 struct StreamContextRow {
     timestamp: i64,
     fields: Vec<Field>,
+}
+
+impl StreamContextRow {
+    /// Approximate in-memory size in bytes (Go `streamContextRow.sizeBytes`),
+    /// used for the `stateSizeBudget` memory accounting.
+    fn size_bytes(&self) -> i64 {
+        let mut n = 0usize;
+        for f in &self.fields {
+            n += f.name.len() + f.value.len() + std::mem::size_of::<Field>();
+        }
+        n += std::mem::size_of::<StreamContextRow>()
+            + std::mem::size_of::<*const StreamContextRow>();
+        n as i64
+    }
 }
 
 /// Port of Go `(*streamContextRow).less`: order by timestamp, then field
@@ -230,6 +257,12 @@ struct PipeStreamContextProcessor {
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<PipeStreamContextProcessorShard>>,
     stop: Arc<AtomicBool>,
+    /// Total state-size budget (~20% of allowed memory) shared across shards
+    /// (Go `maxStateSize`/`stateSizeBudget`).
+    max_state_size: i64,
+    state_size_budget: AtomicI64,
+    /// Rendered pipe string for the out-of-memory error (Go `pcp.pc.String()`).
+    pc_str: String,
 }
 
 /// Per-shard buffer of matching rows keyed by `_stream_id` (Go
@@ -237,6 +270,9 @@ struct PipeStreamContextProcessor {
 #[derive(Default)]
 struct PipeStreamContextProcessorShard {
     m: HashMap<String, Vec<StreamContextRow>>,
+    /// Portion of the global budget this shard has stolen (Go
+    /// `pipeStreamContextProcessorShard.stateSizeBudget`).
+    state_size_budget: i64,
 }
 
 impl PipeProcessor for PipeStreamContextProcessor {
@@ -246,6 +282,22 @@ impl PipeProcessor for PipeStreamContextProcessor {
         }
 
         let mut shard = self.shards[worker_id].lock().unwrap();
+
+        // Steal budget from the global pool when this shard's is exhausted (Go
+        // `writeBlock`'s `stateSizeBudget` loop); stop when the pool is empty.
+        while shard.state_size_budget < 0 {
+            let remaining = self
+                .state_size_budget
+                .fetch_sub(STATE_SIZE_BUDGET_CHUNK, AtomicOrdering::SeqCst)
+                - STATE_SIZE_BUDGET_CHUNK;
+            if remaining < 0 {
+                if remaining + STATE_SIZE_BUDGET_CHUNK >= 0 {
+                    self.stop.store(true, AtomicOrdering::SeqCst);
+                }
+                return;
+            }
+            shard.state_size_budget += STATE_SIZE_BUDGET_CHUNK;
+        }
 
         if shard.m.len() > PIPE_STREAM_CONTEXT_MAX_STREAMS {
             // Too many streams for showing stream context; stop processing.
@@ -274,6 +326,7 @@ impl PipeProcessor for PipeStreamContextProcessor {
                 });
             }
             let row = StreamContextRow { timestamp, fields };
+            shard.state_size_budget -= row.size_bytes();
 
             let stream_id = String::from_utf8_lossy(&stream_id_values[i]).into_owned();
             let rows = shard.m.entry(stream_id).or_default();
@@ -328,6 +381,19 @@ impl PipeProcessor for PipeStreamContextProcessor {
             }
         };
 
+        // The budget left after buffering the matching rows in write_block
+        // bounds the surrounding-log fetch below (Go flush's stateSizeBudget
+        // snapshot); if it is already exhausted, the fetch cannot proceed.
+        let n = self.state_size_budget.load(AtomicOrdering::SeqCst);
+        if n <= 0 {
+            return Err(format!(
+                "cannot calculate [{}], since it requires more than {}MB of memory",
+                self.pc_str,
+                self.max_state_size / (1 << 20)
+            ));
+        }
+        let state_size_budget = n;
+
         // Write output contexts in ascending order of their minimum timestamp.
         let mut wctx = WriteContext::new(self.pp_next.clone());
         let multi_stream = m.len() > 1;
@@ -348,7 +414,8 @@ impl PipeProcessor for PipeStreamContextProcessor {
                 ));
             }
 
-            let stream_rowss = get_stream_rowss(self, stream_id, rows, &run_query)?;
+            let stream_rowss =
+                get_stream_rowss(self, stream_id, rows, &run_query, state_size_budget)?;
 
             for stream_rows in &stream_rowss {
                 for stream_row in stream_rows {
@@ -384,13 +451,30 @@ fn get_stream_rowss(
     stream_id: &str,
     needed_rows: &[StreamContextRow],
     run_query: &RunQueryFn,
+    mut state_size_budget: i64,
 ) -> Result<Vec<Vec<StreamContextRow>>, String> {
     let mut needed_timestamps: Vec<i64> = needed_rows.iter().map(|r| r.timestamp).collect();
     needed_timestamps.sort_unstable();
 
-    let trs = get_time_ranges_for_stream_rowss(pcp, stream_id, &needed_timestamps, run_query)?;
-    let mut rowss =
-        get_stream_rowss_by_time_ranges(pcp, stream_id, &needed_timestamps, &trs, run_query)?;
+    // Charge the needed_timestamps slice (Go: sizeof(int64) * len).
+    state_size_budget -= (std::mem::size_of::<i64>() * needed_timestamps.len()) as i64;
+
+    let (trs, ranges_state_size) = get_time_ranges_for_stream_rowss(
+        pcp,
+        stream_id,
+        &needed_timestamps,
+        run_query,
+        state_size_budget,
+    )?;
+    state_size_budget -= ranges_state_size;
+    let mut rowss = get_stream_rowss_by_time_ranges(
+        pcp,
+        stream_id,
+        &needed_timestamps,
+        &trs,
+        run_query,
+        state_size_budget,
+    )?;
 
     for rows in rowss.iter_mut() {
         rows.sort_by(cmp_row);
@@ -405,12 +489,29 @@ fn get_time_ranges_for_stream_rowss(
     stream_id: &str,
     needed_timestamps: &[i64],
     run_query: &RunQueryFn,
-) -> Result<Vec<TimeRange>, String> {
+    state_size_budget: i64,
+) -> Result<(Vec<TimeRange>, i64), String> {
     let tr = get_time_range_for_needed_timestamps(pcp, needed_timestamps);
     let time_filter = get_time_filter(tr.start, tr.end);
     let q_str = format!("_stream_id:{stream_id} {time_filter} | fields _time");
 
-    let rowss = execute_query(pcp, stream_id, &q_str, needed_timestamps, run_query)?;
+    let (rowss, state_size) = execute_query(
+        pcp,
+        stream_id,
+        &q_str,
+        needed_timestamps,
+        run_query,
+        state_size_budget,
+    )?;
+
+    let new_state_size = (std::mem::size_of::<TimeRange>() * rowss.len()) as i64;
+    if state_size + new_state_size > state_size_budget {
+        return Err(format!(
+            "more than {}MB of memory is needed for fetching the surrounding logs for {} matching logs",
+            state_size_budget / (1 << 20),
+            needed_timestamps.len()
+        ));
+    }
 
     let mut trs = Vec::with_capacity(rowss.len());
     for rows in &rowss {
@@ -437,7 +538,7 @@ fn get_time_ranges_for_stream_rowss(
             end: max_timestamp,
         });
     }
-    Ok(trs)
+    Ok((trs, new_state_size))
 }
 
 /// Port of Go `(*pipeStreamContextProcessor).getTimeRangeForNeededTimestamps`.
@@ -472,6 +573,7 @@ fn get_stream_rowss_by_time_ranges(
     needed_timestamps: &[i64],
     trs: &[TimeRange],
     run_query: &RunQueryFn,
+    state_size_budget: i64,
 ) -> Result<Vec<Vec<StreamContextRow>>, String> {
     let mut q_str = format!("_stream_id:{stream_id}");
     let mut min_timestamp = i64::MAX;
@@ -503,7 +605,15 @@ fn get_stream_rowss_by_time_ranges(
     // `storage_search::init_subqueries`).
     q_str.push_str(&pcp.fields_filter);
 
-    execute_query(pcp, stream_id, &q_str, needed_timestamps, run_query)
+    let (rowss, _state_size) = execute_query(
+        pcp,
+        stream_id,
+        &q_str,
+        needed_timestamps,
+        run_query,
+        state_size_budget,
+    )?;
+    Ok(rowss)
 }
 
 /// Port of Go `getTimeFilter`.
@@ -532,7 +642,8 @@ fn execute_query(
     q_str: &str,
     needed_timestamps: &[i64],
     run_query: &RunQueryFn,
-) -> Result<Vec<Vec<StreamContextRow>>, String> {
+    state_size_budget: i64,
+) -> Result<(Vec<Vec<StreamContextRow>>, i64), String> {
     let context_rows: Vec<StreamContextRows> = needed_timestamps
         .iter()
         .map(|&t| StreamContextRows::new(t, pcp.lines_before, pcp.lines_after))
@@ -542,10 +653,18 @@ fn execute_query(
     let needed: Vec<i64> = context_rows.iter().map(|c| c.needed_timestamp).collect();
 
     let state = Arc::new(Mutex::new(context_rows));
+    let state_size = Arc::new(AtomicI64::new(0));
     let state_cb = Arc::clone(&state);
+    let state_size_cb = Arc::clone(&state_size);
     let stop = Arc::clone(&pcp.stop);
     let callback: WriteBlockResultFn = Arc::new(move |br: &mut BlockResult| {
         let mut context_rows = state_cb.lock().unwrap();
+        // Stop fetching once the accumulated surrounding-log state exceeds the
+        // budget (Go executeQuery's `stateSize > stateSizeBudget` guard).
+        if state_size_cb.load(AtomicOrdering::SeqCst) > state_size_budget {
+            stop.store(true, AtomicOrdering::SeqCst);
+            return;
+        }
         for i in 0..context_rows.len() {
             if stop.load(AtomicOrdering::Relaxed) {
                 return;
@@ -562,11 +681,21 @@ fn execute_query(
                 if i + 1 < needed.len() && timestamp >= needed[i + 1] {
                     continue;
                 }
-                context_rows[i].update(br, j, timestamp);
+                let delta = context_rows[i].update(br, j, timestamp);
+                state_size_cb.fetch_add(delta, AtomicOrdering::SeqCst);
             }
         }
     });
     run_query(stream_id, q_str, callback)?;
+
+    let total_state_size = state_size.load(AtomicOrdering::SeqCst);
+    if total_state_size > state_size_budget {
+        return Err(format!(
+            "more than {}MB of memory is needed for fetching the surrounding logs for {} matching logs",
+            state_size_budget / (1 << 20),
+            needed_timestamps.len()
+        ));
+    }
 
     let context_rows = std::mem::take(&mut *state.lock().unwrap());
     let mut rowss = Vec::with_capacity(context_rows.len());
@@ -576,7 +705,7 @@ fn execute_query(
         rows.extend(ctx.rows_after);
         rowss.push(rows);
     }
-    Ok(rowss)
+    Ok((rowss, total_state_size))
 }
 
 /// Port of Go `deduplicateStreamRowss`: drops leading empty context windows and
@@ -756,44 +885,54 @@ impl StreamContextRows {
     }
 
     /// Port of Go `(*streamContextRows).update`.
-    fn update(&mut self, br: &mut BlockResult, row_idx: usize, row_timestamp: i64) {
+    /// Returns the change in buffered state size in bytes (Go
+    /// `streamContextRows.update`), for the `stateSizeBudget` accounting.
+    fn update(&mut self, br: &mut BlockResult, row_idx: usize, row_timestamp: i64) -> i64 {
         if row_timestamp < self.needed_timestamp {
             if self.lines_before == 0 {
-                return;
+                return 0;
             }
             if self.rows_before.len() < self.lines_before {
                 let r = copy_row_at_idx(br, row_idx, row_timestamp);
+                let n = r.size_bytes();
                 self.rows_before.push(r);
-                return;
+                return n;
             }
             let (min_idx, min_ts) = self.rows_before_min();
             if row_timestamp <= min_ts {
-                return;
+                return 0;
             }
-            self.rows_before[min_idx] = copy_row_at_idx(br, row_idx, row_timestamp);
-            return;
+            let r = copy_row_at_idx(br, row_idx, row_timestamp);
+            let delta = r.size_bytes() - self.rows_before[min_idx].size_bytes();
+            self.rows_before[min_idx] = r;
+            return delta;
         }
 
         if row_timestamp > self.needed_timestamp {
             if self.lines_after == 0 {
-                return;
+                return 0;
             }
             if self.rows_after.len() < self.lines_after {
                 let r = copy_row_at_idx(br, row_idx, row_timestamp);
+                let n = r.size_bytes();
                 self.rows_after.push(r);
-                return;
+                return n;
             }
             let (max_idx, max_ts) = self.rows_after_max();
             if row_timestamp >= max_ts {
-                return;
+                return 0;
             }
-            self.rows_after[max_idx] = copy_row_at_idx(br, row_idx, row_timestamp);
-            return;
+            let r = copy_row_at_idx(br, row_idx, row_timestamp);
+            let delta = r.size_bytes() - self.rows_after[max_idx].size_bytes();
+            self.rows_after[max_idx] = r;
+            return delta;
         }
 
         // row_timestamp == needed_timestamp
         let r = copy_row_at_idx(br, row_idx, row_timestamp);
+        let n = r.size_bytes();
         self.rows_matched.push(r);
+        n
     }
 }
 
@@ -1103,6 +1242,9 @@ mod tests {
             pp_next: Arc::new(crate::pipe_update::test_utils::CollectProcessor::default()),
             shards: vec![Mutex::new(PipeStreamContextProcessorShard::default())],
             stop: Arc::new(AtomicBool::new(false)),
+            max_state_size: i64::MAX,
+            state_size_budget: AtomicI64::new(i64::MAX),
+            pc_str: "stream_context".to_string(),
         };
         let mut br = BlockResult::default();
         br.must_init_from_rows(&input);
@@ -1175,6 +1317,43 @@ mod tests {
                 &[("_time", &ts_str(20)), ("_stream_id", "s1"), ("_msg", "b")],
                 &[("_time", &ts_str(30)), ("_stream_id", "s1"), ("_msg", "c")],
             ]),
+        );
+    }
+
+    // When the matching rows have already consumed the whole state-size budget,
+    // the surrounding-log fetch cannot proceed and flush reports the OOM error
+    // (Go flush's `stateSizeBudget <= 0` guard).
+    #[test]
+    fn test_flush_errors_when_state_size_budget_exhausted() {
+        let run_query: RunQueryFn = Arc::new(move |_s, _q, _cb| Ok(()));
+        let processor = PipeStreamContextProcessor {
+            lines_before: 1,
+            lines_after: 1,
+            time_window: PIPE_STREAM_CONTEXT_DEFAULT_TIME_WINDOW,
+            run_query: Some(run_query),
+            fields_filter: String::new(),
+            pp_next: Arc::new(crate::pipe_update::test_utils::CollectProcessor::default()),
+            shards: vec![Mutex::new(PipeStreamContextProcessorShard::default())],
+            stop: Arc::new(AtomicBool::new(false)),
+            max_state_size: 8 << 20,
+            state_size_budget: AtomicI64::new(0), // already exhausted
+            pc_str: "stream_context before 1 after 1".to_string(),
+        };
+        processor.shards[0].lock().unwrap().m.insert(
+            "s1".to_string(),
+            vec![StreamContextRow {
+                timestamp: 20,
+                fields: vec![Field {
+                    name: "_msg".to_string(),
+                    value: "b".to_string(),
+                }],
+            }],
+        );
+
+        let err = processor.flush().unwrap_err();
+        assert!(
+            err.contains("requires more than 8MB of memory"),
+            "unexpected error: {err}"
         );
     }
 }

@@ -324,9 +324,6 @@ what remains in section (a) is confirmed-present divergence.
   (`update_filter_with_time_offset` is a no-op).
 - `parser/parse_stats.rs:240` — `stats switch(...)` is rejected (`not
   supported by this port`); Go accepts it.
-- `pipe_stream_context.rs:190` — the surrounding-log fetch has no
-  `stateSizeBudget`; Go errors when the fetch exceeds ~20% of memory, the
-  port never does.
 - `pipe_stats.rs:28` — stats `stateSizeBudget`/cancel is dropped: at extreme
   group cardinality Go stops with a state-size error while the port keeps
   accumulating (fuller results or OOM).
