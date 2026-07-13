@@ -25,7 +25,9 @@ static HTTP_LISTEN_ADDR: Flag<ArrayString> = Flag::new(
     "TCP address to listen for incoming http requests. \
      Set this flag to empty value in order to disable listening on any port. \
      This mode may be useful for running multiple eslagent instances on the same server.",
-    || ArrayString(vec![":9429".to_string()]),
+    // No baked-in default (Go's flagutil.NewArrayString has none): `:9429` is
+    // the fallback applied below, not a base that CLI addresses append to.
+    ArrayString::default,
 );
 
 static TMP_DATA_PATH: Flag<String> = Flag::new(
@@ -50,14 +52,13 @@ fn main() {
     pushmetrics::init_secret_flags();
     logger::init();
 
-    // Empty entries disable listening (Go: `-httpListenAddr=''`).
-    let listen_addrs: Vec<String> = HTTP_LISTEN_ADDR
-        .get()
-        .0
-        .iter()
-        .filter(|a| !a.is_empty())
-        .cloned()
-        .collect();
+    // Go `main.run`: fall back to `:9429` only when no address is configured,
+    // then drop empty entries so `-httpListenAddr=''` disables listening.
+    let mut listen_addrs: Vec<String> = HTTP_LISTEN_ADDR.get().0.clone();
+    if listen_addrs.is_empty() {
+        listen_addrs = vec![":9429".to_string()];
+    }
+    let listen_addrs: Vec<String> = listen_addrs.into_iter().filter(|a| !a.is_empty()).collect();
     infof!("starting eslagent at {listen_addrs:?}...");
     let start_time = Instant::now();
 

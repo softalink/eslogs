@@ -39,7 +39,11 @@ use esl_logstorage::storage::Storage;
 static HTTP_LISTEN_ADDR: Flag<ArrayString> = Flag::new(
     "httpListenAddr",
     "TCP address to listen for incoming http requests. See also -httpListenAddr.useProxyProtocol",
-    || ArrayString(vec![":9428".to_string()]),
+    // No baked-in default (Go's flagutil.NewArrayString has none): the flag is
+    // empty unless set, and `:9428` is applied as a fallback below. Baking
+    // `:9428` into the default here would make it the base that CLI-provided
+    // addresses append to (a double-bind on :9428).
+    ArrayString::default,
 );
 
 // PORT NOTE: Windows' default system timer resolution is ~15.6ms, which
@@ -95,7 +99,11 @@ fn main() {
     pushmetrics::init_secret_flags();
     logger::init();
 
-    let listen_addrs: Vec<String> = HTTP_LISTEN_ADDR.get().0.clone();
+    // Go `main.run`: fall back to `:9428` only when no address is configured.
+    let mut listen_addrs: Vec<String> = HTTP_LISTEN_ADDR.get().0.clone();
+    if listen_addrs.is_empty() {
+        listen_addrs = vec![":9428".to_string()];
+    }
     infof!("starting EsLogs at {listen_addrs:?}...");
     let start_time = Instant::now();
 
