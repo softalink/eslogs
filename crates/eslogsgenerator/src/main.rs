@@ -597,12 +597,13 @@ impl fmt::Display for DurationFlag {
 /// The parsed `-addr` ingestion URL with `_stream_fields=host,worker_id`
 /// injected into the query string, like Go does via `url.Values.Set`.
 ///
-/// PORT NOTE: Go parses `-addr` with `net/url` and pushes via `http.Client`,
-/// so any scheme supported by the client (including https) works. This
-/// std-only port speaks plain HTTP/1.1 over TCP, so only `http://` URLs are
-/// accepted. Query parameters keep their original order and encoding instead
-/// of Go's sorted, percent-encoded re-serialization via `url.Values.Encode`
-/// (so `_stream_fields=host,worker_id` is sent with a literal comma).
+/// The query string is re-serialized like Go's `url.Values.Encode` (keys
+/// sorted, keys and values percent-escaped), so the `_stream_fields` comma is
+/// sent as `%2C`.
+///
+/// PORT NOTE: Go parses `-addr` with `net/url` and pushes via `http.Client`, so
+/// any scheme supported by the client (including https) works. This std-only
+/// port speaks plain HTTP/1.1 over TCP, so only `http://` URLs are accepted.
 #[derive(Debug, PartialEq)]
 struct RemoteWriteUrl {
     host: String,
@@ -635,26 +636,94 @@ impl RemoteWriteUrl {
             Some((p, q)) => (p, q),
             None => (path_query, ""),
         };
-        let mut pairs: Vec<String> = query
+        // Mirror Go: `q := u.Query(); q.Set("_stream_fields", "host,worker_id");
+        // u.RawQuery = q.Encode()`. `Query()` percent-decodes the existing
+        // pairs, `Set` replaces every `_stream_fields`, and `Encode()` re-emits
+        // them sorted by key and percent-escaped (so the comma becomes `%2C`).
+        let mut values: Vec<(String, String)> = query
             .split('&')
             .filter(|s| !s.is_empty())
-            .map(str::to_string)
+            .map(|pair| match pair.split_once('=') {
+                Some((k, v)) => (query_unescape(k), query_unescape(v)),
+                None => (query_unescape(pair), String::new()),
+            })
             .collect();
-        let mut replaced = false;
-        for p in pairs.iter_mut() {
-            if p == "_stream_fields" || p.starts_with("_stream_fields=") {
-                *p = "_stream_fields=host,worker_id".to_string();
-                replaced = true;
-            }
-        }
-        if !replaced {
-            pairs.push("_stream_fields=host,worker_id".to_string());
-        }
+        values.retain(|(k, _)| k != "_stream_fields");
+        values.push(("_stream_fields".to_string(), "host,worker_id".to_string()));
+        values.sort_by(|a, b| a.0.cmp(&b.0));
+        let encoded = values
+            .iter()
+            .map(|(k, v)| format!("{}={}", query_escape(k), query_escape(v)))
+            .collect::<Vec<_>>()
+            .join("&");
         Ok(RemoteWriteUrl {
             host,
             port,
-            request_uri: format!("{path}?{}", pairs.join("&")),
+            request_uri: format!("{path}?{encoded}"),
         })
+    }
+}
+
+/// Go `url.QueryEscape` (the `encodeQueryComponent` mode): unreserved bytes pass
+/// through, space becomes `+`, everything else is `%XX` with uppercase hex.
+fn query_escape(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Go `url.QueryUnescape`: `+` becomes a space and `%XX` decodes to a byte;
+/// malformed escapes are left verbatim (lenient, like the values fed here).
+fn query_unescape(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                match (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push((h << 4) | l);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -850,27 +919,29 @@ mod tests {
         let u = RemoteWriteUrl::parse("http://localhost:9428/insert/jsonline").unwrap();
         assert_eq!(u.host, "localhost");
         assert_eq!(u.port, 9428);
+        // Go's url.Values.Encode percent-escapes the comma.
         assert_eq!(
             u.request_uri,
-            "/insert/jsonline?_stream_fields=host,worker_id"
+            "/insert/jsonline?_stream_fields=host%2Cworker_id"
         );
         assert_eq!(
             u.to_string(),
-            "http://localhost:9428/insert/jsonline?_stream_fields=host,worker_id"
+            "http://localhost:9428/insert/jsonline?_stream_fields=host%2Cworker_id"
         );
 
-        // Existing query params are preserved; _stream_fields is replaced.
+        // Existing query params are preserved; _stream_fields is replaced; keys
+        // are sorted (`_stream_fields` < `foo` because `_` < `f`).
         let u = RemoteWriteUrl::parse("http://127.0.0.1/insert/jsonline?foo=bar&_stream_fields=x")
             .unwrap();
         assert_eq!(u.port, 80);
         assert_eq!(
             u.request_uri,
-            "/insert/jsonline?foo=bar&_stream_fields=host,worker_id"
+            "/insert/jsonline?_stream_fields=host%2Cworker_id&foo=bar"
         );
 
         // Missing path defaults to "/".
         let u = RemoteWriteUrl::parse("http://host:1234").unwrap();
-        assert_eq!(u.request_uri, "/?_stream_fields=host,worker_id");
+        assert_eq!(u.request_uri, "/?_stream_fields=host%2Cworker_id");
 
         assert!(RemoteWriteUrl::parse("stdout").is_err());
         assert!(RemoteWriteUrl::parse("https://host/insert").is_err());

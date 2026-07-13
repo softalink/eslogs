@@ -488,9 +488,9 @@ what remains in section (a) is confirmed-present divergence.
   and Windows prints without paging. (Ctrl+C now cancels the in-flight query
   and returns to the prompt instead of killing the process.)
 - `eslogsgenerator/src/main.rs:600` — the generator pushes over `http://` only
-  (rejects `https://`) and keeps the original query order/encoding instead of
-  Go's sorted `url.Values.Encode()` (e.g. a literal comma in
-  `_stream_fields`).
+  (rejects `https://`), because the std-only client speaks plain HTTP/1.1 over
+  TCP. (The query string is now re-serialized like Go's `url.Values.Encode` —
+  keys sorted, keys/values percent-escaped — so this is the only residual.)
 
 ### (b) Mechanism divergences (identical observable behavior)
 
