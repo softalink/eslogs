@@ -23,7 +23,7 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use esl_common::flagutil::Flag;
+use esl_common::flagutil::{ArrayString, Flag};
 use esl_common::httpserver::{Request, ResponseWriter};
 use esl_common::{
     buildinfo, envflag, fatalf, flagutil, httpserver, infof, logger, procutil, pushmetrics,
@@ -31,13 +31,15 @@ use esl_common::{
 
 use esl_logstorage::storage::Storage;
 
-// PORT NOTE: Go declares `-httpListenAddr` as an `ArrayString` (multiple
-// listeners). The ported `httpserver::serve` binds a single address, so the
-// flag is a single `String` here. The benchmark passes exactly one address.
-static HTTP_LISTEN_ADDR: Flag<String> = Flag::new(
+// `-httpListenAddr` is an `ArrayString` (Go), so several listeners can be
+// started, each with its own indexed `-tls*` config (via
+// `httpserver::serve_listener`).
+//
+// PORT NOTE: Go's per-listener `-httpListenAddr.useProxyProtocol` is not ported.
+static HTTP_LISTEN_ADDR: Flag<ArrayString> = Flag::new(
     "httpListenAddr",
     "TCP address to listen for incoming http requests. See also -httpListenAddr.useProxyProtocol",
-    || ":9428".to_string(),
+    || ArrayString(vec![":9428".to_string()]),
 );
 
 // PORT NOTE: Windows' default system timer resolution is ~15.6ms, which
@@ -93,8 +95,8 @@ fn main() {
     pushmetrics::init_secret_flags();
     logger::init();
 
-    let listen_addr = HTTP_LISTEN_ADDR.get().clone();
-    infof!("starting EsLogs at {listen_addr:?}...");
+    let listen_addrs: Vec<String> = HTTP_LISTEN_ADDR.get().0.clone();
+    infof!("starting EsLogs at {listen_addrs:?}...");
     let start_time = Instant::now();
 
     let storage = esl_storage::init();
@@ -106,18 +108,23 @@ fn main() {
     // unless -syslog.listenAddr.* flags are set).
     esl_insert::syslog_listeners::must_init(&storage);
 
-    // Build the router closure. It owns a clone of the storage `Arc` and is
-    // `Send + Sync + 'static`, as required by `httpserver::serve`.
-    let router_storage = Arc::clone(&storage);
-    let handle = match httpserver::serve(&listen_addr, move |req, w| {
-        request_handler(&router_storage, req, w);
-    }) {
-        Ok(h) => h,
-        Err(err) => {
-            fatalf!("cannot start the http server at {listen_addr:?}: {err}");
-            unreachable!()
-        }
-    };
+    // Start one HTTP server per `-httpListenAddr`; each router closure owns a
+    // clone of the storage `Arc` (`Send + Sync + 'static`, as `serve` requires)
+    // and each listener reads its own indexed `-tls*` config.
+    let mut handles: Vec<httpserver::ServerHandle> = Vec::with_capacity(listen_addrs.len());
+    for (i, addr) in listen_addrs.iter().enumerate() {
+        let router_storage = Arc::clone(&storage);
+        let handle = match httpserver::serve_listener(addr, i, move |req, w| {
+            request_handler(&router_storage, req, w);
+        }) {
+            Ok(h) => h,
+            Err(err) => {
+                fatalf!("cannot start the http server at {addr:?}: {err}");
+                unreachable!()
+            }
+        };
+        handles.push(handle);
+    }
 
     infof!(
         "started EsLogs in {:.3} seconds; see https://docs.victoriametrics.com/victorialogs/",
@@ -130,9 +137,11 @@ fn main() {
     infof!("received signal {sig}");
     pushmetrics::stop();
 
-    infof!("gracefully shutting down webservice at {listen_addr:?}");
+    infof!("gracefully shutting down webservice at {listen_addrs:?}");
     let start_time = Instant::now();
-    handle.stop();
+    for handle in handles {
+        handle.stop();
+    }
     infof!(
         "successfully shut down the webservice in {:.3} seconds",
         start_time.elapsed().as_secs_f64()

@@ -5,16 +5,14 @@
 //! kubernetes collectors) feed `remotewrite`, which buffers the rows in
 //! persistent queues and ships them to every `-remoteWrite.url`.
 //!
-//! PORT NOTE: Go declares `-httpListenAddr` as an ArrayString (multiple
-//! listeners) plus `-httpListenAddr.useProxyProtocol`. The ported
-//! `httpserver::serve` binds a single address and has no proxy-protocol
-//! support, so the flag is a single `String` here (mirroring the ported
-//! es-logs binary).
+//! PORT NOTE: `-httpListenAddr` is an ArrayString (Go), so several listeners
+//! can be started, each with its own indexed `-tls*` config. Go's per-listener
+//! `-httpListenAddr.useProxyProtocol` is not ported.
 //!
 use std::sync::Arc;
 use std::time::Instant;
 
-use esl_common::flagutil::Flag;
+use esl_common::flagutil::{ArrayString, Flag};
 use esl_common::httpserver::{Request, ResponseWriter};
 use esl_common::{
     buildinfo, envflag, fatalf, flagutil, httpserver, infof, logger, procutil, pushmetrics,
@@ -22,12 +20,12 @@ use esl_common::{
 
 use esl_agent::{filecollector, kubernetescollector, remotewrite, tail};
 
-static HTTP_LISTEN_ADDR: Flag<String> = Flag::new(
+static HTTP_LISTEN_ADDR: Flag<ArrayString> = Flag::new(
     "httpListenAddr",
     "TCP address to listen for incoming http requests. \
      Set this flag to empty value in order to disable listening on any port. \
      This mode may be useful for running multiple eslagent instances on the same server.",
-    || ":9429".to_string(),
+    || ArrayString(vec![":9429".to_string()]),
 );
 
 static TMP_DATA_PATH: Flag<String> = Flag::new(
@@ -52,8 +50,15 @@ fn main() {
     pushmetrics::init_secret_flags();
     logger::init();
 
-    let listen_addr = HTTP_LISTEN_ADDR.get().clone();
-    infof!("starting eslagent at {listen_addr:?}...");
+    // Empty entries disable listening (Go: `-httpListenAddr=''`).
+    let listen_addrs: Vec<String> = HTTP_LISTEN_ADDR
+        .get()
+        .0
+        .iter()
+        .filter(|a| !a.is_empty())
+        .cloned()
+        .collect();
+    infof!("starting eslagent at {listen_addrs:?}...");
     let start_time = Instant::now();
 
     // Go: insertutil.SetLogRowsStorage(&remotewrite.Storage{}). The ported
@@ -73,22 +78,21 @@ fn main() {
     // unless -syslog.listenAddr.* flags are set).
     esl_insert::syslog_listeners::must_init(&storage);
 
-    // PORT NOTE: Go disables the HTTP server entirely when -httpListenAddr=''
-    // is passed; keep that behavior for parity.
-    let handle = if listen_addr.is_empty() {
-        None
-    } else {
+    // Go disables the HTTP server entirely when every -httpListenAddr is empty;
+    // otherwise start one listener per address with its indexed `-tls*` config.
+    let mut handles: Vec<httpserver::ServerHandle> = Vec::with_capacity(listen_addrs.len());
+    for (i, addr) in listen_addrs.iter().enumerate() {
         let router_storage = Arc::clone(&storage);
-        match httpserver::serve(&listen_addr, move |req, w| {
+        match httpserver::serve_listener(addr, i, move |req, w| {
             request_handler(&router_storage, req, w);
         }) {
-            Ok(h) => Some(h),
+            Ok(h) => handles.push(h),
             Err(err) => {
-                fatalf!("cannot start the http server at {listen_addr:?}: {err}");
+                fatalf!("cannot start the http server at {addr:?}: {err}");
                 unreachable!()
             }
         }
-    };
+    }
     infof!(
         "started eslagent in {:.3} seconds",
         start_time.elapsed().as_secs_f64()
@@ -100,8 +104,8 @@ fn main() {
     pushmetrics::stop();
 
     let start_time = Instant::now();
-    infof!("gracefully shutting down webservice at {listen_addr:?}");
-    if let Some(handle) = handle {
+    infof!("gracefully shutting down webservice at {listen_addrs:?}");
+    for handle in handles {
         handle.stop();
     }
     // Go eslinsert.Stop().

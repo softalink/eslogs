@@ -144,9 +144,9 @@ const MAX_FORM_SIZE: usize = 10 << 20;
 // ---------------------------------------------------------------------------
 
 // Like Go, the flags live in the shared httpserver library, so every binary
-// that calls [`serve`] (es-logs, eslagent) gets them. The ported server binds
-// a single -httpListenAddr (see the PORT NOTE in the binaries), so only index
-// 0 of each array flag is consulted.
+// that calls [`serve`]/[`serve_listener`] (es-logs, eslagent) gets them. Each
+// listener consults its own index of these array flags (Go indexes by
+// listener); [`serve`] is the index-0 case.
 static TLS_ENABLE: Flag<ArrayBool> = Flag::new(
     "tls",
     "Whether to enable TLS for incoming HTTP requests at the given -httpListenAddr (aka https). \
@@ -1308,14 +1308,25 @@ pub fn serve<H>(addr: &str, handler: H) -> io::Result<ServerHandle>
 where
     H: Fn(&mut Request, &mut ResponseWriter) + Send + Sync + 'static,
 {
+    serve_listener(addr, 0, handler)
+}
+
+/// [`serve`] for the `listener_index`-th `-httpListenAddr` listener, reading the
+/// `-tls*` flag arrays at that index so each of several listeners gets its own
+/// TLS config (Go indexes the flag arrays by listener). `serve` is the
+/// `listener_index == 0` case.
+pub fn serve_listener<H>(addr: &str, listener_index: usize, handler: H) -> io::Result<ServerHandle>
+where
+    H: Fn(&mut Request, &mut ResponseWriter) + Send + Sync + 'static,
+{
     // Build the TLS server config from the -tls* flags (Go does this inside
     // Serve before netutil.NewTCPListener). Go logger.Fatalf's on a bad
     // config; here the error is returned and the binaries fatalf on it, with
     // the same message.
-    let tls_cfg = if TLS_ENABLE.get().get_optional_arg(0) {
-        let cert_file = TLS_CERT_FILE.get().get_optional_arg(0);
-        let key_file = TLS_KEY_FILE.get().get_optional_arg(0);
-        let min_version = TLS_MIN_VERSION.get().get_optional_arg(0);
+    let tls_cfg = if TLS_ENABLE.get().get_optional_arg(listener_index) {
+        let cert_file = TLS_CERT_FILE.get().get_optional_arg(listener_index);
+        let key_file = TLS_KEY_FILE.get().get_optional_arg(listener_index);
+        let min_version = TLS_MIN_VERSION.get().get_optional_arg(listener_index);
         let cipher_suites: &[String] = TLS_CIPHER_SUITES.get();
         let cfg =
             crate::tlsutil::get_server_tls_config(cert_file, key_file, min_version, cipher_suites)
@@ -2380,6 +2391,25 @@ mod tests {
         );
         assert_eq!(body, b"fromheader");
         srv.stop();
+    }
+
+    #[test]
+    fn test_multiple_listeners_coexist() {
+        // Two independent listeners (as several `-httpListenAddr` would start)
+        // bind separate ports and serve requests independently.
+        let srv0 = serve_listener("127.0.0.1:0", 0, |_req, rw| rw.write_str("a")).unwrap();
+        let srv1 = serve_listener("127.0.0.1:0", 1, |_req, rw| rw.write_str("b")).unwrap();
+        let (a0, a1) = (srv0.local_addr(), srv1.local_addr());
+        assert_ne!(a0, a1, "listeners must bind distinct ports");
+
+        let req = b"GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let (s0, b0) = request_once(a0, req);
+        let (s1, b1) = request_once(a1, req);
+        assert_eq!((s0, b0.as_slice()), (200, b"a".as_slice()));
+        assert_eq!((s1, b1.as_slice()), (200, b"b".as_slice()));
+
+        srv0.stop();
+        srv1.stop();
     }
 
     #[test]
