@@ -11,7 +11,12 @@
 //! [`process_line`] per framed message.
 
 use esl_logstorage::rows::{Field, rename_field};
-use esl_logstorage::syslog_parser::{get_syslog_parser, put_syslog_parser};
+use std::sync::Arc;
+
+use esl_common::tzdata::Location;
+use esl_logstorage::syslog_parser::{
+    get_syslog_parser, get_syslog_parser_with_location, put_syslog_parser,
+};
 
 use crate::common_params::{
     LogMessageProcessor, LogRowsStorage, extract_timestamp_from_fields, now_unix_nanos,
@@ -41,8 +46,9 @@ impl<S: LogRowsStorage> SyslogLogMessageProcessor for LogMessageProcessor<'_, S>
 /// Parses a single syslog `line` and adds the resulting row to `lmp`.
 ///
 /// `current_year` is used for the RFC 3164 format (which omits the year).
-/// `timezone_offset_secs` is the fixed UTC offset for RFC 3164 timestamps
-/// (see the PORT NOTE on `syslog_parser::get_syslog_parser`).
+/// `timezone_offset_secs` is the fixed UTC offset for RFC 3164 timestamps when
+/// `timezone` is `None`; a `Some(location)` resolves a DST-aware IANA zone
+/// instead (see the PORT NOTE on `syslog_parser::get_syslog_parser`).
 ///
 /// When `use_local_timestamp` is true, the current time is used instead of the
 /// timestamp parsed from the message. When `remote_ip` is non-empty it is added
@@ -51,11 +57,15 @@ pub fn process_line<P: SyslogLogMessageProcessor + ?Sized>(
     line: &str,
     current_year: i64,
     timezone_offset_secs: i64,
+    timezone: Option<Arc<Location>>,
     use_local_timestamp: bool,
     remote_ip: &str,
     lmp: &mut P,
 ) -> Result<(), String> {
-    let mut p = get_syslog_parser(current_year, timezone_offset_secs);
+    let mut p = match timezone {
+        Some(location) => get_syslog_parser_with_location(current_year, location),
+        None => get_syslog_parser(current_year, timezone_offset_secs),
+    };
     p.parse(line);
 
     let ts = if use_local_timestamp {
@@ -107,7 +117,7 @@ mod tests {
 
         // RFC5424 line; use_local_timestamp=true forces the current time.
         let line = "<165>1 2023-01-01T00:00:00.000Z myhost myapp 1 - - hello world";
-        let res = process_line(line, 2024, 0, true, "", &mut lmp);
+        let res = process_line(line, 2024, 0, None, true, "", &mut lmp);
         assert!(res.is_ok(), "unexpected error: {res:?}");
 
         lmp.close();

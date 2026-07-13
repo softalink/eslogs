@@ -368,10 +368,15 @@ what remains in section (a) is confirmed-present divergence.
   vs Go's `0xFF`×4, so a `string_range` filter's *matching* differs for stored
   byte values in `0xF5..0xFF` (rendering is unaffected — the sentinel never
   appears in `String()`).
-- `syslog_parser.rs:24/:571` — RFC3164 timestamps use a fixed UTC offset;
-  DST/IANA zone rules are not applied. Related:
-  `esl-insert/src/syslog_listeners.rs:368/:1658` — named IANA timezones are
-  a fatal startup error (only `UTC`/`Local`/fixed offsets are supported).
+- `syslog_parser.rs`, `esl-insert/src/syslog_listeners.rs` — a named IANA
+  `-syslog.timezone` (e.g. `America/New_York`) is now supported on Unix: it is
+  loaded DST-aware from the system zoneinfo database (`crate::tzdata`) and the
+  RFC3164 timestamp's offset is resolved per timestamp via
+  `Location::offset_for_wall_secs` (Go `time.Date`), so it is no longer a fatal
+  startup error. Fixed forms (UTC/`Etc/GMT±N`/`±HH:MM`/`Local`) keep the cheap
+  fixed-offset path. Residual: Windows named zones remain unsupported (no system
+  zoneinfo; the port does not bundle tzdata), and `Local` still samples a single
+  offset at startup.
 
 **Storage engine (esl-logstorage)**
 

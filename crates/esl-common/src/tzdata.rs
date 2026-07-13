@@ -65,6 +65,17 @@ impl Location {
         self.types.get(idx).map_or(0, |ti| ti.utoff)
     }
 
+    /// UTC offset (seconds, east positive) for a *wall-clock* instant expressed
+    /// as if it were UTC (`wall_naive_secs`), resolving DST like Go's
+    /// `time.Date(..., loc)`: look up the offset at the naive instant, correct
+    /// the instant by it, and re-look-up — one correction converges for every
+    /// real transition. During a DST gap/overlap this picks the post-correction
+    /// offset, matching Go's normalization.
+    pub fn offset_for_wall_secs(&self, wall_naive_secs: i64) -> i32 {
+        let off1 = self.offset_at_secs(wall_naive_secs);
+        self.offset_at_secs(wall_naive_secs - off1 as i64)
+    }
+
     /// Loads the named IANA zone, like Go `time.LoadLocation`.
     ///
     /// `UTC`/`""` resolve to a fixed-zero location without touching the disk;
@@ -272,6 +283,20 @@ mod tests {
         assert_eq!(ny.offset_at_secs(1_610_712_000), -5 * 3600);
         // 2021-07-15T12:00:00Z -> EDT (UTC-4).
         assert_eq!(ny.offset_at_secs(1_626_350_400), -4 * 3600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_offset_for_wall_dst() {
+        let Ok(ny) = Location::load("America/New_York") else {
+            return;
+        };
+        // 2021-01-15 12:00:00 wall time in New York -> EST (UTC-5).
+        let jan_wall = 1_610_712_000; // 2021-01-15T12:00:00 treated as UTC seconds
+        assert_eq!(ny.offset_for_wall_secs(jan_wall), -5 * 3600);
+        // 2021-07-15 12:00:00 wall time in New York -> EDT (UTC-4).
+        let jul_wall = 1_626_350_400;
+        assert_eq!(ny.offset_for_wall_secs(jul_wall), -4 * 3600);
     }
 
     #[cfg(unix)]

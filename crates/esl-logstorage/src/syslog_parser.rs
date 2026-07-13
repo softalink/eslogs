@@ -1,8 +1,9 @@
 //! Port of `lib/logstorage/syslog_parser.go`.
 
 use std::borrow::Cow;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use esl_common::tzdata::Location;
 use esl_common::{bytesutil, fasttime};
 
 use crate::json_parser::{JSONParser, get_json_parser, put_json_parser};
@@ -21,13 +22,11 @@ use crate::values_encoder::{
 /// The timezone is used for the rfc3164 format for setting the desired
 /// timezone.
 ///
-/// PORT NOTE: Go takes *time.Location (any IANA zone; time.Date resolves the
-/// UTC offset at the timestamp's wall-clock date, i.e. DST-aware); std Rust
-/// has no timezone database, so the port takes a fixed UTC offset in seconds
-/// instead (0 for UTC). For every timezone the port's -syslog.timezone flag
-/// can express (UTC, Etc/GMT±N, fixed ±HH:MM) the result is identical to Go;
-/// the divergence is confined to DST-observing zones ("Local" in a DST zone,
-/// named IANA zones) — see esl-insert's parse_timezone_offset_secs.
+/// PORT NOTE: Go takes `*time.Location`. This entry point takes a fixed UTC
+/// offset (UTC, `Etc/GMT±N`, `±HH:MM`, `Local`), the cheap common path. For a
+/// DST-observing named IANA zone use [`get_syslog_parser_with_location`], which
+/// resolves the offset per timestamp like Go's `time.Date`. (`Local` still
+/// samples a single offset at startup.)
 ///
 /// Return back the parser to the pool by calling put_syslog_parser when it is
 /// no longer needed.
@@ -35,6 +34,17 @@ pub fn get_syslog_parser(current_year: i64, timezone_offset_secs: i64) -> Syslog
     let mut p = SYSLOG_PARSER_POOL.lock().unwrap().pop().unwrap_or_default();
     p.current_year = current_year;
     p.timezone_offset_secs = timezone_offset_secs;
+    p
+}
+
+/// Like [`get_syslog_parser`], but resolves the RFC 3164 timezone via a
+/// DST-aware IANA [`Location`] (Go stores `*time.Location`) rather than a fixed
+/// offset. The shared `Arc` keeps the per-message cost to a refcount bump plus a
+/// binary search over the zone's transitions.
+pub fn get_syslog_parser_with_location(current_year: i64, location: Arc<Location>) -> SyslogParser {
+    let mut p = SYSLOG_PARSER_POOL.lock().unwrap().pop().unwrap_or_default();
+    p.current_year = current_year;
+    p.timezone = Some(location);
     p
 }
 
@@ -77,9 +87,14 @@ pub struct SyslogParser {
     /// current_year is used as the current year for rfc3164 messages.
     current_year: i64,
 
-    /// timezone_offset_secs is used as the current timezone offset for
-    /// rfc3164 messages (see the PORT NOTE at get_syslog_parser).
+    /// timezone_offset_secs is the fixed UTC offset for rfc3164 messages when
+    /// `timezone` is `None` (UTC, `Etc/GMT±N`, `±HH:MM`, `Local`).
     timezone_offset_secs: i64,
+
+    /// A DST-aware IANA zone for rfc3164 messages (named `-syslog.timezone`
+    /// values); when set it takes precedence over `timezone_offset_secs` and
+    /// the offset is resolved per timestamp.
+    timezone: Option<Arc<Location>>,
     // PORT NOTE: Go's unescaper strings.Replacer (`\]` -> `]`) is replaced by
     // str::replace in parse_rfc5424_sd_line.
 }
@@ -92,6 +107,7 @@ impl SyslogParser {
 
         self.current_year = 0;
         self.timezone_offset_secs = 0;
+        self.timezone = None;
         self.reset_fields();
     }
 
@@ -567,26 +583,38 @@ impl SyslogParser {
         }
     }
 
+    /// UTC offset (seconds) to subtract from a naive-UTC wall-clock instant to
+    /// get the real instant: the fixed offset for `None`, or the DST-aware
+    /// per-instant offset for a named zone. The `None` branch is the hot path
+    /// for UTC/fixed zones and stays a single field read.
+    fn wall_offset_secs(&self, naive_secs: i64) -> i64 {
+        match &self.timezone {
+            None => self.timezone_offset_secs,
+            Some(loc) => loc.offset_for_wall_secs(naive_secs) as i64,
+        }
+    }
+
     fn try_parse_timestamp_rfc3164(&mut self, s: &str) -> bool {
         let (month, day, hour, minute, second) = match parse_time_stamp(s) {
             Some(parts) => parts,
             None => return false,
         };
 
-        // PORT NOTE: Go builds time.Date(currentYear, ...) in p.timezone,
-        // resolving the UTC offset at that wall-clock date (DST-aware); the
-        // port computes the unix time directly with the fixed timezone
-        // offset. Identical to Go for fixed-offset timezones (the only kind
-        // the port's -syslog.timezone accepts); differs by the DST delta in
-        // DST-observing zones. Out-of-range days overflow into the next month
-        // (unix_from_civil), matching Go's time.Date normalization, and the
-        // uint64 wraparound below matches Go's `uint64(t.Unix())-24*3600`.
-        let mut unix = unix_from_civil(self.current_year, month, day, hour, minute, second)
-            - self.timezone_offset_secs;
+        // Go builds time.Date(currentYear, ...) in p.timezone, resolving the UTC
+        // offset at that wall-clock date (DST-aware). The port does the same:
+        // for a fixed-offset zone (`timezone` is None) it subtracts the fixed
+        // offset; for a named IANA zone it resolves the offset for that
+        // wall-clock instant via the loaded Location (see `wall_offset_secs`).
+        // Out-of-range days overflow into the next month (unix_from_civil),
+        // matching Go's time.Date normalization, and the uint64 wraparound below
+        // matches Go's `uint64(t.Unix())-24*3600`.
+        let naive = unix_from_civil(self.current_year, month, day, hour, minute, second);
+        let mut unix = naive - self.wall_offset_secs(naive);
         if (unix as u64).wrapping_sub(24 * 3600) > fasttime::unix_timestamp() {
             // Adjust time to the previous year
-            unix = unix_from_civil(self.current_year - 1, month, day, hour, minute, second)
-                - self.timezone_offset_secs;
+            let naive_prev =
+                unix_from_civil(self.current_year - 1, month, day, hour, minute, second);
+            unix = naive_prev - self.wall_offset_secs(naive_prev);
         }
         let mut buf = Vec::new();
         marshal_timestamp_rfc3339_nano_string(&mut buf, unix * 1_000_000_000);
@@ -801,6 +829,40 @@ fn prev_backslashes_count(b: &[u8], offset: usize) -> usize {
 mod tests {
     use super::*;
     use crate::rows::marshal_fields_to_logfmt;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rfc3164_dst_aware_named_timezone() {
+        // Skip gracefully where the system lacks the zone.
+        let Ok(loc) = Location::load("America/New_York") else {
+            return;
+        };
+        let loc = Arc::new(loc);
+        let ts_of = |line: &str| -> String {
+            // 2021 is in the past, so the "adjust to previous year" branch does
+            // not fire (fasttime::unix_timestamp() is later).
+            let mut p = get_syslog_parser_with_location(2021, Arc::clone(&loc));
+            p.parse(line);
+            let ts = p
+                .fields
+                .iter()
+                .find(|f| f.name == "timestamp")
+                .map(|f| f.value.clone())
+                .unwrap_or_default();
+            put_syslog_parser(p);
+            ts
+        };
+        // Summer -> EDT (UTC-4): 12:00 New York == 16:00 UTC.
+        assert!(
+            ts_of("Jul 15 12:00:00 host app: msg").starts_with("2021-07-15T16:00:00"),
+            "EDT offset not applied"
+        );
+        // Winter -> EST (UTC-5): 12:00 New York == 17:00 UTC.
+        assert!(
+            ts_of("Jan 15 12:00:00 host app: msg").starts_with("2021-01-15T17:00:00"),
+            "EST offset not applied"
+        );
+    }
 
     #[test]
     fn test_syslog_parser() {

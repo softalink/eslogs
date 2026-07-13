@@ -41,7 +41,7 @@ use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,7 @@ use esl_common::cgroup::available_cpus;
 use esl_common::flagutil::{ArrayBool, ArrayString, Flag};
 use esl_common::timeutil::{add_jitter_to_duration, get_local_timezone_offset_nsecs};
 use esl_common::tlsutil::{TlsServerStream, get_server_tls_config, rustls, server_accept};
+use esl_common::tzdata::Location;
 use esl_common::{errorf, fatalf, infof, panicf};
 
 use esl_logstorage::rows::Field;
@@ -350,10 +351,22 @@ pub fn must_init<S: LogRowsStorage + 'static>(storage: &Arc<S>) {
 
     let tz = SYSLOG_TIMEZONE.get();
     match parse_timezone_offset_secs(tz) {
+        // Fixed-offset zones (UTC, Etc/GMT±N, ±HH:MM, Local) keep the cheap
+        // fixed-offset path.
         Ok(offset_secs) => GLOBAL_TIMEZONE_OFFSET_SECS.store(offset_secs, Ordering::SeqCst),
-        Err(err) => {
-            fatalf!("cannot parse -syslog.timezone={tz:?}: {err}");
-        }
+        // A named IANA zone (America/New_York, ...) is loaded DST-aware from the
+        // system zoneinfo database, like Go's time.LoadLocation.
+        Err(offset_err) => match Location::load(tz) {
+            Ok(loc) => {
+                let _ = GLOBAL_TIMEZONE_LOCATION.set(Arc::new(loc));
+            }
+            Err(loc_err) => {
+                fatalf!(
+                    "cannot parse -syslog.timezone={tz:?}: {offset_err}; \
+                     and it is not a loadable IANA zone: {loc_err}"
+                );
+            }
+        },
     }
 
     *workers = Some(Workers { stop, handles });
@@ -368,13 +381,18 @@ fn spawn_worker(name: String, f: impl FnOnce() + Send + 'static) -> JoinHandle<(
 
 // Go: globalCurrentYear atomic.Int64 / globalTimezone *time.Location.
 //
-// PORT NOTE: std Rust has no IANA timezone database, so the timezone is kept
-// as a fixed UTC offset in seconds, resolved once at startup (see
-// `parse_timezone_offset_secs` below for the exact -syslog.timezone
-// divergence from Go's DST-aware time.LoadLocation, and
-// `syslog_parser::get_syslog_parser` for the parser-side contract).
+// The `-syslog.timezone` is resolved once at startup: fixed-offset forms
+// (UTC, Etc/GMT±N, ±HH:MM, Local) into GLOBAL_TIMEZONE_OFFSET_SECS, and named
+// IANA zones into GLOBAL_TIMEZONE_LOCATION (DST-aware, loaded from the system
+// zoneinfo database like Go's time.LoadLocation — see `crate`-level
+// `esl_common::tzdata`).
 static GLOBAL_CURRENT_YEAR: AtomicI64 = AtomicI64::new(0);
 static GLOBAL_TIMEZONE_OFFSET_SECS: AtomicI64 = AtomicI64::new(0);
+
+/// A DST-aware IANA zone for RFC 3164 timestamps, set at init when
+/// `-syslog.timezone` is a named zone that `parse_timezone_offset_secs` can't
+/// express as a fixed offset. `None` means the fixed offset above is used.
+static GLOBAL_TIMEZONE_LOCATION: OnceLock<Arc<Location>> = OnceLock::new();
 
 // Go: workersWG sync.WaitGroup / workersStopCh chan struct{}.
 struct Workers {
@@ -1211,12 +1229,19 @@ fn process_uncompressed_stream<P: SyslogLogMessageProcessor>(
     let mut n: u64 = 0;
     while slr.next_line() {
         let current_year = GLOBAL_CURRENT_YEAR.load(Ordering::SeqCst);
-        let timezone_offset_secs = GLOBAL_TIMEZONE_OFFSET_SECS.load(Ordering::SeqCst);
+        // A named IANA zone resolves DST per timestamp; otherwise the fixed
+        // offset applies (the common case, and an `Arc::clone` is only a
+        // refcount bump when a zone is set).
+        let (timezone_offset_secs, timezone) = match GLOBAL_TIMEZONE_LOCATION.get() {
+            Some(loc) => (0, Some(Arc::clone(loc))),
+            None => (GLOBAL_TIMEZONE_OFFSET_SECS.load(Ordering::SeqCst), None),
+        };
         let line = String::from_utf8_lossy(&slr.line);
         process_line(
             &line,
             current_year,
             timezone_offset_secs,
+            timezone,
             use_local_timestamp,
             remote_ip,
             lmp,
