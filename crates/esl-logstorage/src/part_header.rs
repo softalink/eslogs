@@ -138,9 +138,9 @@ impl PartHeader {
     ///
     /// PORT NOTE: Go uses encoding/json; the port implements a minimal parser
     /// for JSON objects with integer members (any member order, missing
-    /// members keep their current value like in Go). Unknown members are
-    /// skipped when their value is a scalar; nested arrays/objects in unknown
-    /// members are rejected. Error wording differs from Go's encoding/json.
+    /// members keep their current value like in Go). Unknown members of any
+    /// type are skipped (scalars and nested arrays/objects), like Go's
+    /// `json.Unmarshal`. Error wording differs from Go's encoding/json.
     fn unmarshal_json(&mut self, src: &[u8]) -> Result<(), String> {
         let mut p = JsonParser { src, pos: 0 };
         p.skip_ws();
@@ -166,7 +166,7 @@ impl PartHeader {
                 "MinTimestamp" => self.min_timestamp = p.parse_int64()?,
                 "MaxTimestamp" => self.max_timestamp = p.parse_int64()?,
                 "BloomValuesShardsCount" => self.bloom_values_shards_count = p.parse_uint64()?,
-                _ => p.skip_scalar_value()?,
+                _ => p.skip_value()?,
             }
             p.skip_ws();
             match p.next() {
@@ -347,6 +347,56 @@ impl<'a> JsonParser<'a> {
         }
     }
 
+    /// Skips a full JSON value — a scalar, or a nested array/object parsed
+    /// recursively — so unknown members of any type are ignored like Go's
+    /// `json.Unmarshal`.
+    fn skip_value(&mut self) -> Result<(), String> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'{') => {
+                self.pos += 1;
+                self.skip_ws();
+                if self.peek() == Some(b'}') {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                loop {
+                    self.skip_ws();
+                    self.parse_string()?;
+                    self.skip_ws();
+                    self.expect(b':')?;
+                    self.skip_value()?;
+                    self.skip_ws();
+                    match self.next() {
+                        Some(b',') => continue,
+                        Some(b'}') => break,
+                        _ => return Err("missing ',' or '}' in nested object member".to_string()),
+                    }
+                }
+                Ok(())
+            }
+            Some(b'[') => {
+                self.pos += 1;
+                self.skip_ws();
+                if self.peek() == Some(b']') {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                loop {
+                    self.skip_value()?;
+                    self.skip_ws();
+                    match self.next() {
+                        Some(b',') => continue,
+                        Some(b']') => break,
+                        _ => return Err("missing ',' or ']' in nested array element".to_string()),
+                    }
+                }
+                Ok(())
+            }
+            _ => self.skip_scalar_value(),
+        }
+    }
+
     fn consume_literal(&mut self, lit: &[u8]) -> Result<(), String> {
         if self.src[self.pos..].starts_with(lit) {
             self.pos += lit.len();
@@ -425,6 +475,22 @@ mod tests {
             PartHeader {
                 rows_count: 42,
                 min_timestamp: -7,
+                ..Default::default()
+            }
+        );
+
+        // Unknown members with nested arrays/objects are skipped like Go's
+        // json.Unmarshal; known members around them still parse.
+        let mut ph = PartHeader::default();
+        ph.unmarshal_json(
+            b"{\"Foo\":{\"a\":1,\"b\":[1,2,{\"c\":3}]},\"RowsCount\":5,\"Bar\":[1,{},[]],\"BlocksCount\":6}",
+        )
+        .unwrap_or_else(|err| panic!("unexpected error skipping nested unknown members: {err}"));
+        assert_eq!(
+            ph,
+            PartHeader {
+                rows_count: 5,
+                blocks_count: 6,
                 ..Default::default()
             }
         );

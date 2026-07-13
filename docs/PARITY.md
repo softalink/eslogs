@@ -389,10 +389,6 @@ what remains in section (a) is confirmed-present divergence.
 - `delete_task.rs:101` — a genuinely nil delete-task list serializes as `[]`
   where Go's `json.Marshal` writes `null` (on-disk bytes differ, both
   readable; an empty-but-non-nil list is `[]` on both sides).
-- `part_header.rs:139` — `metadata.json` parsing rejects unknown members
-  containing nested arrays/objects that Go's `json.Unmarshal` skips
-  (forward-compat / hand-edited-file concern; unreachable via self-written
-  files, which hold only the known scalar fields).
 - `rows.rs:442` — duplicate field names are sorted stably (`sort_by`) where
   Go uses unstable `sort.Slice`, so tie order can differ; Go's tie order is
   unspecified, so this is a valid instance of Go's contract surfaced only by
