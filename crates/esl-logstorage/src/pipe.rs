@@ -54,8 +54,15 @@ use crate::prefix_filter;
 /// block results to the given processor. Port of Go `runUnionQueryFunc`; wired
 /// into `union` pipes by `storage_search::init_subqueries` via
 /// [`Pipe::init_union_query`].
-pub type RunUnionQueryFn =
-    Arc<dyn Fn(&str, Arc<dyn PipeProcessor>) -> Result<(), String> + Send + Sync>;
+pub type RunUnionQueryFn = Arc<
+    dyn Fn(
+            &str,
+            Arc<dyn PipeProcessor>,
+            Option<Arc<std::sync::atomic::AtomicBool>>,
+        ) -> Result<(), String>
+        + Send
+        + Sync,
+>;
 
 /// The `by (...)` / result-field structure of a `| stats ...` pipe, as needed
 /// by `Query::get_stats_labels*` (Go downcasts to `*pipeStats` and reads

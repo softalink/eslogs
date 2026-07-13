@@ -802,6 +802,7 @@ pub(crate) fn run_query(
         sink,
         cancel,
         qs,
+        None,
     )
 }
 
@@ -809,6 +810,7 @@ pub(crate) fn run_query(
 /// [`PipeProcessor`] sink so `union` subqueries can stream their block results
 /// straight into the outer pipeline (Go passes `writeBlockResultFunc`s around
 /// instead).
+#[allow(clippy::too_many_arguments)]
 fn run_query_with_sink(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
@@ -817,6 +819,11 @@ fn run_query_with_sink(
     sink: Arc<dyn PipeProcessor>,
     cancel: Option<&Arc<AtomicBool>>,
     qs: &Arc<QueryStats>,
+    // Benign early-stop (a `union` subquery's parent-pipeline stop): when set,
+    // the scan terminates without surfacing a cancel error, so the subquery
+    // stops as soon as the downstream pipeline no longer wants rows (Go wraps
+    // the parent stop channel into the subquery context here).
+    benign_stop: Option<&Arc<AtomicBool>>,
 ) -> Result<(), String> {
     if let Some(c) = cancel
         && c.load(Ordering::SeqCst)
@@ -838,8 +845,24 @@ fn run_query_with_sink(
         q.pipes(),
         concurrency,
         |stop, head| {
+            // If the parent pipeline has already stopped (benign), skip the
+            // scan; otherwise flip the search's internal stop as soon as the
+            // parent stops mid-scan so it terminates without a cancel error.
+            if let Some(b) = benign_stop
+                && b.load(Ordering::SeqCst)
+            {
+                stop.store(true, Ordering::SeqCst);
+            }
             let head_w = Arc::clone(head);
+            let benign_w = benign_stop.cloned();
+            let stop_w: &AtomicBool = stop;
             let write_block = move |worker_id: usize, br: &mut BlockResult| {
+                if let Some(b) = &benign_w
+                    && b.load(Ordering::SeqCst)
+                {
+                    stop_w.store(true, Ordering::SeqCst);
+                    return;
+                }
                 head_w.write_block(worker_id, br);
             };
             let head_s = Arc::clone(head);
@@ -1688,7 +1711,7 @@ pub(crate) fn init_subqueries(
         let cancel_u: Option<Arc<AtomicBool>> = cancel.cloned();
         let qs_u = Arc::clone(qs);
         let run_union_query: crate::pipe::RunUnionQueryFn =
-            Arc::new(move |q_text, sink| -> Result<(), String> {
+            Arc::new(move |q_text, sink, benign_stop| -> Result<(), String> {
                 let q_sub = crate::parser::ParseQueryAtTimestamp(q_text, timestamp)
                     .map_err(|e| format!("BUG: cannot parse subquery [{q_text}]: {e}"))?;
                 run_query_with_sink(
@@ -1699,6 +1722,7 @@ pub(crate) fn init_subqueries(
                     sink,
                     cancel_u.as_ref(),
                     &qs_u,
+                    benign_stop.as_ref(),
                 )
             });
         for p in &mut q_new.pipes {
@@ -1760,6 +1784,7 @@ pub(crate) fn init_subqueries(
                         sink,
                         cancel_sc.as_ref(),
                         &qs_sc,
+                        None,
                     )
                 },
             );

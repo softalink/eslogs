@@ -186,7 +186,7 @@ impl Pipe for PipeUnion {
     fn new_pipe_processor(
         &self,
         _concurrency: usize,
-        _stop: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
         pp_next: Arc<dyn PipeProcessor>,
     ) -> Arc<dyn PipeProcessor> {
         Arc::new(PipeUnionProcessor {
@@ -194,6 +194,7 @@ impl Pipe for PipeUnion {
             rows: self.rows.clone(),
             run_query: self.run_query.clone(),
             pp_next,
+            stop,
         })
     }
 }
@@ -203,6 +204,9 @@ struct PipeUnionProcessor {
     rows: Option<Vec<Vec<Field>>>,
     run_query: Option<RunUnionQueryFn>,
     pp_next: Arc<dyn PipeProcessor>,
+    /// The pipeline stop, so the subquery scan stops as soon as a downstream
+    /// pipe (e.g. `limit`) stops early (Go wraps this into the subquery context).
+    stop: Arc<AtomicBool>,
 }
 
 impl PipeProcessor for PipeUnionProcessor {
@@ -216,9 +220,9 @@ impl PipeProcessor for PipeUnionProcessor {
     fn flush(&self) -> Result<(), String> {
         // execute the query to union
         //
-        // PORT NOTE: Go wraps the pipeline stop channel into a context here
-        // (`contextutil.NewStopChanContext`); the Rust `run_query` has no
-        // cancellation (see its PORT NOTE), so nothing is threaded through.
+        // The pipeline `stop` is passed as the subquery's benign early-stop (Go
+        // wraps it into a `contextutil.NewStopChanContext`), so the subquery
+        // scan terminates as soon as a downstream pipe stops early.
         if let Some(rows) = &self.rows {
             let mut br = BlockResult::default();
             br.must_init_from_rows(rows);
@@ -227,7 +231,11 @@ impl PipeProcessor for PipeUnionProcessor {
         }
 
         match (&self.query_text, &self.run_query) {
-            (Some(q_text), Some(run_query)) => run_query(q_text, Arc::clone(&self.pp_next)),
+            (Some(q_text), Some(run_query)) => run_query(
+                q_text,
+                Arc::clone(&self.pp_next),
+                Some(Arc::clone(&self.stop)),
+            ),
             // PORT NOTE: reachable only when the pipe runs outside
             // `Storage::run_query` (unit harnesses) — `init_union_query`
             // wires `run_query` before every real query execution (Go would

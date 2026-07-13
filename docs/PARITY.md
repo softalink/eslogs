@@ -333,10 +333,6 @@ what remains in section (a) is confirmed-present divergence.
   capacities (and shares value bytes in the `byFields` path), so the port
   accounts more memory per block and can cross the identical 20% threshold on
   smaller input — a borderline sort errors in the port but not in Go.
-- `pipe_union.rs:204` — a union subquery is not cancelled when the downstream
-  pipeline stops early: the `RunUnionQueryFn` type carries no context/cancel
-  and the `stop` flag is dropped, so the subquery keeps running (Go cancels
-  via `contextutil.NewStopChanContext`).
 
 **LogsQL text rendering / round-trip (esl-logstorage)**
 
