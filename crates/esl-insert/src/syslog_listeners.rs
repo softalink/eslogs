@@ -40,6 +40,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -48,7 +49,7 @@ use esl_common::metrics::Counter;
 
 use esl_common::cgroup::available_cpus;
 use esl_common::flagutil::{ArrayBool, ArrayString, Flag};
-use esl_common::timeutil::get_local_timezone_offset_nsecs;
+use esl_common::timeutil::{add_jitter_to_duration, get_local_timezone_offset_nsecs};
 use esl_common::tlsutil::{TlsServerStream, get_server_tls_config, rustls, server_accept};
 use esl_common::{errorf, fatalf, infof, panicf};
 
@@ -58,7 +59,9 @@ use crate::common_params::LogRowsStorage;
 use esl_logstorage::stream_tags::check_stream_field_names;
 use esl_logstorage::tenant_id::{TenantID, parse_tenant_id};
 
-use crate::common_params::{CommonParams, get_common_params_for_syslog, now_unix_nanos};
+use crate::common_params::{
+    CommonParams, LogMessageProcessor, get_common_params_for_syslog, now_unix_nanos,
+};
 use crate::line_reader::MAX_LINE_SIZE_BYTES;
 use crate::syslog::{SyslogLogMessageProcessor, process_line};
 
@@ -1099,10 +1102,63 @@ fn process_stream<S: LogRowsStorage + 'static>(
     cp: &CommonParams,
     storage: &Arc<S>,
 ) -> Result<(), String> {
-    let mut lmp = cp.new_log_message_processor(storage, &format!("syslog_{protocol}"));
-    let res = process_stream_internal(r, compress_method, use_local_timestamp, remote_ip, &mut lmp);
-    lmp.close();
+    // Stream-mode ingestion: mirror Go's `logMessageProcessor.initPeriodicFlush`
+    // (only started when `isStreamMode=true`, i.e. syslog TCP/unix). The
+    // processor is shared with a background flusher thread through a `Mutex`
+    // (Go serializes `AddRow`/`flushLocked` on `logMessageProcessor.mu`); a
+    // scoped thread lets the flusher borrow it without a `'static` bound, and an
+    // mpsc channel stands in for Go's `stopCh` — its disconnect wakes the
+    // flusher immediately when the stream ends.
+    let lmp = Arc::new(Mutex::new(
+        cp.new_log_message_processor(storage, &format!("syslog_{protocol}")),
+    ));
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+
+    let res = thread::scope(|scope| {
+        let lmp_flusher = Arc::clone(&lmp);
+        scope.spawn(move || {
+            // AddJitterToDuration(time.Second), like Go's ticker interval.
+            let d = Duration::from_nanos(add_jitter_to_duration(1_000_000_000) as u64);
+            loop {
+                match stop_rx.recv_timeout(d) {
+                    Err(RecvTimeoutError::Timeout) => lmp_flusher.lock().unwrap().flush_if_idle(d),
+                    // stop_tx dropped (stream ended) or an unexpected send: stop.
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        });
+
+        let mut shared = SharedStreamProcessor(Arc::clone(&lmp));
+        let res = process_stream_internal(
+            r,
+            compress_method,
+            use_local_timestamp,
+            remote_ip,
+            &mut shared,
+        );
+        // Signal the flusher to stop (Go closes stopCh), then the scope joins it.
+        drop(stop_tx);
+        res
+    });
+
+    // The flusher thread (joined at scope end) and `shared` have both released
+    // their clones, so this is the sole owner and can reclaim the processor.
+    Arc::into_inner(lmp).unwrap().into_inner().unwrap().close();
     res
+}
+
+/// Wraps the shared stream-mode processor so each `add_row` takes the flush
+/// mutex, matching Go's per-`AddRow` `logMessageProcessor.mu` lock that
+/// serializes ingestion against the periodic flusher.
+struct SharedStreamProcessor<'a, S: LogRowsStorage>(Arc<Mutex<LogMessageProcessor<'a, S>>>);
+
+impl<S: LogRowsStorage> SyslogLogMessageProcessor for SharedStreamProcessor<'_, S> {
+    fn add_row(&mut self, timestamp: i64, fields: &mut [Field], stream_fields_len: isize) {
+        self.0
+            .lock()
+            .unwrap()
+            .add_row(timestamp, fields, stream_fields_len);
+    }
 }
 
 fn process_stream_internal<P: SyslogLogMessageProcessor>(

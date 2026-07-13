@@ -514,10 +514,9 @@ impl<S: LogRowsStorage> LogMessageProcessor<'_, S> {
     /// (the body of Go's `initPeriodicFlush` ticker goroutine), for stream-mode
     /// ingestion.
     ///
-    /// PORT NOTE: the method is ported but not yet driven by a per-connection
-    /// flusher thread in `syslog_listeners` — idle stream connections still
-    /// flush on buffer-fill/disconnect rather than on a timer (ledger gap).
-    #[allow(dead_code)]
+    /// Driven by the per-connection flusher thread in
+    /// `syslog_listeners::process_stream` (the syslog TCP/unix stream path,
+    /// which is Go's `isStreamMode=true` case).
     pub(crate) fn flush_if_idle(&mut self, d: std::time::Duration) {
         if self.last_flush_time.elapsed() >= d {
             self.flush();
@@ -684,6 +683,48 @@ mod tests {
             name: name.to_string(),
             value: value.to_string(),
         }
+    }
+
+    /// Counts calls to `must_add_rows` for exercising the stream-mode flush.
+    struct CountingStorage {
+        flushes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LogRowsStorage for CountingStorage {
+        fn must_add_rows(self: &Arc<Self>, _lr: &LogRows) {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn can_write_data(self: &Arc<Self>) -> Result<(), (String, u16)> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_flush_if_idle_respects_interval() {
+        let storage = Arc::new(CountingStorage {
+            flushes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cp = CommonParams::empty();
+        let mut lmp = cp.new_log_message_processor(&storage, "test");
+
+        // One small row does not reach the need_flush threshold, so nothing has
+        // been flushed to the storage yet.
+        lmp.add_row(1, &mut [field("_msg", "hello")], -1);
+        assert_eq!(storage.flushes.load(Ordering::SeqCst), 0);
+
+        // Idle for less than the interval: no periodic flush.
+        lmp.flush_if_idle(std::time::Duration::from_secs(3600));
+        assert_eq!(storage.flushes.load(Ordering::SeqCst), 0);
+
+        // Idle for at least the interval (zero threshold always elapses): flush.
+        lmp.flush_if_idle(std::time::Duration::ZERO);
+        assert_eq!(storage.flushes.load(Ordering::SeqCst), 1);
+
+        // A second idle tick with no new data still flushes (matches Go's
+        // ticker, which flushes an empty LogRows as a no-op add).
+        lmp.flush_if_idle(std::time::Duration::ZERO);
+        assert_eq!(storage.flushes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

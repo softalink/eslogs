@@ -263,18 +263,23 @@ and belong here until proven otherwise.
 > (UTC/Local), the `-memory.allowedBytes` size suffixes; the missing
 > `process_*`/`filestream`/`fs` metric series; the internalselect concurrency
 > limiter; and eslogscli Ctrl+C query cancellation. Each is annotated at its
-> site. **Three items landed only partially and remain open** (still section-(a)):
+> site. **Three items that had landed only partially are now all CLOSED**
+> (moved out of section-(a)):
 > (1) **CLOSED** — log deletion including stream-filtered rows now works (the
 > drop path's `add_field_if_needed` used the wrong canonicalizer so `_msg` was
 > never materialized; fixed to `get_canonical_column_name`, full Go delete test
 > passes);
-> (2) **syslog idle-connection periodic flush** — `flush_if_idle` is ported but
-> not yet driven by a per-connection flusher thread (idle stream conns flush on
-> buffer-fill/disconnect only); (3) **iff-nested subquery propagation** — a
-> pipe's `if (...)` filter containing `in(subquery)` is not visited by
-> `visit_subqueries` (`filter_has_subqueries` is the ported-but-unwired guard).
-> A future audit should re-verify the remaining entries below against shifted
-> line numbers.
+> (2) **CLOSED** — syslog idle-connection periodic flush now runs: the
+> stream-mode syslog path (`syslog_listeners::process_stream`) drives
+> `flush_if_idle` from a per-connection flusher thread (a `thread::scope`d
+> `AddJitterToDuration(1s)` ticker over an `mpsc` stopCh, mirroring Go's
+> `logMessageProcessor.initPeriodicFlush` for `isStreamMode=true`), so idle
+> stream connections flush on a timer instead of only on buffer-fill/disconnect;
+> (3) **CLOSED** — iff-nested subquery propagation now works: a pipe's
+> `if (...)` filter containing `in(subquery)` is visited by `visit_subqueries`
+> via `visit_subqueries_in_shared_filter` (`filter_has_subqueries` wired in
+> `pipe_filter`). A future audit should re-verify the remaining entries below
+> against shifted line numbers.
 
 ### (a) Observable behavioral divergences
 
@@ -472,8 +477,6 @@ and belong here until proven otherwise.
   enforced on the snappy path (Loki protobuf).
 - `journald.rs:13`, `syslog_listeners.rs:30/:1112` — the
   `writeconcurrencylimiter` backpressure/queueing layer is not ported.
-- `syslog_listeners.rs:1083` — no periodic background flush for long-lived
-  syslog connections; rows become searchable only on buffer-full/close.
 - `syslog_listeners.rs:25/:445/:539/:806` *(verify)* — unix-socket listeners
   are `cfg(unix)`-only, UDP4/TCP6 network selection flags are not honored,
   and unrecoverable accept errors back off instead of `Fatalf`.
