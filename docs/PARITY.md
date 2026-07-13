@@ -424,10 +424,13 @@ what remains in section (a) is confirmed-present divergence.
   cryptographically secure RNG on both platforms — `/dev/urandom` on Unix,
   `BCryptGenRandom` on Windows — and panics on read failure like Go's
   `crypto/rand`, instead of the previous non-crypto Windows fallback.)
-- `logger.rs:147` — arbitrary IANA `-loggerTimezone` values panic (`UTC` and
-  `Local` are handled); `:311/:500/:640` — per-arg length truncation,
-  multi-byte truncation (lossy `U+FFFD` vs Go's raw byte slice), and the
-  error-writer caller location differ.
+- `logger.rs:311/:500/:640` — per-arg length truncation, multi-byte truncation
+  (lossy `U+FFFD` vs Go's raw byte slice), and the error-writer caller location
+  differ (part of the raw-byte `String`-vs-`[]byte` family). (Named IANA
+  `-loggerTimezone` values are now supported on Unix — they load from the system
+  zoneinfo database via `crate::tzdata` and the offset is looked up per log
+  timestamp, so DST is honored; only Windows named zones remain unsupported, as
+  the port does not bundle tzdata.)
 - `regexutil/gosyntax.rs:607` — the simplified-regex `String()` escapes via a
   looser `is_print` than Go's `unicode.IsPrint`, so the serialized (internal)
   suffix text differs for format/exotic code points; matches are unaffected —

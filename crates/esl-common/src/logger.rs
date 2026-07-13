@@ -151,21 +151,29 @@ fn init_internal(log_flags: bool) {
 /// `var timezone = time.UTC`.
 static TIMEZONE_OFFSET_SECS: AtomicI64 = AtomicI64::new(0);
 
-// PORT NOTE: Go loads the -loggerTimezone IANA timezone via time.LoadLocation
-// (with embedded tzdata). The port has no IANA tzdb dependency, so it
-// supports "UTC" (and "", which LoadLocation also treats as UTC) and "Local".
-// "Local" uses the OS zone offset sampled at startup, so unlike Go a DST
-// transition during the process lifetime does not shift later timestamps.
-// Any other zone name is a fatal init error (Go fatals only on UNKNOWN
-// zones).
+/// A loaded named IANA zone for `-loggerTimezone` (from the system zoneinfo
+/// database). `None` for `UTC`/`""`/`Local`, which use the fixed
+/// [`TIMEZONE_OFFSET_SECS`]. Named zones honor DST per timestamp.
+static TIMEZONE_LOCATION: OnceLock<crate::tzdata::Location> = OnceLock::new();
+
+// Go loads the -loggerTimezone IANA timezone via time.LoadLocation. The port
+// reads the same system zoneinfo database (see `crate::tzdata`): "UTC" (and
+// "", which LoadLocation also treats as UTC) and "Local" use a fixed offset;
+// any other name is loaded as an IANA zone whose offset is looked up per log
+// timestamp (so DST is honored). An unknown zone is a fatal init error, like
+// Go's Fatalf. ("Local" still samples the OS offset once at startup.)
 fn init_timezone() {
     let tz = LOGGER_TIMEZONE.get().as_str();
     let offset_secs = match tz {
         "UTC" | "" => 0,
         "Local" => crate::timeutil::get_local_timezone_offset_nsecs() / 1_000_000_000,
-        _ => panic!(
-            "cannot load timezone {tz:?}: named IANA timezones need a tzdb, which this port does not bundle; supported values: UTC, Local"
-        ),
+        _ => match crate::tzdata::Location::load(tz) {
+            Ok(loc) => {
+                let _ = TIMEZONE_LOCATION.set(loc);
+                0
+            }
+            Err(err) => panic!("cannot load -loggerTimezone={tz:?}: {err}"),
+        },
     };
     TIMEZONE_OFFSET_SECS.store(offset_secs, Ordering::Relaxed);
 }
@@ -454,11 +462,13 @@ fn now_timestamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    timestamp_with_offset(
-        now.as_secs(),
-        now.subsec_millis(),
-        TIMEZONE_OFFSET_SECS.load(Ordering::Relaxed),
-    )
+    // A named IANA zone resolves its offset for this instant (DST-aware);
+    // UTC/Local use the fixed offset.
+    let offset_secs = match TIMEZONE_LOCATION.get() {
+        Some(loc) => loc.offset_at_secs(now.as_secs() as i64) as i64,
+        None => TIMEZONE_OFFSET_SECS.load(Ordering::Relaxed),
+    };
+    timestamp_with_offset(now.as_secs(), now.subsec_millis(), offset_secs)
 }
 
 /// Renders `secs`/`millis` since the epoch in Go's
