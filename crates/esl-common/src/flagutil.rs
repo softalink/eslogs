@@ -72,6 +72,13 @@ pub fn parse() {
     parse_args(&args);
 }
 
+/// Returns true if `-h` or `-help` (any number of leading dashes) was passed.
+/// Go's `flag` package prints the usage banner and exits for these; the port
+/// mirrors that from each binary's `main` (see the binaries' `usage`).
+pub fn help_requested() -> bool {
+    raw_occurrences("h").is_some() || raw_occurrences("help").is_some()
+}
+
 /// Returns the last raw command-line value of `name`, i.e. Go's observable
 /// value for scalar flags.
 pub(crate) fn raw(name: &str) -> Option<&'static str> {

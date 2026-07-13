@@ -94,6 +94,12 @@ fn main() {
     // the std flag package and adds environment-variable expansion).
     envflag::parse();
     buildinfo::init();
+    // Go's flag.Parse prints the usage banner (version-prefixed via buildinfo)
+    // and exits for -h/-help; do the same before any further startup.
+    if flagutil::help_requested() {
+        usage();
+        std::process::exit(0);
+    }
     // Go registers `-pushmetrics.url` as secret in package init(), before
     // logger.Init logs the flags; mirror that ordering here.
     pushmetrics::init_secret_flags();
@@ -211,16 +217,15 @@ fn request_handler(storage: &Arc<Storage>, req: &mut Request, w: &mut ResponseWr
     w.errorf(req, &format!("unsupported path requested: {path:?}"));
 }
 
-/// Prints the CLI usage banner. Mirrors Go `main.usage`.
-///
-/// PORT NOTE: Go registers this via `flag.Usage`; there is no central usage
-/// hook in the ported flag layer yet, so it is exposed for the `-help` path to
-/// call once that lands.
-#[allow(dead_code)]
+/// Prints the CLI usage banner for `-h`/`-help`. Mirrors Go `main.usage` via
+/// `flagutil.Usage`, with the version line prepended (Go's `buildinfo` wraps
+/// `flag.Usage` to print the version first). Written to stderr, like Go's
+/// `flag.CommandLine.Output()`.
 fn usage() {
+    let mut out = std::io::stderr();
+    let _ = std::io::Write::write_all(&mut out, buildinfo::version().as_bytes());
     let s = "\nes-logs is a log management and analytics service.\n\n\
          See the docs at https://docs.victoriametrics.com/victorialogs/\n";
-    let mut out = std::io::stdout();
     let _ = std::io::Write::write_all(&mut out, s.as_bytes());
     flagutil::write_flags(&mut out);
 }

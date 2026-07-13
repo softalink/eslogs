@@ -46,6 +46,11 @@ fn main() {
     // Parse flags (envflag first, mirroring Go `envflag.Parse()`).
     envflag::parse();
     buildinfo::init();
+    // Go's flag.Parse prints the version-prefixed usage and exits for -h/-help.
+    if flagutil::help_requested() {
+        usage();
+        std::process::exit(0);
+    }
     remotewrite::init_secret_flags();
     // Go registers `-pushmetrics.url` as secret in package init(), before
     // logger.Init logs the flags; mirror that ordering here.
@@ -201,11 +206,11 @@ impl tail::Processor for TailProcessorAdapter {
 /// PORT NOTE: Go registers this via `flag.Usage`; there is no central usage
 /// hook in the ported flag layer yet, so it is exposed for the `-help` path to
 /// call once that lands (same as the es-logs binary).
-#[allow(dead_code)]
 fn usage() {
+    let mut out = std::io::stderr();
+    let _ = std::io::Write::write_all(&mut out, buildinfo::version().as_bytes());
     let s = "\neslagent collects logs via popular data ingestion protocols and routes it to EsLogs.\n\n\
          See the docs at https://docs.victoriametrics.com/victorialogs/vlagent/ .\n";
-    let mut out = std::io::stdout();
     let _ = std::io::Write::write_all(&mut out, s.as_bytes());
     flagutil::write_flags(&mut out);
 }

@@ -37,8 +37,9 @@ fn short_version_of(version: &str) -> String {
 /// Must be called after flag parsing. Prints the version and exits when the
 /// `-version` flag is set.
 ///
-/// PORT NOTE: Go also prepends the version to `flag.Usage` output; there is
-/// no central usage printer in this port yet.
+/// Go's `buildinfo` also wraps `flag.Usage` to print the version first; the
+/// port has no central usage hook, so each binary prepends `version()` in its
+/// own `usage()` (invoked on `-h`/`-help` via `flagutil::help_requested`).
 pub fn init() {
     init_with_default(env!("CARGO_PKG_VERSION"));
 }

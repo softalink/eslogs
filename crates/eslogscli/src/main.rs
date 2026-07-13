@@ -1075,8 +1075,10 @@ fn usage() {
              See the docs at https://docs.victoriametrics.com/victorialogs/querying/vlogscli/\n";
     // PORT NOTE: Go's flagutil.Usage prints all registered flags with their
     // defaults; the ported flag layer registers flags lazily, so only the
-    // explicitly set flags are printed here.
+    // explicitly set flags are printed here. The version line is prepended, as
+    // Go's buildinfo wraps flag.Usage to print it first.
     let mut out = io::stdout();
+    let _ = writeln!(out, "{}", buildinfo::version());
     let _ = out.write_all(s.as_bytes());
     flagutil::write_flags(&mut out);
 }

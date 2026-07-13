@@ -437,8 +437,6 @@ what remains in section (a) is confirmed-present divergence.
   0777-vs-0755 divergence is closed: `must_mkdir` now sets mode `0o755`
   explicitly via `DirBuilderExt`, matching Go's `os.MkdirAll(path, 0755)`
   under any umask.)
-- `buildinfo.rs:40` — the version line is not prepended to `-help`/usage
-  output (also `es-logs/src/main.rs:203`, `eslogscli/src/main.rs:1073`).
 - `appmetrics.rs:12`, `metrics/process_metrics_linux.rs:319` — the
   `vm_os_info`-equivalent lacks the Windows release label (Linux uname is at
   parity); `process_start_time_seconds` is derived from the exact kernel start
