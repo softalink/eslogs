@@ -441,15 +441,19 @@ fn parse_push_url(push_url: &str) -> Result<ParsedUrl, String> {
 
     // Basic auth from userinfo, like Go's `http.NewRequest`.
     //
-    // PORT NOTE: Go percent-decodes the userinfo; the port passes it through
-    // verbatim.
+    // Go's `http.NewRequest` sets basic auth from `url.Userinfo.Username()` /
+    // `.Password()`, which are percent-decoded (Go splits the raw userinfo on
+    // the first ':' first, then unescapes each half). `Redacted()` keeps the
+    // encoded username, so only the credentials fed to base64 are decoded here.
     let (auth_header, redacted) = match userinfo {
         Some(u) => {
             let (user, pass) = match u.split_once(':') {
                 Some((user, pass)) => (user, Some(pass)),
                 None => (u, None),
             };
-            let creds = format!("{user}:{}", pass.unwrap_or(""));
+            let user_dec = crate::httpserver::percent_decode(user, false);
+            let pass_dec = crate::httpserver::percent_decode(pass.unwrap_or(""), false);
+            let creds = format!("{user_dec}:{pass_dec}");
             let auth = format!("Basic {}", base64_std_encode(creds.as_bytes()));
             let redacted = match pass {
                 Some(_) => format!(
@@ -914,6 +918,16 @@ mod tests {
         // base64("user:pass") == "dXNlcjpwYXNz"
         assert_eq!(u.auth_header.as_deref(), Some("Basic dXNlcjpwYXNz"));
         assert_eq!(u.redacted, "https://user:xxxxx@bar/path");
+
+        // Percent-encoded userinfo is decoded before base64 (Go's
+        // url.Userinfo.Username()/Password() return the unescaped values),
+        // while Redacted() keeps the encoded username.
+        let u = super::parse_push_url("http://us%40er:p%40ss@bar/path").unwrap();
+        assert_eq!(
+            u.auth_header.as_deref(),
+            Some(format!("Basic {}", super::base64_std_encode(b"us@er:p@ss")).as_str())
+        );
+        assert_eq!(u.redacted, "http://us%40er:xxxxx@bar/path");
 
         assert!(super::parse_push_url("foobar").is_err());
         assert!(super::parse_push_url("aaa://foobar").is_err());

@@ -429,13 +429,11 @@ what remains in section (a) is confirmed-present divergence.
   both re-parse to the same matcher. `regexutil.rs:461/:597` — `MustCompile`
   returns an error instead of panicking (deliberate: no `expect`-panic API).
   (`\p{...}` classes are now accepted and `\b` is ASCII like Go.)
-- `metrics/push.rs:444` — push-URL userinfo is base64'd raw, not
-  percent-decoded first, so `%`-escaped credentials produce a different basic
-  auth header than Go's `url.Parse`.
 - `fs/mod.rs:11` + `filestream.rs:215/:389` — file-close errors are swallowed
-  (file closed on `Drop`) where Go's `MustClose` panics; `fs/mod.rs:243` —
-  `create_dir_all` uses `0777&umask` vs Go's explicit `0755&umask` (identical
-  under the default umask 022; differs under a permissive umask).
+  (file closed on `Drop`) where Go's `MustClose` panics. (The `must_mkdir`
+  0777-vs-0755 divergence is closed: `must_mkdir` now sets mode `0o755`
+  explicitly via `DirBuilderExt`, matching Go's `os.MkdirAll(path, 0755)`
+  under any umask.)
 - `buildinfo.rs:40` — the version line is not prepended to `-help`/usage
   output (also `es-logs/src/main.rs:203`, `eslogscli/src/main.rs:1073`).
 - `appmetrics.rs:12`, `metrics/process_metrics_linux.rs:319` — the

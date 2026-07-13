@@ -2005,7 +2005,7 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 /// Percent-decodes `s`; when `plus_as_space` is set, `+` becomes a space.
-fn percent_decode(s: &str, plus_as_space: bool) -> String {
+pub(crate) fn percent_decode(s: &str, plus_as_space: bool) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

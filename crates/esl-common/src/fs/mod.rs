@@ -241,9 +241,17 @@ pub fn must_mkdir_fail_if_exist(path: impl AsRef<Path>) {
 }
 
 fn must_mkdir(path: &Path) {
-    // PORT NOTE: Go creates the dirs with mode 0755; std::fs::create_dir_all
-    // uses 0777 & umask, which yields 0755 under the default umask 022.
-    if let Err(err) = std::fs::create_dir_all(path) {
+    // Go creates the dirs with mode 0755 (`os.MkdirAll(path, 0755)`); mirror
+    // that explicitly so the result matches under a permissive umask too
+    // (std's bare `create_dir_all` uses 0777 & umask).
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o755);
+    }
+    if let Err(err) = builder.create(path) {
         panicf!(
             "FATAL: cannot create directory: mkdir {}: {err}",
             path.display()
