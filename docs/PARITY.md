@@ -319,8 +319,12 @@ what remains in section (a) is confirmed-present divergence.
   suppresses it. (A faithful fix needs the option stack threaded through the
   `visit_subqueries` re-parse — a change across all 24 `visit_subqueries_mut`
   impls, deferred.)
-- `parser/parse_stats.rs:240` — `stats switch(...)` is rejected (`not
-  supported by this port`); Go accepts it.
+- `parser/parse_stats.rs` — `stats switch(...)` is now accepted and executed,
+  but because the port's `Box<dyn StatsFunc>` is not `Clone`, it is expanded at
+  parse time into the equivalent `if`-guarded funcs (each case, plus a `default`
+  whose filter is the negation of all case filters). The query computes
+  identical results to Go but re-renders as the expanded funcs (e.g.
+  `count(*) if (x) as a, count(*) if (!(x)) as b`) rather than as `switch(...)`.
 - `pipe_sort.rs:26/:536` — the sort state-size budget charges the copied
   per-value byte lengths where Go charges the cloned block's buffer
   capacities (and shares value bytes in the `byFields` path), so the port

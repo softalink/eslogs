@@ -107,7 +107,7 @@ fn parse_pipe_stats_ext(
     let mut funcs = Vec::new();
     loop {
         let (e, e_str) = parse_stats_entry(lex)?;
-        funcs.push(e);
+        funcs.extend(e);
         if lex.is_query_part_trailer() {
             break;
         }
@@ -228,19 +228,17 @@ fn try_parse_bucket_offset(s: &str) -> Option<f64> {
     None
 }
 
-/// Port of Go `parseStatsEntry` (the `switch` branch is unsupported). Returns
-/// the built func plus its result-name (for the caller's error messages, since
-/// `PipeStatsFunc.result_name` is private).
+/// Port of Go `parseStatsEntry`. Returns the built funcs (one, or several for a
+/// `switch(...)`) plus a result-name string for the caller's error messages.
 fn parse_stats_entry(
     lex: &mut Lexer,
-) -> Result<(crate::pipe_stats::PipeStatsFunc, String), String> {
+) -> Result<(Vec<crate::pipe_stats::PipeStatsFunc>, String), String> {
     let sf = parse_stats_func(lex)?;
     let sf_str = sf.to_string();
 
     if lex.is_keyword(&["switch"]) {
-        return Err(format!(
-            "cannot parse 'switch' for [{sf_str}]: 'stats ... switch(...)' is not supported by this port"
-        ));
+        return parse_stats_switch(lex, &sf_str)
+            .map_err(|e| format!("cannot parse 'switch' for [{sf_str}]: {e}"));
     }
 
     let mut iff_filter: Option<Box<dyn Filter>> = None;
@@ -254,7 +252,7 @@ fn parse_stats_entry(
 
     let result_name = if lex.is_keyword(&[","]) || lex.is_query_part_trailer() {
         if iff_str.is_empty() {
-            sf_str
+            sf_str.clone()
         } else {
             format!("{sf_str} {iff_str}")
         }
@@ -267,7 +265,133 @@ fn parse_stats_entry(
     };
 
     let func = crate::pipe_stats::new_pipe_stats_func(sf, iff_filter, result_name.clone());
-    Ok((func, result_name))
+    Ok((vec![func], result_name))
+}
+
+/// Port of Go `parseStatsSwitch` + `pipeStatsSwitch.appendToFuncs`: expands
+/// `<func> switch(case (...) as name, ..., default as name)` into one
+/// if-guarded [`PipeStatsFunc`] per case, the `default` case's filter being the
+/// negation of all the other case filters (Go `getDefaultFilter`).
+///
+/// PORT NOTE: Go keeps the switch as a `pipeStatsEntry` rendered as
+/// `switch(...)`; the port's `Box<dyn StatsFunc>` is not `Clone`, so it expands
+/// the switch into the equivalent `if`-guarded funcs at parse time (re-parsing
+/// the stats func per case). The query executes identically but re-renders as
+/// the expanded funcs rather than as `switch(...)`.
+fn parse_stats_switch(
+    lex: &mut Lexer,
+    sf_str: &str,
+) -> Result<(Vec<crate::pipe_stats::PipeStatsFunc>, String), String> {
+    lex.next_token(); // consume "switch"
+    if !lex.is_keyword(&["("]) {
+        return Err("missing '(' after the 'switch'".to_string());
+    }
+    lex.next_token();
+
+    struct SwitchCase {
+        filter: Option<Box<dyn Filter>>,
+        result_name: String,
+    }
+    let mut cases: Vec<SwitchCase> = Vec::new();
+    let mut default_set = false;
+    let timestamp = lex.current_timestamp();
+
+    while !lex.is_keyword(&[")"]) {
+        if lex.is_keyword(&["case", "if"]) {
+            let (fb, _s) =
+                parse_if_filter_boxed(lex).map_err(|e| format!("cannot parse case filter: {e}"))?;
+            if lex.is_keyword(&["as"]) {
+                lex.next_token();
+            }
+            let result_name = parse_field_name(lex)
+                .map_err(|e| format!("cannot parse result name for the case: {e}"))?;
+            cases.push(SwitchCase {
+                filter: Some(fb),
+                result_name,
+            });
+        } else if lex.is_keyword(&["default"]) {
+            if default_set {
+                return Err("switch(...) cannot contain more than one 'default'".to_string());
+            }
+            default_set = true;
+            lex.next_token();
+            if lex.is_keyword(&["as"]) {
+                lex.next_token();
+            }
+            let result_name = parse_field_name(lex)
+                .map_err(|e| format!("cannot parse result name for the default case: {e}"))?;
+            cases.push(SwitchCase {
+                filter: None,
+                result_name,
+            });
+        } else {
+            return Err(format!(
+                "unexpected token inside switch(...): {}; want 'case' or 'default'",
+                go_quote(&lex.token)
+            ));
+        }
+        if !lex.is_keyword(&[",", ")"]) {
+            return Err(format!(
+                "unexpected token: {}; want ',' or ')'",
+                go_quote(&lex.token)
+            ));
+        }
+        if lex.is_keyword(&[","]) {
+            lex.next_token();
+        }
+    }
+    if cases.is_empty() {
+        return Err("switch(...) must contain at least a single 'case' or 'default'".to_string());
+    }
+    lex.next_token(); // consume ")"
+
+    // Build the default-case filter = NOT(OR(all case filters)) (Go
+    // getDefaultFilter). Re-parse each case filter's text so the case funcs keep
+    // their own owned copies.
+    let case_filter_texts: Vec<String> = cases
+        .iter()
+        .filter_map(|c| c.filter.as_ref().map(|f| f.to_string()))
+        .collect();
+    let mut default_filter: Option<Box<dyn Filter>> = if case_filter_texts.is_empty() {
+        Some(Box::new(crate::filter_noop::new_filter_noop()))
+    } else {
+        let mut or_filters: Vec<Box<dyn Filter>> = Vec::with_capacity(case_filter_texts.len());
+        for text in &case_filter_texts {
+            let mut lx = Lexer::new_at(text, timestamp);
+            or_filters.push(
+                parse_filter(&mut lx, true)
+                    .map_err(|e| format!("BUG: cannot re-parse case filter [{text}]: {e}"))?,
+            );
+        }
+        Some(Box::new(crate::filter_not::new_filter_not(Box::new(
+            crate::filter_or::new_filter_or(or_filters),
+        ))))
+    };
+
+    // Expand each case into an if-guarded func with its own re-parsed stats func.
+    let mut funcs = Vec::with_capacity(cases.len());
+    for case in cases {
+        let func_f = reparse_stats_func(sf_str)?;
+        let iff = match case.filter {
+            Some(f) => f,
+            None => default_filter
+                .take()
+                .expect("switch has at most one default case"),
+        };
+        funcs.push(crate::pipe_stats::new_pipe_stats_func(
+            func_f,
+            Some(iff),
+            case.result_name,
+        ));
+    }
+    Ok((funcs, sf_str.to_string()))
+}
+
+/// Re-parses a stats function from its rendered text, cloning it for each
+/// switch case (the port's `Box<dyn StatsFunc>` is not `Clone`).
+fn reparse_stats_func(sf_str: &str) -> Result<BoxStats, String> {
+    let mut lex = Lexer::new(sf_str);
+    parse_stats_func(&mut lex)
 }
 
 /// Parses an `if (...)` / `case (...)` clause and returns `(filter, "if (...)")`.

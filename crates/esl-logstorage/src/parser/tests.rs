@@ -1485,6 +1485,53 @@ fn test_options_time_offset_shifts_time_filter() {
     );
 }
 
+/// `stats ... switch(...)` expands to one `if`-guarded func per case; the
+/// `default` case's filter is the negation of all case filters (Go
+/// `parseStatsSwitch` + `getDefaultFilter`).
+#[test]
+fn test_parse_stats_switch() {
+    #[track_caller]
+    fn f(q_str: &str, expected: &str) {
+        let q = ParseQuery(q_str).unwrap_or_else(|e| panic!("cannot parse [{q_str}]: {e}"));
+        assert_eq!(q.to_string(), expected, "unexpected expansion of [{q_str}]");
+    }
+
+    // default => NOT(OR(case filters)).
+    f(
+        "* | stats count() switch(case (x:foo) as a, default as b)",
+        "* | stats count(*) if (x:foo) as a, count(*) if (!(x:foo)) as b",
+    );
+    // multiple cases, no default => no negation func.
+    f(
+        "* | stats by (h) sum(n) switch(case (x:1) as lo, case (x:2) as hi)",
+        "* | stats by (h) sum(n) if (x:1) as lo, sum(n) if (x:2) as hi",
+    );
+    // `if` is accepted as an alias for `case`.
+    f(
+        "* | stats count() switch(if (a:1) as x, default as y)",
+        "* | stats count(*) if (a:1) as x, count(*) if (!(a:1)) as y",
+    );
+
+    // Error cases.
+    for (q_str, want_err) in [
+        ("* | stats count() switch()", "at least a single"),
+        (
+            "* | stats count() switch(default as x, default as y)",
+            "more than one 'default'",
+        ),
+        (
+            "* | stats count() switch(foo as x)",
+            "want 'case' or 'default'",
+        ),
+    ] {
+        let err = match ParseQuery(q_str) {
+            Ok(_) => panic!("expected an error for [{q_str}]"),
+            Err(e) => e,
+        };
+        assert!(err.contains(want_err), "for [{q_str}] got error: {err}");
+    }
+}
+
 /// Port of Go `TestQuery_AddExtraFilters`.
 #[test]
 fn test_query_add_extra_filters() {
