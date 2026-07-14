@@ -18,7 +18,7 @@ use crate::consts::{
 use crate::encoding::{StringsBlockUnmarshaler, marshal_strings_block};
 use crate::hash_tokenizer::tokenize_hashes;
 use crate::log_rows::{
-    estimated_json_field_len, estimated_json_row_len, get_canonical_column_name,
+    estimated_json_field_len, estimated_json_row_len, get_canonical_column_name_bytes,
 };
 use crate::rows::{Field, Rows, append_fields};
 use crate::stream_id::StreamID;
@@ -71,13 +71,13 @@ impl Block {
 
         // size of constant fields (included in every row)
         for cc in &self.const_columns {
-            let name = get_canonical_column_name(&cc.name);
+            let name = get_canonical_column_name_bytes(&cc.name);
             total_size += estimated_json_field_len(name, &cc.value) * rows_count;
         }
 
         // add size of variable fields
         for c in &self.columns {
-            let name = get_canonical_column_name(&c.name);
+            let name = get_canonical_column_name_bytes(&c.name);
 
             for v in &c.values {
                 // EsLogs data model (https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model)
@@ -182,7 +182,7 @@ impl Block {
         // PORT NOTE: Go pools the `map[string]int` via columnIdxsPool; the
         // port uses a local HashMap with keys borrowed from rows, which
         // cannot outlive this call, so the pool is dropped.
-        let mut column_idxs: HashMap<&str, usize> = HashMap::new();
+        let mut column_idxs: HashMap<&[u8], usize> = HashMap::new();
         let mut i = 0;
         while i < rows.len() {
             let fields = &rows[i];
@@ -192,7 +192,11 @@ impl Block {
                 // since the storage isn't designed to work with too big number of unique field names
                 // per log stream - this leads to excess usage of RAM, CPU, disk IO and disk space.
                 // It is better emitting a warning, so the user is aware of the problem and fixes it ASAP.
-                let field_names: Vec<&str> = column_idxs.keys().copied().collect();
+                // Log text only: raw name bytes are rendered via a lossy view.
+                let field_names: Vec<String> = column_idxs
+                    .keys()
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .collect();
                 warnf!(
                     "ignoring {} rows in the block, because they contain more than {} unique field names: [{}]",
                     rows.len() - i,
@@ -202,7 +206,7 @@ impl Block {
                 break;
             }
             for f in fields {
-                if !column_idxs.contains_key(f.name.as_str()) {
+                if !column_idxs.contains_key(f.name.as_slice()) {
                     column_idxs.insert(&f.name, column_idxs.len());
                 }
             }
@@ -224,14 +228,14 @@ impl Block {
         for (name, &idx) in &column_idxs {
             let c = &mut cs[idx];
             c.name.clear();
-            c.name.push_str(name);
+            c.name.extend_from_slice(name);
             c.resize_values(rows.len());
         }
 
         // Write rows to block
         for (i, row) in rows.iter().enumerate() {
             for f in row {
-                let idx = column_idxs[f.name.as_str()];
+                let idx = column_idxs[f.name.as_slice()];
                 cs[idx].values[i].clone_from(&f.value);
             }
         }
@@ -294,13 +298,14 @@ impl Block {
             .sort_unstable_by(|a, b| a.name.cmp(&b.name));
     }
 
+    /// Panic/log text only: raw name bytes are rendered via a lossy view.
     fn get_column_names(&self) -> Vec<String> {
         let mut a = Vec::with_capacity(self.columns.len() + self.const_columns.len());
         for c in &self.columns {
-            a.push(c.name.clone());
+            a.push(String::from_utf8_lossy(&c.name).into_owned());
         }
         for cc in &self.const_columns {
-            a.push(cc.name.clone());
+            a.push(String::from_utf8_lossy(&cc.name).into_owned());
         }
         a
     }
@@ -350,7 +355,7 @@ impl Block {
         self.resize_columns(cds.len());
         for (i, cd) in cds.iter().enumerate() {
             let c = &mut self.columns[i];
-            c.name = sbu.copy_string(&cd.name);
+            c.name = cd.name.clone();
             // Column values are raw bytes, so the decoded buffers are moved
             // straight into c.values without any UTF-8 validation/allocation
             // pass (Go strings are arbitrary bytes).
@@ -453,7 +458,9 @@ pub fn uncompressed_rows_size_bytes(rows: &[Vec<Field>]) -> u64 {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Column {
     /// name is the field name
-    pub name: String,
+    ///
+    /// PORT NOTE: raw bytes (Go strings are arbitrary bytes).
+    pub name: Vec<u8>,
 
     /// values is the values seen for the given log entries.
     ///
@@ -596,9 +603,9 @@ fn are_same_fields_in_rows(rows: &[Vec<Field>]) -> bool {
     // PORT NOTE: Go pools the fields set map via fieldsSetPool; the port uses
     // a local set with keys borrowed from rows, which cannot outlive this
     // call, so the pool is dropped.
-    let mut m: HashSet<&str> = HashSet::new();
+    let mut m: HashSet<&[u8]> = HashSet::new();
     for f in fields {
-        if !m.insert(f.name.as_str()) {
+        if !m.insert(f.name.as_slice()) {
             // Field name isn't unique
             return false;
         }
@@ -669,7 +676,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -720,7 +727,7 @@ mod tests {
         let b_expected = Block {
             timestamps: vec![3, 5],
             columns: vec![Column {
-                name: "instance".to_string(),
+                name: b"instance".to_vec(),
                 values: vec![b"host1".to_vec(), b"host2".to_vec()],
             }],
             const_columns: vec![field("job", "foo")],
@@ -738,11 +745,11 @@ mod tests {
             timestamps: vec![3, 5, 10],
             columns: vec![
                 Column {
-                    name: "a".to_string(),
+                    name: b"a".to_vec(),
                     values: vec![b"".to_vec(), b"aaa".to_vec(), b"".to_vec()],
                 },
                 Column {
-                    name: "msg".to_string(),
+                    name: b"msg".to_vec(),
                     values: vec![b"foo".to_vec(), b"".to_vec(), b"".to_vec()],
                 },
             ],
@@ -847,8 +854,11 @@ mod tests {
                     if f.value.is_empty() {
                         continue; // skip empty values
                     }
-                    let key = get_canonical_column_name(&f.name);
-                    m.insert(key.to_string(), String::from_utf8(f.value.clone()).unwrap());
+                    let key = get_canonical_column_name_bytes(&f.name);
+                    m.insert(
+                        String::from_utf8(key.to_vec()).unwrap(),
+                        String::from_utf8(f.value.clone()).unwrap(),
+                    );
                 }
 
                 total_size += json_object_size(&m) + 1; // +1 for newline if expected

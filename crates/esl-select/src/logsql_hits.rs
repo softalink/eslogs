@@ -187,12 +187,12 @@ pub fn process_hits_request(storage: &Arc<Storage>, req: &Request, w: &mut Respo
 fn write_fields_for_hits(dst: &mut Vec<u8>, columns: &[BlockColumn], row_idx: usize) {
     dst.push(b'{');
     if !columns.is_empty() {
-        append_json_string(dst, columns[0].name.as_bytes());
+        append_json_string(dst, &columns[0].name);
         dst.push(b':');
         append_json_string(dst, &columns[0].values[row_idx]);
         for c in &columns[1..] {
             dst.push(b',');
-            append_json_string(dst, c.name.as_bytes());
+            append_json_string(dst, &c.name);
             dst.push(b':');
             append_json_string(dst, &c.values[row_idx]);
         }

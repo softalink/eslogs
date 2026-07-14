@@ -152,7 +152,7 @@ impl Pipe for PipeUnpackLogfmt {
                 p.parse(s);
             }
             for f in &p.fields {
-                if !prefix_filter::match_filters(&field_filters, &f.name) {
+                if !prefix_filter::match_filters_bytes(&field_filters, &f.name) {
                     continue;
                 }
                 uctx.add_field(&f.name, &f.value);
@@ -161,9 +161,9 @@ impl Pipe for PipeUnpackLogfmt {
                 if prefix_filter::is_wildcard_filter(filter) {
                     continue;
                 }
-                let add_empty_field = !p.fields.iter().any(|f| f.name == *filter);
+                let add_empty_field = !p.fields.iter().any(|f| f.name == filter.as_bytes());
                 if add_empty_field {
-                    uctx.add_field(filter, "");
+                    uctx.add_field(filter.as_bytes(), "");
                 }
             }
             put_logfmt_parser(p);

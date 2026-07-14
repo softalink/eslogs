@@ -966,13 +966,13 @@ impl PipeStatsProcessor {
         let mut rcs: Vec<ResultColumn> = Vec::with_capacity(ncols);
         for bf in self.by_fields.iter() {
             rcs.push(ResultColumn {
-                name: bf.name.clone(),
+                name: bf.name.clone().into_bytes(),
                 values: Vec::new(),
             });
         }
         for f in funcs.iter() {
             rcs.push(ResultColumn {
-                name: f.result_name.clone(),
+                name: f.result_name.clone().into_bytes(),
                 values: Vec::new(),
             });
         }
@@ -1090,10 +1090,7 @@ mod tests {
     impl PipeProcessor for Collector {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cols = br.get_columns();
-            let names: Vec<String> = cols
-                .iter()
-                .map(|&c| br.column_name(c).to_string())
-                .collect();
+            let names: Vec<Vec<u8>> = cols.iter().map(|&c| br.column_name(c).to_vec()).collect();
             let n = br.rows_len();
             let mut out = self.blocks.lock().unwrap();
             for i in 0..n {
@@ -1114,7 +1111,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -1176,7 +1173,7 @@ mod tests {
         let out = run(&ps, blocks);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].len(), 1);
-        assert_eq!(out[0][0].name, "rows");
+        assert_eq!(out[0][0].name, b"rows");
         assert_eq!(out[0][0].value, b"3");
     }
 
@@ -1202,7 +1199,7 @@ mod tests {
         ]];
         let out = run(&ps, blocks);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0][0].name, "r");
+        assert_eq!(out[0][0].name, b"r");
         assert_eq!(out[0][0].value, b"1");
     }
 
@@ -1235,7 +1232,7 @@ mod tests {
         // One group (the single 2s bucket): rate = 4 / 2 = 2.
         let r = out
             .iter()
-            .find_map(|row| row.iter().find(|f| f.name == "r"))
+            .find_map(|row| row.iter().find(|f| f.name == b"r"))
             .expect("rate column present");
         assert_eq!(r.value, b"2");
     }
@@ -1260,7 +1257,7 @@ mod tests {
         let mut out = run(&ps, blocks);
         out.sort_by(|r1, r2| r1[0].value.cmp(&r2[0].value));
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0][0].name, "host");
+        assert_eq!(out[0][0].name, b"host");
         assert_eq!(out[0][0].value, b"a");
         assert_eq!(out[0][1].value, b"2");
         assert_eq!(out[1][0].value, b"b");
@@ -1294,7 +1291,7 @@ mod tests {
         // a/x → 15
         assert_eq!(out[0][0].value, b"a");
         assert_eq!(out[0][1].value, b"x");
-        assert_eq!(out[0][2].name, "s");
+        assert_eq!(out[0][2].name, b"s");
         assert_eq!(out[0][2].value, b"15");
         // b/y → 3
         assert_eq!(out[1][0].value, b"b");

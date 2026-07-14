@@ -4,7 +4,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::sync::Mutex;
 
-use esl_common::{bytesutil, encoding, stringsutil};
+use esl_common::{encoding, stringsutil};
 
 use crate::stream_tags;
 
@@ -12,7 +12,10 @@ use crate::stream_tags;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Field {
     /// Name is the name of the field.
-    pub name: String,
+    ///
+    /// PORT NOTE: Go strings are arbitrary bytes; the name is stored as raw
+    /// bytes so invalid UTF-8 survives ingestion/queries byte-identically.
+    pub name: Vec<u8>,
 
     /// Value is the value of the field.
     ///
@@ -41,7 +44,7 @@ impl Field {
 
     pub fn marshal(&self, dst: &mut Vec<u8>, marshal_field_name: bool) {
         if marshal_field_name {
-            encoding::marshal_bytes(dst, self.name.as_bytes());
+            encoding::marshal_bytes(dst, &self.name);
         }
         encoding::marshal_bytes(dst, &self.value);
     }
@@ -66,8 +69,7 @@ impl Field {
             }
             src = &src[n_size as usize..];
             self.name.clear();
-            self.name
-                .push_str(bytesutil::to_unsafe_string(name.unwrap_or_default()));
+            self.name.extend_from_slice(name.unwrap_or_default());
         }
 
         // Unmarshal field value
@@ -83,23 +85,23 @@ impl Field {
     }
 
     pub fn marshal_to_json(&self, dst: &mut Vec<u8>) {
-        let name = if self.name.is_empty() {
-            "_msg"
+        let name: &[u8] = if self.name.is_empty() {
+            b"_msg"
         } else {
             &self.name
         };
-        dst.extend_from_slice(stringsutil::json_string(name).as_bytes());
+        stringsutil::json_string_bytes_append(dst, name);
         dst.push(b':');
         stringsutil::json_string_bytes_append(dst, &self.value);
     }
 
     pub fn marshal_to_logfmt(&self, dst: &mut Vec<u8>) {
-        let name = if self.name.is_empty() {
-            "_msg"
+        let name: &[u8] = if self.name.is_empty() {
+            b"_msg"
         } else {
             &self.name
         };
-        dst.extend_from_slice(name.as_bytes());
+        dst.extend_from_slice(name);
         dst.push(b'=');
         if needs_logfmt_quoting(&self.value) {
             stringsutil::json_string_bytes_append(dst, &self.value);
@@ -109,13 +111,13 @@ impl Field {
     }
 
     pub fn marshal_to_stream_tag(&self, dst: &mut Vec<u8>) {
-        dst.extend_from_slice(self.name.as_bytes());
+        dst.extend_from_slice(&self.name);
         dst.push(b'=');
         append_quote(dst, &self.value);
     }
 
     pub fn indexdb_marshal(&self, dst: &mut Vec<u8>) {
-        stream_tags::marshal_tag_value(dst, self.name.as_bytes());
+        stream_tags::marshal_tag_value(dst, &self.name);
         stream_tags::marshal_tag_value(dst, &self.value);
     }
 
@@ -128,7 +130,7 @@ impl Field {
         let src = stream_tags::unmarshal_tag_value(&mut buf, src)
             .map_err(|err| format!("cannot unmarshal key: {err}"))?;
         self.name.clear();
-        self.name.push_str(bytesutil::to_unsafe_string(&buf));
+        self.name.extend_from_slice(&buf);
 
         buf.clear();
         let src = stream_tags::unmarshal_tag_value(&mut buf, src)
@@ -153,7 +155,7 @@ impl fmt::Display for Field {
 
 pub fn get_field_value_by_name<'a>(fields: &'a [Field], name: &str) -> &'a [u8] {
     for f in fields {
-        if f.name == name {
+        if f.name == name.as_bytes() {
             return &f.value;
         }
     }
@@ -211,9 +213,9 @@ pub fn rename_field(fields: &mut [Field], old_names: &[&str], new_name: &str) {
     }
     for n in old_names {
         for f in fields.iter_mut() {
-            if f.name == *n && !f.value.is_empty() {
+            if f.name == n.as_bytes() && !f.value.is_empty() {
                 f.name.clear();
-                f.name.push_str(new_name);
+                f.name.extend_from_slice(new_name.as_bytes());
                 return;
             }
         }
@@ -350,13 +352,13 @@ impl Rows {
         add_field_if_needed(
             &mut tmp_fields.fields,
             drop_filter_fields,
-            "_stream",
+            b"_stream",
             stream.as_bytes(),
         );
         add_field_if_needed(
             &mut tmp_fields.fields,
             drop_filter_fields,
-            "_stream_id",
+            b"_stream_id",
             stream_id.as_bytes(),
         );
         let tmp_fields_base_len = tmp_fields.fields.len();
@@ -430,13 +432,13 @@ impl Rows {
 fn add_field_if_needed(
     dst: &mut Vec<Field>,
     pf: &crate::prefix_filter::Filter,
-    name: &str,
+    name: &[u8],
     value: &[u8],
 ) {
-    let name = crate::log_rows::get_canonical_column_name(name);
-    if pf.match_string(name) {
+    let name = crate::log_rows::get_canonical_column_name_bytes(name);
+    if pf.match_string_bytes(name) {
         dst.push(Field {
-            name: name.to_string(),
+            name: name.to_vec(),
             value: value.to_vec(),
         });
     }
@@ -473,7 +475,7 @@ impl Fields {
     /// Adds (name, value) field to f.
     pub fn add(&mut self, name: &str, value: impl AsRef<[u8]>) {
         self.fields.push(Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_ref().to_vec(),
         });
     }
@@ -500,10 +502,11 @@ static FIELDS_POOL: Mutex<Vec<Fields>> = Mutex::new(Vec::new());
 #[cfg(test)]
 mod tests {
     use super::*;
+    use esl_common::bytesutil;
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -573,7 +576,7 @@ mod tests {
         // Values are raw bytes (Go strings are arbitrary bytes): invalid
         // UTF-8 must pass through JSON marshaling byte-identically.
         let fields = [Field {
-            name: "foo".to_string(),
+            name: b"foo".to_vec(),
             value: b"a\xff\xfeb".to_vec(),
         }];
         let mut result = Vec::new();
@@ -584,7 +587,7 @@ mod tests {
     #[test]
     fn test_field_marshal_unmarshal_invalid_utf8_roundtrip() {
         let f = Field {
-            name: "foo".to_string(),
+            name: b"foo".to_vec(),
             value: b"a\xff\xfeb".to_vec(),
         };
         let mut data = Vec::new();

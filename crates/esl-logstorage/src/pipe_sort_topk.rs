@@ -147,10 +147,7 @@ impl PipeTopkProcessor {
 
         if ps.by_fields.is_empty() {
             // Sort by all fields.
-            let names: Vec<String> = cols
-                .iter()
-                .map(|&r| br.column_name(r).to_string())
-                .collect();
+            let names: Vec<Vec<u8>> = cols.iter().map(|&r| br.column_name(r).to_vec()).collect();
             let col_values: Vec<Vec<Vec<u8>>> = cols
                 .iter()
                 .map(|&r| br.column_get_values(r).to_vec())
@@ -202,10 +199,10 @@ impl PipeTopkProcessor {
             // `add_row` and never need them, so they are materialized lazily
             // per accepted row (Go gets this for free since its getValues
             // returns strings referencing the block arena).
-            let mut other_cols: Vec<(String, crate::block_result::ColRef)> = Vec::new();
+            let mut other_cols: Vec<(Vec<u8>, crate::block_result::ColRef)> = Vec::new();
             for &r in &cols {
-                let name = br.column_name(r).to_string();
-                if by_fields.iter().any(|bf| bf.name == name) {
+                let name = br.column_name(r).to_vec();
+                if by_fields.iter().any(|bf| bf.name.as_bytes() == name) {
                     continue;
                 }
                 other_cols.push((name, r));
@@ -541,7 +538,7 @@ impl PipeTopkProcessor {
         let has_rank = !ps.rank_field_name.is_empty();
 
         let mut rcs: Vec<ResultColumn> = Vec::new();
-        let mut cur_names: Vec<String> = Vec::new();
+        let mut cur_names: Vec<Vec<u8>> = Vec::new();
         let mut rows_count: usize = 0;
         let mut values_len: usize = 0;
         let mut rows_written: u64 = 0;
@@ -555,12 +552,12 @@ impl PipeTopkProcessor {
                 break;
             }
 
-            let mut names: Vec<String> = Vec::new();
+            let mut names: Vec<Vec<u8>> = Vec::new();
             if has_rank {
-                names.push(ps.rank_field_name.clone());
+                names.push(ps.rank_field_name.clone().into_bytes());
             }
             for bf in &ps.by_fields {
-                names.push(bf.name.clone());
+                names.push(bf.name.clone().into_bytes());
             }
             for c in &r.other_columns {
                 names.push(c.name.clone());

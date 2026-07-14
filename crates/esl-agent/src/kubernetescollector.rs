@@ -2096,7 +2096,9 @@ fn new_log_file_processor(
 ) -> LogFileProcessor {
     let fs: Vec<Field> = common_fields
         .iter()
-        .filter(|f| should_include_metadata_field(&f.name))
+        // Metadata field names are engine-generated ASCII ("kubernetes.*");
+        // the lossy view only feeds the prefix check, names stay raw.
+        .filter(|f| should_include_metadata_field(&String::from_utf8_lossy(&f.name)))
         .cloned()
         .collect();
     let common_fields_json_len = estimated_json_row_len(&fs);
@@ -2355,7 +2357,7 @@ impl LogFileProcessor {
             // port stores an unstructured container log line containing
             // invalid UTF-8 verbatim, exactly like Go.
             parser.fields_mut().push(Field {
-                name: "_msg".to_string(),
+                name: b"_msg".to_vec(),
                 value: line.to_vec(),
             });
         }
@@ -2494,7 +2496,7 @@ fn try_parse_klog(mut dst: Vec<Field>, src: &str, current: i64) -> Option<(i64, 
     }
     let mut src = &src[1..];
     dst.push(Field {
-        name: "level".to_string(),
+        name: b"level".to_vec(),
         value: level.as_bytes().to_vec(),
     });
 
@@ -2526,7 +2528,7 @@ fn try_parse_klog(mut dst: Vec<Field>, src: &str, current: i64) -> Option<(i64, 
     let thread_id = &src[..n];
     src = &src[n + 1..];
     dst.push(Field {
-        name: "thread_id".to_string(),
+        name: b"thread_id".to_vec(),
         value: thread_id.as_bytes().to_vec(),
     });
 
@@ -2542,7 +2544,7 @@ fn try_parse_klog(mut dst: Vec<Field>, src: &str, current: i64) -> Option<(i64, 
     }
     src = &src[1..];
     dst.push(Field {
-        name: "source_line".to_string(),
+        name: b"source_line".to_vec(),
         value: source_line.as_bytes().to_vec(),
     });
 
@@ -2618,7 +2620,7 @@ fn try_parse_klog_content(mut dst: Vec<Field>, src: &str) -> Option<Vec<Field>> 
     if !src.starts_with('"') {
         // Fast path: message is not quoted and does not contain additional key="value" fields.
         dst.push(Field {
-            name: "_msg".to_string(),
+            name: b"_msg".to_vec(),
             value: src.as_bytes().to_vec(),
         });
         return Some(dst);
@@ -2629,7 +2631,7 @@ fn try_parse_klog_content(mut dst: Vec<Field>, src: &str) -> Option<Vec<Field>> 
     let msg = unquote(prefix)?;
     let mut src = &src[prefix.len()..];
     dst.push(Field {
-        name: "_msg".to_string(),
+        name: b"_msg".to_vec(),
         value: msg.into_bytes(),
     });
 
@@ -2651,7 +2653,7 @@ fn try_parse_klog_content(mut dst: Vec<Field>, src: &str) -> Option<Vec<Field>> 
         src = &src[prefix.len()..];
 
         dst.push(Field {
-            name: key.to_string(),
+            name: key.as_bytes().to_vec(),
             value: value.into_bytes(),
         });
     }
@@ -2799,7 +2801,7 @@ fn get_klog_level(l: u8) -> &'static str {
 fn field_index(fields: &[Field], names: &[String]) -> isize {
     for n in names {
         for (j, f) in fields.iter().enumerate() {
-            if &f.name == n && !f.value.is_empty() {
+            if f.name == n.as_bytes() && !f.value.is_empty() {
                 return j as isize;
             }
         }
@@ -3051,7 +3053,10 @@ fn should_include_metadata_field(field: &str) -> bool {
 
 /// Go `mustGetFieldValByName`.
 fn must_get_field_val_by_name<'a>(common_fields: &'a [Field], field_name: &str) -> &'a [u8] {
-    match common_fields.iter().find(|f| f.name == field_name) {
+    match common_fields
+        .iter()
+        .find(|f| f.name == field_name.as_bytes())
+    {
         Some(f) => &f.value,
         None => panic!("BUG: cannot find field {field_name:?} in commonFields"),
     }
@@ -3983,7 +3988,7 @@ mod tests {
     fn run_processor_lines(log_lines: &[&str], rows_expected: usize) {
         let storage = Arc::new(TestLogRowsStorage::default());
         let common_fields = vec![Field {
-            name: "name".to_string(),
+            name: b"name".to_vec(),
             value: b"benchmarkProcessor".to_vec(),
         }];
         let mut proc = new_log_file_processor(

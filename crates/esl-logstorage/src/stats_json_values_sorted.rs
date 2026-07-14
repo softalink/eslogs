@@ -66,7 +66,7 @@ pub(crate) fn new_stats_json_values_sorted_entry(
     let fields: Vec<Field> = cs
         .iter()
         .map(|&c| {
-            let name = br.column_name(c).to_string();
+            let name = br.column_name(c).to_vec();
             let value = br.column_get_value_at_row(c, row_idx).to_vec();
             Field { name, value }
         })

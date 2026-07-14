@@ -82,7 +82,7 @@ impl StatsProcessor for StatsCountEmptyProcessor {
         // enumerated inside count_empty().
         let mut non_empty = vec![false; rows_len];
         for c in br.get_columns() {
-            if !prefix_filter::match_filters(&self.field_filters, br.column_name(c)) {
+            if !prefix_filter::match_filters_bytes(&self.field_filters, br.column_name(c)) {
                 continue;
             }
             if br.column_is_const(c) {
@@ -125,7 +125,7 @@ impl StatsProcessor for StatsCountEmptyProcessor {
 
         // Slow path - count the row if all enumerated fields are empty.
         for c in br.get_columns() {
-            if !prefix_filter::match_filters(&self.field_filters, br.column_name(c)) {
+            if !prefix_filter::match_filters_bytes(&self.field_filters, br.column_name(c)) {
                 continue;
             }
             if !br.column_get_value_at_row(c, row_index).is_empty() {

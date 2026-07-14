@@ -184,7 +184,7 @@ fn json_rows(rows: &[Vec<Field>]) -> Vec<u8> {
         }
         buf.push(b'{');
         let f = &fields[0];
-        append_json_string(&mut buf, f.name.as_bytes());
+        append_json_string(&mut buf, &f.name);
         buf.push(b':');
         append_json_string(&mut buf, &f.value);
         for f in &fields[1..] {
@@ -192,7 +192,7 @@ fn json_rows(rows: &[Vec<Field>]) -> Vec<u8> {
                 continue;
             }
             buf.push(b',');
-            append_json_string(&mut buf, f.name.as_bytes());
+            append_json_string(&mut buf, &f.name);
             buf.push(b':');
             append_json_string(&mut buf, &f.value);
         }
@@ -270,7 +270,7 @@ impl TailProcessor {
             let mut fields = Vec::with_capacity(columns.len());
             for c in columns {
                 let value = c.values[i].clone();
-                if c.name == "_stream_id" {
+                if c.name == b"_stream_id" {
                     stream_id = value.clone();
                 }
                 fields.push(Field {
@@ -329,32 +329,32 @@ mod tests {
         let rows = vec![
             vec![
                 Field {
-                    name: "_msg".to_string(),
+                    name: b"_msg".to_vec(),
                     value: b"hello".to_vec(),
                 },
                 Field {
-                    name: "empty".to_string(),
+                    name: b"empty".to_vec(),
                     value: Vec::new(),
                 },
                 Field {
-                    name: "host".to_string(),
+                    name: b"host".to_vec(),
                     value: b"node-1".to_vec(),
                 },
             ],
             // Leading empty-valued fields are skipped entirely.
             vec![
                 Field {
-                    name: "lead".to_string(),
+                    name: b"lead".to_vec(),
                     value: Vec::new(),
                 },
                 Field {
-                    name: "k".to_string(),
+                    name: b"k".to_vec(),
                     value: b"v".to_vec(),
                 },
             ],
             // Rows with no valued fields produce no output.
             vec![Field {
-                name: "only-empty".to_string(),
+                name: b"only-empty".to_vec(),
                 value: Vec::new(),
             }],
         ];
@@ -439,11 +439,11 @@ mod tests {
                 let mut lr = get_log_rows(&["host"], &[], &[], &[], "");
                 let mut fields = vec![
                     Field {
-                        name: "_msg".to_string(),
+                        name: b"_msg".to_vec(),
                         value: b"tail-late".to_vec(),
                     },
                     Field {
-                        name: "host".to_string(),
+                        name: b"host".to_vec(),
                         value: b"node-1".to_vec(),
                     },
                 ];

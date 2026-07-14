@@ -44,7 +44,7 @@ impl FastStringTransformer {
 
     /// Applies transform_func to `s` and returns the result.
     pub fn transform(&self, s: &str) -> Arc<str> {
-        if is_skip_cache(s) {
+        if is_skip_cache(s.len()) {
             // PORT NOTE: Go clones the result when it equals s to drop
             // references to a possible bigger backing string; the Rust
             // transform_func already returns an owned String.

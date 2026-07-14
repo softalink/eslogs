@@ -322,7 +322,7 @@ impl<'a> StreamWriters<'a> {
 
     pub fn get_bloom_values_writer_for_column_name(
         &mut self,
-        name: &str,
+        name: &[u8],
     ) -> &mut BloomValuesWriter<'a> {
         if name.is_empty() {
             return &mut self.message_bloom_values_writer;

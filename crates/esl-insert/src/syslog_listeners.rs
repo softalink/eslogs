@@ -1479,10 +1479,13 @@ fn parse_extra_fields(s: &str) -> Result<Vec<Field>, String> {
             // decoded String to bytes is lossless.
             let value = p.parse_string()?.into_bytes();
             // Go decodes into map[string]string: a duplicate key overwrites.
-            if let Some(f) = fields.iter_mut().find(|f| f.name == name) {
+            if let Some(f) = fields.iter_mut().find(|f| f.name == name.as_bytes()) {
                 f.value = value;
             } else {
-                fields.push(Field { name, value });
+                fields.push(Field {
+                    name: name.into_bytes(),
+                    value,
+                });
             }
             p.skip_ws();
             match p.next_byte() {

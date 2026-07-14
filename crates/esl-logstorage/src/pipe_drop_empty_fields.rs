@@ -79,7 +79,7 @@ impl PipeProcessor for PipeDropEmptyFieldsProcessor {
 
         let cs = br.get_columns();
         let rows_len = br.rows_len();
-        let names: Vec<String> = cs.iter().map(|&c| br.column_name(c).to_string()).collect();
+        let names: Vec<Vec<u8>> = cs.iter().map(|&c| br.column_name(c).to_vec()).collect();
 
         shard.column_values.clear();
         for &c in &cs {
@@ -209,7 +209,7 @@ impl PipeDropEmptyFieldsWriteContext {
         // resetValues() reuses the same column buffers. Rust's set_result_columns
         // takes ownership, so we record the names and rebuild empty columns after
         // the flush — behaviorally identical to Go's resetValues().
-        let names: Vec<String> = rcs.iter().map(|rc| rc.name.clone()).collect();
+        let names: Vec<Vec<u8>> = rcs.iter().map(|rc| rc.name.clone()).collect();
         let rows_count = self.rows_count;
         self.br.set_result_columns(rcs, rows_count);
         self.rows_count = 0;

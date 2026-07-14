@@ -289,7 +289,7 @@ mod tests {
             for r in 0..n {
                 let mut row = Vec::new();
                 for &c in &cols {
-                    let name = br.column_name(c).to_string();
+                    let name = br.column_name(c).to_vec();
                     let value = br.column_get_value_at_row(c, r).to_vec();
                     if !value.is_empty() {
                         row.push(Field { name, value });
@@ -303,19 +303,19 @@ mod tests {
         }
     }
 
-    fn canon(mut row: Vec<Field>) -> Vec<(String, Vec<u8>)> {
+    fn canon(mut row: Vec<Field>) -> Vec<(Vec<u8>, Vec<u8>)> {
         row.sort_by(|a, b| a.name.cmp(&b.name));
         row.into_iter().map(|f| (f.name, f.value)).collect()
     }
 
     fn f(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
 
-    fn run(pipe: PipeReplaceRegexp, rows: Vec<Vec<Field>>) -> Vec<Vec<(String, Vec<u8>)>> {
+    fn run(pipe: PipeReplaceRegexp, rows: Vec<Vec<Field>>) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
         let cap = Arc::new(Capture(Mutex::new(Vec::new())));
         let stop = Arc::new(AtomicBool::new(false));
         let pp = pipe.new_pipe_processor(1, stop, cap.clone() as Arc<dyn PipeProcessor>);
@@ -327,7 +327,7 @@ mod tests {
         out.into_iter().map(canon).collect()
     }
 
-    fn expected(rows: Vec<Vec<Field>>) -> Vec<Vec<(String, Vec<u8>)>> {
+    fn expected(rows: Vec<Vec<Field>>) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
         rows.into_iter()
             .map(|r| canon(r.into_iter().filter(|f| !f.value.is_empty()).collect()))
             .collect()

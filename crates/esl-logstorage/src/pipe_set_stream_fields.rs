@@ -10,7 +10,7 @@ use crate::bitmap::Bitmap;
 use crate::block_result::{BlockResult, ColRef, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::pipe_update::IfFilter;
-use crate::prefix_filter::{self, match_filters};
+use crate::prefix_filter::{self, match_filters_bytes};
 use crate::rows::Field;
 use crate::stats_count_uniq::field_names_string;
 use crate::stream_tags::{get_stream_tags, put_stream_tags};
@@ -169,19 +169,19 @@ impl PipeProcessor for PipeSetStreamFieldsProcessor {
         // Determine the columns contributing to the stream (deduped is not
         // needed — block column names are unique).
         let cs = br.get_columns();
-        let names: Vec<String> = cs.iter().map(|&c| br.column_name(c).to_string()).collect();
-        let matching: Vec<(ColRef, String)> = cs
+        let names: Vec<Vec<u8>> = cs.iter().map(|&c| br.column_name(c).to_vec()).collect();
+        let matching: Vec<(ColRef, Vec<u8>)> = cs
             .iter()
             .zip(names.iter())
-            .filter(|(_, name)| match_filters(&self.stream_field_filters, name.as_str()))
+            .filter(|(_, name)| match_filters_bytes(&self.stream_field_filters, name))
             .map(|(&c, name)| (c, name.clone()))
             .collect();
 
         let stream_column = br.get_column_by_name("_stream");
         let stream_id_column = br.get_column_by_name("_stream_id");
 
-        shard.rcs[0].name = "_stream".to_string();
-        shard.rcs[1].name = "_stream_id".to_string();
+        shard.rcs[0].name = b"_stream".to_vec();
+        shard.rcs[1].name = b"_stream_id".to_vec();
 
         for row_idx in 0..rows_len {
             let (stream, stream_id) = if !has_iff || shard.bm.is_set_bit(row_idx) {
@@ -220,7 +220,7 @@ impl PipeProcessor for PipeSetStreamFieldsProcessor {
 /// them by the same `Field` ordering, and feeds them to `StreamTags` in sorted
 /// order — producing identical output.
 fn set_log_stream_fields(
-    matching: &[(ColRef, String)],
+    matching: &[(ColRef, Vec<u8>)],
     br: &mut BlockResult,
     row_idx: usize,
     tags: &mut Vec<Field>,
@@ -231,13 +231,9 @@ fn set_log_stream_fields(
         if v.is_empty() {
             continue;
         }
-        let tag_name = if name.is_empty() {
-            "_msg"
-        } else {
-            name.as_str()
-        };
+        let tag_name: &[u8] = if name.is_empty() { b"_msg" } else { name };
         tags.push(Field {
-            name: tag_name.to_string(),
+            name: tag_name.to_vec(),
             value: v.to_vec(),
         });
     }

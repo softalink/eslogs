@@ -233,7 +233,7 @@ fn parse_json_request<S: LogRowsStorage>(
             })?;
             for (k, val) in labels {
                 fields_tmp.push(Field {
-                    name: k.clone(),
+                    name: k.clone().into_bytes(),
                     value: val.marshaled().into_bytes(),
                 });
             }
@@ -278,7 +278,7 @@ fn parse_json_request<S: LogRowsStorage>(
                 })?;
                 for (k, val) in metadata {
                     fields_tmp.push(Field {
-                        name: k.clone(),
+                        name: k.clone().into_bytes(),
                         value: val.marshaled().into_bytes(),
                     });
                 }
@@ -342,7 +342,7 @@ pub(crate) fn add_msg_field(
                 true
             } else {
                 fs.push(Field {
-                    name: "_msg".to_string(),
+                    name: b"_msg".to_vec(),
                     value: msg_orig.to_vec(),
                 });
                 false
@@ -350,7 +350,7 @@ pub(crate) fn add_msg_field(
         }
         _ => {
             fs.push(Field {
-                name: "_msg".to_string(),
+                name: b"_msg".to_vec(),
                 value: msg_orig.to_vec(),
             });
             false

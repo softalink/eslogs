@@ -270,15 +270,13 @@ impl Pipe for PipeFacets {
 
 #[derive(Default)]
 struct Shard {
-    m: HashMap<String, FieldHits>,
+    m: HashMap<Vec<u8>, FieldHits>,
     rows_total: u64,
 }
 
 impl Shard {
-    fn get_field_hits(&mut self, name: &str) -> &mut FieldHits {
-        self.m
-            .entry(name.to_string())
-            .or_insert_with(FieldHits::new)
+    fn get_field_hits(&mut self, name: &[u8]) -> &mut FieldHits {
+        self.m.entry(name.to_vec()).or_insert_with(FieldHits::new)
     }
 }
 
@@ -299,7 +297,7 @@ impl PipeFacetsProcessor {
         br: &mut BlockResult,
         c: crate::block_result::ColRef,
     ) {
-        let name = br.column_name(c).to_string();
+        let name = br.column_name(c).to_vec();
         let max_values_per_field = self.max_values_per_field;
         let max_value_len = self.max_value_len;
 
@@ -379,8 +377,8 @@ impl PipeProcessor for PipeFacetsProcessor {
 
     fn flush(&self) -> Result<(), String> {
         // Merge shard state per field, honoring must_ignore.
-        let mut ignore: HashSet<String> = HashSet::new();
-        let mut merged: HashMap<String, HitsMap> = HashMap::new();
+        let mut ignore: HashSet<Vec<u8>> = HashSet::new();
+        let mut merged: HashMap<Vec<u8>, HitsMap> = HashMap::new();
         let mut rows_total: u64 = 0;
 
         for m in &self.shards {
@@ -405,20 +403,20 @@ impl PipeProcessor for PipeFacetsProcessor {
             rows_total += shard.rows_total;
         }
 
-        let mut field_names: Vec<String> = merged.keys().cloned().collect();
+        let mut field_names: Vec<Vec<u8>> = merged.keys().cloned().collect();
         field_names.sort();
 
         let mut rcs = vec![
             ResultColumn {
-                name: "field_name".to_string(),
+                name: b"field_name".to_vec(),
                 values: Vec::new(),
             },
             ResultColumn {
-                name: "field_value".to_string(),
+                name: b"field_value".to_vec(),
                 values: Vec::new(),
             },
             ResultColumn {
-                name: "hits".to_string(),
+                name: b"hits".to_vec(),
                 values: Vec::new(),
             },
         ];
@@ -459,7 +457,7 @@ impl PipeProcessor for PipeFacetsProcessor {
             }
 
             for (value, hits) in vs {
-                rcs[0].add_value(field_name.as_bytes());
+                rcs[0].add_value(field_name);
                 rcs[1].add_value(&value);
                 let mut hb = Vec::new();
                 marshal_uint64_string(&mut hb, hits);
@@ -496,10 +494,7 @@ mod tests {
     impl PipeProcessor for Collector {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cols = br.get_columns();
-            let names: Vec<String> = cols
-                .iter()
-                .map(|&c| br.column_name(c).to_string())
-                .collect();
+            let names: Vec<Vec<u8>> = cols.iter().map(|&c| br.column_name(c).to_vec()).collect();
             let n = br.rows_len();
             let mut out = self.blocks.lock().unwrap();
             for i in 0..n {
@@ -520,7 +515,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -539,7 +534,14 @@ mod tests {
 
     fn triple(r: &[Field]) -> (String, String, String) {
         let get = |name: &str| {
-            String::from_utf8(r.iter().find(|f| f.name == name).unwrap().value.clone()).unwrap()
+            String::from_utf8(
+                r.iter()
+                    .find(|f| f.name == name.as_bytes())
+                    .unwrap()
+                    .value
+                    .clone(),
+            )
+            .unwrap()
         };
         (get("field_name"), get("field_value"), get("hits"))
     }
@@ -587,7 +589,7 @@ mod tests {
         // "k" is constant over all rows -> skipped. Only "v" facets remain.
         for r in &out {
             assert_ne!(
-                r.iter().find(|f| f.name == "field_name").unwrap().value,
+                r.iter().find(|f| f.name == b"field_name").unwrap().value,
                 b"k"
             );
         }
@@ -624,7 +626,7 @@ mod tests {
         );
         for r in &out {
             assert_ne!(
-                r.iter().find(|f| f.name == "field_name").unwrap().value,
+                r.iter().find(|f| f.name == b"field_name").unwrap().value,
                 b"x"
             );
         }

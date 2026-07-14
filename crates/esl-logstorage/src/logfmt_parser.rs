@@ -31,7 +31,7 @@ impl LogfmtParser {
         }
         let mut f = self.spare_fields.pop().unwrap_or_default();
         f.name.clear();
-        f.name.push_str(name);
+        f.name.extend_from_slice(name.as_bytes());
         f.value.clear();
         f.value.extend_from_slice(value.as_bytes());
         self.fields.push(f);

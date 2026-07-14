@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::flagutil::Flag;
 
-use super::{to_unsafe_string, unix_timestamp};
+use super::unix_timestamp;
 
 static INTERN_STRING_MAX_LEN: Flag<i64> = Flag::new(
     "internStringMaxLen",
@@ -112,26 +112,60 @@ fn add_jitter_to_duration(d: Duration) -> Duration {
     d + Duration::from_secs_f64(p * dv.as_secs_f64())
 }
 
-#[derive(Clone)]
-struct InternStringMapEntry {
-    deadline: u64,
-    s: Arc<str>,
+/// PORT NOTE: the map is generic over `str`/`[u8]` so column names (raw
+/// bytes, possibly invalid UTF-8) can be interned alongside plain strings;
+/// Go has a single string map because Go strings are arbitrary bytes.
+trait Internable: Eq + std::hash::Hash {
+    fn byte_len(&self) -> usize;
+    fn to_arc(&self) -> Arc<Self>;
 }
 
-struct MutableState {
-    m: HashMap<Arc<str>, Arc<str>>,
+impl Internable for str {
+    fn byte_len(&self) -> usize {
+        self.len()
+    }
+    fn to_arc(&self) -> Arc<str> {
+        Arc::from(self)
+    }
+}
+
+impl Internable for [u8] {
+    fn byte_len(&self) -> usize {
+        self.len()
+    }
+    fn to_arc(&self) -> Arc<[u8]> {
+        Arc::from(self)
+    }
+}
+
+struct InternStringMapEntry<T: ?Sized> {
+    deadline: u64,
+    s: Arc<T>,
+}
+
+impl<T: ?Sized> Clone for InternStringMapEntry<T> {
+    fn clone(&self) -> Self {
+        InternStringMapEntry {
+            deadline: self.deadline,
+            s: self.s.clone(),
+        }
+    }
+}
+
+struct MutableState<T: ?Sized + Internable> {
+    m: HashMap<Arc<T>, Arc<T>>,
     reads: u64,
 }
 
 // PORT NOTE: Go stores the readonly map in an `atomic.Pointer` for lock-free
 // reads; std Rust has no atomic Arc swap, so the port uses
 // `RwLock<Arc<HashMap<..>>>` (readers only clone the Arc under the read lock).
-struct InternStringMap {
-    mutable: Mutex<MutableState>,
-    readonly: RwLock<Arc<HashMap<Arc<str>, InternStringMapEntry>>>,
+struct InternStringMap<T: ?Sized + Internable> {
+    mutable: Mutex<MutableState<T>>,
+    readonly: RwLock<Arc<HashMap<Arc<T>, InternStringMapEntry<T>>>>,
 }
 
-impl InternStringMap {
+impl<T: ?Sized + Internable> InternStringMap<T> {
     fn new() -> Self {
         InternStringMap {
             mutable: Mutex::new(MutableState {
@@ -142,13 +176,13 @@ impl InternStringMap {
         }
     }
 
-    fn get_readonly(&self) -> Arc<HashMap<Arc<str>, InternStringMapEntry>> {
+    fn get_readonly(&self) -> Arc<HashMap<Arc<T>, InternStringMapEntry<T>>> {
         self.readonly.read().unwrap().clone()
     }
 
-    fn intern(&self, s: &str) -> Arc<str> {
-        if is_skip_cache(s) {
-            return Arc::from(s);
+    fn intern(&self, s: &T) -> Arc<T> {
+        if is_skip_cache(s.byte_len()) {
+            return s.to_arc();
         }
 
         let mut readonly = self.get_readonly();
@@ -169,9 +203,9 @@ impl InternStringMap {
                     Some(e) => e.s.clone(),
                     None => {
                         // Slowest path - register the string in mutable map.
-                        // Arc::from(s) makes a fresh copy, removing references
+                        // to_arc(s) makes a fresh copy, removing references
                         // to a possible bigger string s refers to.
-                        let s_interned: Arc<str> = Arc::from(s);
+                        let s_interned: Arc<T> = s.to_arc();
                         mutable.m.insert(s_interned.clone(), s_interned.clone());
                         s_interned
                     }
@@ -188,9 +222,9 @@ impl InternStringMap {
         s_interned
     }
 
-    fn migrate_mutable_to_readonly_locked(&self, mutable: &mut MutableState) {
+    fn migrate_mutable_to_readonly_locked(&self, mutable: &mut MutableState<T>) {
         let readonly = self.get_readonly();
-        let mut readonly_copy: HashMap<Arc<str>, InternStringMapEntry> =
+        let mut readonly_copy: HashMap<Arc<T>, InternStringMapEntry<T>> =
             HashMap::with_capacity(readonly.len() + mutable.m.len());
         for (k, e) in readonly.iter() {
             readonly_copy.insert(k.clone(), e.clone());
@@ -217,7 +251,7 @@ impl InternStringMap {
             return;
         }
 
-        let readonly_copy: HashMap<Arc<str>, InternStringMapEntry> = readonly
+        let readonly_copy: HashMap<Arc<T>, InternStringMapEntry<T>> = readonly
             .iter()
             .filter(|(_, e)| e.deadline > current_time)
             .map(|(k, e)| (k.clone(), e.clone()))
@@ -226,14 +260,16 @@ impl InternStringMap {
     }
 }
 
-pub(super) fn is_skip_cache(s: &str) -> bool {
-    *DISABLE_CACHE.get() || s.len() as i64 > *INTERN_STRING_MAX_LEN.get()
+pub(super) fn is_skip_cache(len: usize) -> bool {
+    *DISABLE_CACHE.get() || len as i64 > *INTERN_STRING_MAX_LEN.get()
 }
 
-/// Interns `b` as a string.
-pub fn intern_bytes(b: &[u8]) -> Arc<str> {
-    let s = to_unsafe_string(b);
-    intern_string(s)
+/// Returns interned `b`.
+///
+/// PORT NOTE: Go interns column names as strings (arbitrary bytes); the
+/// byte-native map keeps invalid UTF-8 intact.
+pub fn intern_bytes(b: &[u8]) -> Arc<[u8]> {
+    ibm().intern(b)
 }
 
 /// Returns interned `s`.
@@ -246,12 +282,24 @@ pub fn intern_string(s: &str) -> Arc<str> {
     ism().intern(s)
 }
 
-fn ism() -> &'static InternStringMap {
-    static ISM: OnceLock<InternStringMap> = OnceLock::new();
-    static CLEANER: Once = Once::new();
+fn ism() -> &'static InternStringMap<str> {
+    static ISM: OnceLock<InternStringMap<str>> = OnceLock::new();
     let m = ISM.get_or_init(InternStringMap::new);
-    // PORT NOTE: Go starts the cleanup goroutine in newInternStringMap();
-    // the port spawns the equivalent named thread on first use.
+    start_cleaner();
+    m
+}
+
+fn ibm() -> &'static InternStringMap<[u8]> {
+    static IBM: OnceLock<InternStringMap<[u8]>> = OnceLock::new();
+    let m = IBM.get_or_init(InternStringMap::new);
+    start_cleaner();
+    m
+}
+
+// PORT NOTE: Go starts the cleanup goroutine in newInternStringMap();
+// the port spawns one named thread sweeping both maps on first use.
+fn start_cleaner() {
+    static CLEANER: Once = Once::new();
     CLEANER.call_once(|| {
         std::thread::Builder::new()
             .name("internstring-cleanup".to_string())
@@ -260,11 +308,11 @@ fn ism() -> &'static InternStringMap {
                     let cleanup_interval = add_jitter_to_duration(cache_expire_duration()) / 2;
                     std::thread::sleep(cleanup_interval);
                     ism().cleanup();
+                    ibm().cleanup();
                 }
             })
             .expect("FATAL: cannot spawn internstring-cleanup thread");
     });
-    m
 }
 
 #[cfg(test)]

@@ -86,7 +86,7 @@ impl PipeProcessor for PipeGenerateSequenceProcessor {
 
     fn flush(&self) -> Result<(), String> {
         let mut rc = ResultColumn {
-            name: "_msg".to_string(),
+            name: b"_msg".to_vec(),
             values: Vec::new(),
         };
 
@@ -107,7 +107,7 @@ impl PipeProcessor for PipeGenerateSequenceProcessor {
                 let rows_len = rc.values.len();
                 br.set_result_columns(vec![std::mem::take(&mut rc)], rows_len);
                 self.pp_next.write_block(0, &mut br);
-                rc.name = "_msg".to_string();
+                rc.name = b"_msg".to_vec();
                 buf.clear();
             }
         }

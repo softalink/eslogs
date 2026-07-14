@@ -310,32 +310,17 @@ impl CommonJson {
 
 /// Composes `field_prefix + prefix_buf + k` into name; an empty name becomes
 /// `_msg` (Go `commonJSON.appendLogField`).
-fn compose_field_name(name: &mut String, field_prefix: &str, prefix_buf: &[u8], k: &[u8]) {
-    name.push_str(field_prefix);
-    push_lossy(name, prefix_buf);
-    push_lossy(name, k);
+///
+/// Go views the raw key bytes as strings (`bytesutil.ToUnsafeString` in
+/// `appendLogField`); `Field.name` is raw bytes, so JSON containing invalid
+/// UTF-8 inside key literals keeps those bytes verbatim in the stored field
+/// name, matching Go.
+fn compose_field_name(name: &mut Vec<u8>, field_prefix: &str, prefix_buf: &[u8], k: &[u8]) {
+    name.extend_from_slice(field_prefix.as_bytes());
+    name.extend_from_slice(prefix_buf);
+    name.extend_from_slice(k);
     if name.is_empty() {
-        name.push_str("_msg");
-    }
-}
-
-/// PORT NOTE: used only for field NAMES. Go views the raw key bytes as
-/// strings (`bytesutil.ToUnsafeString` in `appendLogField`), so JSON
-/// containing invalid UTF-8 inside key literals is ingested with those bytes
-/// kept verbatim in the stored field name. `Field.name` is a Rust `String`
-/// (crate-wide decision), which must hold valid UTF-8, so each invalid
-/// sequence is replaced with U+FFFD instead: input key bytes `b"a\xffb"` are
-/// stored by Go as `a\xffb` and by the port as `a\u{FFFD}b`. This never
-/// triggers for valid UTF-8 JSON input. Field VALUES are `Vec<u8>` and keep
-/// the raw bytes verbatim.
-fn push_lossy(dst: &mut String, b: &[u8]) {
-    // Fast path for valid UTF-8 (the overwhelmingly common case for log data):
-    // `str::from_utf8` is SIMD-validated and borrows directly, avoiding the
-    // `Utf8Chunks` iterator + Cow machinery of `from_utf8_lossy`. Only genuinely
-    // invalid bytes fall back to the lossy (replacement-char) path.
-    match std::str::from_utf8(b) {
-        Ok(s) => dst.push_str(s),
-        Err(_) => dst.push_str(&String::from_utf8_lossy(b)),
+        name.extend_from_slice(b"_msg");
     }
 }
 
@@ -1234,7 +1219,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -1253,13 +1238,11 @@ mod tests {
         f("{\"foo\",}");
     }
 
-    // PORT-ONLY TEST: upstream has no invalid-UTF-8 coverage. Pins the
-    // divergence documented on push_lossy: Go stores the raw bytes of an
-    // invalid-UTF-8 JSON key; the port U+FFFD-replaces each invalid sequence
-    // in the NAME because Field.name is a String. VALUES are raw bytes and
-    // are preserved verbatim.
+    // PORT-ONLY TEST: upstream has no invalid-UTF-8 coverage. Pins that both
+    // field NAMES and VALUES are raw bytes (Go strings are arbitrary bytes):
+    // an invalid-UTF-8 JSON key and value are ingested byte-verbatim.
     #[test]
-    fn test_json_parser_invalid_utf8_lossy() {
+    fn test_json_parser_invalid_utf8_raw_bytes() {
         let mut p = get_json_parser();
         // {"a\xffb":"x\xffy"} with a raw 0xFF byte in both key and value.
         let data = b"{\"a\xffb\":\"x\xffy\"}";
@@ -1268,7 +1251,7 @@ mod tests {
         assert_eq!(
             p.fields(),
             &[Field {
-                name: "a\u{FFFD}b".to_string(),
+                name: b"a\xffb".to_vec(),
                 value: b"x\xffy".to_vec(),
             }],
             "unexpected fields: {:?}",

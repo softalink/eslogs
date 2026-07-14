@@ -348,7 +348,7 @@ impl PipeProcessor for PipeMathProcessor {
         for e in &self.entries {
             let (values, min_value, max_value) = execute_math_entry(e, br);
             let rc = ResultColumn {
-                name: e.result_field.clone(),
+                name: e.result_field.clone().into_bytes(),
                 values,
             };
             br.add_result_column_float64(rc, min_value, max_value);
@@ -751,17 +751,14 @@ mod tests {
     impl PipeProcessor for CapturePp {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cols = br.get_columns();
-            let names: Vec<String> = cols
-                .iter()
-                .map(|&c| br.column_name(c).to_string())
-                .collect();
+            let names: Vec<Vec<u8>> = cols.iter().map(|&c| br.column_name(c).to_vec()).collect();
             let n = br.rows_len();
             let mut out = self.rows.lock().unwrap();
             for r in 0..n {
                 let mut row = Vec::with_capacity(cols.len());
                 for (i, &c) in cols.iter().enumerate() {
                     let v = String::from_utf8(br.column_get_value_at_row(c, r).to_vec()).unwrap();
-                    row.push((names[i].clone(), v));
+                    row.push((String::from_utf8(names[i].clone()).unwrap(), v));
                 }
                 out.push(row);
             }
@@ -773,7 +770,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }

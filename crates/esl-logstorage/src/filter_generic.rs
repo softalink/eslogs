@@ -140,10 +140,15 @@ impl Filter for FilterGeneric {
         // Slow path - match the row by wildcard.
         let prefix = &self.field_name[..self.field_name.len() - 1];
         for f in fields {
-            if !f.name.starts_with(prefix) {
+            if !f.name.starts_with(prefix.as_bytes()) {
                 continue;
             }
-            if self.f.match_row_by_field(fields, &f.name) {
+            // Match-only lossy view: the FieldFilter trait takes text names
+            // (query-side API); the stored name bytes stay raw.
+            if self
+                .f
+                .match_row_by_field(fields, &String::from_utf8_lossy(&f.name))
+            {
                 return true;
             }
         }
@@ -186,13 +191,19 @@ impl Filter for FilterGeneric {
 
         // Collect const-column and column-header names before mutating bs via
         // the per-field accessors (the columns header borrows bs).
+        // Match-only lossy views: the FieldFilter trait takes text names
+        // (query-side API); the stored name bytes stay raw in the headers.
         let (const_names, col_names): (Vec<String>, Vec<String>) = {
             let csh = bs.get_columns_header();
-            let const_names = csh.const_columns.iter().map(|cc| cc.name.clone()).collect();
+            let const_names = csh
+                .const_columns
+                .iter()
+                .map(|cc| String::from_utf8_lossy(&cc.name).into_owned())
+                .collect();
             let col_names = csh
                 .column_headers
                 .iter()
-                .map(|ch| ch.name.clone())
+                .map(|ch| String::from_utf8_lossy(&ch.name).into_owned())
                 .collect();
             (const_names, col_names)
         };
@@ -258,9 +269,10 @@ impl Filter for FilterGeneric {
         bm_result.copy_from(bm);
 
         let cols = br.get_columns();
+        // Match-only lossy views (see the block-search slow path above).
         let names: Vec<String> = cols
             .iter()
-            .map(|&r| br.column_name(r).to_string())
+            .map(|&r| String::from_utf8_lossy(br.column_name(r)).into_owned())
             .collect();
         for name in &names {
             if !name.starts_with(&prefix) {

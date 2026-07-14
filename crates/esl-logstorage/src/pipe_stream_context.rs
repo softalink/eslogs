@@ -308,7 +308,7 @@ impl PipeProcessor for PipeStreamContextProcessor {
         // Materialize everything out of `br` (see write_block borrow discipline)
         // before touching the locked shard.
         let cs = br.get_columns();
-        let names: Vec<String> = cs.iter().map(|&c| br.column_name(c).to_string()).collect();
+        let names: Vec<Vec<u8>> = cs.iter().map(|&c| br.column_name(c).to_vec()).collect();
         let stream_id_col = br.get_column_by_name("_stream_id");
         let mut col_values: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cs.len());
         for &c in &cs {
@@ -771,19 +771,19 @@ fn new_delimiter_row_fields(r: &StreamContextRow, stream_id: &str) -> Vec<Field>
     marshal_timestamp_rfc3339_nano_string(&mut time_buf, r.timestamp + 1);
     vec![
         Field {
-            name: "_time".to_string(),
+            name: b"_time".to_vec(),
             value: time_buf,
         },
         Field {
-            name: "_stream_id".to_string(),
+            name: b"_stream_id".to_vec(),
             value: stream_id.as_bytes().to_vec(),
         },
         Field {
-            name: "_stream".to_string(),
+            name: b"_stream".to_vec(),
             value: get_field_value_by_name(&r.fields, "_stream").to_vec(),
         },
         Field {
-            name: "_msg".to_string(),
+            name: b"_msg".to_vec(),
             value: b"---".to_vec(),
         },
     ]
@@ -945,7 +945,7 @@ fn copy_row_at_idx(br: &mut BlockResult, row_idx: usize, row_timestamp: i64) -> 
             fields: Vec::new(),
         };
     }
-    let names: Vec<String> = cs.iter().map(|&c| br.column_name(c).to_string()).collect();
+    let names: Vec<Vec<u8>> = cs.iter().map(|&c| br.column_name(c).to_vec()).collect();
     let mut fields = Vec::with_capacity(cs.len());
     for (k, &c) in cs.iter().enumerate() {
         let v = br.column_get_value_at_row(c, row_idx).to_vec();
@@ -1024,7 +1024,7 @@ impl WriteContext {
         // Preserve the column skeleton (names) for reuse across the flush, since
         // `set_result_columns` consumes the `ResultColumn`s (Go reuses the same
         // slice via `resetValues`).
-        let names: Vec<String> = self.rcs.iter().map(|rc| rc.name.clone()).collect();
+        let names: Vec<Vec<u8>> = self.rcs.iter().map(|rc| rc.name.clone()).collect();
         let rcs = std::mem::take(&mut self.rcs);
 
         self.br.set_result_columns(rcs, self.rows_count);
@@ -1214,8 +1214,9 @@ mod tests {
             }],
         };
         let fields = new_delimiter_row_fields(&r, "stream-42");
-        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["_time", "_stream_id", "_stream", "_msg"]);
+        let names: Vec<&[u8]> = fields.iter().map(|f| f.name.as_slice()).collect();
+        let expected: Vec<&[u8]> = vec![b"_time", b"_stream_id", b"_stream", b"_msg"];
+        assert_eq!(names, expected);
         assert_eq!(get_field_value_by_name(&fields, "_stream_id"), b"stream-42");
         assert_eq!(get_field_value_by_name(&fields, "_stream"), b"{app=\"x\"}");
         assert_eq!(get_field_value_by_name(&fields, "_msg"), b"---");
@@ -1344,7 +1345,7 @@ mod tests {
             vec![StreamContextRow {
                 timestamp: 20,
                 fields: vec![Field {
-                    name: "_msg".to_string(),
+                    name: b"_msg".to_vec(),
                     value: b"b".to_vec(),
                 }],
             }],

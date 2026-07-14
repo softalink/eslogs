@@ -202,7 +202,7 @@ fn get_extra_fields(req: &Request) -> Result<Vec<Field>, String> {
         match ef.find('=') {
             Some(n) if n > 0 && n != ef.len() - 1 => {
                 extra_fields.push(Field {
-                    name: ef[..n].to_string(),
+                    name: ef.as_bytes()[..n].to_vec(),
                     value: ef.as_bytes()[n + 1..].to_vec(),
                 });
             }
@@ -257,7 +257,7 @@ pub fn extract_timestamp_from_fields(
 ) -> Result<i64, String> {
     for time_field in time_fields {
         for f in fields.iter_mut() {
-            if f.name != *time_field {
+            if f.name != time_field.as_bytes() {
                 continue;
             }
             // R3: invalid UTF-8 fails the timestamp parse, matching Go's
@@ -662,7 +662,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -738,7 +738,7 @@ mod tests {
             );
 
             for fld in fields.iter() {
-                if fld.name == time_field {
+                if fld.name == time_field.as_bytes() {
                     assert_eq!(
                         fld.value, b"",
                         "unexpected value for field {time_field}; got {:?}; want \"\"",

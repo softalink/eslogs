@@ -63,7 +63,7 @@ struct PipePackProcessorShard {
     buf: Vec<u8>,
     fields: Vec<Field>,
     cs: Vec<ColRef>,
-    cs_names: Vec<String>,
+    cs_names: Vec<Vec<u8>>,
 }
 
 impl PipeProcessor for PipePackProcessor {
@@ -76,13 +76,11 @@ impl PipeProcessor for PipePackProcessor {
         let mut guard = shard_arc.lock().unwrap();
         let shard = &mut *guard;
 
-        shard.rc.name = self.result_field.clone();
+        shard.rc.name = self.result_field.clone().into_bytes();
 
         let cs_all = br.get_columns();
-        let cs_all_names: Vec<String> = cs_all
-            .iter()
-            .map(|&c| br.column_name(c).to_string())
-            .collect();
+        let cs_all_names: Vec<Vec<u8>> =
+            cs_all.iter().map(|&c| br.column_name(c).to_vec()).collect();
 
         shard.cs.clear();
         shard.cs_names.clear();
@@ -95,7 +93,9 @@ impl PipeProcessor for PipePackProcessor {
             for (i, &c) in cs_all.iter().enumerate() {
                 let name = &cs_all_names[i];
                 for f in &self.fields {
-                    if name == f || (f.ends_with('*') && name.starts_with(&f[..f.len() - 1])) {
+                    if *name == f.as_bytes()
+                        || (f.ends_with('*') && name.starts_with(&f.as_bytes()[..f.len() - 1]))
+                    {
                         shard.cs.push(c);
                         shard.cs_names.push(name.clone());
                         break;

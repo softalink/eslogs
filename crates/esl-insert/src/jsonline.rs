@@ -240,7 +240,7 @@ mod tests {
         let cap = Arc::clone(&captured);
         let write: WriteDataBlockFn = Arc::new(move |_wid, db: &mut DataBlock| {
             for c in db.get_columns(false) {
-                if c.name == "_msg" {
+                if c.name == b"_msg" {
                     for v in &c.values {
                         cap.lock().unwrap().push(v.clone());
                     }

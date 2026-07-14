@@ -27,7 +27,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
     let cs = br.get_columns();
     let mut dst = Vec::new();
     for &c in &cs {
-        if prefix_filter::match_filters(filters, br.column_name(c)) {
+        if prefix_filter::match_filters_bytes(filters, br.column_name(c)) {
             dst.push(c);
         }
     }
@@ -37,7 +37,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
         }
         let mut need_empty = true;
         for &c in &cs {
-            if br.column_name(c) == f.as_str() {
+            if br.column_name(c) == f.as_bytes() {
                 need_empty = false;
                 break;
             }

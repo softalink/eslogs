@@ -847,7 +847,7 @@ pub fn new_processor<S: LogRowsStorage>(
     let file_field = FILE_FIELD.get();
     if !file_field.is_empty() {
         efs.push(Field {
-            name: file_field.clone(),
+            name: file_field.clone().into_bytes(),
             value: file_path.as_bytes().to_vec(),
         });
         default_stream_fields.push(file_field);
@@ -856,7 +856,7 @@ pub fn new_processor<S: LogRowsStorage>(
     let hostname_field = HOSTNAME_FIELD.get();
     if !hostname_field.is_empty() {
         efs.push(Field {
-            name: hostname_field.clone(),
+            name: hostname_field.clone().into_bytes(),
             value: hostname().into_bytes(),
         });
         default_stream_fields.push(hostname_field);
@@ -919,7 +919,7 @@ impl<S: LogRowsStorage + 'static> TailProcessor for Processor<S> {
             // with byte-valued `Field`s the port stores a non-JSON log line
             // containing invalid UTF-8 verbatim as `_msg`, exactly like Go.
             parser.fields_mut().push(Field {
-                name: "_msg".to_string(),
+                name: b"_msg".to_vec(),
                 value: line.to_vec(),
             });
         }

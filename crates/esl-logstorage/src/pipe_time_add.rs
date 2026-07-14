@@ -113,7 +113,7 @@ impl PipeProcessor for PipeTimeAddProcessor {
             // Reborrow to a plain `&mut Shard` so `rc` and `buf` can be borrowed
             // as disjoint fields in the same expression.
             let shard = &mut *guard;
-            shard.rc.name = self.field.clone();
+            shard.rc.name = self.field.clone().into_bytes();
 
             let c = br.get_column_by_name(&self.field);
             let rows_len = br.rows_len();

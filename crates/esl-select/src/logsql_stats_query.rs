@@ -20,7 +20,7 @@ use crate::logsql::{
 
 /// Go `statsRow`.
 struct StatsRow {
-    name: String,
+    name: Vec<u8>,
     labels: Vec<Field>,
     timestamp: i64,
     value: Vec<u8>,
@@ -28,7 +28,7 @@ struct StatsRow {
 
 /// Go `statsSeries` (the `key` lives as the map key / sort key).
 struct StatsSeries {
-    name: String,
+    name: Vec<u8>,
     labels: Vec<Field>,
     points: Vec<StatsPoint>,
 }
@@ -163,7 +163,7 @@ pub fn process_stats_query_request(storage: &Arc<Storage>, req: &Request, w: &mu
         for i in 0..rows_count {
             let mut labels: Vec<Field> = Vec::with_capacity(label_fields.len());
             for c in columns {
-                if label_fields.contains(&c.name) {
+                if label_fields.iter().any(|lf| lf.as_bytes() == c.name) {
                     labels.push(Field {
                         name: c.name.clone(),
                         value: c.values[i].clone(),
@@ -172,7 +172,7 @@ pub fn process_stats_query_request(storage: &Arc<Storage>, req: &Request, w: &mu
             }
 
             for c in columns {
-                if label_fields.contains(&c.name) {
+                if label_fields.iter().any(|lf| lf.as_bytes() == c.name) {
                     continue;
                 }
 
@@ -187,12 +187,13 @@ pub fn process_stats_query_request(storage: &Arc<Storage>, req: &Request, w: &mu
                     // stats function. Convert it to values for individual
                     // buckets.
                     if let Ok(buckets) = parse_histogram_buckets(vs) {
-                        let name = format!("{}_bucket", c.name);
+                        let mut name = c.name.clone();
+                        name.extend_from_slice(b"_bucket");
                         let mut bucket_rows: Vec<StatsRow> = Vec::with_capacity(buckets.len());
                         for bucket in buckets {
                             let mut bucket_labels = labels.clone();
                             bucket_labels.push(Field {
-                                name: "vmrange".to_string(),
+                                name: b"vmrange".to_vec(),
                                 value: bucket.vmrange.into_bytes(),
                             });
                             bucket_rows.push(StatsRow {
@@ -322,7 +323,7 @@ pub fn process_stats_query_range_request(
             let mut ts = q_timestamp;
             let mut labels: Vec<Field> = Vec::with_capacity(label_fields.len());
             for c in columns {
-                if c.name == "_time" {
+                if c.name == b"_time" {
                     // R3: invalid UTF-8 fails the timestamp parse, exactly
                     // like Go's parse on arbitrary bytes.
                     if let Some(nsec) = std::str::from_utf8(&c.values[i])
@@ -333,7 +334,7 @@ pub fn process_stats_query_range_request(
                         continue;
                     }
                 }
-                if label_fields.contains(&c.name) {
+                if label_fields.iter().any(|lf| lf.as_bytes() == c.name) {
                     labels.push(Field {
                         name: c.name.clone(),
                         value: c.values[i].clone(),
@@ -343,7 +344,7 @@ pub fn process_stats_query_range_request(
 
             let mut column_idx: u32 = 0;
             for c in columns {
-                if label_fields.contains(&c.name) {
+                if label_fields.iter().any(|lf| lf.as_bytes() == c.name) {
                     continue;
                 }
 
@@ -358,11 +359,12 @@ pub fn process_stats_query_range_request(
                     // stats function. Convert it to values for individual
                     // buckets.
                     if let Ok(buckets) = parse_histogram_buckets(vs) {
-                        let name = format!("{}_bucket", c.name);
+                        let mut name = c.name.clone();
+                        name.extend_from_slice(b"_bucket");
                         for bucket in buckets {
                             let mut bucket_labels = labels.clone();
                             bucket_labels.push(Field {
-                                name: "vmrange".to_string(),
+                                name: b"vmrange".to_vec(),
                                 value: bucket.vmrange.into_bytes(),
                             });
                             let p = StatsPoint {
@@ -432,18 +434,18 @@ pub fn process_stats_query_range_request(
 /// `MarshalUint32(columnIdx) + name + MarshalFieldsToJSON(labels)`.
 fn add_point(
     m: &Mutex<HashMap<Vec<u8>, StatsSeries>>,
-    name: &str,
+    name: &[u8],
     column_idx: u32,
     labels: Vec<Field>,
     p: StatsPoint,
 ) {
     let mut key = column_idx.to_be_bytes().to_vec();
-    key.extend_from_slice(name.as_bytes());
+    key.extend_from_slice(name);
     marshal_fields_to_json(&mut key, &labels);
 
     let mut m = m.lock().unwrap();
     let ss = m.entry(key).or_insert_with(|| StatsSeries {
-        name: name.to_string(),
+        name: name.to_vec(),
         labels,
         points: Vec::new(),
     });
@@ -459,12 +461,12 @@ fn format_timestamp_seconds(timestamp: i64) -> String {
 
 /// Go `streamformatStatsRow` metric object:
 /// `{"__name__":<name>[,<label>:<value>...]}`.
-fn write_metric_object(dst: &mut Vec<u8>, name: &str, labels: &[Field]) {
+fn write_metric_object(dst: &mut Vec<u8>, name: &[u8], labels: &[Field]) {
     dst.extend_from_slice(b"{\"__name__\":");
-    append_json_string(dst, name.as_bytes());
+    append_json_string(dst, name);
     for label in labels {
         dst.push(b',');
-        append_json_string(dst, label.name.as_bytes());
+        append_json_string(dst, &label.name);
         dst.push(b':');
         append_json_string(dst, &label.value);
     }
@@ -655,9 +657,9 @@ mod tests {
     #[test]
     fn test_write_stats_query_response_shape() {
         let rows = vec![StatsRow {
-            name: "rows".to_string(),
+            name: b"rows".to_vec(),
             labels: vec![Field {
-                name: "host".to_string(),
+                name: b"host".to_vec(),
                 value: b"node-1".to_vec(),
             }],
             timestamp: 1_500_000_000_000_000_000,

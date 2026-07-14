@@ -133,7 +133,7 @@ impl PipeProcessor for PipeSplitProcessor {
         let cols = br.get_columns();
         let mut rcs: Vec<ResultColumn> = Vec::with_capacity(cols.len() + 1);
         for &c in &cols {
-            let name = br.column_name(c).to_string();
+            let name = br.column_name(c).to_vec();
             let values = br.column_get_values(c).to_vec();
             rcs.push(ResultColumn { name, values });
         }
@@ -160,7 +160,7 @@ impl PipeProcessor for PipeSplitProcessor {
             dst_values.push(encoded.clone());
         }
         rcs.push(ResultColumn {
-            name: self.dst_field.clone(),
+            name: self.dst_field.clone().into_bytes(),
             values: dst_values,
         });
 
@@ -211,7 +211,7 @@ mod tests {
 
     fn f(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -424,10 +424,7 @@ mod tests {
     impl PipeProcessor for CollectProcessor {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cols = br.get_columns();
-            let names: Vec<String> = cols
-                .iter()
-                .map(|&c| br.column_name(c).to_string())
-                .collect();
+            let names: Vec<Vec<u8>> = cols.iter().map(|&c| br.column_name(c).to_vec()).collect();
             let mut colvals: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cols.len());
             for &c in &cols {
                 colvals.push(br.column_get_values(c).to_vec());

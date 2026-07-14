@@ -191,7 +191,7 @@ fn append_msg_fields(fields: &mut Vec<Field>, v: &json::Value) -> Result<(), Str
     match v {
         json::Value::Str(val) => {
             fields.push(Field {
-                name: "_msg".to_string(),
+                name: b"_msg".to_vec(),
                 value: val.as_bytes().to_vec(),
             });
         }
@@ -202,14 +202,14 @@ fn append_msg_fields(fields: &mut Vec<Field>, v: &json::Value) -> Result<(), Str
                         // Go's GetStringBytes yields "" for non-string values.
                         let val = v.as_str().unwrap_or("");
                         fields.push(Field {
-                            name: "_msg".to_string(),
+                            name: b"_msg".to_vec(),
                             value: val.as_bytes().to_vec(),
                         });
                     }
                     "status" => {
                         let val = v.as_str().unwrap_or("");
                         fields.push(Field {
-                            name: "status".to_string(),
+                            name: b"status".to_vec(),
                             value: val.as_bytes().to_vec(),
                         });
                     }
@@ -228,7 +228,7 @@ fn append_msg_fields(fields: &mut Vec<Field>, v: &json::Value) -> Result<(), Str
                                 )
                             })?;
                             fields.push(Field {
-                                name: k.clone(),
+                                name: k.clone().into_bytes(),
                                 value: val.as_bytes().to_vec(),
                             });
                         }
@@ -300,13 +300,13 @@ fn read_logs_request(
                                 None => {
                                     // No tag value.
                                     fields.push(Field {
-                                        name: pair.to_string(),
+                                        name: pair.as_bytes().to_vec(),
                                         value: b"no_label_value".to_vec(),
                                     });
                                 }
                                 Some(n) => {
                                     fields.push(Field {
-                                        name: pair[..n].to_string(),
+                                        name: pair.as_bytes()[..n].to_vec(),
                                         value: pair.as_bytes()[n + 1..].to_vec(),
                                     });
                                 }
@@ -325,7 +325,7 @@ fn read_logs_request(
                         )
                     })?;
                     fields.push(Field {
-                        name: k.clone(),
+                        name: k.clone().into_bytes(),
                         value: val.as_bytes().to_vec(),
                     });
                 }

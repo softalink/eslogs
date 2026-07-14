@@ -1086,7 +1086,7 @@ mod tests {
         let columns = names
             .iter()
             .map(|&name| BlockColumn {
-                name: name.to_string(),
+                name: name.as_bytes().to_vec(),
                 values: vec![if name == "RowsFound" {
                     format!("{rows_found}").into_bytes()
                 } else {
@@ -1136,7 +1136,7 @@ mod tests {
         payload.push(0u8); // data block marker
         let mut db = DataBlock::default();
         db.set_columns(vec![BlockColumn {
-            name: "_msg".to_string(),
+            name: b"_msg".to_vec(),
             values: vec![b"hello".to_vec(), b"world".to_vec()],
         }]);
         db.marshal(&mut payload);

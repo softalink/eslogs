@@ -52,7 +52,7 @@ impl RunningStatsLastProcessor {
     pub(crate) fn update_running_stats(&mut self, sf: &RunningStatsLast, row: &[Field]) {
         let mut value = Vec::new();
         for f in row {
-            if f.name == sf.field_name {
+            if f.name == sf.field_name.as_bytes() {
                 value = f.value.clone();
                 break;
             }
@@ -115,7 +115,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }

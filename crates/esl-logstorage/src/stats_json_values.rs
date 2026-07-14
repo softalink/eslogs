@@ -186,7 +186,7 @@ impl StatsJSONValuesProcessor {
         self.fields_buf = cs
             .iter()
             .map(|&c| {
-                let name = br.column_name(c).to_string();
+                let name = br.column_name(c).to_vec();
                 let value = br.column_get_value_at_row(c, row_idx).to_vec();
                 Field { name, value }
             })
@@ -332,13 +332,13 @@ fn is_single_field(filters: &[String]) -> bool {
 
 fn get_matching_columns_slow(br: &mut BlockResult, filters: &[String]) -> Vec<ColRef> {
     let all = br.get_columns();
-    let names: Vec<String> = all.iter().map(|&c| br.column_name(c).to_string()).collect();
+    let names: Vec<Vec<u8>> = all.iter().map(|&c| br.column_name(c).to_vec()).collect();
 
     let mut dst: Vec<ColRef> = Vec::new();
 
     // Add columns matching the given filters.
     for (i, &c) in all.iter().enumerate() {
-        if prefix_filter::match_filters(filters, &names[i]) {
+        if prefix_filter::match_filters_bytes(filters, &names[i]) {
             dst.push(c);
         }
     }
@@ -348,7 +348,7 @@ fn get_matching_columns_slow(br: &mut BlockResult, filters: &[String]) -> Vec<Co
         if prefix_filter::is_wildcard_filter(f) {
             continue;
         }
-        if !names.iter().any(|n| n == f) {
+        if !names.iter().any(|n| n == f.as_bytes()) {
             dst.push(br.get_column_by_name(f));
         }
     }
@@ -373,7 +373,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }

@@ -230,10 +230,10 @@ pub struct StreamReaders<'a> {
     pub bloom_values_shards: Vec<BloomValuesReader<'a>>,
 
     /// columnIdxs contains bloomValuesShards indexes for column names seen in the part
-    pub column_idxs: HashMap<Arc<str>, u64>,
+    pub column_idxs: HashMap<Arc<[u8]>, u64>,
 
     /// columnNames contains id->columnName mapping for all the columns seen in the part
-    pub column_names: Vec<Arc<str>>,
+    pub column_names: Vec<Arc<[u8]>>,
 }
 
 impl<'a> StreamReaders<'a> {
@@ -352,7 +352,7 @@ impl<'a> StreamReaders<'a> {
 
     pub fn get_bloom_values_reader_for_column_name(
         &mut self,
-        name: &str,
+        name: &[u8],
     ) -> &mut BloomValuesReader<'a> {
         if name.is_empty() {
             return &mut self.message_bloom_values_reader;
@@ -364,7 +364,7 @@ impl<'a> StreamReaders<'a> {
             let n = self.bloom_values_shards.len();
             let mut shard_idx = 0u64;
             if n > 1 {
-                let h = xxhash_rust::xxh64::xxh64(name.as_bytes(), 0);
+                let h = xxhash_rust::xxh64::xxh64(name, 0);
                 shard_idx = h % n as u64;
             }
             shard_idx
@@ -372,8 +372,10 @@ impl<'a> StreamReaders<'a> {
             match self.column_idxs.get(name) {
                 Some(&shard_idx) => shard_idx,
                 None => {
+                    // Panic text only: lossy view of the raw name bytes.
                     panicf!(
-                        "BUG: missing column index for {name:?}; columnIdxs={:?}",
+                        "BUG: missing column index for {:?}; columnIdxs={:?}",
+                        String::from_utf8_lossy(name),
                         self.column_idxs
                     );
                     unreachable!()

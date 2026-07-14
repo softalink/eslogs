@@ -161,7 +161,7 @@ pub(crate) mod pipe_test_util {
 
     pub(crate) fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -181,10 +181,7 @@ pub(crate) mod pipe_test_util {
     impl PipeProcessor for CollectingProcessor {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cols = br.get_columns();
-            let names: Vec<String> = cols
-                .iter()
-                .map(|&c| br.column_name(c).to_string())
-                .collect();
+            let names: Vec<Vec<u8>> = cols.iter().map(|&c| br.column_name(c).to_vec()).collect();
             let mut col_values: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cols.len());
             for &c in &cols {
                 col_values.push(br.column_get_values(c).to_vec());
@@ -246,8 +243,8 @@ pub(crate) mod pipe_test_util {
         collector.rows()
     }
 
-    fn sorted_key(row: &[Field]) -> Vec<(String, Vec<u8>)> {
-        let mut k: Vec<(String, Vec<u8>)> = row
+    fn sorted_key(row: &[Field]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut k: Vec<(Vec<u8>, Vec<u8>)> = row
             .iter()
             .map(|f| (f.name.clone(), f.value.clone()))
             .collect();
@@ -258,8 +255,9 @@ pub(crate) mod pipe_test_util {
     /// Asserts two row sets are equal ignoring row and field order (mirrors
     /// Go's `assertRowsEqual`).
     pub(crate) fn assert_rows_eq(got: Vec<Vec<Field>>, expected: &[Vec<Field>]) {
-        let mut got_keys: Vec<Vec<(String, Vec<u8>)>> = got.iter().map(|r| sorted_key(r)).collect();
-        let mut want_keys: Vec<Vec<(String, Vec<u8>)>> =
+        let mut got_keys: Vec<Vec<(Vec<u8>, Vec<u8>)>> =
+            got.iter().map(|r| sorted_key(r)).collect();
+        let mut want_keys: Vec<Vec<(Vec<u8>, Vec<u8>)>> =
             expected.iter().map(|r| sorted_key(r)).collect();
         got_keys.sort();
         want_keys.sort();

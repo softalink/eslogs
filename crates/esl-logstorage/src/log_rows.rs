@@ -21,7 +21,7 @@ use crate::rows::{
 };
 use crate::stream_id::StreamID;
 use crate::stream_tags::{
-    check_stream_field_name, get_stream_tags, get_stream_tags_string, put_stream_tags,
+    check_stream_field_name_bytes, get_stream_tags, get_stream_tags_string, put_stream_tags,
 };
 use crate::tenant_id::TenantID;
 use crate::values_encoder::marshal_timestamp_rfc3339_nano_string;
@@ -204,31 +204,37 @@ impl LogRows {
         if stream_fields_len >= 0 {
             // Compose StreamTags from fields[..stream_fields_len] and ignore lr.stream_fields with lr.extra_stream_fields.
             for f in &fields[..stream_fields_len as usize] {
-                let field_name = get_canonical_field_name(&f.name);
+                let field_name = get_canonical_field_name_bytes(&f.name);
 
-                if let Err(err) = check_stream_field_name(field_name) {
+                if let Err(err) = check_stream_field_name_bytes(field_name) {
                     let line = fields_to_json_string(fields);
+                    // Log text only: lossy view of the raw name bytes.
                     INVALID_STREAM_TAGS_LOGGER.warnf(format_args!(
-                        "invalid stream field name {field_name:?}: {err}; skipping the log entry; log entry: {line}"
+                        "invalid stream field name {:?}: {err}; skipping the log entry; log entry: {line}",
+                        String::from_utf8_lossy(field_name)
                     ));
                     put_stream_tags(st);
                     return;
                 }
 
-                if !self.ignore_fields.match_string(field_name) {
+                if !self.ignore_fields.match_string_bytes(field_name) {
                     st.add(field_name, &f.value);
                 }
             }
         } else if !self.stream_fields.is_empty() || !self.extra_stream_fields.is_empty() {
             // Compose StreamTags from lr.stream_fields and lr.extra_stream_fields.
             for f in fields.iter() {
-                let field_name = get_canonical_field_name(&f.name);
-                if self.stream_fields.iter().any(|s| s == field_name) {
+                let field_name = get_canonical_field_name_bytes(&f.name);
+                if self
+                    .stream_fields
+                    .iter()
+                    .any(|s| s.as_bytes() == field_name)
+                {
                     st.add(field_name, &f.value);
                 }
             }
             for f in &self.extra_stream_fields {
-                let field_name = get_canonical_field_name(&f.name);
+                let field_name = get_canonical_field_name_bytes(&f.name);
                 st.add(field_name, &f.value);
             }
         } else {
@@ -236,8 +242,8 @@ impl LogRows {
             // This can be used when importing the raw logs in JSON line format
             // received from /select/logsql/query endpoint.
             for i in 0..fields.len() {
-                match fields[i].name.as_str() {
-                    "_stream" => {
+                match fields[i].name.as_slice() {
+                    b"_stream" => {
                         // The _stream value is a rendered `{k="v",...}` string;
                         // invalid UTF-8 is a malformed stream string, routed
                         // through the same parse-error path.
@@ -266,7 +272,7 @@ impl LogRows {
                         // Remove _stream field, since it is re-generated from st below.
                         fields[i].value.clear();
                     }
-                    "_stream_id" => {
+                    b"_stream_id" => {
                         // Remove _stream_id field, since it is re-generated from st below.
                         fields[i].value.clear();
                     }
@@ -363,7 +369,7 @@ impl LogRows {
         // Add optional default _msg field
         if !has_msg_field && !self.default_msg_value.is_empty() {
             row.push(Field {
-                name: String::new(),
+                name: Vec::new(),
                 value: self.default_msg_value.clone().into_bytes(),
             });
         }
@@ -392,16 +398,16 @@ impl LogRows {
 
         let mut has_msg_field = false;
         for (i, f) in fields.iter().enumerate() {
-            let field_name = get_canonical_field_name(&f.name);
+            let field_name = get_canonical_field_name_bytes(&f.name);
 
-            if use_filters && self.ignore_fields.match_string(field_name) {
+            if use_filters && self.ignore_fields.match_string_bytes(field_name) {
                 continue;
             }
             if f.value.is_empty() {
                 // Skip fields without values
                 continue;
             }
-            if field_name == "_time" {
+            if field_name == b"_time" {
                 // Values for the _time field are stored in lr.timestamps
                 // See https://github.com/VictoriaMetrics/VictoriaLogs/issues/1168
                 let line = fields_to_json_string(fields);
@@ -412,11 +418,13 @@ impl LogRows {
                 ));
                 continue;
             }
-            if field_name == "_stream" || field_name == "_stream_id" {
+            if field_name == b"_stream" || field_name == b"_stream_id" {
                 let line = fields_to_json_string(fields);
+                // Log text only: lossy view of the raw name bytes.
                 UNEXPECTED_STREAM_FIELD_LOGGER.warnf(format_args!(
-                    "skipping {field_name:?} field with the value {:?} since it clashes with the automatically generated field by EsLogs; \
+                    "skipping {:?} field with the value {:?} since it clashes with the automatically generated field by EsLogs; \
                     see https://docs.victoriametrics.com/victorialogs/keyconcepts/#stream-fields; log entry: {line}",
+                    String::from_utf8_lossy(field_name),
                     f.value
                 ));
                 continue;
@@ -432,10 +440,10 @@ impl LogRows {
 
             match prev_field {
                 Some(prev) if prev.name == field_name => {
-                    dst_field.name.push_str(field_name);
+                    dst_field.name.extend_from_slice(field_name);
                 }
                 _ => {
-                    dst_field.name.push_str(field_name);
+                    dst_field.name.extend_from_slice(field_name);
                     if must_copy_fields {
                         self.a_size_bytes += field_name.len();
                     }
@@ -453,7 +461,7 @@ impl LogRows {
                     }
 
                     if use_filters
-                        && self.decolorize_fields.match_string(field_name)
+                        && self.decolorize_fields.match_string_bytes(field_name)
                         && has_color_sequences(&dst_field.value)
                     {
                         let mut b = Vec::new();
@@ -481,11 +489,11 @@ impl LogRows {
         let stream_tags = get_stream_tags_string(&self.stream_tags_canonicals[idx]);
         let mut fields: Vec<Field> = self.rows[idx].clone();
         fields.push(Field {
-            name: "_time".to_string(),
+            name: b"_time".to_vec(),
             value: time_buf,
         });
         fields.push(Field {
-            name: "_stream".to_string(),
+            name: b"_stream".to_vec(),
             value: stream_tags.into_bytes(),
         });
         sort_fields_by_name(&mut fields);
@@ -545,9 +553,27 @@ pub(crate) fn get_canonical_field_name(field_name: &str) -> &str {
     field_name
 }
 
+/// Byte-name variant of [`get_canonical_field_name`] for `Field.name`
+/// (raw bytes) call sites.
+pub(crate) fn get_canonical_field_name_bytes(field_name: &[u8]) -> &[u8] {
+    if field_name == b"_msg" {
+        return b"";
+    }
+    field_name
+}
+
 pub(crate) fn get_canonical_column_name(field_name: &str) -> &str {
     if field_name.is_empty() {
         return "_msg";
+    }
+    field_name
+}
+
+/// Byte-name variant of [`get_canonical_column_name`] for `Field.name`
+/// (raw bytes) call sites.
+pub(crate) fn get_canonical_column_name_bytes(field_name: &[u8]) -> &[u8] {
+    if field_name.is_empty() {
+        return b"_msg";
     }
     field_name
 }
@@ -594,8 +620,11 @@ pub fn get_log_rows(
     for f in extra_fields {
         // Extra fields must override the existing fields for the sake of consistency and security,
         // so the client won't be able to override them.
-        let field_name = get_canonical_field_name(&f.name);
-        lr.ignore_fields.add_allow_filter(field_name);
+        // Extra-field names come from query args (valid UTF-8); the lossy
+        // view only feeds the filter set, the stored name stays raw.
+        let field_name = String::from_utf8_lossy(&f.name);
+        lr.ignore_fields
+            .add_allow_filter(get_canonical_field_name(&field_name));
     }
 
     // initialize decolorize_fields
@@ -614,10 +643,10 @@ pub fn get_log_rows(
 
     // Initialize extra_stream_fields
     for f in extra_fields {
-        let field_name = get_canonical_field_name(&f.name);
-        if stream_fields.contains(&field_name) {
+        let field_name = get_canonical_field_name_bytes(&f.name);
+        if stream_fields.iter().any(|s| s.as_bytes() == field_name) {
             lr.extra_stream_fields.push(f.clone());
-            lr.stream_fields.retain(|s| s != field_name);
+            lr.stream_fields.retain(|s| s.as_bytes() != field_name);
         }
     }
 
@@ -696,7 +725,7 @@ impl LogRowsInternal {
 
         let mut dst_fields: Vec<Field> = Vec::with_capacity(fields.len());
         for f in fields {
-            let field_name = get_canonical_field_name(&f.name);
+            let field_name = get_canonical_field_name_bytes(&f.name);
 
             // PORT NOTE: Go dedupes each field against
             // fieldsBuf[len(fieldsBuf)-len(fields)] (the first field of the
@@ -716,7 +745,7 @@ impl LogRowsInternal {
             }
 
             dst_fields.push(Field {
-                name: field_name.to_string(),
+                name: field_name.to_vec(),
                 value: f.value.clone(),
             });
         }
@@ -803,7 +832,7 @@ pub fn estimated_json_row_len(fields: &[Field]) -> usize {
             continue;
         }
 
-        let name = get_canonical_column_name(&f.name);
+        let name = get_canonical_column_name_bytes(&f.name);
         n += estimated_json_field_len(name, &f.value);
     }
     n
@@ -812,7 +841,7 @@ pub fn estimated_json_row_len(fields: &[Field]) -> usize {
 /// Returns an approximate length of the field with the given name and value if represented as JSON.
 ///
 /// The field name must be in raw form (e.g., "" to "_msg") before passing.
-pub(crate) fn estimated_json_field_len(name: &str, value: &[u8]) -> usize {
+pub(crate) fn estimated_json_field_len(name: &[u8], value: &[u8]) -> usize {
     r#","":"""#.len() + name.len() + value.len()
 }
 
@@ -957,7 +986,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -1300,7 +1329,7 @@ mod tests {
         let mut dst = Vec::new();
         encoding::marshal_var_uint64(&mut dst, tags.len() as u64);
         for tag in &tags {
-            encoding::marshal_bytes(&mut dst, tag.name.as_bytes());
+            encoding::marshal_bytes(&mut dst, &tag.name);
             encoding::marshal_bytes(&mut dst, &tag.value);
         }
         dst

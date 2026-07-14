@@ -352,7 +352,7 @@ fn decode_label_pair(src: &[u8], fs: &mut Vec<Field>) -> Result<(), String> {
 
     if !name.is_empty() && !value.is_empty() {
         fs.push(Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.to_vec(),
         });
     }
@@ -444,11 +444,10 @@ fn parse_prom_labels(fs: &mut Vec<Field>, s: &[u8]) -> Result<(), String> {
         })?;
         s = &s[qs_len..];
 
-        // Append the found field to dst. The label NAME becomes Field.name
-        // (a String), so an invalid-UTF-8 name is U+FFFD-replaced; the value
-        // bytes are preserved verbatim.
+        // Append the found field to dst. Field.name is raw bytes, so an
+        // invalid-UTF-8 label name is preserved verbatim like Go.
         fs.push(Field {
-            name: d(name),
+            name: name.to_vec(),
             value,
         });
 
@@ -719,7 +718,8 @@ mod tests {
             .iter()
             .map(|f| {
                 let v = std::str::from_utf8(&f.value).expect("test label values are UTF-8");
-                format!("{}={}", f.name, quote(v))
+                let n = std::str::from_utf8(&f.name).expect("test label names are UTF-8");
+                format!("{n}={}", quote(v))
             })
             .collect();
         format!("{{{}}}", a.join(", "))

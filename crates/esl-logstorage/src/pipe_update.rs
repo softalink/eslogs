@@ -175,7 +175,7 @@ impl PipeProcessor for PipeUpdateProcessor {
             }
         }
 
-        shard.rc.name = self.field.clone();
+        shard.rc.name = self.field.clone().into_bytes();
 
         let c = br.get_column_by_name(&self.field);
         let values: Vec<Vec<u8>> = br.column_get_values(c).to_vec();
@@ -238,7 +238,7 @@ pub(crate) mod test_utils {
     impl PipeProcessor for CollectProcessor {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cs = br.get_columns();
-            let names: Vec<String> = cs.iter().map(|&c| br.column_name(c).to_string()).collect();
+            let names: Vec<Vec<u8>> = cs.iter().map(|&c| br.column_name(c).to_vec()).collect();
             let mut column_values: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cs.len());
             for &c in &cs {
                 column_values.push(br.column_get_values(c).to_vec());
@@ -356,7 +356,7 @@ pub(crate) mod test_utils {
             .map(|row| {
                 row.iter()
                     .map(|(n, v)| Field {
-                        name: n.to_string(),
+                        name: n.as_bytes().to_vec(),
                         value: v.as_bytes().to_vec(),
                     })
                     .collect()

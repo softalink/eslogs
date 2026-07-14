@@ -282,7 +282,7 @@ fn extract_timestamp_from_fields(
 ) -> Result<i64, String> {
     for time_field in time_fields {
         for f in fields.iter_mut() {
-            if f.name != *time_field {
+            if f.name != time_field.as_bytes() {
                 continue;
             }
             // R3: invalid UTF-8 fails the timestamp parse, matching Go's

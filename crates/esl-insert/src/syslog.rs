@@ -92,7 +92,7 @@ pub fn process_line<P: SyslogLogMessageProcessor + ?Sized>(
         let has_hostname = p
             .fields
             .iter()
-            .any(|f| f.name == "hostname" && !f.value.is_empty());
+            .any(|f| f.name == b"hostname" && !f.value.is_empty());
         if !has_hostname {
             p.add_field("hostname", remote_ip);
         }

@@ -35,7 +35,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering as AtomicOrdering};
 
 use esl_common::memory;
-use esl_common::stringsutil::{json_string, less_natural};
+use esl_common::stringsutil::less_natural;
 
 use crate::block_result::{BlockResult, ResultColumn, get_block_result, put_block_result};
 use crate::pipe::{Pipe, PipeProcessor};
@@ -345,7 +345,7 @@ struct SortByColumn {
 
 /// A non-`by` column of a buffered block.
 struct SortOtherColumn {
-    name: String,
+    name: Vec<u8>,
     values: Vec<Vec<u8>>,
 }
 
@@ -403,8 +403,8 @@ pub(crate) fn create_float64_values(values: &[Vec<u8>]) -> Vec<f64> {
 }
 
 /// Go `marshalJSONKeyValue`.
-pub(crate) fn marshal_json_key_value(dst: &mut Vec<u8>, k: &str, v: &[u8]) {
-    dst.extend_from_slice(json_string(k).as_bytes());
+pub(crate) fn marshal_json_key_value(dst: &mut Vec<u8>, k: &[u8], v: &[u8]) {
+    esl_common::stringsutil::json_string_bytes_append(dst, k);
     dst.push(b':');
     esl_common::stringsutil::json_string_bytes_append(dst, v);
 }
@@ -451,10 +451,7 @@ impl PipeSortProcessor {
         let block = if by_fields.is_empty() {
             // Sort by all the columns: marshal every column per row into a
             // single JSON-ish string and sort rows by the resulting string.
-            let names: Vec<String> = cols
-                .iter()
-                .map(|&r| br.column_name(r).to_string())
-                .collect();
+            let names: Vec<Vec<u8>> = cols.iter().map(|&r| br.column_name(r).to_vec()).collect();
             let mut col_values: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cols.len());
             for &r in &cols {
                 col_values.push(br.column_get_values(r).to_vec());
@@ -519,8 +516,8 @@ impl PipeSortProcessor {
 
             let mut other_columns = Vec::new();
             for &r in &cols {
-                let name = br.column_name(r).to_string();
-                if by_fields.iter().any(|bf| bf.name == name) {
+                let name = br.column_name(r).to_vec();
+                if by_fields.iter().any(|bf| bf.name.as_bytes() == name) {
                     continue;
                 }
                 let values = br.column_get_values(r).to_vec();
@@ -629,7 +626,7 @@ impl PipeSortProcessor {
         let has_rank = !ps.rank_field_name.is_empty();
 
         let mut rcs: Vec<ResultColumn> = Vec::new();
-        let mut cur_names: Vec<String> = Vec::new();
+        let mut cur_names: Vec<Vec<u8>> = Vec::new();
         let mut rows_count: usize = 0;
         let mut values_len: usize = 0;
         let mut rows_written: u64 = 0;
@@ -641,12 +638,12 @@ impl PipeSortProcessor {
             }
             let block = &blocks[bi];
 
-            let mut names: Vec<String> = Vec::new();
+            let mut names: Vec<Vec<u8>> = Vec::new();
             if has_rank {
-                names.push(ps.rank_field_name.clone());
+                names.push(ps.rank_field_name.clone().into_bytes());
             }
             for bf in &ps.by_fields {
-                names.push(bf.name.clone());
+                names.push(bf.name.clone().into_bytes());
             }
             for oc in &block.other_columns {
                 names.push(oc.name.clone());

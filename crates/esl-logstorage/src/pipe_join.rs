@@ -95,7 +95,7 @@ fn build_join_map(
         for bf in by_fields {
             let mut v: &[u8] = b"";
             for f in row {
-                if f.name == *bf {
+                if f.name == bf.as_bytes() {
                     v = &f.value;
                     break;
                 }
@@ -105,11 +105,14 @@ fn build_join_map(
 
         let mut fields: Vec<Field> = Vec::new();
         for f in row {
-            if !by_fields.iter().any(|bf| bf == &f.name) {
+            if !by_fields.iter().any(|bf| bf.as_bytes() == f.name) {
                 let name = if prefix.is_empty() {
                     f.name.clone()
                 } else {
-                    format!("{}{}", prefix, f.name)
+                    let mut name = Vec::with_capacity(prefix.len() + f.name.len());
+                    name.extend_from_slice(prefix.as_bytes());
+                    name.extend_from_slice(&f.name);
+                    name
                 };
                 fields.push(Field {
                     name,
@@ -324,8 +327,8 @@ impl PipeProcessor for PipeJoinProcessor {
         let by_values_idxs: Vec<Option<usize>> = cs
             .iter()
             .map(|&c| {
-                let name = br.column_name(c).to_string();
-                self.by_fields.iter().position(|bf| bf == &name)
+                let name = br.column_name(c);
+                self.by_fields.iter().position(|bf| bf.as_bytes() == name)
             })
             .collect();
 
@@ -390,7 +393,7 @@ struct PipeJoinWriteContext {
     skip_empty_results: bool,
 
     cs_src: Vec<ColRef>,
-    cs_src_names: Vec<String>,
+    cs_src_names: Vec<Vec<u8>>,
 
     rcs: Vec<ResultColumn>,
     br: BlockResult,
@@ -432,7 +435,7 @@ impl PipeJoinWriteContext {
         self.cs_src_names = self
             .cs_src
             .iter()
-            .map(|&r| br_src.column_name(r).to_string())
+            .map(|&r| br_src.column_name(r).to_vec())
             .collect();
     }
 
@@ -472,7 +475,7 @@ impl PipeJoinWriteContext {
         for (i, f) in extra_fields.iter().enumerate() {
             let mut v = f.value.clone();
             if ((v.is_empty() && self.skip_empty_results) || self.keep_original_fields)
-                && let Some(idx) = self.cs_src_names.iter().position(|n| n == &f.name)
+                && let Some(idx) = self.cs_src_names.iter().position(|n| *n == f.name)
             {
                 let v_orig = br_src
                     .column_get_value_at_row(self.cs_src[idx], row_idx)

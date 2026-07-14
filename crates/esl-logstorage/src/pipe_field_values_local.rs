@@ -265,7 +265,7 @@ impl<'a> PipeFixedFieldsWriteContext<'a> {
         let rcs = fields
             .iter()
             .map(|name| ResultColumn {
-                name: name.clone(),
+                name: name.as_bytes().to_vec(),
                 values: Vec::new(),
             })
             .collect();
@@ -308,7 +308,7 @@ impl<'a> PipeFixedFieldsWriteContext<'a> {
             .fields
             .iter()
             .map(|name| ResultColumn {
-                name: name.clone(),
+                name: name.as_bytes().to_vec(),
                 values: Vec::new(),
             })
             .collect();

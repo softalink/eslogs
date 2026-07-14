@@ -235,7 +235,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -423,11 +423,11 @@ mod tests {
         // encode->decode path byte-identically.
         let fields = vec![
             Field {
-                name: "_msg".to_string(),
+                name: b"_msg".to_vec(),
                 value: b"a\xff\xfeb".to_vec(),
             },
             Field {
-                name: "other".to_string(),
+                name: b"other".to_vec(),
                 value: b"\x80\x81".to_vec(),
             },
         ];
@@ -450,11 +450,11 @@ mod tests {
         // "_msg" is stored under the canonical empty column name.
         let expected = vec![
             Field {
-                name: String::new(),
+                name: Vec::new(),
                 value: b"a\xff\xfeb".to_vec(),
             },
             Field {
-                name: "other".to_string(),
+                name: b"other".to_vec(),
                 value: b"\x80\x81".to_vec(),
             },
         ];

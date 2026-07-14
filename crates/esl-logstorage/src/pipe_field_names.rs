@@ -133,21 +133,26 @@ struct PipeFieldNamesProcessor {
 
 #[derive(Default)]
 struct PipeFieldNamesProcessorShard {
-    /// Hits per field name.
-    m: HashMap<String, u64>,
+    /// Hits per field name (raw bytes; Go strings are arbitrary bytes).
+    m: HashMap<Vec<u8>, u64>,
 }
 
 impl PipeFieldNamesProcessorShard {
-    fn update_column_hits(&mut self, column_name: &str, filter: &str, hits: u64) {
-        let column_name = if column_name.is_empty() {
-            "_msg"
+    fn update_column_hits(&mut self, column_name: &[u8], filter: &str, hits: u64) {
+        let column_name: &[u8] = if column_name.is_empty() {
+            b"_msg"
         } else {
             column_name
         };
-        if !filter.is_empty() && !column_name.contains(filter) {
+        // Byte-wise substring check (Go strings.Contains is a byte search).
+        if !filter.is_empty()
+            && !column_name
+                .windows(filter.len())
+                .any(|w| w == filter.as_bytes())
+        {
             return;
         }
-        *self.m.entry(column_name.to_string()).or_insert(0) += hits;
+        *self.m.entry(column_name.to_vec()).or_insert(0) += hits;
     }
 }
 
@@ -172,17 +177,14 @@ impl PipeProcessor for PipeFieldNamesProcessor {
             for name in &names {
                 shard.update_column_hits(name, &self.filter, hits);
             }
-            shard.update_column_hits("_time", &self.filter, hits);
-            shard.update_column_hits("_stream", &self.filter, hits);
-            shard.update_column_hits("_stream_id", &self.filter, hits);
+            shard.update_column_hits(b"_time", &self.filter, hits);
+            shard.update_column_hits(b"_stream", &self.filter, hits);
+            shard.update_column_hits(b"_stream_id", &self.filter, hits);
             return;
         }
 
         let cols = br.get_columns();
-        let names: Vec<String> = cols
-            .iter()
-            .map(|&c| br.column_name(c).to_string())
-            .collect();
+        let names: Vec<Vec<u8>> = cols.iter().map(|&c| br.column_name(c).to_vec()).collect();
 
         let mut shard = self.shards[worker_id].lock().unwrap();
         for name in &names {
@@ -196,7 +198,7 @@ impl PipeProcessor for PipeFieldNamesProcessor {
         }
 
         // Merge state across shards.
-        let mut merged: HashMap<String, u64> = HashMap::new();
+        let mut merged: HashMap<Vec<u8>, u64> = HashMap::new();
         for shard in &self.shards {
             let shard = shard.lock().unwrap();
             for (name, hits) in &shard.m {
@@ -229,8 +231,8 @@ struct PipeFieldNamesWriteContext<'a> {
 impl<'a> PipeFieldNamesWriteContext<'a> {
     fn new(result_name: &str, pp_next: &'a dyn PipeProcessor) -> Self {
         let mut rcs: [ResultColumn; 2] = Default::default();
-        rcs[0].name = result_name.to_string();
-        rcs[1].name = "hits".to_string();
+        rcs[0].name = result_name.as_bytes().to_vec();
+        rcs[1].name = b"hits".to_vec();
         Self {
             pp_next,
             rcs,
@@ -240,8 +242,8 @@ impl<'a> PipeFieldNamesWriteContext<'a> {
         }
     }
 
-    fn write_row(&mut self, name: &str, hits: &str) {
-        self.rcs[0].add_value(name.as_bytes());
+    fn write_row(&mut self, name: &[u8], hits: &str) {
+        self.rcs[0].add_value(name);
         self.rcs[1].add_value(hits.as_bytes());
         self.values_len += name.len() + hits.len();
         self.rows_count += 1;

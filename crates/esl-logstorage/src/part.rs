@@ -110,14 +110,14 @@ pub struct Part<'a> {
 
     /// columnNameIDs is a mapping from column names seen in the given part to internal IDs.
     /// The internal IDs are used in columnHeaderRef.
-    pub column_name_ids: HashMap<Arc<str>, u64>,
+    pub column_name_ids: HashMap<Arc<[u8]>, u64>,
 
     /// columnNames is a mapping from internal IDs to column names.
     /// The internal IDs are used in columnHeaderRef.
-    pub column_names: Vec<Arc<str>>,
+    pub column_names: Vec<Arc<[u8]>>,
 
     /// columnIdxs is a mapping from column name to the corresponding item at bloomValuesShards
-    pub column_idxs: HashMap<Arc<str>, u64>,
+    pub column_idxs: HashMap<Arc<[u8]>, u64>,
 
     /// indexBlockHeaders contains a list of indexBlockHeader entries for the given part.
     pub index_block_headers: Vec<IndexBlockHeader>,
@@ -340,7 +340,7 @@ pub fn must_close_part(p: &mut Part) {
 }
 
 impl Part<'_> {
-    pub fn get_bloom_values_file_for_column_name(&self, name: &str) -> &BloomValuesReaderAt<'_> {
+    pub fn get_bloom_values_file_for_column_name(&self, name: &[u8]) -> &BloomValuesReaderAt<'_> {
         if name.is_empty() {
             return &self.message_bloom_values;
         }
@@ -352,7 +352,7 @@ impl Part<'_> {
             let n = self.bloom_values_shards.len();
             let mut shard_idx = 0u64;
             if n > 1 {
-                let h = xxhash_rust::xxh64::xxh64(name.as_bytes(), 0);
+                let h = xxhash_rust::xxh64::xxh64(name, 0);
                 shard_idx = h % n as u64;
             }
             return &self.bloom_values_shards[shard_idx as usize];
@@ -361,8 +361,10 @@ impl Part<'_> {
         match self.column_idxs.get(name) {
             Some(&shard_idx) => &self.bloom_values_shards[shard_idx as usize],
             None => {
+                // Panic text only: lossy view of the raw name bytes.
                 panicf!(
-                    "BUG: unknown shard index for column {name:?}; columnIdxs={:?}",
+                    "BUG: unknown shard index for column {:?}; columnIdxs={:?}",
+                    String::from_utf8_lossy(name),
                     self.column_idxs
                 );
                 unreachable!()

@@ -39,7 +39,7 @@ use esl_common::encoding::{
 use esl_common::stringsutil::{json_string_bytes_append, less_natural};
 
 use crate::block_result::{BlockResult, ColRef};
-use crate::prefix_filter::{Filter, is_wildcard_filter, match_filters};
+use crate::prefix_filter::{Filter, is_wildcard_filter, match_filters_bytes};
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::stats_count_uniq::{SIZE_OF_STRING, field_names_string, need_stop};
 use crate::values_encoder::{
@@ -66,7 +66,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
     let cols = br.get_columns();
     let mut dst: Vec<ColRef> = Vec::new();
     for &r in &cols {
-        if match_filters(filters, br.column_name(r)) {
+        if match_filters_bytes(filters, br.column_name(r)) {
             dst.push(r);
         }
     }
@@ -76,7 +76,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
         }
         let mut need_empty = true;
         for &r in &cols {
-            if br.column_name(r) == f.as_str() {
+            if br.column_name(r) == f.as_bytes() {
                 need_empty = false;
                 break;
             }

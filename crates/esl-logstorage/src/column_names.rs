@@ -22,9 +22,9 @@ pub fn must_write_column_idxs(w: &mut WriterWithStats<'_>, column_idxs: &HashMap
 /// Reads the column indexes from r.
 pub fn must_read_column_idxs(
     r: &mut dyn filestream::ReadCloser,
-    column_names: &[Arc<str>],
+    column_names: &[Arc<[u8]>],
     shards_count: u64,
-) -> HashMap<Arc<str>, u64> {
+) -> HashMap<Arc<[u8]>, u64> {
     let src = match read_all(r) {
         Ok(src) => src,
         Err(err) => {
@@ -52,9 +52,9 @@ pub fn marshal_column_idxs(dst: &mut Vec<u8>, column_idxs: &HashMap<u64, u64>) {
 
 pub fn unmarshal_column_idxs(
     src: &[u8],
-    column_names: &[Arc<str>],
+    column_names: &[Arc<[u8]>],
     shards_count: u64,
-) -> Result<HashMap<Arc<str>, u64>, String> {
+) -> Result<HashMap<Arc<[u8]>, u64>, String> {
     let mut src = src;
 
     let (n, n_bytes) = encoding::unmarshal_var_uint64(src);
@@ -72,7 +72,7 @@ pub fn unmarshal_column_idxs(
         ));
     }
 
-    let mut shard_idxs: HashMap<Arc<str>, u64> = HashMap::with_capacity(n as usize);
+    let mut shard_idxs: HashMap<Arc<[u8]>, u64> = HashMap::with_capacity(n as usize);
     for i in 0..n {
         let (column_id, n_bytes) = encoding::unmarshal_var_uint64(src);
         if n_bytes <= 0 {
@@ -111,16 +111,14 @@ pub fn unmarshal_column_idxs(
 }
 
 /// Writes the column names dictionary to w.
-pub fn must_write_column_names<S: AsRef<str>>(w: &mut WriterWithStats<'_>, column_names: &[S]) {
+pub fn must_write_column_names<S: AsRef<[u8]>>(w: &mut WriterWithStats<'_>, column_names: &[S]) {
     let mut data = Vec::new();
     marshal_column_names(&mut data, column_names);
     w.must_write(&data);
 }
 
 /// Reads the column names dictionary from r.
-pub fn must_read_column_names(
-    r: &mut dyn filestream::ReadCloser,
-) -> (Vec<Arc<str>>, HashMap<Arc<str>, u64>) {
+pub fn must_read_column_names(r: &mut dyn filestream::ReadCloser) -> ColumnNamesWithIDs {
     let src = match read_all(r) {
         Ok(src) => src,
         Err(err) => {
@@ -138,14 +136,14 @@ pub fn must_read_column_names(
     }
 }
 
-pub fn marshal_column_names<S: AsRef<str>>(dst: &mut Vec<u8>, column_names: &[S]) {
+pub fn marshal_column_names<S: AsRef<[u8]>>(dst: &mut Vec<u8>, column_names: &[S]) {
     let mut data = Vec::new();
     encoding::marshal_var_uint64(&mut data, column_names.len() as u64);
     // PORT NOTE: Go calls marshalStrings (defined in storage_search.go); it
     // is inlined here like in values_encoder.rs, since storage_search belongs
     // to a later layer.
     for name in column_names {
-        encoding::marshal_bytes(&mut data, name.as_ref().as_bytes());
+        encoding::marshal_bytes(&mut data, name.as_ref());
     }
 
     encoding::compress_zstd_level(dst, &data, 1);
@@ -153,12 +151,12 @@ pub fn marshal_column_names<S: AsRef<str>>(dst: &mut Vec<u8>, column_names: &[S]
 
 /// The column names list and the column name → id mapping returned by
 /// [`unmarshal_column_names`] (Go's `([]string, map[string]uint64)`).
-pub type ColumnNamesWithIDs = (Vec<Arc<str>>, HashMap<Arc<str>, u64>);
+pub type ColumnNamesWithIDs = (Vec<Arc<[u8]>>, HashMap<Arc<[u8]>, u64>);
 
 /// PORT NOTE: Go returns `([]string, map[string]uint64)` with interned
-/// strings; the port uses `Arc<str>` (the shape of
-/// `esl_common::bytesutil::intern_bytes`). Like `bytesutil::to_unsafe_string`,
-/// it panics on non-UTF-8 column names, which Go string headers would accept.
+/// strings (Go strings are arbitrary bytes); the port uses `Arc<[u8]>` (the
+/// shape of `esl_common::bytesutil::intern_bytes`), so non-UTF-8 column names
+/// round-trip byte-identically.
 pub fn unmarshal_column_names(src: &[u8]) -> Result<ColumnNamesWithIDs, String> {
     let mut data = Vec::new();
     encoding::decompress_zstd(&mut data, src).map_err(|err| {
@@ -184,8 +182,8 @@ pub fn unmarshal_column_names(src: &[u8]) -> Result<ColumnNamesWithIDs, String> 
         ));
     }
 
-    let mut column_name_ids: HashMap<Arc<str>, u64> = HashMap::with_capacity(n as usize);
-    let mut column_names: Vec<Arc<str>> = Vec::with_capacity(n as usize);
+    let mut column_name_ids: HashMap<Arc<[u8]>, u64> = HashMap::with_capacity(n as usize);
+    let mut column_names: Vec<Arc<[u8]>> = Vec::with_capacity(n as usize);
 
     for id in 0..n {
         let (name, n_bytes) = encoding::unmarshal_bytes(src);
@@ -201,9 +199,10 @@ pub fn unmarshal_column_names(src: &[u8]) -> Result<ColumnNamesWithIDs, String> 
         let name_str = bytesutil::intern_bytes(name);
 
         if let Some(&id_prev) = column_name_ids.get(name_str.as_ref()) {
+            // Error text only: lossy view of the raw name bytes.
             return Err(format!(
                 "duplicate ids for column name {:?}: {id_prev} and {id}",
-                bytesutil::to_unsafe_string(name)
+                String::from_utf8_lossy(name)
             ));
         }
 
@@ -224,10 +223,10 @@ pub fn unmarshal_column_names(src: &[u8]) -> Result<ColumnNamesWithIDs, String> 
 #[derive(Debug, Default)]
 pub struct ColumnNameIDGenerator {
     /// column_name_ids contains columnName->id mapping for already seen columns
-    pub column_name_ids: HashMap<Arc<str>, u64>,
+    pub column_name_ids: HashMap<Arc<[u8]>, u64>,
 
     /// column_names contains id->columnName mapping for already seen columns
-    pub column_names: Vec<Arc<str>>,
+    pub column_names: Vec<Arc<[u8]>>,
 }
 
 impl ColumnNameIDGenerator {
@@ -237,7 +236,7 @@ impl ColumnNameIDGenerator {
         self.column_names = Vec::new();
     }
 
-    pub fn get_column_name_id(&mut self, name: &str) -> u64 {
+    pub fn get_column_name_id(&mut self, name: &[u8]) -> u64 {
         if let Some(&id) = self.column_name_ids.get(name) {
             return id;
         }
@@ -246,7 +245,7 @@ impl ColumnNameIDGenerator {
         // it is better to intern the column name instead of cloning it with string.Clone,
         // since the number of column names is usually small (e.g. less than 10K).
         // This reduces memory allocations.
-        let name_copy = bytesutil::intern_string(name);
+        let name_copy = bytesutil::intern_bytes(name);
 
         self.column_name_ids.insert(name_copy.clone(), id);
         self.column_names.push(name_copy);
@@ -283,19 +282,21 @@ mod tests {
             };
 
             // Check column_names
-            let result_column_names: Vec<&str> =
+            let result_column_names: Vec<&[u8]> =
                 result_column_names.iter().map(|s| s.as_ref()).collect();
+            let column_names_bytes: Vec<&[u8]> =
+                column_names.iter().map(|s| s.as_bytes()).collect();
             assert_eq!(
-                result_column_names, column_names,
-                "unexpected umarshaled columnNames\ngot\n{result_column_names:?}\nwant\n{column_names:?}"
+                result_column_names, column_names_bytes,
+                "unexpected umarshaled columnNames\ngot\n{result_column_names:?}\nwant\n{column_names_bytes:?}"
             );
 
             // Check column_name_ids
-            let mut expected_column_name_ids: HashMap<&str, u64> = HashMap::new();
+            let mut expected_column_name_ids: HashMap<&[u8], u64> = HashMap::new();
             for (i, n) in column_names.iter().enumerate() {
-                expected_column_name_ids.insert(n, i as u64);
+                expected_column_name_ids.insert(n.as_bytes(), i as u64);
             }
-            let result_column_name_ids: HashMap<&str, u64> = result_column_name_ids
+            let result_column_name_ids: HashMap<&[u8], u64> = result_column_name_ids
                 .iter()
                 .map(|(k, &v)| (k.as_ref(), v))
                 .collect();
@@ -325,7 +326,7 @@ mod tests {
         let mut g = ColumnNameIDGenerator::default();
 
         for (i, s) in a.iter().enumerate() {
-            let id = g.get_column_name_id(s);
+            let id = g.get_column_name_id(s.as_bytes());
             assert_eq!(
                 id, i as u64,
                 "first run: unexpected id generated for s={s:?}; got {id}; want {i}; g={g:?}"
@@ -334,7 +335,7 @@ mod tests {
 
         // Repeat the loop
         for (i, s) in a.iter().enumerate() {
-            let id = g.get_column_name_id(s);
+            let id = g.get_column_name_id(s.as_bytes());
             assert_eq!(
                 id, i as u64,
                 "second run: unexpected id generated for s={s:?}; got {id}; want {i}; g={g:?}"

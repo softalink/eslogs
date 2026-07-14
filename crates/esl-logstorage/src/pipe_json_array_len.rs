@@ -121,7 +121,7 @@ impl PipeProcessor for PipeJSONArrayLenProcessor {
         let shard = &mut *guard;
 
         shard.rc.reset();
-        shard.rc.name = self.result_field.clone();
+        shard.rc.name = self.result_field.clone().into_bytes();
         shard.min_value = f64::NAN;
         shard.max_value = f64::NAN;
 

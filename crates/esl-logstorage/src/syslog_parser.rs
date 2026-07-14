@@ -154,7 +154,7 @@ impl SyslogParser {
     /// Adds name=value log field to p.fields.
     pub fn add_field(&mut self, name: &str, value: impl AsRef<[u8]>) {
         self.fields.push(Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_ref().to_vec(),
         });
     }
@@ -405,17 +405,22 @@ impl SyslogParser {
             }
         } else {
             let sd_fields = std::mem::take(&mut self.sd_parser.fields);
-            // PORT NOTE: sd_id becomes part of field NAMES (String in this
-            // port) — lossy-decoded; SD param values flow through sd_parser.
-            let sd_id = String::from_utf8_lossy(sd_id);
+            // sd_id becomes part of field NAMES; names are raw bytes, so the
+            // SD-ID bytes are preserved verbatim like Go.
             for f in &sd_fields {
                 if sd_id.is_empty() {
-                    self.add_field(&f.name, &f.value);
+                    self.fields.push(f.clone());
                     continue;
                 }
 
-                let field_name = format!("{sd_id}.{}", f.name);
-                self.add_field(&field_name, &f.value);
+                let mut field_name = Vec::with_capacity(sd_id.len() + 1 + f.name.len());
+                field_name.extend_from_slice(sd_id);
+                field_name.push(b'.');
+                field_name.extend_from_slice(&f.name);
+                self.fields.push(Field {
+                    name: field_name,
+                    value: f.value.clone(),
+                });
             }
             self.sd_parser.fields = sd_fields;
         }
@@ -872,7 +877,7 @@ mod tests {
             let ts = p
                 .fields
                 .iter()
-                .find(|f| f.name == "timestamp")
+                .find(|f| f.name == b"timestamp")
                 .map(|f| f.value.clone())
                 .unwrap_or_default();
             put_syslog_parser(p);
@@ -1210,7 +1215,7 @@ mod tests {
             let msg = p
                 .fields
                 .iter()
-                .find(|f| f.name == "message")
+                .find(|f| f.name == b"message")
                 .map(|f| f.value.clone())
                 .expect("missing message field");
             put_syslog_parser(p);

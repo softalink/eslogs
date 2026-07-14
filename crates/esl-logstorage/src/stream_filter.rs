@@ -300,7 +300,7 @@ impl StreamName {
             s = &s[q_prefix.len()..];
 
             self.tags.push(Field {
-                name: name.to_string(),
+                name: name.as_bytes().to_vec(),
                 value: value.into_bytes(),
             });
 
@@ -331,7 +331,7 @@ impl StreamName {
 
     fn get_tag_value_by_tag_name(&self, name: &str) -> &[u8] {
         for t in &self.tags {
-            if t.name == name {
+            if t.name == name.as_bytes() {
                 return &t.value;
             }
         }

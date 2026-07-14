@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::block_result::{BlockResult, ColRef, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
-use crate::prefix_filter::{self, is_wildcard_filter, match_filter};
+use crate::prefix_filter::{self, is_wildcard_filter, match_filter_bytes};
 use crate::stats_count_uniq::field_names_string;
 use crate::stream_filter::quote_token_if_needed;
 
@@ -113,27 +113,27 @@ impl PipeProcessor for PipeCoalesceProcessor {
 
         // Determine the columns to coalesce, deduped by name (Go shard.cs).
         let cs = br.get_columns();
-        let cs_names: Vec<String> = cs.iter().map(|&c| br.column_name(c).to_string()).collect();
+        let cs_names: Vec<Vec<u8>> = cs.iter().map(|&c| br.column_name(c).to_vec()).collect();
 
         let mut selected: Vec<ColRef> = Vec::new();
-        let mut selected_names: Vec<String> = Vec::new();
-        let add_col = |c: ColRef, name: &str, sel: &mut Vec<ColRef>, names: &mut Vec<String>| {
+        let mut selected_names: Vec<Vec<u8>> = Vec::new();
+        let add_col = |c: ColRef, name: &[u8], sel: &mut Vec<ColRef>, names: &mut Vec<Vec<u8>>| {
             if names.iter().any(|n| n == name) {
                 return;
             }
             sel.push(c);
-            names.push(name.to_string());
+            names.push(name.to_vec());
         };
 
         for ff in &self.src_field_filters {
             if !is_wildcard_filter(ff) {
                 let c = br.get_column_by_name(ff);
-                let name = br.column_name(c).to_string();
+                let name = br.column_name(c).to_vec();
                 add_col(c, &name, &mut selected, &mut selected_names);
                 continue;
             }
             for (&c, name) in cs.iter().zip(cs_names.iter()) {
-                if match_filter(ff, name) {
+                if match_filter_bytes(ff, name) {
                     add_col(c, name, &mut selected, &mut selected_names);
                 }
             }
@@ -155,7 +155,7 @@ impl PipeProcessor for PipeCoalesceProcessor {
             shard.rc.add_value(&value);
         }
 
-        shard.rc.name = self.dst_field.clone();
+        shard.rc.name = self.dst_field.clone().into_bytes();
         let rc = std::mem::take(&mut shard.rc);
         br.add_result_column(rc);
         drop(shard);

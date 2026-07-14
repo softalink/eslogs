@@ -139,7 +139,7 @@ impl PipeProcessor for PipeLenProcessor {
         }
 
         let mut shard = self.shards[worker_id].lock().unwrap();
-        shard.rc.name = self.result_field.clone();
+        shard.rc.name = self.result_field.clone().into_bytes();
 
         let c = br.get_column_by_name(&self.field_name);
         if br.column_is_const(c) {

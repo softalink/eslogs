@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use esl_common::encoding::MarshalType;
-use esl_common::{bytesutil, encoding, panicf, slicesutil};
+use esl_common::{encoding, panicf, slicesutil};
 
 use crate::column_names::ColumnNameIDGenerator;
 use crate::consts::{
@@ -421,11 +421,11 @@ impl ColumnsHeader {
     }
 
     /// PORT NOTE: columnNames is `[]string` in Go; the port takes the interned
-    /// `Arc<str>` names produced by the column_names module.
+    /// `Arc<[u8]>` names produced by the column_names module.
     pub fn set_column_names(
         &mut self,
         csh_index: &ColumnsHeaderIndex,
-        column_names: &[Arc<str>],
+        column_names: &[Arc<[u8]>],
     ) -> Result<(), String> {
         if csh_index.column_headers_refs.len() != self.column_headers.len() {
             return Err(format!(
@@ -444,7 +444,7 @@ impl ColumnsHeader {
                     format_string_slice(column_names)
                 ));
             }
-            self.column_headers[i].name = column_names[column_name_id as usize].to_string();
+            self.column_headers[i].name = column_names[column_name_id as usize].to_vec();
         }
 
         if csh_index.const_columns_refs.len() != self.const_columns.len() {
@@ -464,7 +464,7 @@ impl ColumnsHeader {
                     format_string_slice(column_names)
                 ));
             }
-            self.const_columns[i].name = column_names[column_name_id as usize].to_string();
+            self.const_columns[i].name = column_names[column_name_id as usize].to_vec();
         }
 
         Ok(())
@@ -600,14 +600,18 @@ impl ColumnsHeader {
     }
 }
 
-fn get_names_from_column_headers(chs: &[ColumnHeader]) -> Vec<String> {
+fn get_names_from_column_headers(chs: &[ColumnHeader]) -> Vec<Vec<u8>> {
     chs.iter().map(|ch| ch.name.clone()).collect()
 }
 
-/// Formats a slice of strings like Go's fmt "%s" / "%v" verbs do
-/// (space-separated values in square brackets).
-fn format_string_slice<S: AsRef<str>>(a: &[S]) -> String {
-    let names: Vec<&str> = a.iter().map(|s| s.as_ref()).collect();
+/// Formats a slice of byte strings like Go's fmt "%s" / "%v" verbs do
+/// (space-separated values in square brackets). Error text only: each raw
+/// byte name is rendered via a lossy view.
+fn format_string_slice<S: AsRef<[u8]>>(a: &[S]) -> String {
+    let names: Vec<String> = a
+        .iter()
+        .map(|s| String::from_utf8_lossy(s.as_ref()).into_owned())
+        .collect();
     format!("[{}]", names.join(" "))
 }
 
@@ -638,7 +642,10 @@ fn format_string_slice<S: AsRef<str>>(a: &[S]) -> String {
 #[derive(Debug, Default)]
 pub struct ColumnHeader {
     /// name contains column name aka label name.
-    pub name: String,
+    ///
+    /// PORT NOTE: Go strings are arbitrary bytes; the name is raw bytes so
+    /// invalid UTF-8 column names survive the on-disk round trip.
+    pub name: Vec<u8>,
 
     /// valueType is the type of values stored in the block.
     pub value_type: ValueType,
@@ -846,15 +853,15 @@ impl ColumnHeader {
                 return Err("cannot unmarshal column name".to_string());
             }
             src = &src[n_size as usize..];
-            self.name
-                .push_str(bytesutil::to_unsafe_string(data.unwrap_or_default()));
+            self.name.extend_from_slice(data.unwrap_or_default());
         }
 
         // Unmarshal value type
         if src.is_empty() {
+            // Error text only: lossy view of the raw name bytes.
             return Err(format!(
                 "cannot unmarshal valueType from 0 bytes for column {:?}; need at least 1 byte",
-                self.name
+                String::from_utf8_lossy(&self.name)
             ));
         }
         self.value_type = ValueType(src[0]);
@@ -1039,9 +1046,11 @@ impl ColumnHeader {
                 })?;
             }
             _ => {
+                // Error text only: lossy view of the raw name bytes.
                 return Err(format!(
                     "unexpected valueType={} for column {:?}",
-                    self.value_type.0, self.name
+                    self.value_type.0,
+                    String::from_utf8_lossy(&self.name)
                 ));
             }
         }
@@ -1337,7 +1346,7 @@ mod tests {
             &ColumnsHeader {
                 column_headers: vec![
                     ColumnHeader {
-                        name: "foobar".to_string(),
+                        name: b"foobar".to_vec(),
                         value_type: ValueType::STRING,
                         values_offset: 12345,
                         values_size: 23434,
@@ -1346,7 +1355,7 @@ mod tests {
                         ..Default::default()
                     },
                     ColumnHeader {
-                        name: "message".to_string(),
+                        name: b"message".to_vec(),
                         value_type: ValueType::UINT16,
                         min_value: 123,
                         max_value: 456,
@@ -1358,7 +1367,7 @@ mod tests {
                     },
                 ],
                 const_columns: vec![Field {
-                    name: "foo".to_string(),
+                    name: b"foo".to_vec(),
                     value: b"bar".to_vec(),
                 }],
             },
@@ -1469,7 +1478,7 @@ mod tests {
         let csh = ColumnsHeader {
             column_headers: vec![
                 ColumnHeader {
-                    name: "foobar".to_string(),
+                    name: b"foobar".to_vec(),
                     value_type: ValueType::STRING,
                     values_offset: 12345,
                     values_size: 23434,
@@ -1478,7 +1487,7 @@ mod tests {
                     ..Default::default()
                 },
                 ColumnHeader {
-                    name: "message".to_string(),
+                    name: b"message".to_vec(),
                     value_type: ValueType::UINT16,
                     min_value: 123,
                     max_value: 456,
@@ -1490,7 +1499,7 @@ mod tests {
                 },
             ],
             const_columns: vec![Field {
-                name: "foo".to_string(),
+                name: b"foo".to_vec(),
                 value: b"bar".to_vec(),
             }],
         };
@@ -1571,7 +1580,7 @@ mod tests {
         let mut csh = ColumnsHeader {
             column_headers: vec![
                 ColumnHeader {
-                    name: "foobar".to_string(),
+                    name: b"foobar".to_vec(),
                     value_type: ValueType::STRING,
                     values_offset: 12345,
                     values_size: 23434,
@@ -1580,7 +1589,7 @@ mod tests {
                     ..Default::default()
                 },
                 ColumnHeader {
-                    name: "message".to_string(),
+                    name: b"message".to_vec(),
                     value_type: ValueType::UINT16,
                     min_value: 123,
                     max_value: 456,
@@ -1592,7 +1601,7 @@ mod tests {
                 },
             ],
             const_columns: vec![Field {
-                name: "foo".to_string(),
+                name: b"foo".to_vec(),
                 value: b"bar".to_vec(),
             }],
         };
@@ -1695,14 +1704,14 @@ mod tests {
 
         f(
             &ColumnHeader {
-                name: "foo".to_string(),
+                name: b"foo".to_vec(),
                 value_type: ValueType::UINT8,
                 ..Default::default()
             },
             7,
         );
         let mut ch = ColumnHeader {
-            name: "foobar".to_string(),
+            name: b"foobar".to_vec(),
             value_type: ValueType::DICT,
 
             values_offset: 12345,
@@ -1728,7 +1737,7 @@ mod tests {
         f(b"foo");
 
         let ch = ColumnHeader {
-            name: "abc".to_string(),
+            name: b"abc".to_vec(),
             value_type: ValueType::UINT16,
             bloom_filter_size: 3244,
             ..Default::default()
@@ -1741,7 +1750,7 @@ mod tests {
     #[test]
     fn test_column_header_reset() {
         let mut ch = ColumnHeader {
-            name: "foobar".to_string(),
+            name: b"foobar".to_vec(),
             value_type: ValueType::UINT16,
 
             values_offset: 12345,

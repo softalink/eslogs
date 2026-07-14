@@ -184,7 +184,7 @@ fn append_json_row(dst: &mut Vec<u8>, columns: &[BlockColumn], row_idx: usize) {
         if value.is_empty() {
             continue;
         }
-        append_json_string(dst, c.name.as_bytes());
+        append_json_string(dst, &c.name);
         dst.push(b':');
         append_json_string(dst, value);
         dst.push(b',');
@@ -1178,11 +1178,11 @@ pub(crate) mod test_support {
         for (i, (msg, host)) in rows.iter().enumerate() {
             let mut fields = vec![
                 Field {
-                    name: "_msg".to_string(),
+                    name: b"_msg".to_vec(),
                     value: msg.as_bytes().to_vec(),
                 },
                 Field {
-                    name: "host".to_string(),
+                    name: b"host".to_vec(),
                     value: host.as_bytes().to_vec(),
                 },
             ];

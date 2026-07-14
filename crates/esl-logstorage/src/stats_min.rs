@@ -166,8 +166,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
     let cols = br.get_columns();
     let mut dst = Vec::new();
     for &c in &cols {
-        let name = br.column_name(c).to_string();
-        if prefix_filter::match_filters(filters, &name) {
+        if prefix_filter::match_filters_bytes(filters, br.column_name(c)) {
             dst.push(c);
         }
     }
@@ -179,7 +178,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
         }
         let mut need_empty = true;
         for &c in &cols {
-            if br.column_name(c) == f.as_str() {
+            if br.column_name(c) == f.as_bytes() {
                 need_empty = false;
                 break;
             }
@@ -353,7 +352,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }

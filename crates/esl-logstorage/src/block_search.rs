@@ -179,7 +179,7 @@ pub struct BlockSearch<'a> {
     timestamps_cache: Option<vc_encoding::Int64s>,
 
     /// Cached bloom filters for requested columns in the given block.
-    bloom_filter_cache: HashMap<String, BloomFilter>,
+    bloom_filter_cache: HashMap<Vec<u8>, BloomFilter>,
 
     /// Cached encoded values for requested columns in the given block.
     ///
@@ -187,7 +187,7 @@ pub struct BlockSearch<'a> {
     /// port owns `Vec<Vec<u8>>` per column because the encoded values are binary
     /// (see the module "Encoded-values representation" contract). The pooled
     /// `stringBucket` reuse is dropped for this cache.
-    values_cache: HashMap<String, Vec<Vec<u8>>>,
+    values_cache: HashMap<Vec<u8>, Vec<Vec<u8>>>,
 
     /// Used for unmarshaling local columns.
     sbu: StringsBlockUnmarshaler,
@@ -291,6 +291,12 @@ impl<'a> BlockSearch<'a> {
         self.pso.hidden_fields_filter.match_string(name)
     }
 
+    /// Byte-name variant of [`Self::is_hidden_field`] for raw `Field.name`
+    /// bytes (the filter patterns are query text; comparison is byte-wise).
+    pub fn is_hidden_field_bytes(&self, name: &[u8]) -> bool {
+        self.pso.hidden_fields_filter.match_string_bytes(name)
+    }
+
     /// Returns the value of the const column with the given name, or an empty
     /// string when the column is not a const column.
     ///
@@ -306,7 +312,7 @@ impl<'a> BlockSearch<'a> {
         if self.part_format_version() < 1 {
             let csh = self.get_columns_header();
             for cc in &csh.const_columns {
-                if cc.name == name {
+                if cc.name == name.as_bytes() {
                     return cc.value.clone();
                 }
             }
@@ -319,7 +325,7 @@ impl<'a> BlockSearch<'a> {
         };
 
         for cc in &self.ccs_cache {
-            if cc.name == name {
+            if cc.name == name.as_bytes() {
                 return cc.value.clone();
             }
         }
@@ -350,7 +356,7 @@ impl<'a> BlockSearch<'a> {
                 cr.offset
             );
         }
-        let name_owned = self.get_column_name_by_id(column_name_id).to_string();
+        let name_owned = self.get_column_name_by_id(column_name_id).to_vec();
         let mut cc = Field::default();
         if let Err(err) = cc.unmarshal_inplace(&self.csh_block_cache[cr.offset as usize..], false) {
             panicf!(
@@ -369,8 +375,14 @@ impl<'a> BlockSearch<'a> {
     /// Returns the column header for the given name, or `None` when the column
     /// is absent or hidden.
     pub fn get_column_header(&mut self, name: &str) -> Option<&ColumnHeader> {
-        let name = get_canonical_field_name(name);
-        if self.is_hidden_field(name) {
+        self.get_column_header_bytes(name.as_bytes())
+    }
+
+    /// Byte-name variant of [`Self::get_column_header`] for raw `Field.name`
+    /// bytes (Go strings are arbitrary bytes).
+    pub fn get_column_header_bytes(&mut self, name: &[u8]) -> Option<&ColumnHeader> {
+        let name = crate::log_rows::get_canonical_field_name_bytes(name);
+        if self.is_hidden_field_bytes(name) {
             return None;
         }
 
@@ -379,7 +391,7 @@ impl<'a> BlockSearch<'a> {
             return csh.column_headers.iter().find(|ch| ch.name == name);
         }
 
-        let column_name_id = self.get_column_name_id(name)?;
+        let column_name_id = self.get_column_name_id_bytes(name)?;
 
         if let Some(pos) = self.chs_cache.iter().position(|ch| ch.name == name) {
             return Some(&self.chs_cache[pos]);
@@ -400,24 +412,26 @@ impl<'a> BlockSearch<'a> {
         self.ensure_columns_header_block();
         let b_len = self.csh_block_cache.len();
         if cr.offset > b_len as u64 {
+            // Panic text only: lossy view of the raw name bytes.
             panicf!(
                 "FATAL: {}: header offset for column {:?} cannot exceed {} bytes; got {} bytes",
                 self.part_path(),
-                name,
+                String::from_utf8_lossy(name),
                 b_len,
                 cr.offset
             );
         }
-        let name_owned = self.get_column_name_by_id(column_name_id).to_string();
+        let name_owned = self.get_column_name_by_id(column_name_id).to_vec();
         let mut ch = ColumnHeader::default();
         if let Err(err) = ch.unmarshal_inplace(
             &self.csh_block_cache[cr.offset as usize..],
             PART_FORMAT_LATEST_VERSION,
         ) {
+            // Panic text only: lossy view of the raw name bytes.
             panicf!(
                 "FATAL: {}: cannot unmarshal header for column {:?}: {}",
                 self.part_path(),
-                name,
+                String::from_utf8_lossy(name),
                 err
             );
         }
@@ -428,11 +442,16 @@ impl<'a> BlockSearch<'a> {
 
     /// Returns the internal id for the given column name.
     pub fn get_column_name_id(&self, name: &str) -> Option<u64> {
+        self.get_column_name_id_bytes(name.as_bytes())
+    }
+
+    /// Byte-name variant of [`Self::get_column_name_id`].
+    pub fn get_column_name_id_bytes(&self, name: &[u8]) -> Option<u64> {
         self.p.column_name_ids.get(name).copied()
     }
 
     /// Returns the column name for the given internal id.
-    pub fn get_column_name_by_id(&self, column_name_id: u64) -> &str {
+    pub fn get_column_name_by_id(&self, column_name_id: u64) -> &[u8] {
         let column_names = &self.p.column_names;
         if column_name_id >= column_names.len() as u64 {
             panicf!(
@@ -630,10 +649,11 @@ impl<'a> BlockSearch<'a> {
             let mut values: Vec<Vec<u8>> = Vec::new();
             let rows_count = self.bh.rows_count;
             if let Err(err) = self.sbu.unmarshal(&mut values, &bb.b, rows_count) {
+                // Panic text only: lossy view of the raw name bytes.
                 panicf!(
                     "FATAL: {}: cannot unmarshal column {:?}: {}",
                     self.part_path(),
-                    ch.name,
+                    String::from_utf8_lossy(&ch.name),
                     err
                 );
             }

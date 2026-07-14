@@ -421,13 +421,13 @@ impl PipeUniqProcessor {
             .by_fields
             .iter()
             .map(|name| ResultColumn {
-                name: name.clone(),
+                name: name.clone().into_bytes(),
                 values: Vec::new(),
             })
             .collect();
         if need_hits {
             rcs.push(ResultColumn {
-                name: self.hits_field_name.clone(),
+                name: self.hits_field_name.clone().into_bytes(),
                 values: Vec::new(),
             });
         }
@@ -509,10 +509,7 @@ mod tests {
     impl PipeProcessor for Collector {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cols = br.get_columns();
-            let names: Vec<String> = cols
-                .iter()
-                .map(|&c| br.column_name(c).to_string())
-                .collect();
+            let names: Vec<Vec<u8>> = cols.iter().map(|&c| br.column_name(c).to_vec()).collect();
             let n = br.rows_len();
             let mut out = self.blocks.lock().unwrap();
             for i in 0..n {
@@ -533,7 +530,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -584,8 +581,14 @@ mod tests {
             .iter()
             .map(|r| {
                 let get = |name: &str| {
-                    String::from_utf8(r.iter().find(|f| f.name == name).unwrap().value.clone())
-                        .unwrap()
+                    String::from_utf8(
+                        r.iter()
+                            .find(|f| f.name == name.as_bytes())
+                            .unwrap()
+                            .value
+                            .clone(),
+                    )
+                    .unwrap()
                 };
                 (get("x"), get("hits"))
             })

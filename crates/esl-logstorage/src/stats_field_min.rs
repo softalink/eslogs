@@ -217,7 +217,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -321,7 +321,7 @@ mod tests {
             for i in 0..n {
                 for c in &columns {
                     out.push((
-                        c.name.clone(),
+                        String::from_utf8(c.name.clone()).unwrap(),
                         String::from_utf8_lossy(&c.values[i]).into_owned(),
                     ));
                 }

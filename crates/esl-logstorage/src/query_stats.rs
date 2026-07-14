@@ -120,7 +120,7 @@ impl QueryStats {
             let mut v = Vec::new();
             crate::values_encoder::marshal_uint64_string(&mut v, value);
             cs.push(crate::storage_search::BlockColumn {
-                name: name.to_string(),
+                name: name.as_bytes().to_vec(),
                 values: vec![v],
             });
         };

@@ -136,7 +136,7 @@ impl PipeProcessor for PipeUnpackWordsProcessor {
         let mut t = get_tokenizer();
         let keep_duplicate_tokens = !self.drop_duplicates;
         let mut field = [Field {
-            name: self.dst_field.clone(),
+            name: self.dst_field.clone().into_bytes(),
             value: Vec::new(),
         }];
         for row_idx in 0..values.len() {

@@ -79,7 +79,7 @@ const COLUMN_NAMES: [&str; 9] = [
 ];
 
 struct RowValues {
-    column_name: String,
+    column_name: Vec<u8>,
     column_type: String,
     values_size: u64,
     bloom_size: u64,
@@ -102,7 +102,7 @@ impl PipeProcessor for PipeBlockStatsProcessor {
         let cols = br.get_columns();
         let mut rows: Vec<RowValues> = Vec::with_capacity(cols.len());
         for &c in &cols {
-            let name = br.column_name(c).to_string();
+            let name = br.column_name(c).to_vec();
             if br.column_is_const(c) {
                 let values_size = br.column_get_value_at_row(c, 0).len() as u64;
                 rows.push(RowValues {
@@ -152,13 +152,13 @@ impl PipeProcessor for PipeBlockStatsProcessor {
         let mut rcs: Vec<ResultColumn> = COLUMN_NAMES
             .iter()
             .map(|name| ResultColumn {
-                name: name.to_string(),
+                name: name.as_bytes().to_vec(),
                 values: Vec::new(),
             })
             .collect();
 
         for r in &rows {
-            rcs[0].add_value(r.column_name.as_bytes());
+            rcs[0].add_value(&r.column_name);
             rcs[1].add_value(r.column_type.as_bytes());
             add_uint64(&mut rcs[2], r.values_size);
             add_uint64(&mut rcs[3], r.bloom_size);
@@ -205,10 +205,7 @@ mod tests {
     impl PipeProcessor for Collector {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cols = br.get_columns();
-            let names: Vec<String> = cols
-                .iter()
-                .map(|&c| br.column_name(c).to_string())
-                .collect();
+            let names: Vec<Vec<u8>> = cols.iter().map(|&c| br.column_name(c).to_vec()).collect();
             let n = br.rows_len();
             let mut out = self.blocks.lock().unwrap();
             for i in 0..n {
@@ -229,14 +226,14 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
 
     fn get<'a>(row: &'a [Field], name: &str) -> &'a str {
         row.iter()
-            .find(|f| f.name == name)
+            .find(|f| f.name == name.as_bytes())
             .map(|f| std::str::from_utf8(&f.value).unwrap())
             .unwrap_or("")
     }

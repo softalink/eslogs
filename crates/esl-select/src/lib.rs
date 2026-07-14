@@ -255,11 +255,11 @@ mod tests {
         for (i, msg) in msgs.iter().enumerate() {
             let mut fields = vec![
                 Field {
-                    name: "_msg".to_string(),
+                    name: b"_msg".to_vec(),
                     value: msg.as_bytes().to_vec(),
                 },
                 Field {
-                    name: "host".to_string(),
+                    name: b"host".to_vec(),
                     value: b"node-1".to_vec(),
                 },
             ];

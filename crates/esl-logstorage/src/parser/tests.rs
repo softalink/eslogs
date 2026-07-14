@@ -1484,11 +1484,11 @@ fn test_options_time_offset_shifts_time_filter() {
             .unwrap();
     let f = q.get_final_filter();
     let row_11 = [Field {
-        name: "_time".to_string(),
+        name: b"_time".to_vec(),
         value: b"2024-06-01T11:00:00Z".to_vec(),
     }];
     let row_12 = [Field {
-        name: "_time".to_string(),
+        name: b"_time".to_vec(),
         value: b"2024-06-01T12:00:00Z".to_vec(),
     }];
     assert!(
@@ -1559,7 +1559,7 @@ fn test_options_global_filter_applied() {
     let f = q.get_final_filter();
 
     let field = |n: &str, v: &str| Field {
-        name: n.to_string(),
+        name: n.as_bytes().to_vec(),
         value: v.as_bytes().to_vec(),
     };
     let matching = [field("host", "web"), field("_msg", "error")];

@@ -457,7 +457,7 @@ mod tests {
         fields
             .iter()
             .map(|(n, v)| crate::rows::Field {
-                name: n.to_string(),
+                name: n.as_bytes().to_vec(),
                 value: v.to_vec(),
             })
             .collect()

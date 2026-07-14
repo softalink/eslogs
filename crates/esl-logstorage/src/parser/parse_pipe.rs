@@ -1405,7 +1405,7 @@ fn parse_row(lex: &mut Lexer) -> Result<Vec<Field>, String> {
             .next_compound_token()
             .map_err(|e| format!("cannot read value after {}: {e}", go_quote(&name)))?;
         fields.push(Field {
-            name,
+            name: name.into_bytes(),
             value: value.into_bytes(),
         });
         if lex.is_keyword(&["}"]) {

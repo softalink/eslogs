@@ -103,7 +103,7 @@ impl PipeProcessor for PipeBlocksCountProcessor {
         let mut value = Vec::new();
         marshal_uint64_string(&mut value, blocks_count);
         let rc = ResultColumn {
-            name: self.result_name.clone(),
+            name: self.result_name.clone().into_bytes(),
             values: vec![value],
         };
 
@@ -137,10 +137,7 @@ mod tests {
     impl PipeProcessor for Collector {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cols = br.get_columns();
-            let names: Vec<String> = cols
-                .iter()
-                .map(|&c| br.column_name(c).to_string())
-                .collect();
+            let names: Vec<Vec<u8>> = cols.iter().map(|&c| br.column_name(c).to_vec()).collect();
             let n = br.rows_len();
             let mut out = self.blocks.lock().unwrap();
             for i in 0..n {
@@ -176,7 +173,7 @@ mod tests {
         // Push three blocks.
         for _ in 0..3 {
             let mut br = block_from_rows(&[vec![Field {
-                name: "x".to_string(),
+                name: b"x".to_vec(),
                 value: b"1".to_vec(),
             }]]);
             pp.write_block(0, &mut br);
@@ -186,7 +183,7 @@ mod tests {
         let out = sink.blocks.lock().unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].len(), 1);
-        assert_eq!(out[0][0].name, "blocks_count");
+        assert_eq!(out[0][0].name, b"blocks_count");
         assert_eq!(out[0][0].value, b"3");
     }
 
@@ -200,12 +197,12 @@ mod tests {
         let pp = pipe.new_pipe_processor(2, stop, sink.clone());
 
         let mut br0 = block_from_rows(&[vec![Field {
-            name: "x".to_string(),
+            name: b"x".to_vec(),
             value: b"1".to_vec(),
         }]]);
         pp.write_block(0, &mut br0);
         let mut br1 = block_from_rows(&[vec![Field {
-            name: "x".to_string(),
+            name: b"x".to_vec(),
             value: b"2".to_vec(),
         }]]);
         pp.write_block(1, &mut br1);
@@ -213,7 +210,7 @@ mod tests {
 
         let out = sink.blocks.lock().unwrap();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0][0].name, "cnt");
+        assert_eq!(out[0][0].name, b"cnt");
         assert_eq!(out[0][0].value, b"2");
     }
 }

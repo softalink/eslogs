@@ -306,7 +306,7 @@ fn read_next_json_object<R: BufRead>(d: &mut JsonDecoder<R>) -> Result<Vec<Field
         };
 
         fields.push(Field {
-            name: key,
+            name: key.into_bytes(),
             value: value.into_bytes(),
         });
     }
@@ -325,9 +325,9 @@ fn write_compact_object(w: &mut Vec<u8>, fields: &[Field]) -> io::Result<()> {
         w.push(b'\n');
         return Ok(());
     }
-    if fields.len() == 2 && (fields[0].name == "_time" || fields[1].name == "_time") {
+    if fields.len() == 2 && (fields[0].name == b"_time" || fields[1].name == b"_time") {
         // Write _time\tfieldValue as is
-        let (first, second) = if fields[0].name == "_time" {
+        let (first, second) = if fields[0].name == b"_time" {
             (&fields[0], &fields[1])
         } else {
             (&fields[1], &fields[0])
@@ -369,7 +369,9 @@ fn write_newline_if_needed(w: &mut Vec<u8>, is_multiline: bool) {
 }
 
 fn write_json_object_key_value(w: &mut Vec<u8>, f: &Field, is_multiline: bool) {
-    let key = get_json_string(&f.name);
+    // Display-only lossy conversion (R5): CLI pretty-printer rendering of the
+    // raw name bytes, mirroring the value handling below.
+    let key = get_json_string(&String::from_utf8_lossy(&f.name));
     // Display-only lossy conversion (R5): this is the CLI pretty-printer, and
     // Go's encoding/json likewise coerces invalid UTF-8 to U+FFFD on output.
     let value = get_json_string(&String::from_utf8_lossy(&f.value));
@@ -421,7 +423,7 @@ mod tests {
         pairs
             .iter()
             .map(|(name, value)| Field {
-                name: name.to_string(),
+                name: name.as_bytes().to_vec(),
                 value: value.as_bytes().to_vec(),
             })
             .collect()

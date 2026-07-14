@@ -52,19 +52,24 @@ impl StreamTags {
         // Verify that the unmarshaled stream tags match the corresponding fields' values.
         // See https://github.com/VictoriaMetrics/VictoriaLogs/issues/38
 
-        let mut prev_tag_name = "";
+        let mut prev_tag_name: &[u8] = b"";
         for tag in &self.tags {
-            let tag_name = tag.name.as_str();
+            let tag_name = tag.name.as_slice();
 
-            if check_stream_field_name(tag_name).is_err() {
+            if check_stream_field_name_bytes(tag_name).is_err() {
+                // Error text only: lossy view of the raw name bytes.
                 return Err(format!(
-                    "invalid stream tag name: {tag_name}; streamTags: {self}"
+                    "invalid stream tag name: {}; streamTags: {self}",
+                    String::from_utf8_lossy(tag_name)
                 ));
             }
 
             if tag_name <= prev_tag_name {
+                // Error text only: lossy view of the raw name bytes.
                 return Err(format!(
-                    "stream tag names must be sorted; got {tag_name:?} after {prev_tag_name:?}; streamTags: {self}"
+                    "stream tag names must be sorted; got {:?} after {:?}; streamTags: {self}",
+                    String::from_utf8_lossy(tag_name),
+                    String::from_utf8_lossy(prev_tag_name)
                 ));
             }
             prev_tag_name = tag_name;
@@ -78,11 +83,13 @@ impl StreamTags {
                 if f.value != tag_value {
                     let mut line = Vec::new();
                     marshal_fields_to_json(&mut line, fields);
+                    // Error text only: lossy views of the raw bytes.
                     return Err(format!(
-                        "unexpected value for the stream tag {tag_name:?}; got {:?}; want {:?}; streamTags: {self}; fields: {}",
+                        "unexpected value for the stream tag {:?}; got {:?}; want {:?}; streamTags: {self}; fields: {}",
+                        String::from_utf8_lossy(tag_name),
                         String::from_utf8_lossy(&f.value),
                         String::from_utf8_lossy(tag_value),
-                        bytesutil::to_unsafe_string(&line)
+                        String::from_utf8_lossy(&line)
                     ));
                 }
                 found = true;
@@ -90,10 +97,12 @@ impl StreamTags {
             if !found {
                 let mut line = Vec::new();
                 marshal_fields_to_json(&mut line, fields);
+                // Error text only: lossy views of the raw bytes.
                 return Err(format!(
-                    "cannot find value for the stream tag {tag_name:?} in fields; want {:?}; streamTags: {self}; fields: {}",
+                    "cannot find value for the stream tag {:?} in fields; want {:?}; streamTags: {self}; fields: {}",
+                    String::from_utf8_lossy(tag_name),
                     String::from_utf8_lossy(tag_value),
-                    bytesutil::to_unsafe_string(&line)
+                    String::from_utf8_lossy(&line)
                 ));
             }
         }
@@ -128,16 +137,17 @@ impl StreamTags {
     }
 
     /// Adds (name:value) tag to st.
-    pub fn add(&mut self, name: &str, value: impl AsRef<[u8]>) {
+    pub fn add(&mut self, name: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
         let value = value.as_ref();
         if value.is_empty() {
             return;
         }
 
-        let name = if name.is_empty() { "_msg" } else { name };
+        let name = name.as_ref();
+        let name: &[u8] = if name.is_empty() { b"_msg" } else { name };
 
         self.tags.push(Field {
-            name: name.to_string(),
+            name: name.to_vec(),
             value: value.to_vec(),
         });
     }
@@ -145,7 +155,7 @@ impl StreamTags {
     /// Marshals st in a canonical way.
     pub fn marshal_canonical(&mut self, dst: &mut Vec<u8>) {
         self.tags.sort_by(|a, b| {
-            (a.name.as_str(), a.value.as_slice()).cmp(&(b.name.as_str(), b.value.as_slice()))
+            (a.name.as_slice(), a.value.as_slice()).cmp(&(b.name.as_slice(), b.value.as_slice()))
         });
         self.marshal_canonical_internal(dst);
     }
@@ -154,7 +164,7 @@ impl StreamTags {
         let tags = &self.tags;
         encoding::marshal_var_uint64(dst, tags.len() as u64);
         for tag in tags {
-            encoding::marshal_bytes(dst, tag.name.as_bytes());
+            encoding::marshal_bytes(dst, &tag.name);
             encoding::marshal_bytes(dst, &tag.value);
         }
     }
@@ -187,8 +197,7 @@ impl StreamTags {
             }
             src = &src[n_size as usize..];
 
-            let s_name = bytesutil::to_unsafe_string(name.unwrap_or_default());
-            self.add(s_name, value.unwrap_or_default());
+            self.add(name.unwrap_or_default(), value.unwrap_or_default());
         }
 
         if !self.is_sorted() {
@@ -364,7 +373,7 @@ pub(crate) fn parse_stream_fields(dst: &mut Vec<Field>, s: &str) -> Result<(), S
         s = &s[n_offset..];
 
         dst.push(Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.into_bytes(),
         });
 
@@ -373,9 +382,10 @@ pub(crate) fn parse_stream_fields(dst: &mut Vec<Field>, s: &str) -> Result<(), S
         }
         if !s.starts_with(',') {
             let f = dst.last().unwrap();
+            // Error text only: lossy view of the raw name bytes.
             return Err(format!(
                 "missing ',' after {}={:?}",
-                f.name,
+                String::from_utf8_lossy(&f.name),
                 String::from_utf8_lossy(&f.value)
             ));
         }
@@ -388,6 +398,27 @@ pub(crate) fn parse_stream_fields(dst: &mut Vec<Field>, s: &str) -> Result<(), S
 pub fn check_stream_field_names(names: &[&str]) -> Result<(), String> {
     for name in names {
         check_stream_field_name(name)?;
+    }
+    Ok(())
+}
+
+/// Byte-name variant of [`check_stream_field_name`] for `Field.name` (raw
+/// bytes) call sites; '=' and '}' are single ASCII bytes, so the byte scan
+/// matches the char scan exactly.
+pub(crate) fn check_stream_field_name_bytes(name: &[u8]) -> Result<(), String> {
+    if name.contains(&b'=') {
+        // Error text only: lossy view of the raw name bytes.
+        return Err(format!(
+            "the {:?} cannot contain '=' char",
+            String::from_utf8_lossy(name)
+        ));
+    }
+    if name.contains(&b'}') {
+        // Error text only: lossy view of the raw name bytes.
+        return Err(format!(
+            "the {:?} cannot contain '}}' char",
+            String::from_utf8_lossy(name)
+        ));
     }
     Ok(())
 }

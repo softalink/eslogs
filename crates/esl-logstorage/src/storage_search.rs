@@ -52,7 +52,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::encoding;
 
 use crate::bitmap::get_bitmap;
@@ -85,8 +84,8 @@ use crate::tenant_id::TenantID;
 /// block layer (column values may hold non-UTF-8 bytes).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BlockColumn {
-    /// The column name.
-    pub name: String,
+    /// The column name (raw bytes; Go strings are arbitrary bytes).
+    pub name: Vec<u8>,
 
     /// The column values.
     pub values: Vec<Vec<u8>>,
@@ -134,7 +133,7 @@ impl DataBlock {
 
     /// Returns the column with the given name, or `None`.
     pub fn get_column_by_name(&self, name: &str) -> Option<&BlockColumn> {
-        self.columns.iter().find(|c| c.name == name)
+        self.columns.iter().find(|c| c.name == name.as_bytes())
     }
 
     /// Appends the parsed `_time` column values to `dst`
@@ -156,12 +155,13 @@ impl DataBlock {
 
         encoding::marshal_var_uint64(dst, self.columns.len() as u64);
         for c in &self.columns {
-            encoding::marshal_bytes(dst, c.name.as_bytes());
+            encoding::marshal_bytes(dst, &c.name);
 
             if c.values.len() != rows_count {
+                // Panic text only: lossy view of the raw name bytes.
                 esl_common::panicf!(
                     "BUG: the column {:?} must contain {} values; got {} values",
-                    c.name,
+                    String::from_utf8_lossy(&c.name),
                     rows_count,
                     c.values.len()
                 );
@@ -224,9 +224,10 @@ impl DataBlock {
             src = &src[n as usize..];
 
             if src.is_empty() {
+                // Error text only: lossy view of the raw name bytes.
                 return Err(format!(
                     "missing value type for column {:?}",
-                    to_unsafe_string(&name)
+                    String::from_utf8_lossy(&name)
                 ));
             }
             let values_type = src[0];
@@ -239,10 +240,11 @@ impl DataBlock {
                     let v = match v {
                         Some(v) if n > 0 => v.to_vec(),
                         _ => {
+                            // Error text only: lossy view of the raw name bytes.
                             return Err(format!(
                                 "cannot unmarshal const value for column #{} with name {:?} from len(src)={}",
                                 i,
-                                to_unsafe_string(&name),
+                                String::from_utf8_lossy(&name),
                                 src.len()
                             ));
                         }
@@ -258,12 +260,13 @@ impl DataBlock {
                         let v = match v {
                             Some(v) if n > 0 => v.to_vec(),
                             _ => {
+                                // Error text only: lossy view of the raw name bytes.
                                 return Err(format!(
                                     "cannot unmarshal value #{} out of {} values for column #{} with name {:?} from len(src)={}",
                                     j,
                                     rows_count,
                                     i,
-                                    to_unsafe_string(&name),
+                                    String::from_utf8_lossy(&name),
                                     src.len()
                                 ));
                             }
@@ -277,10 +280,7 @@ impl DataBlock {
                 }
             }
 
-            columns.push(BlockColumn {
-                name: to_unsafe_string(&name).to_string(),
-                values,
-            });
+            columns.push(BlockColumn { name, values });
         }
         self.columns = columns;
 
@@ -293,7 +293,7 @@ impl DataBlock {
 
         let cs = br.get_columns();
         for r in cs {
-            let name = br.column_name(r).to_string();
+            let name = br.column_name(r).to_vec();
             let values = br.column_get_values(r).to_vec();
             self.columns.push(BlockColumn { name, values });
         }
@@ -423,7 +423,7 @@ pub fn parse_stream_fields(mut dst: Vec<Field>, s: &str) -> Result<Vec<Field>, S
         s = &s[n_offset..];
 
         dst.push(Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.into_bytes(),
         });
 
@@ -1152,9 +1152,10 @@ impl Storage {
         let streams =
             self.get_streams(tenant_ids, q, hidden_fields_filters, u64::MAX, cancel, qs)?;
 
-        let mut m: HashMap<String, u64> = HashMap::new();
+        let mut m: HashMap<Vec<u8>, u64> = HashMap::new();
         for_each_stream_field(&streams, |f, hits| {
-            if !filter.is_empty() && !f.name.contains(filter) {
+            // Byte-wise substring check (Go strings.Contains is a byte search).
+            if !filter.is_empty() && !f.name.windows(filter.len()).any(|w| w == filter.as_bytes()) {
                 return;
             }
 
@@ -1197,7 +1198,7 @@ impl Storage {
                 return;
             }
 
-            if f.name != field_name {
+            if f.name != field_name.as_bytes() {
                 return;
             }
             *m.entry(f.value.clone()).or_insert(0) += hits;
@@ -2047,10 +2048,11 @@ fn schedule_by_stream_ids<'s>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use esl_common::bytesutil::to_unsafe_string;
 
     fn col(name: &str, values: &[&str]) -> BlockColumn {
         BlockColumn {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             values: values.iter().map(|v| v.as_bytes().to_vec()).collect(),
         }
     }
@@ -2130,11 +2132,11 @@ mod tests {
         for (i, msg) in msgs.iter().enumerate() {
             let mut fields = vec![
                 Field {
-                    name: "_msg".to_string(),
+                    name: b"_msg".to_vec(),
                     value: msg.as_bytes().to_vec(),
                 },
                 Field {
-                    name: "host".to_string(),
+                    name: b"host".to_vec(),
                     value: b"node-1".to_vec(),
                 },
             ];
@@ -2163,7 +2165,7 @@ mod tests {
                 for i in 0..n {
                     for c in &db.columns {
                         cap.lock().unwrap().push((
-                            c.name.clone(),
+                            String::from_utf8(c.name.clone()).unwrap(),
                             String::from_utf8_lossy(&c.values[i]).into_owned(),
                         ));
                     }
@@ -2174,6 +2176,77 @@ mod tests {
             assert_eq!(rows.len(), 1, "stats count() must emit exactly one value");
             assert_eq!(rows[0].0, "rows", "stats result column name");
             assert_eq!(rows[0].1, "5", "stats count() value");
+        }
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
+    }
+
+    /// PORT-ONLY TEST: field NAMES are raw bytes (Go strings are arbitrary
+    /// bytes). A stored field whose NAME contains invalid UTF-8 must
+    /// round-trip byte-identically: ingest -> block column name -> on-disk
+    /// column names -> query result field name.
+    #[test]
+    fn test_run_query_invalid_utf8_field_name_roundtrip() {
+        let path = run_query_temp_path("invalid-utf8-name");
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+
+        let tenant = TenantID {
+            account_id: 0,
+            project_id: 0,
+        };
+
+        // Field name and value both carry a raw invalid-UTF-8 byte.
+        let bad_name: &[u8] = b"na\xffme";
+        let bad_value: &[u8] = b"va\xfelue";
+
+        let mut lr = get_log_rows(&[], &[], &[], &[], "");
+        let mut fields = vec![
+            Field {
+                name: b"_msg".to_vec(),
+                value: b"hello".to_vec(),
+            },
+            Field {
+                name: bad_name.to_vec(),
+                value: bad_value.to_vec(),
+            },
+        ];
+        lr.must_add(tenant, now_nanos(), &mut fields, -1);
+        s.must_add_rows(&lr);
+        s.debug_flush();
+
+        type CapturedFields = Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>;
+        let q = ParseQuery("*").expect("parse query");
+        let captured: CapturedFields = Arc::new(Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let write: WriteDataBlockFn = Arc::new(move |_wid, db: &mut DataBlock| {
+            let n = db.rows_count();
+            for i in 0..n {
+                for c in &db.columns {
+                    cap.lock()
+                        .unwrap()
+                        .push((c.name.clone(), c.values[i].clone()));
+                }
+            }
+        });
+        s.run_query(&[tenant], &q, write).expect("run_query");
+
+        {
+            let rows = captured.lock().unwrap();
+            let got = rows
+                .iter()
+                .find(|(name, _)| name == bad_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "cannot find field with raw-byte name {bad_name:?}; got names: {:?}",
+                        rows.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(
+                got.1, bad_value,
+                "invalid UTF-8 field value must round-trip byte-identically"
+            );
         }
 
         s.must_close();
@@ -2203,11 +2276,11 @@ mod tests {
         for (i, msg) in msgs.iter().enumerate() {
             let mut fields = vec![
                 Field {
-                    name: "_msg".to_string(),
+                    name: b"_msg".to_vec(),
                     value: msg.as_bytes().to_vec(),
                 },
                 Field {
-                    name: "host".to_string(),
+                    name: b"host".to_vec(),
                     value: b"node-1".to_vec(),
                 },
             ];
@@ -2226,7 +2299,7 @@ mod tests {
             let mut dst = cap.lock().unwrap();
             for i in 0..n {
                 for c in cs {
-                    if c.name == "_msg" {
+                    if c.name == b"_msg" {
                         dst.push(String::from_utf8_lossy(&c.values[i]).into_owned());
                     }
                 }
@@ -2345,7 +2418,7 @@ mod tests {
                         .iter()
                         .map(|c| {
                             (
-                                c.name.clone(),
+                                String::from_utf8(c.name.clone()).unwrap(),
                                 String::from_utf8_lossy(&c.values[i]).into_owned(),
                             )
                         })
@@ -2522,7 +2595,7 @@ mod tests {
 
         fn field(name: &str, value: &str) -> Field {
             Field {
-                name: name.to_string(),
+                name: name.as_bytes().to_vec(),
                 value: value.as_bytes().to_vec(),
             }
         }
@@ -2847,7 +2920,7 @@ mod tests {
                         .iter()
                         .map(|c| {
                             (
-                                c.name.clone(),
+                                String::from_utf8(c.name.clone()).unwrap(),
                                 String::from_utf8_lossy(&c.values[i]).into_owned(),
                             )
                         })
@@ -3115,19 +3188,19 @@ mod tests {
         for (i, (foo, bar)) in rows.iter().enumerate() {
             let mut fields = vec![
                 Field {
-                    name: "_msg".to_string(),
+                    name: b"_msg".to_vec(),
                     value: b"message".to_vec(),
                 },
                 Field {
-                    name: "host".to_string(),
+                    name: b"host".to_vec(),
                     value: b"node-1".to_vec(),
                 },
                 Field {
-                    name: "foo".to_string(),
+                    name: b"foo".to_vec(),
                     value: foo.to_vec(),
                 },
                 Field {
-                    name: "bar".to_string(),
+                    name: b"bar".to_vec(),
                     value: bar.as_bytes().to_vec(),
                 },
             ];
@@ -3154,7 +3227,7 @@ mod tests {
                 let cs = db.get_columns(false);
                 let mut dst = cap.lock().unwrap();
                 for c in cs {
-                    if c.name == "foo" {
+                    if c.name == b"foo" {
                         for i in 0..n {
                             dst.push(c.values[i].clone());
                         }
@@ -3359,28 +3432,28 @@ mod tests {
             for stream_id in 0..STREAMS_PER_TENANT {
                 fields.clear();
                 fields.push(Field {
-                    name: "host".to_string(),
+                    name: b"host".to_vec(),
                     value: format!("host-{stream_id}").into_bytes(),
                 });
                 fields.push(Field {
-                    name: "app".to_string(),
+                    name: b"app".to_vec(),
                     value: format!("app-{}", 200 + stream_id).into_bytes(),
                 });
                 for tenant_id in tenant_ids {
                     for day_id in 0..DAYS {
                         fields.push(Field {
-                            name: "_msg".to_string(),
+                            name: b"_msg".to_vec(),
                             value: format!(
                                 "value #{row_id} at the day {day_id} for the tenantID={tenant_id} and streamID={stream_id}"
                             )
                             .into_bytes(),
                         });
                         fields.push(Field {
-                            name: "row_id".to_string(),
+                            name: b"row_id".to_vec(),
                             value: format!("{row_id}").into_bytes(),
                         });
                         fields.push(Field {
-                            name: "tenant_id".to_string(),
+                            name: b"tenant_id".to_vec(),
                             value: tenant_id.to_string().into_bytes(),
                         });
                         let timestamp = now - day_id * NSECS_PER_DAY;

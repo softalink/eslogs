@@ -83,6 +83,16 @@ impl Filter {
         !self.deny.match_string(s)
     }
 
+    /// Byte-name variant of [`Filter::match_string`] for raw `Field.name`
+    /// bytes: the filter patterns are query text (valid UTF-8), and the
+    /// comparison is byte-wise, matching Go's raw-byte string comparison.
+    pub fn match_string_bytes(&self, s: &[u8]) -> bool {
+        if !self.allow.match_string_bytes(s) {
+            return false;
+        }
+        !self.deny.match_string_bytes(s)
+    }
+
     fn normalize(&mut self) {
         if self.allow.wildcards.is_empty() {
             self.deny.reset();
@@ -272,6 +282,21 @@ impl InnerFilter {
             .iter()
             .any(|wc| wildcard.starts_with(wc.as_str()))
     }
+
+    /// Byte variant of [`InnerFilter::match_string`] (see
+    /// [`Filter::match_string_bytes`]).
+    fn match_string_bytes(&self, s: &[u8]) -> bool {
+        if self.match_nothing() {
+            // Fast path for common case when there are no filters.
+            return false;
+        }
+
+        // Slower path for regular case.
+        if self.wildcards.iter().any(|wc| s.starts_with(wc.as_bytes())) {
+            return true;
+        }
+        self.full_strings.iter().any(|x| x.as_bytes() == s)
+    }
 }
 
 /// Returns true if the filter ends with '*', e.g. it matches any string containing the prefix in front of '*'.
@@ -288,11 +313,28 @@ pub fn match_filter(filter: &str, s: &str) -> bool {
     s.starts_with(wildcard)
 }
 
+/// Byte-name variant of [`match_filter`] for raw `Field.name` bytes (the
+/// filter is query text; comparison is byte-wise like Go).
+pub fn match_filter_bytes(filter: &str, s: &[u8]) -> bool {
+    if !is_wildcard_filter(filter) {
+        return filter.as_bytes() == s;
+    }
+    let wildcard = &filter[..filter.len() - 1];
+    s.starts_with(wildcard.as_bytes())
+}
+
 /// Returns true if s matches any filter from filters.
 pub fn match_filters<S: AsRef<str>>(filters: &[S], s: &str) -> bool {
     filters
         .iter()
         .any(|filter| match_filter(filter.as_ref(), s))
+}
+
+/// Byte-name variant of [`match_filters`] (see [`match_filter_bytes`]).
+pub fn match_filters_bytes<S: AsRef<str>>(filters: &[S], s: &[u8]) -> bool {
+    filters
+        .iter()
+        .any(|filter| match_filter_bytes(filter.as_ref(), s))
 }
 
 /// Returns true if filters match any string.
@@ -305,18 +347,24 @@ pub fn match_all<S: AsRef<str>>(filters: &[S]) -> bool {
 /// PORT NOTE: Go returns the (possibly reallocated) dst slice; Rust appends to
 /// the `Vec` in place, following the esl-common `marshal_*` convention.
 pub fn append_replace(dst: &mut Vec<u8>, src_filter: &str, dst_filter: &str, s: &str) {
+    append_replace_bytes(dst, src_filter, dst_filter, s.as_bytes());
+}
+
+/// Byte-name variant of [`append_replace`] for raw `Field.name` bytes (the
+/// filters are query text; the raw name bytes are preserved verbatim).
+pub fn append_replace_bytes(dst: &mut Vec<u8>, src_filter: &str, dst_filter: &str, s: &[u8]) {
     if !is_wildcard_filter(src_filter) {
-        if s == src_filter {
+        if s == src_filter.as_bytes() {
             dst.extend_from_slice(dst_filter.as_bytes());
         } else {
-            dst.extend_from_slice(s.as_bytes());
+            dst.extend_from_slice(s);
         }
         return;
     }
 
     let src_prefix = &src_filter[..src_filter.len() - 1];
-    if !s.starts_with(src_prefix) {
-        dst.extend_from_slice(s.as_bytes());
+    if !s.starts_with(src_prefix.as_bytes()) {
+        dst.extend_from_slice(s);
         return;
     }
     if !is_wildcard_filter(dst_filter) {
@@ -327,7 +375,7 @@ pub fn append_replace(dst: &mut Vec<u8>, src_filter: &str, dst_filter: &str, s: 
     let src_suffix = &s[src_prefix.len()..];
     let dst_prefix = &dst_filter[..dst_filter.len() - 1];
     dst.extend_from_slice(dst_prefix.as_bytes());
-    dst.extend_from_slice(src_suffix.as_bytes());
+    dst.extend_from_slice(src_suffix);
 }
 
 #[cfg(test)]

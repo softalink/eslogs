@@ -171,11 +171,14 @@ impl FieldsUnpackerContext {
     }
 
     /// Adds a field, applying the configured field prefix to its name.
-    pub(crate) fn add_field(&mut self, name: &str, value: impl AsRef<[u8]>) {
+    pub(crate) fn add_field(&mut self, name: &[u8], value: impl AsRef<[u8]>) {
         let name_copy = if self.field_prefix.is_empty() {
-            name.to_string()
+            name.to_vec()
         } else {
-            format!("{}{}", self.field_prefix, name)
+            let mut name_copy = Vec::with_capacity(self.field_prefix.len() + name.len());
+            name_copy.extend_from_slice(self.field_prefix.as_bytes());
+            name_copy.extend_from_slice(name);
+            name_copy
         };
         self.fields.push(Field {
             name: name_copy,
@@ -198,7 +201,7 @@ pub(crate) struct PipeUnpackWriteContext {
     skip_empty_results: bool,
 
     cs_src: Vec<ColRef>,
-    cs_src_names: Vec<String>,
+    cs_src_names: Vec<Vec<u8>>,
 
     rcs: Vec<ResultColumn>,
     br: BlockResult,
@@ -240,7 +243,7 @@ impl PipeUnpackWriteContext {
         self.cs_src_names = self
             .cs_src
             .iter()
-            .map(|&r| br_src.column_name(r).to_string())
+            .map(|&r| br_src.column_name(r).to_vec())
             .collect();
     }
 
@@ -329,7 +332,7 @@ impl PipeUnpackWriteContext {
 }
 
 /// Port of Go's `getBlockResultColumnIdxByName`.
-fn get_block_result_column_idx_by_name(names: &[String], name: &str) -> Option<usize> {
+fn get_block_result_column_idx_by_name(names: &[Vec<u8>], name: &[u8]) -> Option<usize> {
     names.iter().position(|n| n == name)
 }
 
@@ -481,7 +484,7 @@ pub(crate) mod test_utils {
 
     pub(crate) fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -500,7 +503,7 @@ pub(crate) mod test_utils {
     impl PipeProcessor for TestPipeProcessor {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cs = br.get_columns();
-            let names: Vec<String> = cs.iter().map(|&c| br.column_name(c).to_string()).collect();
+            let names: Vec<Vec<u8>> = cs.iter().map(|&c| br.column_name(c).to_vec()).collect();
             let mut column_values: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cs.len());
             for &c in &cs {
                 column_values.push(br.column_get_values(c).to_vec());
@@ -585,7 +588,7 @@ pub(crate) mod test_utils {
     fn row_key(row: &[Field]) -> Vec<u8> {
         let mut s = Vec::new();
         for f in row {
-            s.extend_from_slice(f.name.as_bytes());
+            s.extend_from_slice(&f.name);
             s.push(0);
             s.extend_from_slice(&f.value);
             s.push(1);

@@ -123,7 +123,7 @@ impl StatsRowAnyProcessor {
         let mut state_size_increase = 0i64;
         self.fields.clear();
         for &c in &cs {
-            let name = br.column_name(c).to_string();
+            let name = br.column_name(c).to_vec();
             let value = br.column_get_value_at_row(c, row_index).to_vec();
             state_size_increase += (name.len() + value.len()) as i64;
             self.fields.push(Field { name, value });
@@ -216,11 +216,11 @@ mod tests {
         let sap = StatsRowAnyProcessor {
             fields: vec![
                 Field {
-                    name: "foo".to_string(),
+                    name: b"foo".to_vec(),
                     value: b"bar".to_vec(),
                 },
                 Field {
-                    name: "abc".to_string(),
+                    name: b"abc".to_vec(),
                     value: b"de".to_vec(),
                 },
             ],

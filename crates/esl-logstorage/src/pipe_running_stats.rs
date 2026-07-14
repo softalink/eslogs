@@ -179,10 +179,7 @@ impl PipeProcessor for PipeRunningStatsProcessor {
             return;
         }
         let cols = br.get_columns();
-        let names: Vec<String> = cols
-            .iter()
-            .map(|&c| br.column_name(c).to_string())
-            .collect();
+        let names: Vec<Vec<u8>> = cols.iter().map(|&c| br.column_name(c).to_vec()).collect();
         let rows_len = br.rows_len();
 
         let idx = worker_id.min(self.shards.len() - 1);
@@ -258,7 +255,7 @@ impl PipeProcessor for PipeRunningStatsProcessor {
                     }
                     let result = sp.get_running_stats();
                     out_fields.push(Field {
-                        name: funcs[i].result_name.clone(),
+                        name: funcs[i].result_name.clone().into_bytes(),
                         value: result,
                     });
                 }
@@ -346,10 +343,7 @@ mod tests {
     impl PipeProcessor for Collector {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cols = br.get_columns();
-            let names: Vec<String> = cols
-                .iter()
-                .map(|&c| br.column_name(c).to_string())
-                .collect();
+            let names: Vec<Vec<u8>> = cols.iter().map(|&c| br.column_name(c).to_vec()).collect();
             let n = br.rows_len();
             let mut out = self.blocks.lock().unwrap();
             for i in 0..n {
@@ -370,7 +364,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }

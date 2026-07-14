@@ -215,15 +215,15 @@ fn get_log_rows_from_data_block(db: &mut DataBlock) -> Result<Vec<LogRow>, Strin
 
         // The _time column must go first, since the query results are sorted by _time.
         for c in columns {
-            if c.name == "_time" {
+            if c.name == b"_time" {
                 fields.push(Field {
-                    name: "_time".to_string(),
+                    name: b"_time".to_vec(),
                     value: c.values[i].clone(),
                 });
             }
         }
         for c in columns {
-            if c.name == "_time" {
+            if c.name == b"_time" {
                 continue;
             }
             fields.push(Field {
@@ -280,7 +280,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -335,9 +335,9 @@ mod tests {
             for c in db.get_columns(false) {
                 for v in &c.values {
                     let v = v.clone();
-                    if c.name == "seq" {
+                    if c.name == b"seq" {
                         seqs.push(v);
-                    } else if c.name == "_time" {
+                    } else if c.name == b"_time" {
                         times.push(v);
                     }
                 }

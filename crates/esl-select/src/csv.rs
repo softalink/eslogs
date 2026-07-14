@@ -120,11 +120,11 @@ mod tests {
     fn test_append_csv_row() {
         let columns = vec![
             BlockColumn {
-                name: "_msg".to_string(),
+                name: b"_msg".to_vec(),
                 values: vec![b"plain".to_vec(), b"needs,quoting".to_vec()],
             },
             BlockColumn {
-                name: "host".to_string(),
+                name: b"host".to_vec(),
                 values: vec![b"node-1".to_vec(), b"no\"de".to_vec()],
             },
         ];

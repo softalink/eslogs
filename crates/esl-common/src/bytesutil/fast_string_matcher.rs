@@ -46,7 +46,7 @@ impl FastStringMatcher {
     /// PORT NOTE: named `matches` because `match` is a Rust keyword (Go:
     /// `Match`).
     pub fn matches(&self, s: &str) -> bool {
-        if is_skip_cache(s) {
+        if is_skip_cache(s.len()) {
             return (self.match_func)(s);
         }
 

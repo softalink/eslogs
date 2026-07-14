@@ -159,7 +159,7 @@ impl PipeProcessor for PipeUnrollProcessor {
         // then their decoded values) so we can build output rows while the
         // block borrow is released. See pipe_coalesce.rs for the discipline.
         let cs = br.get_columns();
-        let src_names: Vec<String> = cs.iter().map(|&c| br.column_name(c).to_string()).collect();
+        let src_names: Vec<Vec<u8>> = cs.iter().map(|&c| br.column_name(c).to_vec()).collect();
         let src_values: Vec<Vec<Vec<u8>>> = cs
             .iter()
             .map(|&c| br.column_get_values(c).to_vec())
@@ -195,7 +195,7 @@ impl PipeProcessor for PipeUnrollProcessor {
                     .iter()
                     .enumerate()
                     .map(|(i, f)| Field {
-                        name: f.clone(),
+                        name: f.clone().into_bytes(),
                         value: field_values[i][row_idx].clone(),
                     })
                     .collect();
@@ -227,7 +227,7 @@ impl PipeUnrollProcessor {
     /// unroll fields at `row_idx` into one or more output rows.
     fn write_unrolled_rows(
         &self,
-        src_names: &[String],
+        src_names: &[Vec<u8>],
         src_values: &[Vec<Vec<u8>>],
         field_values: &[Vec<Vec<u8>>],
         row_idx: usize,
@@ -259,7 +259,7 @@ impl PipeUnrollProcessor {
                 .iter()
                 .enumerate()
                 .map(|(i, name)| Field {
-                    name: name.clone(),
+                    name: name.clone().into_bytes(),
                     value: unrolled[i].get(unroll_idx).cloned().unwrap_or_default(),
                 })
                 .collect();
@@ -277,7 +277,7 @@ impl PipeUnrollProcessor {
 /// source column. The port merges directly: an extra field replaces the value
 /// of the same-named source column in place, otherwise it is appended.
 fn build_row(
-    src_names: &[String],
+    src_names: &[Vec<u8>],
     src_values: &[Vec<Vec<u8>>],
     row_idx: usize,
     extra: &[Field],

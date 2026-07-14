@@ -335,7 +335,7 @@ fn decode_scope_logs(
                 fs.fields.insert(
                     stream_fields_len,
                     Field {
-                        name: "event_name".to_string(),
+                        name: b"event_name".to_vec(),
                         value: event_name,
                     },
                 );

@@ -350,7 +350,8 @@ impl TimestampsData {
 #[derive(Debug, Default)]
 pub struct ColumnData {
     /// name is the column name
-    pub name: String,
+    /// PORT NOTE: raw bytes (Go strings are arbitrary bytes).
+    pub name: Vec<u8>,
 
     /// valueType is the type of values stored in valuesData
     pub value_type: ValueType,
@@ -543,7 +544,7 @@ mod tests {
 
     fn field(name: &str, value: &str) -> Field {
         Field {
-            name: name.to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.as_bytes().to_vec(),
         }
     }
@@ -567,7 +568,7 @@ mod tests {
                 max_timestamp: 23443,
             },
             columns_data: vec![ColumnData {
-                name: "foo".to_string(),
+                name: b"foo".to_vec(),
                 value_type: ValueType::UINT16,
                 values_data: b"aaa".to_vec(),
                 bloom_filter_data: b"bsdf".to_vec(),
@@ -624,14 +625,14 @@ mod tests {
             },
             columns_data: vec![
                 ColumnData {
-                    name: "foo".to_string(),
+                    name: b"foo".to_vec(),
                     value_type: ValueType::UINT16,
                     values_data: b"aaa".to_vec(),
                     bloom_filter_data: b"bsdf".to_vec(),
                     ..Default::default()
                 },
                 ColumnData {
-                    name: "bar".to_string(),
+                    name: b"bar".to_vec(),
                     values_data: b"aaa".to_vec(),
                     bloom_filter_data: b"bsdf".to_vec(),
                     ..Default::default()

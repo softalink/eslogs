@@ -250,7 +250,7 @@ impl PipeProcessor for PipeFormatProcessor {
             }
         }
 
-        shard.rc.name = self.result_field.clone();
+        shard.rc.name = self.result_field.clone().into_bytes();
 
         let result_column = br.get_column_by_name(&self.result_field);
         for row_idx in 0..br.rows_len() {

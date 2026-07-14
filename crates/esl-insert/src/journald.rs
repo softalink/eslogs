@@ -330,7 +330,7 @@ fn read_journald_log_entry(
                 }
                 if !remote_ip.is_empty() {
                     fb.fields.push(Field {
-                        name: "remote_ip".to_string(),
+                        name: b"remote_ip".to_vec(),
                         value: remote_ip.as_bytes().to_vec(),
                     });
                 }
@@ -451,13 +451,13 @@ fn read_journald_log_entry(
         if name == "PRIORITY" {
             let priority = journald_priority_to_level(value);
             fb.fields.push(Field {
-                name: "level".to_string(),
+                name: b"level".to_vec(),
                 value: priority.to_vec(),
             });
         }
 
         if !name.starts_with("__") || *JOURNALD_INCLUDE_ENTRY_METADATA.get() {
-            let name = name.to_string();
+            let name = name.as_bytes().to_vec();
             let value = value.to_vec();
             fb.fields.push(Field { name, value });
         }

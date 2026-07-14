@@ -27,7 +27,7 @@ pub(crate) fn for_each_matching_field(
         let mut found = false;
         let field_name = &field_filters[0];
         for f in fields {
-            if &f.name == field_name {
+            if f.name == field_name.as_bytes() {
                 callback(&f.value);
                 found = true;
             }
@@ -39,7 +39,7 @@ pub(crate) fn for_each_matching_field(
     }
 
     for f in fields {
-        if prefix_filter::match_filters(field_filters, &f.name) {
+        if prefix_filter::match_filters_bytes(field_filters, &f.name) {
             callback(&f.value);
         }
     }

@@ -47,15 +47,15 @@
 
 use std::collections::HashMap;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::{decimal, encoding as vencoding, fastnum};
 
 use crate::bitmap::Bitmap;
 use crate::block_header::{ColumnHeader, ColumnsHeader};
 use crate::block_search::BlockSearch;
-use crate::log_rows::get_canonical_column_name;
+use crate::log_rows::get_canonical_column_name_bytes;
 use crate::prefix_filter::{
-    self as prefixfilter, Filter, append_replace, is_wildcard_filter, match_filter, match_filters,
+    self as prefixfilter, Filter, append_replace_bytes, is_wildcard_filter, match_filter_bytes,
+    match_filters_bytes,
 };
 use crate::rows::Field;
 use crate::values_encoder::{
@@ -300,7 +300,7 @@ impl BlockResult {
 
         // Slow path - rows have different fields. Assign a column index to each
         // field name in first-appearance order (matches Go's columnIdxs).
-        let mut column_idxs: HashMap<String, usize> = HashMap::new();
+        let mut column_idxs: HashMap<Vec<u8>, usize> = HashMap::new();
         for fields in rows {
             for f in fields {
                 let next = column_idxs.len();
@@ -310,7 +310,7 @@ impl BlockResult {
 
         // Initialize columns as string columns with empty values.
         let ncols = column_idxs.len();
-        let mut names: Vec<String> = vec![String::new(); ncols];
+        let mut names: Vec<Vec<u8>> = vec![Vec::new(); ncols];
         for (name, &idx) in &column_idxs {
             names[idx] = name.clone();
         }
@@ -346,9 +346,10 @@ impl BlockResult {
     /// Adds a float64 result column with the given min/max values.
     pub fn add_result_column_float64(&mut self, rc: ResultColumn, min_value: f64, max_value: f64) {
         if rc.values.len() != self.rows_len {
+            // Panic text only: lossy view of the raw name bytes.
             esl_common::panicf!(
                 "BUG: column {:?} must contain {} rows, but it contains {} rows",
-                rc.name,
+                String::from_utf8_lossy(&rc.name),
                 self.rows_len,
                 rc.values.len()
             );
@@ -366,9 +367,10 @@ impl BlockResult {
     /// Adds a result column, choosing const or string encoding.
     pub fn add_result_column(&mut self, rc: ResultColumn) {
         if rc.values.len() != self.rows_len {
+            // Panic text only: lossy view of the raw name bytes.
             esl_common::panicf!(
                 "BUG: column {:?} must contain {} rows, but it contains {} rows",
-                rc.name,
+                String::from_utf8_lossy(&rc.name),
                 self.rows_len,
                 rc.values.len()
             );
@@ -432,7 +434,7 @@ impl BlockResult {
     /// fall back to `get_columns` then. The returned names cover the column
     /// headers and const columns only — the caller adds the generated
     /// `_time` / `_stream` / `_stream_id` columns itself, like Go.
-    pub(crate) fn field_names_from_columns_header_index(&mut self) -> Option<Vec<String>> {
+    pub(crate) fn field_names_from_columns_header_index(&mut self) -> Option<Vec<Vec<u8>>> {
         self.bs?;
         let bs = self.bs_ptr();
         // SAFETY: bs points at the BlockSearch that initialized this
@@ -453,7 +455,7 @@ impl BlockResult {
                 .chain((*csh_index).const_columns_refs.iter());
             let mut names = Vec::new();
             for cr in refs {
-                names.push((*bs).get_column_name_by_id(cr.column_name_id).to_string());
+                names.push((*bs).get_column_name_by_id(cr.column_name_id).to_vec());
             }
             Some(names)
         }
@@ -544,13 +546,14 @@ impl BlockResult {
         // before the mutating `add_*` calls, which do not touch csh.
         let csh: &ColumnsHeader = unsafe { &*((*bs).get_columns_header() as *const ColumnsHeader) };
 
-        let mut const_to_add: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut const_to_add: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for cc in &csh.const_columns {
             if is_special_column(&cc.name) {
                 // Special columns have been added above.
                 continue;
             }
-            if pf.match_string(&cc.name) && unsafe { !(*bs).is_hidden_field(&cc.name) } {
+            if pf.match_string_bytes(&cc.name) && unsafe { !(*bs).is_hidden_field_bytes(&cc.name) }
+            {
                 const_to_add.push((cc.name.clone(), cc.value.clone()));
             }
         }
@@ -561,7 +564,8 @@ impl BlockResult {
                 // Special columns have been added above.
                 continue;
             }
-            if pf.match_string(&ch.name) && unsafe { !(*bs).is_hidden_field(&ch.name) } {
+            if pf.match_string_bytes(&ch.name) && unsafe { !(*bs).is_hidden_field_bytes(&ch.name) }
+            {
                 cols_to_add.push(ch as *const ColumnHeader);
             }
         }
@@ -628,14 +632,14 @@ impl BlockResult {
     /// in-memory blocks.
     pub(crate) fn block_stats_column_header(
         &mut self,
-        name: &str,
+        name: &[u8],
         is_dict: bool,
     ) -> Option<(u64, u64, u64, u64)> {
         self.bs?;
         // SAFETY: bs is valid for the lifetime of this block result.
         let bs = self.bs_ptr();
         unsafe {
-            let Some(ch) = (*bs).get_column_header(name) else {
+            let Some(ch) = (*bs).get_column_header_bytes(name) else {
                 // Unreachable for columns materialized from this block search
                 // (Go would nil-panic here); keep the row with zero sizes.
                 return Some((0, 0, 0, 0));
@@ -661,7 +665,7 @@ impl BlockResult {
     /// Adds a column for the given column header.
     pub fn add_column(&mut self, ch: &ColumnHeader) {
         self.cs_buf.push(BlockResultColumn {
-            name: get_canonical_column_name(&ch.name).to_string(),
+            name: get_canonical_column_name_bytes(&ch.name).to_vec(),
             value_type: ch.value_type,
             min_value: ch.min_value,
             max_value: ch.max_value,
@@ -675,16 +679,16 @@ impl BlockResult {
     /// Adds the `_time` column.
     pub fn add_time_column(&mut self) {
         self.cs_add(BlockResultColumn {
-            name: "_time".to_string(),
+            name: b"_time".to_vec(),
             is_time: true,
             ..Default::default()
         });
     }
 
     /// Adds a const column with the given name and value (raw value bytes).
-    pub fn add_const_column(&mut self, name: &str, value: impl AsRef<[u8]>) {
+    pub fn add_const_column(&mut self, name: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
         self.cs_add(BlockResultColumn {
-            name: name.to_string(),
+            name: name.as_ref().to_vec(),
             is_const: true,
             values_encoded: Some(vec![value.as_ref().to_vec()]),
             ..Default::default()
@@ -862,23 +866,24 @@ impl BlockResult {
         if !self.cs_initialized {
             self.cs_init();
         }
-        let column_name = get_canonical_column_name(column_name).to_string();
+        let column_name = get_canonical_column_name_bytes(column_name.as_bytes());
         for &ci in &self.cs {
             if self.cs_buf[ci].name == column_name {
                 return ColRef::Buf(ci);
             }
         }
+        let column_name = column_name.to_vec();
         self.get_empty_column_by_name(&column_name)
     }
 
-    fn get_empty_column_by_name(&mut self, column_name: &str) -> ColRef {
+    fn get_empty_column_by_name(&mut self, column_name: &[u8]) -> ColRef {
         for (i, c) in self.cs_empty.iter().enumerate() {
             if c.name == column_name {
                 return ColRef::Empty(i);
             }
         }
         self.cs_empty.push(BlockResultColumn {
-            name: column_name.to_string(),
+            name: column_name.to_vec(),
             is_const: true,
             values_encoded: Some(vec![Vec::new()]),
             ..Default::default()
@@ -993,14 +998,13 @@ impl BlockResult {
         let mut to_add: Vec<BlockResultColumn> = Vec::new();
         for &r in &cols {
             let c = self.col(r);
-            if !match_filter(src_filter, &c.name) {
+            if !match_filter_bytes(src_filter, &c.name) {
                 continue;
             }
             let mut buf = Vec::new();
-            append_replace(&mut buf, src_filter, dst_filter, &c.name);
-            let field_name = to_unsafe_string(&buf).to_string();
+            append_replace_bytes(&mut buf, src_filter, dst_filter, &c.name);
             let mut c_copy = c.clone_shallow();
-            c_copy.name = field_name;
+            c_copy.name = buf;
             to_add.push(c_copy);
             found = true;
         }
@@ -1031,19 +1035,19 @@ impl BlockResult {
         let mut found = false;
         for &r in &cols {
             let c = self.col(r);
-            if !match_filter(src_filter, &c.name) {
+            if !match_filter_bytes(src_filter, &c.name) {
                 new_buf.push(c.clone_shallow());
             }
         }
         for &r in &cols {
             let c = self.col(r);
-            if !match_filter(src_filter, &c.name) {
+            if !match_filter_bytes(src_filter, &c.name) {
                 continue;
             }
             let mut buf = Vec::new();
-            append_replace(&mut buf, src_filter, dst_filter, &c.name);
+            append_replace_bytes(&mut buf, src_filter, dst_filter, &c.name);
             let mut c_copy = c.clone_shallow();
-            c_copy.name = to_unsafe_string(&buf).to_string();
+            c_copy.name = buf;
             new_buf.push(c_copy);
             found = true;
         }
@@ -1065,7 +1069,7 @@ impl BlockResult {
         let mut new_buf: Vec<BlockResultColumn> = Vec::new();
         for &r in &cols {
             let c = self.col(r);
-            if !match_filters(column_filters, &c.name) {
+            if !match_filters_bytes(column_filters, &c.name) {
                 new_buf.push(c.clone_shallow());
             }
         }
@@ -1087,7 +1091,7 @@ impl BlockResult {
                     new_buf.push(self.col(r).clone_shallow());
                 } else {
                     let mut c = BlockResultColumn {
-                        name: field.clone(),
+                        name: field.as_bytes().to_vec(),
                         is_const: true,
                         values_encoded: Some(vec![Vec::new()]),
                         ..Default::default()
@@ -1108,7 +1112,7 @@ impl BlockResult {
         let mut new_buf: Vec<BlockResultColumn> = Vec::new();
         for &r in &cols {
             let c = self.col(r);
-            if match_filters(column_filters, &c.name) {
+            if match_filters_bytes(column_filters, &c.name) {
                 new_buf.push(c.clone_shallow());
             }
         }
@@ -1118,7 +1122,7 @@ impl BlockResult {
             }
             if self.find_column_by_name(&cols, column_filter).is_none() {
                 new_buf.push(BlockResultColumn {
-                    name: column_filter.clone(),
+                    name: column_filter.as_bytes().to_vec(),
                     is_const: true,
                     values_encoded: Some(vec![Vec::new()]),
                     ..Default::default()
@@ -1134,12 +1138,12 @@ impl BlockResult {
         }
         cols.iter()
             .zip(column_filters)
-            .all(|(&r, name)| &self.col(r).name == name)
+            .all(|(&r, name)| self.col(r).name == name.as_bytes())
     }
 
     fn are_same_wildcard_columns(&self, cols: &[ColRef], column_filters: &[String]) -> bool {
         for &r in cols {
-            if !match_filters(column_filters, &self.col(r).name) {
+            if !match_filters_bytes(column_filters, &self.col(r).name) {
                 return false;
             }
         }
@@ -1155,7 +1159,7 @@ impl BlockResult {
     }
 
     fn find_column_by_name<'a>(&self, cols: &'a [ColRef], name: &str) -> Option<&'a ColRef> {
-        cols.iter().find(|&&r| self.col(r).name == name)
+        cols.iter().find(|&&r| self.col(r).name == name.as_bytes())
     }
 
     // -- column accessors ----------------------------------------------------
@@ -1175,8 +1179,9 @@ impl BlockResult {
         }
     }
 
-    /// Returns the name of the column referenced by `r`.
-    pub fn column_name(&self, r: ColRef) -> &str {
+    /// Returns the name of the column referenced by `r` (raw bytes; Go
+    /// strings are arbitrary bytes).
+    pub fn column_name(&self, r: ColRef) -> &[u8] {
         &self.col(r).name
     }
 
@@ -1486,8 +1491,8 @@ unsafe impl Send for BlockResult {}
 /// resolve through the owning block result.
 #[derive(Default, Clone)]
 pub struct BlockResultColumn {
-    /// Column name.
-    name: String,
+    /// Column name (raw bytes; Go strings are arbitrary bytes).
+    name: Vec<u8>,
     /// True if the column is a const column (value in `values_encoded[0]`).
     is_const: bool,
     /// True if the column contains `_time` values.
@@ -1964,8 +1969,8 @@ fn map_encoded(ve: &[Vec<u8>], f: impl Fn(&[u8]) -> Vec<u8>) -> Vec<Vec<u8>> {
 /// A column with result values, not owning them.
 #[derive(Default, Clone)]
 pub struct ResultColumn {
-    /// Column name.
-    pub name: String,
+    /// Column name (raw bytes; Go strings are arbitrary bytes).
+    pub name: Vec<u8>,
     /// Result values (as bytes; UTF-8 for human-readable values).
     pub values: Vec<Vec<u8>>,
 }
@@ -1989,9 +1994,9 @@ impl ResultColumn {
 }
 
 /// Appends a result column with the given name to `dst`.
-pub fn append_result_column_with_name(dst: &mut Vec<ResultColumn>, name: &str) {
+pub fn append_result_column_with_name<S: AsRef<[u8]>>(dst: &mut Vec<ResultColumn>, name: S) {
     dst.push(ResultColumn {
-        name: name.to_string(),
+        name: name.as_ref().to_vec(),
         values: Vec::new(),
     });
 }
@@ -2316,15 +2321,15 @@ fn are_const_values(values: &[Vec<u8>]) -> bool {
 
 /// Returns true if `c` is one of the special columns (`_msg`, `_time`,
 /// `_stream`, `_stream_id`). The canonical form of `_msg` is the empty string.
-fn is_special_column(c: &str) -> bool {
+fn is_special_column(c: &[u8]) -> bool {
     if c.is_empty() {
         // This is a _msg column.
         return true;
     }
-    if !c.starts_with('_') {
+    if !c.starts_with(b"_") {
         return false;
     }
-    c == "_time" || c == "_stream" || c == "_stream_id"
+    c == b"_time" || c == b"_stream" || c == b"_stream_id"
 }
 
 /// PORT NOTE: reimplemented locally (Go's `areSameFieldsInRows` lives in
@@ -2334,9 +2339,9 @@ fn are_same_fields_in_rows(rows: &[Vec<Field>]) -> bool {
         return true;
     }
     let fields = &rows[0];
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
     for f in fields {
-        if !seen.insert(f.name.as_str()) {
+        if !seen.insert(f.name.as_slice()) {
             return false;
         }
     }
@@ -2420,7 +2425,7 @@ fn _keep_surface_alive() {
     let _ = ResultColumn::reset;
     let _ = ResultColumn::reset_values;
     let _ = ResultColumn::add_value;
-    let _ = append_result_column_with_name;
+    let _ = append_result_column_with_name::<&str>;
     let _ = try_parse_bucket_size;
     let _ = vencoding::marshal_uint64 as fn(&mut Vec<u8>, u64);
     let _ = prefixfilter::match_all::<String>;
@@ -2762,7 +2767,7 @@ mod tests {
             for row_idx in 0..rows.len() {
                 let mut fields: Vec<Field> = Vec::new();
                 for &r in &cols {
-                    let name = br.column_name(r).to_string();
+                    let name = br.column_name(r).to_vec();
                     let value = br.column_get_value_at_row(r, row_idx).to_vec();
                     fields.push(Field { name, value });
                 }
