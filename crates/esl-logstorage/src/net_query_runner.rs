@@ -391,7 +391,7 @@ fn get_rows_net(q: &Query, run_net_query: &RunNetQueryFn<'_>) -> Result<Vec<Vec<
                     continue;
                 }
                 let name = c.name.clone();
-                let value = String::from_utf8_lossy(v).into_owned();
+                let value = v.clone();
                 block_size +=
                     (name.len() + value.len()) as i64 + 2 * std::mem::size_of::<String>() as i64;
                 fields.push(Field { name, value });

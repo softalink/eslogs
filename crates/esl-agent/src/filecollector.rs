@@ -848,7 +848,7 @@ pub fn new_processor<S: LogRowsStorage>(
     if !file_field.is_empty() {
         efs.push(Field {
             name: file_field.clone(),
-            value: file_path.to_string(),
+            value: file_path.as_bytes().to_vec(),
         });
         default_stream_fields.push(file_field);
     }
@@ -857,7 +857,7 @@ pub fn new_processor<S: LogRowsStorage>(
     if !hostname_field.is_empty() {
         efs.push(Field {
             name: hostname_field.clone(),
-            value: hostname(),
+            value: hostname().into_bytes(),
         });
         default_stream_fields.push(hostname_field);
     }
@@ -915,16 +915,12 @@ impl<S: LogRowsStorage + 'static> TailProcessor for Processor<S> {
             rename_field(parser.fields_mut(), &msg_fields, "_msg");
         }
         if !ok {
-            // PORT NOTE: Go aliases the raw line bytes via
-            // bytesutil.ToUnsafeString, so a non-JSON log line containing
-            // invalid UTF-8 is stored verbatim as `_msg`. The Rust `Field`
-            // value is a `String` (crate-wide decision), so each invalid
-            // sequence is U+FFFD-replaced instead: line bytes `b"a\xffb"`
-            // are stored by Go as `a\xffb` and by the port as `a\u{FFFD}b`.
-            // Closing this would require a String→bytes `Field` refactor.
+            // Go aliases the raw line bytes via bytesutil.ToUnsafeString;
+            // with byte-valued `Field`s the port stores a non-JSON log line
+            // containing invalid UTF-8 verbatim as `_msg`, exactly like Go.
             parser.fields_mut().push(Field {
                 name: "_msg".to_string(),
-                value: String::from_utf8_lossy(line).into_owned(),
+                value: line.to_vec(),
             });
         }
 
@@ -1151,7 +1147,7 @@ mod tests {
     // testLogRowsStorage implements the LogRowsStorage trait.
     #[derive(Default)]
     struct TestLogRowsStorage {
-        log_rows: Mutex<Vec<String>>,
+        log_rows: Mutex<Vec<Vec<u8>>>,
         timestamps: Mutex<Vec<i64>>,
     }
 
@@ -1161,10 +1157,7 @@ mod tests {
             lr.for_each_row(|_, r| {
                 let mut row = Vec::new();
                 marshal_fields_to_json(&mut row, &r.fields);
-                self.log_rows
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8(row).unwrap());
+                self.log_rows.lock().unwrap().push(row);
                 self.timestamps.lock().unwrap().push(r.timestamp);
             });
         }
@@ -1186,7 +1179,8 @@ mod tests {
             }
 
             let expected = results_expected.join("\n");
-            let got = storage.log_rows.lock().unwrap().join("\n");
+            let got = storage.log_rows.lock().unwrap().join(&b'\n');
+            let got = String::from_utf8(got).expect("valid UTF-8 test rows");
             assert_eq!(expected, got, "expected:\n{expected}\ngot:\n{got}");
         };
 
@@ -1231,10 +1225,13 @@ mod tests {
         let mut proc = new_processor(0, "test.log", storage.clone());
         proc.try_add_line(b"a\xffb");
 
-        let got = storage.log_rows.lock().unwrap().join("\n");
+        // The raw 0xFF byte is preserved verbatim, exactly like Go.
+        let got = storage.log_rows.lock().unwrap().join(&b'\n');
         assert_eq!(
-            got, "{\"_msg\":\"a\u{FFFD}b\",\"file\":\"test.log\"}",
-            "unexpected result: {got}"
+            got,
+            b"{\"_msg\":\"a\xffb\",\"file\":\"test.log\"}",
+            "unexpected result: {}",
+            String::from_utf8_lossy(&got)
         );
     }
 

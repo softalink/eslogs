@@ -7,7 +7,6 @@
 //! 255,255})` is deferred to the parser port (its only consumer, `parser.go`);
 //! it is not valid UTF-8 and is unused by the filter logic here.
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -110,7 +109,7 @@ impl FieldFilter for FilterStringRange {
         let ch = match bs.get_column_header(field_name) {
             Some(ch) => clone_column_header(ch),
             None => {
-                if !match_string_range("", &min_value, &max_value) {
+                if !match_string_range(b"", &min_value, &max_value) {
                     bm.reset_bits();
                 }
                 return;
@@ -158,7 +157,7 @@ fn match_timestamp_iso8601_by_string_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_timestamp_iso8601_string(&part_path, &mut bb, v);
-        match_string_range(to_unsafe_string(&bb), min_value, max_value)
+        match_string_range(&bb, min_value, max_value)
     });
 }
 
@@ -177,7 +176,7 @@ fn match_ipv4_by_string_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_ipv4_string(&part_path, &mut bb, v);
-        match_string_range(to_unsafe_string(&bb), min_value, max_value)
+        match_string_range(&bb, min_value, max_value)
     });
 }
 
@@ -196,7 +195,7 @@ fn match_float64_by_string_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_float64_string(&part_path, &mut bb, v);
-        match_string_range(to_unsafe_string(&bb), min_value, max_value)
+        match_string_range(&bb, min_value, max_value)
     });
 }
 
@@ -221,9 +220,7 @@ fn match_string_by_string_range(
     min_value: &str,
     max_value: &str,
 ) {
-    visit_values(bs, ch, bm, |v| {
-        match_string_range(to_unsafe_string(v), min_value, max_value)
-    });
+    visit_values(bs, ch, bm, |v| match_string_range(v, min_value, max_value));
 }
 
 fn match_uint8_by_string_range(
@@ -241,7 +238,7 @@ fn match_uint8_by_string_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint8_string(&part_path, &mut bb, v);
-        match_string_range(to_unsafe_string(&bb), min_value, max_value)
+        match_string_range(&bb, min_value, max_value)
     });
 }
 
@@ -260,7 +257,7 @@ fn match_uint16_by_string_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint16_string(&part_path, &mut bb, v);
-        match_string_range(to_unsafe_string(&bb), min_value, max_value)
+        match_string_range(&bb, min_value, max_value)
     });
 }
 
@@ -279,7 +276,7 @@ fn match_uint32_by_string_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint32_string(&part_path, &mut bb, v);
-        match_string_range(to_unsafe_string(&bb), min_value, max_value)
+        match_string_range(&bb, min_value, max_value)
     });
 }
 
@@ -298,7 +295,7 @@ fn match_uint64_by_string_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint64_string(&part_path, &mut bb, v);
-        match_string_range(to_unsafe_string(&bb), min_value, max_value)
+        match_string_range(&bb, min_value, max_value)
     });
 }
 
@@ -317,16 +314,16 @@ fn match_int64_by_string_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_int64_string(&part_path, &mut bb, v);
-        match_string_range(to_unsafe_string(&bb), min_value, max_value)
+        match_string_range(&bb, min_value, max_value)
     });
 }
 
 /// Port of Go `matchStringRange`.
 ///
-/// PORT NOTE: Go compares plain strings by byte order; Rust's `str` ordering is
-/// also byte-wise (`str::cmp` compares `as_bytes()`), so `>=`/`<` match exactly.
-pub(crate) fn match_string_range(s: &str, min_value: &str, max_value: &str) -> bool {
-    s >= min_value && s < max_value
+/// PORT NOTE: Go compares plain strings by byte order; `&[u8]` `Ord` is the
+/// same byte-wise lexicographic order, so `>=`/`<` match exactly.
+pub(crate) fn match_string_range(s: &[u8], min_value: &str, max_value: &str) -> bool {
+    s >= min_value.as_bytes() && s < max_value.as_bytes()
 }
 
 #[cfg(test)]
@@ -335,13 +332,13 @@ mod tests {
 
     #[test]
     fn test_match_string_range() {
-        assert!(match_string_range("abc", "abc", "abd"));
-        assert!(!match_string_range("abd", "abc", "abd")); // max excluded
-        assert!(!match_string_range("abb", "abc", "abd"));
-        assert!(match_string_range("10", "0", "9a"));
-        assert!(!match_string_range("", "a", "z"));
+        assert!(match_string_range(b"abc", "abc", "abd"));
+        assert!(!match_string_range(b"abd", "abc", "abd")); // max excluded
+        assert!(!match_string_range(b"abb", "abc", "abd"));
+        assert!(match_string_range(b"10", "0", "9a"));
+        assert!(!match_string_range(b"", "a", "z"));
         // included min, excluded max
-        assert!(match_string_range("a", "a", "b"));
-        assert!(!match_string_range("b", "a", "b"));
+        assert!(match_string_range(b"a", "a", "b"));
+        assert!(!match_string_range(b"b", "a", "b"));
     }
 }

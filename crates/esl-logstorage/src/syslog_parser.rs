@@ -3,8 +3,8 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
+use esl_common::fasttime;
 use esl_common::tzdata::Location;
-use esl_common::{bytesutil, fasttime};
 
 use crate::json_parser::{JSONParser, get_json_parser, put_json_parser};
 use crate::logfmt_parser::LogfmtParser;
@@ -152,10 +152,10 @@ impl SyslogParser {
     }
 
     /// Adds name=value log field to p.fields.
-    pub fn add_field(&mut self, name: &str, value: &str) {
+    pub fn add_field(&mut self, name: &str, value: impl AsRef<[u8]>) {
         self.fields.push(Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_ref().to_vec(),
         });
     }
 
@@ -204,11 +204,11 @@ impl SyslogParser {
 
         let mut buf = Vec::new();
         marshal_uint64_string(&mut buf, facility);
-        self.add_field("facility", bytesutil::to_unsafe_string(&buf));
+        self.add_field("facility", &buf);
 
         buf.clear();
         marshal_uint64_string(&mut buf, severity);
-        self.add_field("severity", bytesutil::to_unsafe_string(&buf));
+        self.add_field("severity", &buf);
 
         self.parse_no_header(s);
     }
@@ -543,7 +543,7 @@ impl SyslogParser {
                 Some(n) => n,
                 None => return false,
             };
-            self.add_field(name, &unescape_cef_value(&s[..n]));
+            self.add_field(name, unescape_cef_value(&s[..n]).as_bytes());
             s = &s[n + 1..];
         }
 
@@ -578,7 +578,7 @@ impl SyslogParser {
                 Some(n) => n,
                 None => return false,
             };
-            self.add_field(&key_name, &unescape_cef_value(&s[..n]));
+            self.add_field(&key_name, unescape_cef_value(&s[..n]).as_bytes());
             s = &s[n + 1..];
         }
     }
@@ -618,7 +618,7 @@ impl SyslogParser {
         }
         let mut buf = Vec::new();
         marshal_timestamp_rfc3339_nano_string(&mut buf, unix * 1_000_000_000);
-        self.add_field("timestamp", bytesutil::to_unsafe_string(&buf));
+        self.add_field("timestamp", &buf);
         true
     }
 
@@ -630,7 +630,7 @@ impl SyslogParser {
 
         let mut buf = Vec::new();
         marshal_timestamp_rfc3339_nano_string(&mut buf, nsecs);
-        self.add_field("timestamp", bytesutil::to_unsafe_string(&buf));
+        self.add_field("timestamp", &buf);
         true
     }
 }
@@ -829,6 +829,7 @@ fn prev_backslashes_count(b: &[u8], offset: usize) -> usize {
 mod tests {
     use super::*;
     use crate::rows::marshal_fields_to_logfmt;
+    use esl_common::bytesutil;
 
     #[cfg(unix)]
     #[test]
@@ -838,7 +839,7 @@ mod tests {
             return;
         };
         let loc = Arc::new(loc);
-        let ts_of = |line: &str| -> String {
+        let ts_of = |line: &str| -> Vec<u8> {
             // 2021 is in the past, so the "adjust to previous year" branch does
             // not fire (fasttime::unix_timestamp() is later).
             let mut p = get_syslog_parser_with_location(2021, Arc::clone(&loc));
@@ -854,12 +855,12 @@ mod tests {
         };
         // Summer -> EDT (UTC-4): 12:00 New York == 16:00 UTC.
         assert!(
-            ts_of("Jul 15 12:00:00 host app: msg").starts_with("2021-07-15T16:00:00"),
+            ts_of("Jul 15 12:00:00 host app: msg").starts_with(b"2021-07-15T16:00:00"),
             "EDT offset not applied"
         );
         // Winter -> EST (UTC-5): 12:00 New York == 17:00 UTC.
         assert!(
-            ts_of("Jan 15 12:00:00 host app: msg").starts_with("2021-01-15T17:00:00"),
+            ts_of("Jan 15 12:00:00 host app: msg").starts_with(b"2021-01-15T17:00:00"),
             "EST offset not applied"
         );
     }

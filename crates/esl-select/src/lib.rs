@@ -256,11 +256,11 @@ mod tests {
             let mut fields = vec![
                 Field {
                     name: "_msg".to_string(),
-                    value: msg.to_string(),
+                    value: msg.as_bytes().to_vec(),
                 },
                 Field {
                     name: "host".to_string(),
-                    value: "node-1".to_string(),
+                    value: b"node-1".to_vec(),
                 },
             ];
             lr.must_add(tenant, base + i as i64, &mut fields, -1);

@@ -6,7 +6,6 @@
 
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -163,7 +162,7 @@ pub(crate) fn match_timestamp_iso8601_by_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_timestamp_iso8601_string(&part_path, &mut buf, v);
-        match_prefix(to_unsafe_string(&buf), prefix)
+        match_prefix(&buf, prefix)
     });
 }
 
@@ -185,7 +184,7 @@ pub(crate) fn match_ipv4_by_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_ipv4_string(&part_path, &mut buf, v);
-        match_prefix(to_unsafe_string(&buf), prefix)
+        match_prefix(&buf, prefix)
     });
 }
 
@@ -218,7 +217,7 @@ pub(crate) fn match_float64_by_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_float64_string(&part_path, &mut buf, v);
-        match_prefix(to_unsafe_string(&buf), prefix)
+        match_prefix(&buf, prefix)
     });
 }
 
@@ -246,7 +245,7 @@ pub(crate) fn match_string_by_prefix(
         bm.reset_bits();
         return;
     }
-    visit_values(bs, ch, bm, |v| match_prefix(to_unsafe_string(v), prefix));
+    visit_values(bs, ch, bm, |v| match_prefix(v, prefix));
 }
 
 pub(crate) fn match_uint8_by_prefix(
@@ -274,7 +273,7 @@ pub(crate) fn match_uint8_by_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint8_string(&part_path, &mut buf, v);
-        match_prefix(to_unsafe_string(&buf), prefix)
+        match_prefix(&buf, prefix)
     });
 }
 
@@ -303,7 +302,7 @@ pub(crate) fn match_uint16_by_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint16_string(&part_path, &mut buf, v);
-        match_prefix(to_unsafe_string(&buf), prefix)
+        match_prefix(&buf, prefix)
     });
 }
 
@@ -332,7 +331,7 @@ pub(crate) fn match_uint32_by_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint32_string(&part_path, &mut buf, v);
-        match_prefix(to_unsafe_string(&buf), prefix)
+        match_prefix(&buf, prefix)
     });
 }
 
@@ -361,7 +360,7 @@ pub(crate) fn match_uint64_by_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint64_string(&part_path, &mut buf, v);
-        match_prefix(to_unsafe_string(&buf), prefix)
+        match_prefix(&buf, prefix)
     });
 }
 
@@ -392,17 +391,19 @@ pub(crate) fn match_int64_by_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_int64_string(&part_path, &mut buf, v);
-        match_prefix(to_unsafe_string(&buf), prefix)
+        match_prefix(&buf, prefix)
     });
 }
 
 /// Port of Go `matchPrefix`.
-pub(crate) fn match_prefix(s: &str, prefix: &str) -> bool {
+///
+/// The haystack `s` is raw value bytes (Go strings are arbitrary bytes).
+pub(crate) fn match_prefix(s: &[u8], prefix: &str) -> bool {
     if prefix.is_empty() {
         // Special case - empty prefix matches any non-empty string.
         return !s.is_empty();
     }
-    let sb = s.as_bytes();
+    let sb = s;
     let pb = prefix.as_bytes();
     if pb.len() > sb.len() {
         return false;
@@ -509,7 +510,7 @@ mod tests {
     #[test]
     fn test_match_prefix() {
         fn f(s: &str, prefix: &str, result_expected: bool) {
-            let result = match_prefix(s, prefix);
+            let result = match_prefix(s.as_bytes(), prefix);
             assert_eq!(result, result_expected, "s={s:?} prefix={prefix:?}");
         }
 

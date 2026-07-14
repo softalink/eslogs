@@ -212,7 +212,7 @@ mod tests {
     fn f(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -439,7 +439,7 @@ mod tests {
             for r in 0..n {
                 let mut row = Vec::with_capacity(names.len());
                 for (j, name) in names.iter().enumerate() {
-                    let v = String::from_utf8_lossy(&colvals[j][r]).into_owned();
+                    let v = colvals[j][r].clone();
                     row.push(Field {
                         name: name.clone(),
                         value: v,

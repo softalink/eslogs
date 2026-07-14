@@ -1182,11 +1182,11 @@ mod tests {
             let mut fields = vec![
                 Field {
                     name: "_msg".to_string(),
-                    value: msg.to_string(),
+                    value: msg.as_bytes().to_vec(),
                 },
                 Field {
                     name: "host".to_string(),
-                    value: "node-1".to_string(),
+                    value: b"node-1".to_vec(),
                 },
             ];
             lr.must_add(tenant, base + i as i64, &mut fields, -1);
@@ -1317,36 +1317,54 @@ mod tests {
             let vhs = client
                 .get_field_names(&qs, &tenants, &q, false, "")
                 .expect("get_field_names failed");
-            let names: Vec<&str> = vhs.iter().map(|vh| vh.value.as_str()).collect();
-            assert!(names.contains(&"_msg"), "field names: {names:?}");
-            assert!(names.contains(&"host"), "field names: {names:?}");
+            let names: Vec<&[u8]> = vhs.iter().map(|vh| vh.value.as_slice()).collect();
+            assert!(
+                names.contains(&b"_msg".as_slice()),
+                "field names: {names:?}"
+            );
+            assert!(
+                names.contains(&b"host".as_slice()),
+                "field names: {names:?}"
+            );
 
             let vhs = client
                 .get_field_values(&qs, &tenants, &q, false, "host", "", 10)
                 .expect("get_field_values failed");
             assert_eq!(vhs.len(), 1, "host values: {vhs:?}");
-            assert_eq!((vhs[0].value.as_str(), vhs[0].hits), ("node-1", 5));
+            assert_eq!(
+                (vhs[0].value.as_slice(), vhs[0].hits),
+                (b"node-1".as_slice(), 5)
+            );
 
             let vhs = client
                 .get_stream_field_names(&qs, &tenants, &q, false, "")
                 .expect("get_stream_field_names failed");
             assert_eq!(vhs.len(), 1, "stream field names: {vhs:?}");
-            assert_eq!((vhs[0].value.as_str(), vhs[0].hits), ("host", 5));
+            assert_eq!(
+                (vhs[0].value.as_slice(), vhs[0].hits),
+                (b"host".as_slice(), 5)
+            );
 
             let vhs = client
                 .get_stream_field_values(&qs, &tenants, &q, false, "host", "", 10)
                 .expect("get_stream_field_values failed");
             assert_eq!(vhs.len(), 1, "stream field values: {vhs:?}");
-            assert_eq!((vhs[0].value.as_str(), vhs[0].hits), ("node-1", 5));
+            assert_eq!(
+                (vhs[0].value.as_slice(), vhs[0].hits),
+                (b"node-1".as_slice(), 5)
+            );
 
             let vhs = client
                 .get_streams(&qs, &tenants, &q, false, 10)
                 .expect("get_streams failed");
             assert_eq!(vhs.len(), 1, "streams: {vhs:?}");
             assert!(
-                vhs[0].value.contains("host=\"node-1\""),
+                vhs[0]
+                    .value
+                    .windows(b"host=\"node-1\"".len())
+                    .any(|w| w == b"host=\"node-1\""),
                 "stream: {}",
-                vhs[0].value
+                String::from_utf8_lossy(&vhs[0].value)
             );
             assert_eq!(vhs[0].hits, 5);
 

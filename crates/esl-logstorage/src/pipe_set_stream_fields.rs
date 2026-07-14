@@ -186,18 +186,16 @@ impl PipeProcessor for PipeSetStreamFieldsProcessor {
         for row_idx in 0..rows_len {
             let (stream, stream_id) = if !has_iff || shard.bm.is_set_bit(row_idx) {
                 let stream = set_log_stream_fields(&matching, br, row_idx, &mut shard.tags);
-                (stream, String::new())
+                (stream, Vec::new())
             } else {
-                let stream = br
-                    .column_get_value_at_row(stream_column, row_idx)
-                    .to_string();
+                let stream = br.column_get_value_at_row(stream_column, row_idx).to_vec();
                 let stream_id = br
                     .column_get_value_at_row(stream_id_column, row_idx)
-                    .to_string();
+                    .to_vec();
                 (stream, stream_id)
             };
-            shard.rcs[0].add_value(stream.as_bytes());
-            shard.rcs[1].add_value(stream_id.as_bytes());
+            shard.rcs[0].add_value(&stream);
+            shard.rcs[1].add_value(&stream_id);
         }
 
         let rc0 = std::mem::take(&mut shard.rcs[0]);
@@ -226,7 +224,7 @@ fn set_log_stream_fields(
     br: &mut BlockResult,
     row_idx: usize,
     tags: &mut Vec<Field>,
-) -> String {
+) -> Vec<u8> {
     tags.clear();
     for (c, name) in matching {
         let v = br.column_get_value_at_row(*c, row_idx);
@@ -240,7 +238,7 @@ fn set_log_stream_fields(
         };
         tags.push(Field {
             name: tag_name.to_string(),
-            value: v.to_string(),
+            value: v.to_vec(),
         });
     }
 
@@ -262,7 +260,7 @@ fn set_log_stream_fields(
     st.marshal_string(&mut buf);
     put_stream_tags(st);
 
-    String::from_utf8_lossy(&buf).into_owned()
+    buf
 }
 
 #[cfg(test)]

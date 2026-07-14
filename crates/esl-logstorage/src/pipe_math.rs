@@ -428,7 +428,12 @@ fn load_arg_values_from_column(br: &mut BlockResult, c: ColRef, rows_len: usize)
     let mut prev: Option<&[u8]> = None;
     for v in values {
         if prev != Some(v.as_slice()) {
-            f = parse_math_number(&String::from_utf8_lossy(v));
+            // Checked UTF-8 view: a non-UTF-8 value cannot be a valid number,
+            // so it fails the parse (NaN) exactly like in Go.
+            f = match std::str::from_utf8(v) {
+                Ok(s) => parse_math_number(s),
+                Err(_) => NAN,
+            };
         }
         dst.push(f);
         prev = Some(v.as_slice());
@@ -636,6 +641,12 @@ pub(crate) fn parse_math_number(s: &str) -> f64 {
     NAN
 }
 
+/// Byte-native variant of [`try_parse_number`]: a non-UTF-8 value cannot be
+/// a valid number, so it fails the parse exactly like in Go.
+pub(crate) fn try_parse_number_bytes(s: &[u8]) -> Option<f64> {
+    std::str::from_utf8(s).ok().and_then(try_parse_number)
+}
+
 /// Port of Go's `tryParseNumber` (block_result.go).
 pub(crate) fn try_parse_number(s: &str) -> Option<f64> {
     if s.is_empty() {
@@ -749,7 +760,7 @@ mod tests {
             for r in 0..n {
                 let mut row = Vec::with_capacity(cols.len());
                 for (i, &c) in cols.iter().enumerate() {
-                    let v = br.column_get_value_at_row(c, r).to_string();
+                    let v = String::from_utf8(br.column_get_value_at_row(c, r).to_vec()).unwrap();
                     row.push((names[i].clone(), v));
                 }
                 out.push(row);
@@ -763,7 +774,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 

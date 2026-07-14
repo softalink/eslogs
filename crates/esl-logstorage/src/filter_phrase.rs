@@ -8,7 +8,6 @@
 
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -173,7 +172,7 @@ pub(crate) fn match_timestamp_iso8601_by_phrase(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_timestamp_iso8601_string(&part_path, &mut buf, v);
-        match_phrase(to_unsafe_string(&buf), phrase)
+        match_phrase(&buf, phrase)
     });
 }
 
@@ -197,7 +196,7 @@ pub(crate) fn match_ipv4_by_phrase(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_ipv4_string(&part_path, &mut buf, v);
-        match_phrase(to_unsafe_string(&buf), phrase)
+        match_phrase(&buf, phrase)
     });
 }
 
@@ -228,7 +227,7 @@ pub(crate) fn match_float64_by_phrase(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_float64_string(&part_path, &mut buf, v);
-        match_phrase(to_unsafe_string(&buf), phrase)
+        match_phrase(&buf, phrase)
     });
 }
 
@@ -256,7 +255,7 @@ pub(crate) fn match_string_by_phrase(
         bm.reset_bits();
         return;
     }
-    visit_values(bs, ch, bm, |v| match_phrase(to_unsafe_string(v), phrase));
+    visit_values(bs, ch, bm, |v| match_phrase(v, phrase));
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +263,9 @@ pub(crate) fn match_string_by_phrase(
 // ---------------------------------------------------------------------------
 
 /// Port of Go `matchPhrase`.
-pub(crate) fn match_phrase(s: &str, phrase: &str) -> bool {
+///
+/// The haystack `s` is raw value bytes (Go strings are arbitrary bytes).
+pub(crate) fn match_phrase(s: &[u8], phrase: &str) -> bool {
     if phrase.is_empty() {
         // Special case - empty phrase matches only empty string.
         return s.is_empty();
@@ -274,11 +275,11 @@ pub(crate) fn match_phrase(s: &str, phrase: &str) -> bool {
 
 /// Port of Go `getPhrasePos`: returns the byte offset of the phrase within `s`
 /// with token boundaries respected, or `None` if the phrase is not found.
-pub(crate) fn get_phrase_pos(s: &str, phrase: &str) -> Option<usize> {
+pub(crate) fn get_phrase_pos(s: &[u8], phrase: &str) -> Option<usize> {
     if phrase.is_empty() {
         return Some(0);
     }
-    let sb = s.as_bytes();
+    let sb = s;
     let pb = phrase.as_bytes();
     if pb.len() > sb.len() {
         return None;
@@ -442,7 +443,7 @@ pub(crate) fn apply_to_block_result_generic<F>(
     phrase: &str,
     match_func: F,
 ) where
-    F: Fn(&str, &str) -> bool,
+    F: Fn(&[u8], &str) -> bool,
 {
     let r = br.get_column_by_name(field_name);
     if br.column_is_const(r) {
@@ -503,10 +504,10 @@ pub(crate) fn match_column_by_generic<F>(
     phrase: &str,
     match_func: &F,
 ) where
-    F: Fn(&str, &str) -> bool,
+    F: Fn(&[u8], &str) -> bool,
 {
     let values = br.column_get_values(r);
-    bm.for_each_set_bit(|idx| match_func(to_unsafe_string(&values[idx]), phrase));
+    bm.for_each_set_bit(|idx| match_func(&values[idx], phrase));
 }
 
 #[cfg(test)]
@@ -516,7 +517,7 @@ mod tests {
     #[test]
     fn test_match_phrase() {
         fn f(s: &str, phrase: &str, result_expected: bool) {
-            let result = match_phrase(s, phrase);
+            let result = match_phrase(s.as_bytes(), phrase);
             assert_eq!(result, result_expected, "s={s:?} phrase={phrase:?}");
         }
 

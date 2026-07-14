@@ -42,7 +42,7 @@ impl RunningStatsFirst {
 /// Port of `runningStatsFirstProcessor`.
 #[derive(Default)]
 pub(crate) struct RunningStatsFirstProcessor {
-    value: String,
+    value: Vec<u8>,
     rows_seen: usize,
 }
 
@@ -59,7 +59,7 @@ impl RunningStatsFirstProcessor {
         self.rows_seen += 1;
     }
 
-    pub(crate) fn get_running_stats(&self) -> String {
+    pub(crate) fn get_running_stats(&self) -> Vec<u8> {
         self.value.clone()
     }
 }
@@ -95,7 +95,7 @@ impl crate::pipe_running_stats::RunningStatsProcessor for RunningStatsFirstProce
         self.update_running_stats(sf, row)
     }
 
-    fn get_running_stats(&self) -> String {
+    fn get_running_stats(&self) -> Vec<u8> {
         self.get_running_stats()
     }
 }
@@ -107,7 +107,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -117,7 +117,7 @@ mod tests {
         let mut sp = sf.new_running_stats_processor();
         sp.update_running_stats(&sf, &[field("a", "one")]);
         sp.update_running_stats(&sf, &[field("a", "two")]);
-        assert_eq!(sp.get_running_stats(), "one");
+        assert_eq!(sp.get_running_stats(), b"one");
     }
 
     #[test]
@@ -128,7 +128,7 @@ mod tests {
             sp.update_running_stats(&sf, &[field("a", v)]);
         }
         // offset 2 -> the 3rd row (index 2)
-        assert_eq!(sp.get_running_stats(), "r2");
+        assert_eq!(sp.get_running_stats(), b"r2");
     }
 
     #[test]

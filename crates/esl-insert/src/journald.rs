@@ -17,7 +17,6 @@
 //! (same bounded-concurrency effect as Go wrapping the raw body then
 //! decompressing), matching the jsonline/elasticsearch siblings.
 
-use std::borrow::Cow;
 use std::io::Read;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Instant;
@@ -332,7 +331,7 @@ fn read_journald_log_entry(
                 if !remote_ip.is_empty() {
                     fb.fields.push(Field {
                         name: "remote_ip".to_string(),
-                        value: remote_ip.to_string(),
+                        value: remote_ip.as_bytes().to_vec(),
                     });
                 }
                 lmp.add_row(ts, &mut fb.fields, -1);
@@ -412,22 +411,23 @@ fn read_journald_log_entry(
 
         // is_valid_field_name guarantees the name is ASCII `A-Z0-9_`.
         let name = std::str::from_utf8(&fb.name).expect("validated ASCII field name");
-        // PORT NOTE: Go aliases the raw value bytes as a string
-        // (`bytesutil.ToUnsafeString`), so a journald value containing
-        // invalid UTF-8 — possible both for plain `NAME=value` entries and
-        // for binary-encoded values — is stored verbatim. The Rust `Field`
-        // value is a `String` (crate-wide decision), so each invalid
-        // sequence is U+FFFD-replaced instead: value bytes `b"a\xffb"` are
-        // stored by Go as `a\xffb` and by the port as `a\u{FFFD}b`. Closing
-        // this would require a String→bytes `Field` refactor.
-        let value: Cow<'_, str> = if is_binary_value {
-            String::from_utf8_lossy(&fb.value[8..fb.value.len() - 1])
+        // Go aliases the raw value bytes as a string
+        // (`bytesutil.ToUnsafeString`); with byte-valued `Field`s the port
+        // now stores journald values — including binary-encoded ones with
+        // invalid UTF-8 — verbatim, exactly like Go.
+        let value: &[u8] = if is_binary_value {
+            &fb.value[8..fb.value.len() - 1]
         } else {
-            String::from_utf8_lossy(&fb.value)
+            &fb.value
         };
 
         if cp.time_fields.iter().any(|tf| tf == name) {
-            match value.parse::<i64>() {
+            // R3: invalid UTF-8 fails the timestamp parse, matching Go's
+            // parse semantics on arbitrary bytes.
+            let parsed = std::str::from_utf8(value)
+                .map_err(|e| e.to_string())
+                .and_then(|s| s.parse::<i64>().map_err(|e| e.to_string()));
+            match parsed {
                 Ok(t) => {
                     // Convert journald microsecond timestamp to nanoseconds
                     ts = t * 1_000;
@@ -449,33 +449,33 @@ fn read_journald_log_entry(
         };
 
         if name == "PRIORITY" {
-            let priority = journald_priority_to_level(&value);
+            let priority = journald_priority_to_level(value);
             fb.fields.push(Field {
                 name: "level".to_string(),
-                value: priority.to_string(),
+                value: priority.to_vec(),
             });
         }
 
         if !name.starts_with("__") || *JOURNALD_INCLUDE_ENTRY_METADATA.get() {
             let name = name.to_string();
-            let value = value.into_owned();
+            let value = value.to_vec();
             fb.fields.push(Field { name, value });
         }
     }
 }
 
-fn journald_priority_to_level(priority: &str) -> &str {
+fn journald_priority_to_level(priority: &[u8]) -> &[u8] {
     // See https://wiki.archlinux.org/title/Systemd/Journal#Priority_level
     // and https://grafana.com/docs/grafana/latest/explore/logs-integration/#log-level
     match priority {
-        "0" => "emerg",
-        "1" => "alert",
-        "2" => "critical",
-        "3" => "error",
-        "4" => "warning",
-        "5" => "notice",
-        "6" => "info",
-        "7" => "debug",
+        b"0" => b"emerg",
+        b"1" => b"alert",
+        b"2" => b"critical",
+        b"3" => b"error",
+        b"4" => b"warning",
+        b"5" => b"notice",
+        b"6" => b"info",
+        b"7" => b"debug",
         _ => priority,
     }
 }

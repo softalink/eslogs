@@ -50,10 +50,6 @@ use crate::values_encoder::{
 const STATE_SIZE_BUDGET_CHUNK: i64 = 1 << 20;
 const MAX_VALUES_LEN: usize = 1_000_000;
 
-fn bytes_str(b: &[u8]) -> &str {
-    std::str::from_utf8(b).unwrap_or("")
-}
-
 // ---------------------------------------------------------------------------
 // row
 // ---------------------------------------------------------------------------
@@ -61,7 +57,7 @@ fn bytes_str(b: &[u8]) -> &str {
 /// A row tracked by the top-N processor (Go `pipeTopkRow`).
 #[derive(Clone, Default)]
 struct PipeTopkRow {
-    by_columns: Vec<String>,
+    by_columns: Vec<Vec<u8>>,
     by_columns_is_time: Vec<bool>,
     other_columns: Vec<Field>,
     timestamp: i64,
@@ -73,7 +69,7 @@ impl PipeTopkRow {
         for v in &self.by_columns {
             n += v.len();
         }
-        n += self.by_columns.len() * std::mem::size_of::<String>();
+        n += self.by_columns.len() * std::mem::size_of::<Vec<u8>>();
         n += self.by_columns_is_time.len();
         for f in &self.other_columns {
             n += f.name.len() + f.value.len();
@@ -163,10 +159,10 @@ impl PipeTopkProcessor {
             for row in 0..rows_len {
                 let mut bb: Vec<u8> = Vec::new();
                 for (i, cv) in col_values.iter().enumerate() {
-                    marshal_json_key_value(&mut bb, &names[i], bytes_str(&cv[row]));
+                    marshal_json_key_value(&mut bb, &names[i], &cv[row]);
                     bb.push(b',');
                 }
-                let by_columns = vec![String::from_utf8_lossy(&bb).into_owned()];
+                let by_columns = vec![bb];
                 let by_columns_is_time = vec![false];
                 let key = build_partition_key(&part_vals, row);
                 add_row(
@@ -180,7 +176,7 @@ impl PipeTopkProcessor {
                         for (i, name) in names.iter().enumerate() {
                             dst.push(Field {
                                 name: name.clone(),
-                                value: bytes_str(&col_values[i][row]).to_string(),
+                                value: col_values[i][row].clone(),
                             });
                         }
                     },
@@ -252,7 +248,7 @@ impl PipeTopkProcessor {
                         let timestamp = timestamps[row];
                         if let Some(rs) = shard.rows_by_partition.get([].as_slice())
                             && rs.len() as u64 >= max_rows
-                            && !candidate_less(ps, &by_is_time, &[""], timestamp, &rs[0])
+                            && !candidate_less(ps, &by_is_time, &[&b""[..]], timestamp, &rs[0])
                         {
                             // Monotone order: every remaining row loses too.
                             break;
@@ -261,7 +257,7 @@ impl PipeTopkProcessor {
                             shard,
                             ps,
                             Vec::new(),
-                            vec![String::new()],
+                            vec![Vec::new()],
                             by_is_time.clone(),
                             timestamp,
                             &mut |dst| {
@@ -269,7 +265,7 @@ impl PipeTopkProcessor {
                                     let vals = br.column_get_values(*r);
                                     dst.push(Field {
                                         name: name.clone(),
-                                        value: bytes_str(&vals[row]).to_string(),
+                                        value: vals[row].clone(),
                                     });
                                 }
                             },
@@ -285,7 +281,7 @@ impl PipeTopkProcessor {
             // reject path is allocation-free since its rows hold strings
             // referencing the block arena).
             let mut key_buf: Vec<u8> = Vec::new();
-            let mut by_strs: Vec<&str> = Vec::with_capacity(by_fields.len());
+            let mut by_strs: Vec<&[u8]> = Vec::with_capacity(by_fields.len());
             for row in 0..rows_len {
                 let timestamp = if any_time { timestamps[row] } else { 0 };
                 key_buf.clear();
@@ -295,9 +291,9 @@ impl PipeTopkProcessor {
                 by_strs.clear();
                 for (i, is_time) in by_is_time.iter().enumerate() {
                     by_strs.push(if *is_time {
-                        ""
+                        &b""[..]
                     } else {
-                        bytes_str(&by_values[i][row])
+                        &by_values[i][row]
                     });
                 }
                 if let Some(rs) = shard.rows_by_partition.get(key_buf.as_slice())
@@ -310,9 +306,9 @@ impl PipeTopkProcessor {
                 let mut by_columns = Vec::with_capacity(by_fields.len());
                 for (i, is_time) in by_is_time.iter().enumerate() {
                     if *is_time {
-                        by_columns.push(String::new());
+                        by_columns.push(Vec::new());
                     } else {
-                        by_columns.push(bytes_str(&by_values[i][row]).to_string());
+                        by_columns.push(by_values[i][row].clone());
                     }
                 }
                 let key = build_partition_key(&part_vals, row);
@@ -328,7 +324,7 @@ impl PipeTopkProcessor {
                             let vals = br.column_get_values(*r);
                             dst.push(Field {
                                 name: name.clone(),
-                                value: bytes_str(&vals[row]).to_string(),
+                                value: vals[row].clone(),
                             });
                         }
                     },
@@ -351,7 +347,7 @@ fn add_row(
     shard: &mut TopkShard,
     ps: &PipeSort,
     partition_key: Vec<u8>,
-    by_columns: Vec<String>,
+    by_columns: Vec<Vec<u8>>,
     by_columns_is_time: Vec<bool>,
     timestamp: i64,
     fill_other_columns: &mut dyn FnMut(&mut Vec<Field>),
@@ -599,14 +595,14 @@ impl PipeTopkProcessor {
                     marshal_timestamp_rfc3339_nano_string(&mut buf, r.timestamp);
                     buf
                 } else {
-                    r.by_columns[i].clone().into_bytes()
+                    r.by_columns[i].clone()
                 };
                 values_len += v.len();
                 rcs[ci].add_value(&v);
                 ci += 1;
             }
             for c in &r.other_columns {
-                let vb = c.value.as_bytes();
+                let vb = c.value.as_slice();
                 values_len += vb.len();
                 rcs[ci].add_value(vb);
                 ci += 1;
@@ -638,7 +634,7 @@ impl PipeTopkProcessor {
 fn candidate_less(
     ps: &PipeSort,
     by_is_time: &[bool],
-    by_strs: &[&str],
+    by_strs: &[&[u8]],
     timestamp: i64,
     b: &PipeTopkRow,
 ) -> bool {
@@ -665,13 +661,13 @@ fn candidate_less(
 
         // PORT NOTE: mirrors Go (and topk_less), which marshals a.timestamp
         // in both branches.
-        let va: Cow<str> = if is_time_a {
-            Cow::Owned(ts_string(timestamp))
+        let va: Cow<[u8]> = if is_time_a {
+            Cow::Owned(ts_bytes(timestamp))
         } else {
             Cow::Borrowed(by_strs[i])
         };
-        let vb: Cow<str> = if is_time_b {
-            Cow::Owned(ts_string(timestamp))
+        let vb: Cow<[u8]> = if is_time_b {
+            Cow::Owned(ts_bytes(timestamp))
         } else {
             Cow::Borrowed(&b.by_columns[i])
         };
@@ -680,9 +676,9 @@ fn candidate_less(
             continue;
         }
         return if is_desc {
-            less_string(&vb, &va)
+            less_value_bytes(&vb, &va)
         } else {
-            less_string(&va, &vb)
+            less_value_bytes(&va, &vb)
         };
     }
     false
@@ -711,13 +707,13 @@ fn topk_less(ps: &PipeSort, a: &PipeTopkRow, b: &PipeTopkRow) -> bool {
         }
 
         // PORT NOTE: mirrors Go, which marshals a.timestamp in both branches.
-        let va: Cow<str> = if is_time_a {
-            Cow::Owned(ts_string(a.timestamp))
+        let va: Cow<[u8]> = if is_time_a {
+            Cow::Owned(ts_bytes(a.timestamp))
         } else {
             Cow::Borrowed(&a.by_columns[i])
         };
-        let vb: Cow<str> = if is_time_b {
-            Cow::Owned(ts_string(a.timestamp))
+        let vb: Cow<[u8]> = if is_time_b {
+            Cow::Owned(ts_bytes(a.timestamp))
         } else {
             Cow::Borrowed(&b.by_columns[i])
         };
@@ -726,18 +722,30 @@ fn topk_less(ps: &PipeSort, a: &PipeTopkRow, b: &PipeTopkRow) -> bool {
             continue;
         }
         return if is_desc {
-            less_string(&vb, &va)
+            less_value_bytes(&vb, &va)
         } else {
-            less_string(&va, &vb)
+            less_value_bytes(&va, &vb)
         };
     }
     false
 }
 
-fn ts_string(nsecs: i64) -> String {
+fn ts_bytes(nsecs: i64) -> Vec<u8> {
     let mut b = Vec::new();
     marshal_timestamp_rfc3339_nano_string(&mut b, nsecs);
-    String::from_utf8_lossy(&b).into_owned()
+    b
+}
+
+/// Byte-value wrapper around [`less_string`]. Valid-UTF-8 values order exactly
+/// like [`less_string`]; invalid UTF-8 fails every numeric parse (as in Go) and
+/// falls back to plain byte ordering.
+/// PORT NOTE: Go's lessNatural works on raw bytes; the byte fallback for
+/// invalid UTF-8 is the closest byte-faithful behavior.
+fn less_value_bytes(a: &[u8], b: &[u8]) -> bool {
+    match (std::str::from_utf8(a), std::str::from_utf8(b)) {
+        (Ok(a), Ok(b)) => less_string(a, b),
+        _ => a < b,
+    }
 }
 
 /// Go `lessString`.

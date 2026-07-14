@@ -1359,7 +1359,7 @@ mod tests {
                 ],
                 const_columns: vec![Field {
                     name: "foo".to_string(),
-                    value: "bar".to_string(),
+                    value: b"bar".to_vec(),
                 }],
             },
             31,
@@ -1491,7 +1491,7 @@ mod tests {
             ],
             const_columns: vec![Field {
                 name: "foo".to_string(),
-                value: "bar".to_string(),
+                value: b"bar".to_vec(),
             }],
         };
         let mut csh_index = get_columns_header_index();
@@ -1593,7 +1593,7 @@ mod tests {
             ],
             const_columns: vec![Field {
                 name: "foo".to_string(),
-                value: "bar".to_string(),
+                value: b"bar".to_vec(),
             }],
         };
         csh.reset();
@@ -1709,7 +1709,7 @@ mod tests {
             values_size: 254452,
             ..Default::default()
         };
-        ch.values_dict.get_or_add("abc");
+        ch.values_dict.get_or_add(b"abc");
         f(&ch, 11);
     }
 
@@ -1751,7 +1751,7 @@ mod tests {
             bloom_filter_size: 873434,
             ..Default::default()
         };
-        ch.values_dict.get_or_add("abc");
+        ch.values_dict.get_or_add(b"abc");
         ch.reset();
         let ch_zero = ColumnHeader::default();
         assert_eq!(

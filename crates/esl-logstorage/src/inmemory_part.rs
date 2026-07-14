@@ -236,7 +236,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -413,6 +413,54 @@ mod tests {
             (compression_rate - compression_rate_expected).abs()
                 <= (compression_rate + compression_rate_expected).abs() * 0.05,
             "unexpected compression rate; got {compression_rate:.1}; want {compression_rate_expected:.1}"
+        );
+    }
+
+    #[test]
+    fn test_inmemory_part_invalid_utf8_value_roundtrip() {
+        // Field values are raw bytes (Go strings are arbitrary bytes): a
+        // value containing invalid UTF-8 must survive the full block
+        // encode->decode path byte-identically.
+        let fields = vec![
+            Field {
+                name: "_msg".to_string(),
+                value: b"a\xff\xfeb".to_vec(),
+            },
+            Field {
+                name: "other".to_string(),
+                value: b"\x80\x81".to_vec(),
+            },
+        ];
+        let mut lr = LogRowsInternal::default();
+        lr.must_add_row(crate::stream_id::StreamID::default(), 1234, &fields);
+
+        let mut mp = get_inmemory_part();
+        mp.must_init_from_rows(&mut lr);
+
+        let mut sbu = get_strings_block_unmarshaler();
+        let mut vd = get_values_decoder();
+        let lr_result = read_log_rows(&mp, &mut sbu, &mut vd);
+        put_values_decoder(vd);
+        put_strings_block_unmarshaler(sbu);
+        put_inmemory_part(mp);
+
+        assert_eq!(lr_result.rows.len(), 1, "unexpected number of rows");
+        let mut row = lr_result.rows[0].clone();
+        sort_fields_by_name(&mut row);
+        // "_msg" is stored under the canonical empty column name.
+        let expected = vec![
+            Field {
+                name: String::new(),
+                value: b"a\xff\xfeb".to_vec(),
+            },
+            Field {
+                name: "other".to_string(),
+                value: b"\x80\x81".to_vec(),
+            },
+        ];
+        assert_eq!(
+            row, expected,
+            "invalid UTF-8 values must round-trip byte-identically"
         );
     }
 

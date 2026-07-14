@@ -119,7 +119,7 @@ impl ValuesEncoder {
     ///
     /// The encoded values are available via `values()` and dict is valid until
     /// values are changed.
-    pub fn encode(&mut self, values: &[String], dict: &mut ValuesDict) -> (ValueType, u64, u64) {
+    pub fn encode(&mut self, values: &[Vec<u8>], dict: &mut ValuesDict) -> (ValueType, u64, u64) {
         self.reset();
 
         if values.is_empty() {
@@ -153,7 +153,7 @@ impl ValuesEncoder {
         self.values.clear();
         for v in values {
             let start = self.buf.len();
-            self.buf.extend_from_slice(v.as_bytes());
+            self.buf.extend_from_slice(v);
             self.values.push((start, self.buf.len()));
         }
         (ValueType::STRING, 0, 0)
@@ -199,7 +199,7 @@ impl ValuesDecoder {
         &mut self,
         values: &mut [Vec<u8>],
         vt: ValueType,
-        dict_values: &[String],
+        dict_values: &[Vec<u8>],
     ) -> Result<(), String> {
         match vt {
             ValueType::STRING => {
@@ -217,7 +217,7 @@ impl ValuesDecoder {
                             dict_values.len()
                         ));
                     }
-                    let dict_value = dict_values[id].as_bytes();
+                    let dict_value = dict_values[id].as_slice();
                     v.clear();
                     v.extend_from_slice(dict_value);
                 }
@@ -352,13 +352,13 @@ static VALUES_DECODER_POOL: Mutex<Vec<ValuesDecoder>> = Mutex::new(Vec::new());
 fn try_timestamp_iso8601_encoding(
     dst_buf: &mut Vec<u8>,
     dst_values: &mut Vec<(usize, usize)>,
-    src_values: &[String],
+    src_values: &[Vec<u8>],
 ) -> (ValueType, u64, u64) {
     let mut i64s = encoding::get_int64s(src_values.len());
     let mut min_value: i64 = 0;
     let mut max_value: i64 = 0;
     for (i, v) in src_values.iter().enumerate() {
-        let Some(n) = try_parse_timestamp_iso8601(v) else {
+        let Some(n) = try_parse_timestamp_iso8601_bytes(v) else {
             encoding::put_int64s(i64s);
             return (ValueType::UNKNOWN, 0, 0);
         };
@@ -479,6 +479,11 @@ fn try_parse_hhmm(s: &[u8]) -> Option<i64> {
 ///
 /// The returned timestamp can be negative if s is smaller than 1970 year.
 pub fn try_parse_timestamp_iso8601(s: &str) -> Option<i64> {
+    try_parse_timestamp_iso8601_bytes(s.as_bytes())
+}
+
+/// Byte-native core of [`try_parse_timestamp_iso8601`].
+pub fn try_parse_timestamp_iso8601_bytes(s: &[u8]) -> Option<i64> {
     // Do not parse timestamps with timezone, since they cannot be converted back
     // to the same string representation in general case.
     // This may break search.
@@ -486,7 +491,7 @@ pub fn try_parse_timestamp_iso8601(s: &str) -> Option<i64> {
         return None;
     }
 
-    let (secs, tail) = try_parse_timestamp_secs(s.as_bytes())?;
+    let (secs, tail) = try_parse_timestamp_secs(s)?;
     let mut s = tail;
     let mut nsecs = secs * 1_000_000_000;
 
@@ -618,7 +623,12 @@ fn days_from_civil(y: i64, m: i64) -> i64 {
 
 /// Parses s as u64 value.
 pub fn try_parse_uint64(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
+    try_parse_uint64_bytes(s.as_bytes())
+}
+
+/// Byte-native core of [`try_parse_uint64`] (Go strings are arbitrary bytes;
+/// invalid UTF-8 simply fails the parse).
+pub fn try_parse_uint64_bytes(b: &[u8]) -> Option<u64> {
     if b.is_empty() || b.len() > "18_446_744_073_709_551_615".len() {
         return None;
     }
@@ -688,12 +698,17 @@ fn try_parse_date_uint64(s: &[u8]) -> Option<u64> {
 
 /// Parses s as i64 value.
 pub fn try_parse_int64(s: &str) -> Option<i64> {
+    try_parse_int64_bytes(s.as_bytes())
+}
+
+/// Byte-native core of [`try_parse_int64`].
+pub fn try_parse_int64_bytes(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    let is_minus = s.as_bytes()[0] == b'-';
+    let is_minus = s[0] == b'-';
     let s = if is_minus { &s[1..] } else { s };
-    let n = try_parse_uint64(s)?;
+    let n = try_parse_uint64_bytes(s)?;
     if n >= 1 << 63 {
         if is_minus && n == 1 << 63 {
             return Some(i64::MIN);
@@ -707,13 +722,13 @@ pub fn try_parse_int64(s: &str) -> Option<i64> {
 fn try_ipv4_encoding(
     dst_buf: &mut Vec<u8>,
     dst_values: &mut Vec<(usize, usize)>,
-    src_values: &[String],
+    src_values: &[Vec<u8>],
 ) -> (ValueType, u64, u64) {
     let mut u32s = encoding::get_uint32s(src_values.len());
     let mut min_value: u32 = 0;
     let mut max_value: u32 = 0;
     for (i, v) in src_values.iter().enumerate() {
-        let Some(n) = try_parse_ipv4(v) else {
+        let Some(n) = try_parse_ipv4_bytes(v) else {
             encoding::put_uint32s(u32s);
             return (ValueType::UNKNOWN, 0, 0);
         };
@@ -736,7 +751,11 @@ fn try_ipv4_encoding(
 
 /// Tries parsing ipv4 from s.
 pub fn try_parse_ipv4(s: &str) -> Option<u32> {
-    let b = s.as_bytes();
+    try_parse_ipv4_bytes(s.as_bytes())
+}
+
+/// Byte-native core of [`try_parse_ipv4`].
+pub fn try_parse_ipv4_bytes(b: &[u8]) -> Option<u32> {
     if b.len() < "1.1.1.1".len()
         || b.len() > "255.255.255.255".len()
         || b.iter().filter(|&&c| c == b'.').count() != 3
@@ -774,13 +793,13 @@ pub fn try_parse_ipv4(s: &str) -> Option<u32> {
 fn try_float64_encoding(
     dst_buf: &mut Vec<u8>,
     dst_values: &mut Vec<(usize, usize)>,
-    src_values: &[String],
+    src_values: &[Vec<u8>],
 ) -> (ValueType, u64, u64) {
     let mut u64s = encoding::get_uint64s(src_values.len());
     let mut min_value: f64 = 0.0;
     let mut max_value: f64 = 0.0;
     for (i, v) in src_values.iter().enumerate() {
-        let Some(f) = try_parse_float64_exact(v) else {
+        let Some(f) = try_parse_float64_exact_bytes(v) else {
             encoding::put_uint64s(u64s);
             return (ValueType::UNKNOWN, 0, 0);
         };
@@ -822,15 +841,25 @@ pub fn try_parse_float64_prefix(s: &str) -> Option<(f64, &str)> {
 /// when converting back to string.
 /// Use try_parse_float64_exact when lossless parsing is needed.
 pub fn try_parse_float64(s: &str) -> Option<f64> {
+    try_parse_float64_internal(s.as_bytes(), false)
+}
+
+/// Byte-native variant of [`try_parse_float64`].
+pub fn try_parse_float64_bytes(s: &[u8]) -> Option<f64> {
     try_parse_float64_internal(s, false)
 }
 
 /// Tries parsing s as f64.
 pub fn try_parse_float64_exact(s: &str) -> Option<f64> {
+    try_parse_float64_internal(s.as_bytes(), true)
+}
+
+/// Byte-native variant of [`try_parse_float64_exact`].
+pub fn try_parse_float64_exact_bytes(s: &[u8]) -> Option<f64> {
     try_parse_float64_internal(s, true)
 }
 
-fn try_parse_float64_internal(s: &str, is_exact: bool) -> Option<f64> {
+fn try_parse_float64_internal(s: &[u8], is_exact: bool) -> Option<f64> {
     if s.is_empty() || s.len() > "-18_446_744_073_709_551_615".len() {
         return None;
     }
@@ -838,11 +867,11 @@ fn try_parse_float64_internal(s: &str, is_exact: bool) -> Option<f64> {
     // Do not allows scientific notation (for example 1.23E+05),
     // since it cannot be converted back to the same string form.
 
-    let minus = s.as_bytes()[0] == b'-';
+    let minus = s[0] == b'-';
     let s = if minus { &s[1..] } else { s };
-    let Some(n) = s.as_bytes().iter().position(|&c| c == b'.') else {
+    let Some(n) = s.iter().position(|&c| c == b'.') else {
         // fast path - there are no dots
-        let n = try_parse_uint64(s)?;
+        let n = try_parse_uint64_bytes(s)?;
         if is_exact && n >= (1 << 53) {
             // The integer cannot be represented as float64 without precision loss.
             return None;
@@ -858,17 +887,17 @@ fn try_parse_float64_internal(s: &str, is_exact: bool) -> Option<f64> {
     let s_int = &s[..n];
     let s_frac = &s[n + 1..];
 
-    let n_int = try_parse_uint64(s_int)?;
+    let n_int = try_parse_uint64_bytes(s_int)?;
 
     // Skip leading zeroes at s_frac, since try_parse_uint64 rejects them.
     // This fixes https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8464
-    let fb = s_frac.as_bytes();
+    let fb = s_frac;
     let mut n = 0;
     while n < fb.len() - 1 && fb[n] == b'0' {
         n += 1;
     }
 
-    let n_frac = try_parse_uint64(&s_frac[n..])?;
+    let n_frac = try_parse_uint64_bytes(&s_frac[n..])?;
 
     let underscores = fb.iter().filter(|&&c| c == b'_').count() as i64;
     let p10 = pow10(underscores - s_frac.len() as i64);
@@ -1168,13 +1197,13 @@ pub fn sub_int64_no_overflow(a: i64, b: i64) -> i64 {
 fn try_int_encoding(
     dst_buf: &mut Vec<u8>,
     dst_values: &mut Vec<(usize, usize)>,
-    src_values: &[String],
+    src_values: &[Vec<u8>],
 ) -> (ValueType, u64, u64) {
     let mut i64s = encoding::get_int64s(src_values.len());
     let mut min_value: i64 = 0;
     let mut max_value: i64 = 0;
     for (i, v) in src_values.iter().enumerate() {
-        let Some(n) = try_parse_int64(v) else {
+        let Some(n) = try_parse_int64_bytes(v) else {
             encoding::put_int64s(i64s);
             return (ValueType::UNKNOWN, 0, 0);
         };
@@ -1198,13 +1227,13 @@ fn try_int_encoding(
 fn try_uint_encoding(
     dst_buf: &mut Vec<u8>,
     dst_values: &mut Vec<(usize, usize)>,
-    src_values: &[String],
+    src_values: &[Vec<u8>],
 ) -> (ValueType, u64, u64) {
     let mut u64s = encoding::get_uint64s(src_values.len());
     let mut min_value: u64 = 0;
     let mut max_value: u64 = 0;
     for (i, v) in src_values.iter().enumerate() {
-        let Some(n) = try_parse_uint64(v) else {
+        let Some(n) = try_parse_uint64_bytes(v) else {
             encoding::put_uint64s(u64s);
             return (ValueType::UNKNOWN, 0, 0);
         };
@@ -1254,7 +1283,7 @@ fn try_uint_encoding(
 fn try_dict_encoding(
     dst_buf: &mut Vec<u8>,
     dst_values: &mut Vec<(usize, usize)>,
-    src_values: &[String],
+    src_values: &[Vec<u8>],
     dict: &mut ValuesDict,
 ) -> ValueType {
     dict.reset();
@@ -1278,7 +1307,7 @@ fn try_dict_encoding(
 /// ValuesDict is a dictionary for a small number of unique column values.
 #[derive(Debug, Default)]
 pub struct ValuesDict {
-    pub values: Vec<String>,
+    pub values: Vec<Vec<u8>>,
 }
 
 impl ValuesDict {
@@ -1301,7 +1330,7 @@ impl ValuesDict {
     /// Returns the id of k in the dict, adding it when not yet present.
     ///
     /// Returns None when the dict is full or k is too long.
-    pub fn get_or_add(&mut self, k: &str) -> Option<u8> {
+    pub fn get_or_add(&mut self, k: &[u8]) -> Option<u8> {
         if k.len() > MAX_DICT_SIZE_BYTES {
             return None;
         }
@@ -1315,7 +1344,7 @@ impl ValuesDict {
         if self.values.len() >= MAX_DICT_LEN || dict_size_bytes + k.len() > MAX_DICT_SIZE_BYTES {
             return None;
         }
-        self.values.push(k.to_string());
+        self.values.push(k.to_vec());
 
         Some((self.values.len() - 1) as u8)
     }
@@ -1338,9 +1367,7 @@ impl ValuesDict {
     ///
     /// PORT NOTE: Go's `unmarshalInplace` keeps unsafe string views into src
     /// valid until src is changed; the port copies the values into owned
-    /// `String`s (the name is kept for parity). Like
-    /// `bytesutil::to_unsafe_string`, it panics on non-UTF-8 dict values,
-    /// which Go string headers would accept.
+    /// byte vectors (the name is kept for parity).
     pub fn unmarshal_inplace<'a>(&mut self, src: &'a [u8]) -> Result<&'a [u8], String> {
         self.reset();
 
@@ -1358,8 +1385,7 @@ impl ValuesDict {
             }
             src = &src[n_size as usize..];
 
-            let v = esl_common::bytesutil::to_unsafe_string(data.unwrap());
-            self.values.push(v.to_string());
+            self.values.push(data.unwrap().to_vec());
         }
         Ok(src)
     }
@@ -1370,9 +1396,9 @@ impl ValuesDict {
 /// PORT NOTE: Go defines marshalStrings in storage_search.go; it is inlined
 /// here since valuesDict.marshal (part of the on-disk columnsHeader format)
 /// depends on it while storage_search is far from being ported.
-fn marshal_strings(dst: &mut Vec<u8>, a: &[String]) {
+fn marshal_strings(dst: &mut Vec<u8>, a: &[Vec<u8>]) {
     for v in a {
-        encoding::marshal_bytes(dst, v.as_bytes());
+        encoding::marshal_bytes(dst, v);
     }
 }
 
@@ -1572,9 +1598,10 @@ mod tests {
             expected_min_value: u64,
             expected_max_value: u64,
         ) {
+            let byte_values: Vec<Vec<u8>> = values.iter().map(|v| v.as_bytes().to_vec()).collect();
             let mut ve = get_values_encoder();
             let mut dict = ValuesDict::default();
-            let (vt, min_value, max_value) = ve.encode(values, &mut dict);
+            let (vt, min_value, max_value) = ve.encode(&byte_values, &mut dict);
             assert_eq!(
                 vt, expected_value_type,
                 "unexpected value type; got {}; want {}",
@@ -1698,6 +1725,55 @@ mod tests {
             1303184641000000000,
             1303184641008000000,
         );
+    }
+
+    #[test]
+    fn test_values_encoder_invalid_utf8_roundtrip() {
+        // Values with invalid UTF-8 must fail every typed encoding (numeric,
+        // ipv4, timestamp) and fall through to STRING (or DICT), surviving
+        // the encode->decode round trip byte-identically - Go semantics for
+        // arbitrary-byte strings.
+        let values: Vec<Vec<u8>> = (0..MAX_DICT_LEN + 1)
+            .map(|i| {
+                let mut v = format!("value_{i}_").into_bytes();
+                v.extend_from_slice(b"a\xff\xfeb");
+                v
+            })
+            .collect();
+
+        let mut ve = get_values_encoder();
+        let mut dict = ValuesDict::default();
+        let (vt, _, _) = ve.encode(&values, &mut dict);
+        assert_eq!(vt, ValueType::STRING, "expecting STRING value type");
+        let mut encoded_values: Vec<Vec<u8>> = ve.values().map(|v| v.to_vec()).collect();
+        put_values_encoder(ve);
+
+        let mut vd = get_values_decoder();
+        vd.decode_inplace(&mut encoded_values, vt, &dict.values)
+            .expect("unexpected error in decode_inplace()");
+        assert_eq!(
+            encoded_values, values,
+            "invalid UTF-8 values must round-trip byte-identically"
+        );
+        put_values_decoder(vd);
+
+        // The same for a small set of values, which is DICT-encoded.
+        let values: Vec<Vec<u8>> = vec![b"a\xff\xfeb".to_vec(), b"\x80".to_vec()];
+        let mut ve = get_values_encoder();
+        let mut dict = ValuesDict::default();
+        let (vt, _, _) = ve.encode(&values, &mut dict);
+        assert_eq!(vt, ValueType::DICT, "expecting DICT value type");
+        let mut encoded_values: Vec<Vec<u8>> = ve.values().map(|v| v.to_vec()).collect();
+        put_values_encoder(ve);
+
+        let mut vd = get_values_decoder();
+        vd.decode_inplace(&mut encoded_values, vt, &dict.values)
+            .expect("unexpected error in decode_inplace()");
+        assert_eq!(
+            encoded_values, values,
+            "invalid UTF-8 dict values must round-trip byte-identically"
+        );
+        put_values_decoder(vd);
     }
 
     #[test]

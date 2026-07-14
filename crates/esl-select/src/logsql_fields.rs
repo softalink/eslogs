@@ -26,7 +26,7 @@ fn values_with_hits_json(values: &[ValueWithHits]) -> Vec<u8> {
             buf.push(b',');
         }
         buf.extend_from_slice(b"{\"value\":");
-        append_json_string(&mut buf, v.value.as_bytes());
+        append_json_string(&mut buf, &v.value);
         buf.extend_from_slice(b",\"hits\":");
         buf.extend_from_slice(v.hits.to_string().as_bytes());
         buf.push(b'}');
@@ -297,11 +297,11 @@ mod tests {
     fn test_values_with_hits_json_escaping() {
         let json = super::values_with_hits_json(&[
             ValueWithHits {
-                value: "plain".to_string(),
+                value: b"plain".to_vec(),
                 hits: 7,
             },
             ValueWithHits {
-                value: "with \"quotes\"\nand newline".to_string(),
+                value: b"with \"quotes\"\nand newline".to_vec(),
                 hits: 1,
             },
         ]);

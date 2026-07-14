@@ -4,7 +4,6 @@
 
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 use esl_common::stringsutil::append_lowercase;
 
@@ -171,13 +170,11 @@ fn match_string_by_any_case_prefix(
     bm: &mut Bitmap,
     prefix_lowercase: &str,
 ) {
-    visit_values(bs, ch, bm, |v| {
-        match_any_case_prefix(to_unsafe_string(v), prefix_lowercase)
-    });
+    visit_values(bs, ch, bm, |v| match_any_case_prefix(v, prefix_lowercase));
 }
 
 /// Port of Go `matchAnyCasePrefix`.
-fn match_any_case_prefix(s: &str, prefix_lowercase: &str) -> bool {
+fn match_any_case_prefix(s: &[u8], prefix_lowercase: &str) -> bool {
     if prefix_lowercase.is_empty() {
         // Special case - empty prefix matches any non-empty string.
         return !s.is_empty();
@@ -192,9 +189,11 @@ fn match_any_case_prefix(s: &str, prefix_lowercase: &str) -> bool {
     }
 
     // Slow path - convert s to lowercase before matching.
+    // Lossy decode matches Go's rune-wise lowercasing (strings.Map/ToLower):
+    // invalid bytes decode to U+FFFD before the case mapping is applied.
     let mut bb = Vec::new();
-    append_lowercase(&mut bb, s);
-    match_prefix(to_unsafe_string(&bb), prefix_lowercase)
+    append_lowercase(&mut bb, &String::from_utf8_lossy(s));
+    match_prefix(&bb, prefix_lowercase)
 }
 
 #[cfg(test)]
@@ -204,7 +203,7 @@ mod tests {
     #[test]
     fn test_match_any_case_prefix() {
         fn f(s: &str, prefix_lowercase: &str, result_expected: bool) {
-            let result = match_any_case_prefix(s, prefix_lowercase);
+            let result = match_any_case_prefix(s.as_bytes(), prefix_lowercase);
             assert_eq!(
                 result, result_expected,
                 "s={s:?} prefix={prefix_lowercase:?}"

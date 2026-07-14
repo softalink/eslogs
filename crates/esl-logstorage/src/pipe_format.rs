@@ -19,7 +19,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use esl_common::stringsutil::json_string;
+use esl_common::stringsutil::json_string_bytes_append;
 use esl_common::timeutil::try_parse_unix_timestamp;
 
 use crate::bitmap::Bitmap;
@@ -33,7 +33,7 @@ use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{
     marshal_duration_string, marshal_float64_string, marshal_ipv4_string,
     marshal_timestamp_rfc3339_nano_string, marshal_uint64_string, try_parse_duration,
-    try_parse_int64, try_parse_uint64,
+    try_parse_int64_bytes, try_parse_uint64_bytes,
 };
 
 // ---------------------------------------------------------------------------
@@ -259,15 +259,14 @@ impl PipeProcessor for PipeFormatProcessor {
                 if (v.is_empty() && self.skip_empty_results) || self.keep_original_fields {
                     let v_orig = br.column_get_value_at_row(result_column, row_idx);
                     if !v_orig.is_empty() {
-                        v = v_orig.to_string();
+                        v = v_orig.to_vec();
                     }
                 }
                 v
             } else {
-                br.column_get_value_at_row(result_column, row_idx)
-                    .to_string()
+                br.column_get_value_at_row(result_column, row_idx).to_vec()
             };
-            shard.rc.add_value(v.as_bytes());
+            shard.rc.add_value(&v);
         }
 
         let rc = std::mem::take(&mut shard.rc);
@@ -282,7 +281,7 @@ impl PipeProcessor for PipeFormatProcessor {
 }
 
 /// Port of Go `(*pipeFormatProcessorShard).formatRow`.
-fn format_row(steps: &[PatternStep], br: &mut BlockResult, row_idx: usize) -> String {
+fn format_row(steps: &[PatternStep], br: &mut BlockResult, row_idx: usize) -> Vec<u8> {
     let mut b: Vec<u8> = Vec::new();
     for step in steps {
         b.extend_from_slice(step.prefix.as_bytes());
@@ -291,52 +290,55 @@ fn format_row(steps: &[PatternStep], br: &mut BlockResult, row_idx: usize) -> St
         }
 
         let c = br.get_column_by_name(&step.field);
-        let v = br.column_get_value_at_row(c, row_idx).to_string();
+        let v = br.column_get_value_at_row(c, row_idx).to_vec();
         match step.field_opt.as_str() {
             "base64decode" => {
                 if !append_base64_decode(&mut b, &v) {
-                    b.extend_from_slice(v.as_bytes());
+                    b.extend_from_slice(&v);
                 }
             }
             "base64encode" => append_base64_encode(&mut b, &v),
-            "duration" => match try_parse_int64(&v) {
+            "duration" => match try_parse_int64_bytes(&v) {
                 Some(nsecs) => marshal_duration_string(&mut b, nsecs),
-                None => b.extend_from_slice(v.as_bytes()),
+                None => b.extend_from_slice(&v),
             },
-            "duration_seconds" => match try_parse_duration(&v) {
+            "duration_seconds" => match std::str::from_utf8(&v).ok().and_then(try_parse_duration) {
                 Some(nsecs) => {
                     let secs = nsecs as f64 / 1e9;
                     marshal_float64_string(&mut b, secs);
                 }
-                None => b.extend_from_slice(v.as_bytes()),
+                None => b.extend_from_slice(&v),
             },
             "hexdecode" => append_hex_decode(&mut b, &v),
             "hexencode" => append_hex_encode(&mut b, &v),
             "hexnumdecode" => append_hex_uint64_decode(&mut b, &v),
-            "hexnumencode" => match try_parse_uint64(&v) {
+            "hexnumencode" => match try_parse_uint64_bytes(&v) {
                 Some(n) => append_hex_uint64_encode(&mut b, n),
-                None => b.extend_from_slice(v.as_bytes()),
+                None => b.extend_from_slice(&v),
             },
-            "ipv4" => match try_parse_uint64(&v) {
+            "ipv4" => match try_parse_uint64_bytes(&v) {
                 Some(ip_num) if ip_num <= u32::MAX as u64 => {
                     marshal_ipv4_string(&mut b, ip_num as u32);
                 }
-                _ => b.extend_from_slice(v.as_bytes()),
+                _ => b.extend_from_slice(&v),
             },
             "lc" => append_lowercase(&mut b, &v),
-            "time" => match try_parse_unix_timestamp(&v) {
+            "time" => match std::str::from_utf8(&v)
+                .ok()
+                .and_then(try_parse_unix_timestamp)
+            {
                 Some(nsecs) => marshal_timestamp_rfc3339_nano_string(&mut b, nsecs),
-                None => b.extend_from_slice(v.as_bytes()),
+                None => b.extend_from_slice(&v),
             },
-            "q" => b.extend_from_slice(json_string(&v).as_bytes()),
+            "q" => json_string_bytes_append(&mut b, &v),
             "uc" => append_uppercase(&mut b, &v),
             "urldecode" => append_url_decode(&mut b, &v),
             "urlencode" => append_url_encode(&mut b, &v),
-            _ => b.extend_from_slice(v.as_bytes()),
+            _ => b.extend_from_slice(&v),
         }
     }
 
-    String::from_utf8_lossy(&b).into_owned()
+    b
 }
 
 // ---------------------------------------------------------------------------
@@ -517,23 +519,36 @@ fn simple_to_lower(c: char) -> char {
 }
 
 /// Port of Go `appendUppercase` (`unicode.ToUpper` per rune).
-fn append_uppercase(dst: &mut Vec<u8>, s: &str) {
-    for ch in s.chars() {
-        let mut buf = [0u8; 4];
-        dst.extend_from_slice(simple_to_upper(ch).encode_utf8(&mut buf).as_bytes());
+fn append_uppercase(dst: &mut Vec<u8>, s: &[u8]) {
+    // Go ranges over the string's runes: every invalid byte decodes to
+    // U+FFFD. `utf8_chunks` + one U+FFFD per invalid byte reproduces that.
+    for chunk in s.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            let mut buf = [0u8; 4];
+            dst.extend_from_slice(simple_to_upper(ch).encode_utf8(&mut buf).as_bytes());
+        }
+        for _ in chunk.invalid() {
+            dst.extend_from_slice("\u{FFFD}".as_bytes());
+        }
     }
 }
 
 /// Port of Go `appendLowercase` (`unicode.ToLower` per rune).
-fn append_lowercase(dst: &mut Vec<u8>, s: &str) {
-    for ch in s.chars() {
-        let mut buf = [0u8; 4];
-        dst.extend_from_slice(simple_to_lower(ch).encode_utf8(&mut buf).as_bytes());
+fn append_lowercase(dst: &mut Vec<u8>, s: &[u8]) {
+    // See append_uppercase for the Go rune-iteration parity note.
+    for chunk in s.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            let mut buf = [0u8; 4];
+            dst.extend_from_slice(simple_to_lower(ch).encode_utf8(&mut buf).as_bytes());
+        }
+        for _ in chunk.invalid() {
+            dst.extend_from_slice("\u{FFFD}".as_bytes());
+        }
     }
 }
 
-fn append_url_decode(dst: &mut Vec<u8>, s: &str) {
-    let mut s = s.as_bytes();
+fn append_url_decode(dst: &mut Vec<u8>, s: &[u8]) {
+    let mut s = s;
     while !s.is_empty() {
         let Some(n) = s.iter().position(|&c| c == b'%' || c == b'+') else {
             dst.extend_from_slice(s);
@@ -560,8 +575,8 @@ fn append_url_decode(dst: &mut Vec<u8>, s: &str) {
     }
 }
 
-fn append_url_encode(dst: &mut Vec<u8>, s: &str) {
-    for &c in s.as_bytes() {
+fn append_url_encode(dst: &mut Vec<u8>, s: &[u8]) {
+    for &c in s {
         // See http://www.w3.org/TR/html5/forms.html#form-submission-algorithm
         if c.is_ascii_alphanumeric() || c == b'-' || c == b'.' || c == b'_' {
             dst.push(c);
@@ -596,17 +611,17 @@ fn append_hex_uint64_encode(dst: &mut Vec<u8>, n: u64) {
     }
 }
 
-fn append_hex_uint64_decode(dst: &mut Vec<u8>, s: &str) {
+fn append_hex_uint64_decode(dst: &mut Vec<u8>, s: &[u8]) {
     if s.len() > 16 {
-        dst.extend_from_slice(s.as_bytes());
+        dst.extend_from_slice(s);
         return;
     }
     let mut n: u64 = 0;
-    for &c in s.as_bytes() {
+    for &c in s {
         match unhex_char(c) {
             Some(x) => n = (n << 4) | u64::from(x),
             None => {
-                dst.extend_from_slice(s.as_bytes());
+                dst.extend_from_slice(s);
                 return;
             }
         }
@@ -614,15 +629,15 @@ fn append_hex_uint64_decode(dst: &mut Vec<u8>, s: &str) {
     marshal_uint64_string(dst, n);
 }
 
-fn append_hex_encode(dst: &mut Vec<u8>, s: &str) {
-    for &c in s.as_bytes() {
+fn append_hex_encode(dst: &mut Vec<u8>, s: &[u8]) {
+    for &c in s {
         dst.push(hex_char_upper(c >> 4));
         dst.push(hex_char_upper(c & 15));
     }
 }
 
-fn append_hex_decode(dst: &mut Vec<u8>, s: &str) {
-    let mut s = s.as_bytes();
+fn append_hex_decode(dst: &mut Vec<u8>, s: &[u8]) {
+    let mut s = s;
     while s.len() >= 2 {
         match (unhex_char(s[0]), unhex_char(s[1])) {
             (Some(hi), Some(lo)) => dst.push((hi << 4) | lo),
@@ -638,8 +653,8 @@ fn append_hex_decode(dst: &mut Vec<u8>, s: &str) {
 
 const BASE64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn append_base64_encode(dst: &mut Vec<u8>, s: &str) {
-    let b = s.as_bytes();
+fn append_base64_encode(dst: &mut Vec<u8>, s: &[u8]) {
+    let b = s;
     let mut i = 0;
     while i + 3 <= b.len() {
         let n = (u32::from(b[i]) << 16) | (u32::from(b[i + 1]) << 8) | u32::from(b[i + 2]);
@@ -682,8 +697,8 @@ fn base64_val(c: u8) -> Option<u8> {
 /// Decodes standard (padded) base64 `s`, appending the bytes to `dst`. Returns
 /// `false` (leaving `dst` unchanged) on any decode error, mirroring Go's
 /// `StdEncoding.AppendDecode`.
-fn append_base64_decode(dst: &mut Vec<u8>, s: &str) -> bool {
-    let b = s.as_bytes();
+fn append_base64_decode(dst: &mut Vec<u8>, s: &[u8]) -> bool {
+    let b = s;
     if !b.len().is_multiple_of(4) {
         return false;
     }
@@ -735,10 +750,10 @@ mod tests {
     use super::*;
     use crate::pipe_update::test_utils::{assert_rows_eq, rows, run_pipe};
 
-    fn enc(f: impl Fn(&mut Vec<u8>, &str)) -> impl Fn(&str) -> String {
+    fn enc(f: impl Fn(&mut Vec<u8>, &[u8])) -> impl Fn(&str) -> String {
         move |s| {
             let mut b = Vec::new();
-            f(&mut b, s);
+            f(&mut b, s.as_bytes());
             String::from_utf8(b).unwrap()
         }
     }

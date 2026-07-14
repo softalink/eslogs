@@ -64,10 +64,10 @@ use crate::values_encoder::{
     marshal_int64_string, marshal_ipv4_string, marshal_timestamp_iso8601_string,
     marshal_timestamp_rfc3339_nano_string, marshal_uint8_string, marshal_uint16_string,
     marshal_uint32_string, marshal_uint64_string, try_parse_bytes, try_parse_duration,
-    try_parse_float64, try_parse_int64, try_parse_ipv4, try_parse_ipv4_mask,
-    try_parse_timestamp_rfc3339_nano, unmarshal_float64, unmarshal_int64, unmarshal_ipv4,
-    unmarshal_timestamp_iso8601, unmarshal_uint8, unmarshal_uint16, unmarshal_uint32,
-    unmarshal_uint64,
+    try_parse_float64, try_parse_float64_bytes, try_parse_int64, try_parse_ipv4,
+    try_parse_ipv4_mask, try_parse_timestamp_rfc3339_nano, unmarshal_float64, unmarshal_int64,
+    unmarshal_ipv4, unmarshal_timestamp_iso8601, unmarshal_uint8, unmarshal_uint16,
+    unmarshal_uint32, unmarshal_uint64,
 };
 
 /// `time.RFC3339Nano` length, used by `sumLenValues` for the `_time` column.
@@ -292,10 +292,7 @@ impl BlockResult {
             let fields = &rows[0];
             for (i, f0) in fields.iter().enumerate() {
                 let name = f0.name.clone();
-                let values: Vec<Vec<u8>> = rows
-                    .iter()
-                    .map(|row| row[i].value.as_bytes().to_vec())
-                    .collect();
+                let values: Vec<Vec<u8>> = rows.iter().map(|row| row[i].value.clone()).collect();
                 self.add_result_column(ResultColumn { name, values });
             }
             return;
@@ -323,7 +320,7 @@ impl BlockResult {
         for (i, fields) in rows.iter().enumerate() {
             for f in fields {
                 let idx = column_idxs[&f.name];
-                values_per_col[idx][i] = f.value.as_bytes().to_vec();
+                values_per_col[idx][i] = f.value.clone();
             }
         }
 
@@ -547,7 +544,7 @@ impl BlockResult {
         // before the mutating `add_*` calls, which do not touch csh.
         let csh: &ColumnsHeader = unsafe { &*((*bs).get_columns_header() as *const ColumnsHeader) };
 
-        let mut const_to_add: Vec<(String, String)> = Vec::new();
+        let mut const_to_add: Vec<(String, Vec<u8>)> = Vec::new();
         for cc in &csh.const_columns {
             if is_special_column(&cc.name) {
                 // Special columns have been added above.
@@ -584,8 +581,7 @@ impl BlockResult {
         let bs = self.bs_ptr();
         let mut bb: Vec<u8> = Vec::new();
         unsafe { (*bs).block_header().stream_id.marshal_string(&mut bb) };
-        let v = to_unsafe_string(&bb).to_string();
-        self.add_const_column("_stream_id", &v);
+        self.add_const_column("_stream_id", &bb);
     }
 
     /// Adds the `_stream` const column from the block search, returning false
@@ -685,12 +681,12 @@ impl BlockResult {
         });
     }
 
-    /// Adds a const column with the given name and value.
-    pub fn add_const_column(&mut self, name: &str, value: &str) {
+    /// Adds a const column with the given name and value (raw value bytes).
+    pub fn add_const_column(&mut self, name: &str, value: impl AsRef<[u8]>) {
         self.cs_add(BlockResultColumn {
             name: name.to_string(),
             is_const: true,
-            values_encoded: Some(vec![value.as_bytes().to_vec()]),
+            values_encoded: Some(vec![value.as_ref().to_vec()]),
             ..Default::default()
         });
     }
@@ -796,11 +792,13 @@ impl BlockResult {
         let c = self.get_column_by_name("_time");
         let timestamp_values: Vec<Vec<u8>> = self.column_get_values(c).to_vec();
         self.timestamps_buf.clear();
-        let strs: Vec<&str> = timestamp_values
+        // Checked UTF-8 views: a non-UTF-8 value cannot be a valid timestamp,
+        // so it fails the parse exactly like in Go.
+        let strs: Option<Vec<&str>> = timestamp_values
             .iter()
-            .map(|v| to_unsafe_string(v))
+            .map(|v| std::str::from_utf8(v).ok())
             .collect();
-        if let Some(ts) = try_parse_timestamps(&strs) {
+        if let Some(ts) = strs.as_deref().and_then(try_parse_timestamps) {
             self.timestamps_buf = ts;
         } else {
             self.timestamps_buf.clear();
@@ -1353,17 +1351,17 @@ impl BlockResult {
         self.col(r).values.as_deref().unwrap()
     }
 
-    /// Returns the value of the given column at the given row.
-    pub fn column_get_value_at_row(&mut self, r: ColRef, row_idx: usize) -> &str {
+    /// Returns the value of the given column at the given row (raw bytes).
+    pub fn column_get_value_at_row(&mut self, r: ColRef, row_idx: usize) -> &[u8] {
         if self.col(r).is_const {
-            return to_unsafe_string(&self.col(r).values_encoded.as_ref().unwrap()[0]);
+            return &self.col(r).values_encoded.as_ref().unwrap()[0];
         }
         if self.col(r).values.is_some() {
-            return to_unsafe_string(&self.col(r).values.as_ref().unwrap()[row_idx]);
+            return &self.col(r).values.as_ref().unwrap()[row_idx];
         }
         let values = self.new_values_for_column(r);
         self.col_mut(r).values = Some(values);
-        to_unsafe_string(&self.col(r).values.as_ref().unwrap()[row_idx])
+        &self.col(r).values.as_ref().unwrap()[row_idx]
     }
 
     fn new_values_for_column(&mut self, r: ColRef) -> Vec<Vec<u8>> {
@@ -1398,8 +1396,8 @@ impl BlockResult {
         let rows_len = self.rows_len;
         let vb = if self.col(r).is_const {
             let v = self.col(r).values_encoded.as_ref().unwrap()[0].clone();
-            let s = get_bucketed_value(to_unsafe_string(&v), bf);
-            get_const_values(s.as_bytes(), rows_len)
+            let s = get_bucketed_value(&v, bf);
+            get_const_values(&s, rows_len)
         } else if self.col(r).is_time {
             let timestamps = self.get_timestamps().to_vec();
             get_bucketed_timestamp_values(&timestamps, bf)
@@ -1418,7 +1416,7 @@ impl BlockResult {
     pub fn column_get_float_value_at_row(&mut self, r: ColRef, row_idx: usize) -> Option<f64> {
         if self.col(r).is_const {
             let v = self.col(r).values_encoded.as_ref().unwrap()[0].clone();
-            return try_parse_float64(to_unsafe_string(&v));
+            return try_parse_float64_bytes(&v);
         }
         if self.col(r).is_time {
             return None;
@@ -1461,7 +1459,7 @@ impl BlockResult {
         let rows_len = self.rows_len;
         if self.col(r).is_const {
             let v = self.col(r).values_encoded.as_ref().unwrap()[0].clone();
-            return match try_parse_float64(to_unsafe_string(&v)) {
+            return match try_parse_float64_bytes(&v) {
                 Some(f) => (f * rows_len as f64, rows_len),
                 None => (0.0, 0),
             };
@@ -1500,8 +1498,8 @@ pub struct BlockResultColumn {
     min_value: u64,
     /// Maximum encoded value for numeric/ipv4/timestamp columns.
     max_value: u64,
-    /// Dict values for `ValueType::DICT`.
-    dict_values: Vec<String>,
+    /// Dict values for `ValueType::DICT` (raw value bytes).
+    dict_values: Vec<Vec<u8>>,
     /// Encoded values (materialized on demand).
     values_encoded: Option<Vec<Vec<u8>>>,
     /// Decoded values (materialized on demand).
@@ -1579,7 +1577,7 @@ impl BlockResultColumn {
             ValueType::STRING => ve.clone(),
             ValueType::DICT => ve
                 .iter()
-                .map(|v| self.dict_values[v[0] as usize].as_bytes().to_vec())
+                .map(|v| self.dict_values[v[0] as usize].clone())
                 .collect(),
             ValueType::UINT8 => map_encoded(ve, |v| {
                 let mut b = Vec::new();
@@ -1636,12 +1634,7 @@ impl BlockResultColumn {
         match self.value_type {
             ValueType::STRING => get_bucketed_strings(ve, bf),
             ValueType::DICT => {
-                let dict_bytes: Vec<Vec<u8>> = self
-                    .dict_values
-                    .iter()
-                    .map(|s| s.as_bytes().to_vec())
-                    .collect();
-                let dict_bucketed = get_bucketed_strings(&dict_bytes, bf);
+                let dict_bucketed = get_bucketed_strings(&self.dict_values, bf);
                 if are_const_values(&dict_bucketed) {
                     return get_const_values(&dict_bucketed[0], rows_len);
                 }
@@ -1854,10 +1847,10 @@ impl BlockResultColumn {
     fn float_value_at_row(&self, row_idx: usize) -> Option<f64> {
         let ve = self.values_encoded.as_ref().unwrap();
         match self.value_type {
-            ValueType::STRING => try_parse_float64(to_unsafe_string(&ve[row_idx])),
+            ValueType::STRING => try_parse_float64_bytes(&ve[row_idx]),
             ValueType::DICT => {
                 let v = &self.dict_values[ve[row_idx][0] as usize];
-                try_parse_float64(v)
+                try_parse_float64_bytes(v)
             }
             ValueType::UINT8 => Some(unmarshal_uint8(&ve[row_idx]) as f64),
             ValueType::UINT16 => Some(unmarshal_uint16(&ve[row_idx]) as f64),
@@ -1886,7 +1879,7 @@ impl BlockResultColumn {
                 let mut ok = false;
                 for (i, v) in ve.iter().enumerate() {
                     if i == 0 || ve[i - 1] != *v {
-                        match try_parse_number(to_unsafe_string(v)) {
+                        match try_parse_number_bytes(v) {
                             Some(x) => {
                                 f = x;
                                 ok = true;
@@ -1905,7 +1898,7 @@ impl BlockResultColumn {
                 let dict_floats: Vec<f64> = self
                     .dict_values
                     .iter()
-                    .map(|v| try_parse_number(v).unwrap_or(f64::NAN))
+                    .map(|v| try_parse_number_bytes(v).unwrap_or(f64::NAN))
                     .collect();
                 let mut sum = 0.0;
                 let mut count = 0;
@@ -2061,25 +2054,31 @@ fn get_bucketed_timestamp_values(timestamps: &[i64], bf: &ByStatsField) -> Vec<V
 
 fn get_bucketed_strings(values_orig: &[Vec<u8>], bf: &ByStatsField) -> Vec<Vec<u8>> {
     let mut out = Vec::with_capacity(values_orig.len());
-    let mut s = String::new();
+    let mut s = Vec::new();
     for (i, v) in values_orig.iter().enumerate() {
         if i == 0 || values_orig[i - 1] != *v {
-            s = get_bucketed_value(to_unsafe_string(v), bf);
+            s = get_bucketed_value(v, bf);
         }
-        out.push(s.as_bytes().to_vec());
+        out.push(s.clone());
     }
     out
 }
 
 /// Returns `s` bucketed according to `bf`.
-fn get_bucketed_value(s: &str, bf: &ByStatsField) -> String {
+fn get_bucketed_value(s: &[u8], bf: &ByStatsField) -> Vec<u8> {
     if s.is_empty() {
-        return String::new();
+        return Vec::new();
     }
-    let c = s.as_bytes()[0];
+    let c = s[0];
     if !c.is_ascii_digit() && c != b'-' {
-        return s.to_string();
+        return s.to_vec();
     }
+    // A non-UTF-8 value cannot parse as a number/timestamp/ipv4/duration, so
+    // it is returned unchanged - exactly like in Go.
+    let Ok(s_str) = std::str::from_utf8(s) else {
+        return s.to_vec();
+    };
+    let s = s_str;
 
     if let Some(n) = try_parse_int64(s) {
         let mut bucket_size = bf.bucket_size as i64;
@@ -2090,7 +2089,7 @@ fn get_bucketed_value(s: &str, bf: &ByStatsField) -> String {
         let n_truncated = truncate_int64(n, bucket_size, bucket_offset);
         let mut b = Vec::new();
         marshal_int64_string(&mut b, n_truncated);
-        return String::from_utf8(b).unwrap();
+        return b;
     }
 
     if let Some(f) = try_parse_float64(s) {
@@ -2104,7 +2103,7 @@ fn get_bucketed_value(s: &str, bf: &ByStatsField) -> String {
         let f = truncate_float64(f, p10, bucket_size_p10, bf.bucket_offset);
         let mut b = Vec::new();
         marshal_float64_string(&mut b, f);
-        return String::from_utf8(b).unwrap();
+        return b;
     }
 
     if let Some(timestamp) = try_parse_timestamp_rfc3339_nano(s) {
@@ -2116,7 +2115,7 @@ fn get_bucketed_value(s: &str, bf: &ByStatsField) -> String {
         let tt = truncate_timestamp(timestamp, bucket_size, bucket_offset, &bf.bucket_size_str);
         let mut b = Vec::new();
         marshal_timestamp_rfc3339_nano_string(&mut b, tt);
-        return String::from_utf8(b).unwrap();
+        return b;
     }
 
     if let Some(n) = try_parse_ipv4(s) {
@@ -2128,7 +2127,7 @@ fn get_bucketed_value(s: &str, bf: &ByStatsField) -> String {
         let n = truncate_uint32(n, bucket_size, bucket_offset);
         let mut b = Vec::new();
         marshal_ipv4_string(&mut b, n);
-        return String::from_utf8(b).unwrap();
+        return b;
     }
 
     if let Some(nsecs) = try_parse_duration(s) {
@@ -2140,10 +2139,10 @@ fn get_bucketed_value(s: &str, bf: &ByStatsField) -> String {
         let nsecs = truncate_int64(nsecs, bucket_size, bucket_offset);
         let mut b = Vec::new();
         marshal_duration_string(&mut b, nsecs);
-        return String::from_utf8(b).unwrap();
+        return b;
     }
 
-    s.to_string()
+    s.as_bytes().to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -2359,7 +2358,7 @@ fn has_wildcard_filters(column_filters: &[String]) -> bool {
 }
 
 // Go `tryParseNumber` (block_result.go): shared port lives in `pipe_math.rs`.
-use crate::pipe_math::try_parse_number;
+use crate::pipe_math::try_parse_number_bytes;
 
 /// PORT NOTE: minimal port of `tryParseBucketSize` (pipe_stats.go); only the
 /// named units used by `truncate_timestamp` tests plus the numeric/duration/
@@ -2764,7 +2763,7 @@ mod tests {
                 let mut fields: Vec<Field> = Vec::new();
                 for &r in &cols {
                     let name = br.column_name(r).to_string();
-                    let value = br.column_get_value_at_row(r, row_idx).to_string();
+                    let value = br.column_get_value_at_row(r, row_idx).to_vec();
                     fields.push(Field { name, value });
                 }
                 let mut buf = Vec::new();

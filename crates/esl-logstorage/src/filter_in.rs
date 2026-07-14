@@ -5,7 +5,6 @@
 
 use std::collections::HashSet;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -59,6 +58,13 @@ pub(crate) fn new_filter_in_query(
     )
 }
 
+/// Membership of raw value bytes in the set of needle strings. The needles are
+/// always valid UTF-8 (they come from query text or subquery `Vec<String>`
+/// results), so a value with invalid UTF-8 can never be a member.
+fn string_values_contain(string_values: &HashSet<String>, v: &[u8]) -> bool {
+    std::str::from_utf8(v).is_ok_and(|s| string_values.contains(s))
+}
+
 impl FilterIn {
     fn match_column_by_string_values(
         br: &mut BlockResult,
@@ -67,7 +73,7 @@ impl FilterIn {
         string_values: &HashSet<String>,
     ) {
         let values = br.column_get_values(r);
-        bm.for_each_set_bit(|idx| string_values.contains(to_unsafe_string(&values[idx])));
+        bm.for_each_set_bit(|idx| string_values_contain(string_values, &values[idx]));
     }
 }
 
@@ -91,7 +97,7 @@ impl FieldFilter for FilterIn {
     fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         let string_values = self.values.get_string_values();
-        string_values.contains(v)
+        string_values_contain(string_values, v)
     }
 
     fn apply_to_block_result_by_field(
@@ -109,7 +115,7 @@ impl FieldFilter for FilterIn {
         if br.column_is_const(r) {
             let string_values = self.values.get_string_values();
             let v = br.column_get_value_at_row(r, 0);
-            if !string_values.contains(v) {
+            if !string_values_contain(string_values, v) {
                 bm.reset_bits();
             }
             return;
@@ -196,7 +202,7 @@ impl FieldFilter for FilterIn {
         let v = bs.get_const_column_value(field_name);
         if !v.is_empty() {
             let string_values = self.values.get_string_values();
-            if !string_values.contains(&v) {
+            if !string_values_contain(string_values, &v) {
                 bm.reset_bits();
             }
             return;
@@ -228,7 +234,7 @@ impl FieldFilter for FilterIn {
                     string_values.is_empty(),
                     common_tokens,
                     token_sets,
-                    |v| string_values.contains(to_unsafe_string(v)),
+                    |v| string_values_contain(string_values, v),
                 );
             }
             ValueType::DICT => {
@@ -408,7 +414,7 @@ fn match_values_dict_by_any_value(
 ) {
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
-        bb.push(u8::from(values.contains(v)));
+        bb.push(u8::from(string_values_contain(values, v)));
     }
     match_encoded_values_dict(bs, ch, bm, &bb);
 }

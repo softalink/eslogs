@@ -1106,11 +1106,11 @@ mod tests {
         let mut data = Vec::new();
         esl_common::encoding::marshal_uint64(&mut data, 2);
         let vh1 = ValueWithHits {
-            value: "foo".to_string(),
+            value: b"foo".to_vec(),
             hits: 10,
         };
         let vh2 = ValueWithHits {
-            value: "bar".to_string(),
+            value: b"bar".to_vec(),
             hits: 5,
         };
         vh1.marshal(&mut data);

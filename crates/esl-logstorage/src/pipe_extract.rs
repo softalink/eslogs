@@ -185,7 +185,7 @@ struct PipeExtractProcessorShard {
     bm: Bitmap,
     ptn: Option<Pattern>,
     result_columns: Vec<ColRef>,
-    result_values: Vec<String>,
+    result_values: Vec<Vec<u8>>,
     rcs: Vec<ResultColumn>,
 }
 
@@ -227,6 +227,9 @@ impl PipeProcessor for PipeExtractProcessor {
         }
 
         let c = br.get_column_by_name(&self.from_field);
+        // PORT NOTE: the pattern matcher operates on &str; invalid UTF-8 source
+        // values are applied via their lossy view (documented residual — Go
+        // matches raw bytes).
         let values: Vec<String> = br
             .column_get_values(c)
             .iter()
@@ -239,7 +242,7 @@ impl PipeProcessor for PipeExtractProcessor {
         }
 
         result_values.clear();
-        result_values.resize(nfields, String::new());
+        result_values.resize(nfields, Vec::new());
 
         let mut need_updates = true;
         let mut v_prev = String::new();
@@ -250,17 +253,17 @@ impl PipeProcessor for PipeExtractProcessor {
                     need_updates = false;
 
                     ptn.apply(v);
-                    let field_vals: Vec<String> = ptn
+                    let field_vals: Vec<Vec<u8>> = ptn
                         .fields
                         .iter()
-                        .map(|f| ptn.field_value(f).to_string())
+                        .map(|f| ptn.field_value(f).as_bytes().to_vec())
                         .collect();
                     for (i, mut val) in field_vals.into_iter().enumerate() {
                         if (val.is_empty() && self.skip_empty_results) || self.keep_original_fields
                         {
                             let v_orig = br
                                 .column_get_value_at_row(result_columns[i], row_idx)
-                                .to_string();
+                                .to_vec();
                             if !v_orig.is_empty() {
                                 val = v_orig;
                             }
@@ -270,13 +273,13 @@ impl PipeProcessor for PipeExtractProcessor {
                 }
             } else {
                 for (i, &rc_col) in result_columns.iter().enumerate() {
-                    result_values[i] = br.column_get_value_at_row(rc_col, row_idx).to_string();
+                    result_values[i] = br.column_get_value_at_row(rc_col, row_idx).to_vec();
                 }
                 need_updates = true;
             }
 
             for (i, val) in result_values.iter().enumerate() {
-                rcs[i].add_value(val.as_bytes());
+                rcs[i].add_value(val);
             }
         }
 

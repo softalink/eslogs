@@ -14,7 +14,7 @@ use crate::filter_generic::{FilterGeneric, clone_column_header, new_filter_gener
 use crate::filter_phrase::{match_column_by_generic, match_encoded_values_dict, visit_values};
 use crate::filter_range::match_ipv4_by_range;
 use crate::rows::{Field, get_field_value_by_name};
-use crate::values_encoder::{ValueType, marshal_ipv4_string, try_parse_ipv4};
+use crate::values_encoder::{ValueType, marshal_ipv4_string, try_parse_ipv4_bytes};
 
 // ---------------------------------------------------------------------------
 // FilterIPv4Range
@@ -166,14 +166,12 @@ fn match_string_by_ipv4_range(
     min_value: u32,
     max_value: u32,
 ) {
-    visit_values(bs, ch, bm, |v| {
-        match_ipv4_range(to_unsafe_string(v), min_value, max_value)
-    });
+    visit_values(bs, ch, bm, |v| match_ipv4_range(v, min_value, max_value));
 }
 
 /// Port of Go `matchIPv4Range`.
-pub(crate) fn match_ipv4_range(s: &str, min_value: u32, max_value: u32) -> bool {
-    match try_parse_ipv4(s) {
+pub(crate) fn match_ipv4_range(s: &[u8], min_value: u32, max_value: u32) -> bool {
+    match try_parse_ipv4_bytes(s) {
         Some(n) => n >= min_value && n <= max_value,
         None => false,
     }
@@ -186,22 +184,22 @@ mod tests {
     #[test]
     fn test_match_ipv4_range() {
         // 127.0.0.1 .. 127.0.0.255
-        let min = try_parse_ipv4("127.0.0.1").unwrap();
-        let max = try_parse_ipv4("127.0.0.255").unwrap();
-        assert!(match_ipv4_range("127.0.0.1", min, max));
-        assert!(match_ipv4_range("127.0.0.128", min, max));
-        assert!(match_ipv4_range("127.0.0.255", min, max));
-        assert!(!match_ipv4_range("127.0.1.0", min, max));
-        assert!(!match_ipv4_range("127.0.0.0", min, max));
-        assert!(!match_ipv4_range("foobar", min, max));
-        assert!(!match_ipv4_range("", min, max));
+        let min = try_parse_ipv4_bytes(b"127.0.0.1").unwrap();
+        let max = try_parse_ipv4_bytes(b"127.0.0.255").unwrap();
+        assert!(match_ipv4_range(b"127.0.0.1", min, max));
+        assert!(match_ipv4_range(b"127.0.0.128", min, max));
+        assert!(match_ipv4_range(b"127.0.0.255", min, max));
+        assert!(!match_ipv4_range(b"127.0.1.0", min, max));
+        assert!(!match_ipv4_range(b"127.0.0.0", min, max));
+        assert!(!match_ipv4_range(b"foobar", min, max));
+        assert!(!match_ipv4_range(b"", min, max));
     }
 
     #[test]
     fn test_to_string() {
         let f = FilterIPv4Range {
-            min_value: try_parse_ipv4("1.2.3.4").unwrap(),
-            max_value: try_parse_ipv4("5.6.7.8").unwrap(),
+            min_value: try_parse_ipv4_bytes(b"1.2.3.4").unwrap(),
+            max_value: try_parse_ipv4_bytes(b"5.6.7.8").unwrap(),
         };
         assert_eq!(f.to_string(), "ipv4_range(1.2.3.4, 5.6.7.8)");
     }

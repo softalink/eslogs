@@ -6,13 +6,12 @@
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::encoding;
 
 use crate::block_result::BlockResult;
 use crate::prefix_filter::Filter;
 use crate::stats::{StatsFunc, StatsProcessor};
-use crate::stats_min::{field_names_string, get_matching_columns, less_string};
+use crate::stats_min::{field_names_string, get_matching_columns, less_bytes};
 
 /// Port of `statsMax`.
 pub(crate) struct StatsMax {
@@ -39,7 +38,7 @@ impl StatsFunc for StatsMax {
     fn new_stats_processor(&self) -> Box<dyn StatsProcessor> {
         Box::new(StatsMaxProcessor {
             field_filters: self.field_filters.clone(),
-            max: String::new(),
+            max: Vec::new(),
             has_items: false,
         })
     }
@@ -48,21 +47,21 @@ impl StatsFunc for StatsMax {
 /// Port of `statsMaxProcessor`.
 pub(crate) struct StatsMaxProcessor {
     field_filters: Vec<String>,
-    max: String,
+    max: Vec<u8>,
     has_items: bool,
 }
 
 impl StatsMaxProcessor {
-    fn needs_update_state(&self, v: &str) -> bool {
-        !self.has_items || less_string(&self.max, v)
+    fn needs_update_state(&self, v: &[u8]) -> bool {
+        !self.has_items || less_bytes(&self.max, v)
     }
 
-    fn set_state(&mut self, v: &str) {
-        self.max = v.to_owned();
+    fn set_state(&mut self, v: &[u8]) {
+        self.max = v.to_vec();
         self.has_items = true;
     }
 
-    fn update_state_string(&mut self, v: &str) {
+    fn update_state_string(&mut self, v: &[u8]) {
         if self.needs_update_state(v) {
             self.set_state(v);
         }
@@ -76,9 +75,8 @@ impl StatsProcessor for StatsMaxProcessor {
         for c in cols {
             let values = br.column_get_values(c);
             for v in values {
-                let s = to_unsafe_string(v);
-                if self.needs_update_state(s) {
-                    self.set_state(s);
+                if self.needs_update_state(v) {
+                    self.set_state(v);
                 }
             }
         }
@@ -119,7 +117,7 @@ impl StatsProcessor for StatsMaxProcessor {
             return;
         }
         dst.push(1);
-        encoding::marshal_bytes(dst, self.max.as_bytes());
+        encoding::marshal_bytes(dst, &self.max);
     }
 
     fn import_state(&mut self, src: &[u8], _stop: Option<&AtomicBool>) -> Result<i64, String> {
@@ -134,10 +132,10 @@ impl StatsProcessor for StatsMaxProcessor {
             if n <= 0 {
                 return Err("cannot unmarshal max value".to_string());
             }
-            self.max = to_unsafe_string(max_value.unwrap_or_default()).to_owned();
+            self.max = max_value.unwrap_or_default().to_vec();
             src = &src[n as usize..];
         } else {
-            self.max = String::new();
+            self.max = Vec::new();
         }
 
         if !src.is_empty() {
@@ -151,7 +149,7 @@ impl StatsProcessor for StatsMaxProcessor {
     }
 
     fn finalize_stats(&self, _sf: &dyn StatsFunc, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
-        dst.extend_from_slice(self.max.as_bytes());
+        dst.extend_from_slice(&self.max);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -169,7 +167,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 

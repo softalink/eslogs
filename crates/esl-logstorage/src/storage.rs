@@ -1763,7 +1763,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -1968,7 +1968,7 @@ mod tests {
                     for (row_id, v) in c.values.iter().enumerate() {
                         rows[row_id].push(Field {
                             name: c.name.clone(),
-                            value: String::from_utf8_lossy(v).into_owned(),
+                            value: v.clone(),
                         });
                     }
                 }

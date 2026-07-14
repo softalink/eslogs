@@ -1020,7 +1020,13 @@ pub(crate) fn process_query_request(storage: &Arc<Storage>, req: &Request, w: &m
                         return;
                     }
                 };
-                let mut fields: Vec<String> = field_names.into_iter().map(|vh| vh.value).collect();
+                // These are field NAMES (Field.name is String in the engine),
+                // so they are valid UTF-8 by construction; lossy is a no-op
+                // safeguard on a name path, not a value path.
+                let mut fields: Vec<String> = field_names
+                    .into_iter()
+                    .map(|vh| String::from_utf8_lossy(&vh.value).into_owned())
+                    .collect();
                 fields.sort();
                 ca.q.add_pipe_fields(&fields);
                 fields
@@ -1173,11 +1179,11 @@ pub(crate) mod test_support {
             let mut fields = vec![
                 Field {
                     name: "_msg".to_string(),
-                    value: msg.to_string(),
+                    value: msg.as_bytes().to_vec(),
                 },
                 Field {
                     name: "host".to_string(),
-                    value: host.to_string(),
+                    value: host.as_bytes().to_vec(),
                 },
             ];
             lr.must_add(tenant, base + i as i64, &mut fields, -1);

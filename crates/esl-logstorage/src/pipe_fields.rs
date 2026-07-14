@@ -162,7 +162,7 @@ pub(crate) mod pipe_test_util {
     pub(crate) fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -185,14 +185,9 @@ pub(crate) mod pipe_test_util {
                 .iter()
                 .map(|&c| br.column_name(c).to_string())
                 .collect();
-            let mut col_values: Vec<Vec<String>> = Vec::with_capacity(cols.len());
+            let mut col_values: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cols.len());
             for &c in &cols {
-                let vals = br.column_get_values(c);
-                col_values.push(
-                    vals.iter()
-                        .map(|v| String::from_utf8_lossy(v).into_owned())
-                        .collect(),
-                );
+                col_values.push(br.column_get_values(c).to_vec());
             }
             let rows_len = br.rows_len();
             let mut out = self.rows.lock().unwrap();
@@ -251,8 +246,8 @@ pub(crate) mod pipe_test_util {
         collector.rows()
     }
 
-    fn sorted_key(row: &[Field]) -> Vec<(String, String)> {
-        let mut k: Vec<(String, String)> = row
+    fn sorted_key(row: &[Field]) -> Vec<(String, Vec<u8>)> {
+        let mut k: Vec<(String, Vec<u8>)> = row
             .iter()
             .map(|f| (f.name.clone(), f.value.clone()))
             .collect();
@@ -263,8 +258,8 @@ pub(crate) mod pipe_test_util {
     /// Asserts two row sets are equal ignoring row and field order (mirrors
     /// Go's `assertRowsEqual`).
     pub(crate) fn assert_rows_eq(got: Vec<Vec<Field>>, expected: &[Vec<Field>]) {
-        let mut got_keys: Vec<Vec<(String, String)>> = got.iter().map(|r| sorted_key(r)).collect();
-        let mut want_keys: Vec<Vec<(String, String)>> =
+        let mut got_keys: Vec<Vec<(String, Vec<u8>)>> = got.iter().map(|r| sorted_key(r)).collect();
+        let mut want_keys: Vec<Vec<(String, Vec<u8>)>> =
             expected.iter().map(|r| sorted_key(r)).collect();
         got_keys.sort();
         want_keys.sort();

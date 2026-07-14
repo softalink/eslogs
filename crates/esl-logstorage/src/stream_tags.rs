@@ -69,7 +69,7 @@ impl StreamTags {
             }
             prev_tag_name = tag_name;
 
-            let tag_value = tag.value.as_str();
+            let tag_value: &[u8] = &tag.value;
             let mut found = false;
             for f in fields {
                 if f.name != tag_name {
@@ -79,8 +79,9 @@ impl StreamTags {
                     let mut line = Vec::new();
                     marshal_fields_to_json(&mut line, fields);
                     return Err(format!(
-                        "unexpected value for the stream tag {tag_name:?}; got {:?}; want {tag_value:?}; streamTags: {self}; fields: {}",
-                        f.value,
+                        "unexpected value for the stream tag {tag_name:?}; got {:?}; want {:?}; streamTags: {self}; fields: {}",
+                        String::from_utf8_lossy(&f.value),
+                        String::from_utf8_lossy(tag_value),
                         bytesutil::to_unsafe_string(&line)
                     ));
                 }
@@ -90,7 +91,8 @@ impl StreamTags {
                 let mut line = Vec::new();
                 marshal_fields_to_json(&mut line, fields);
                 return Err(format!(
-                    "cannot find value for the stream tag {tag_name:?} in fields; want {tag_value:?}; streamTags: {self}; fields: {}",
+                    "cannot find value for the stream tag {tag_name:?} in fields; want {:?}; streamTags: {self}; fields: {}",
+                    String::from_utf8_lossy(tag_value),
                     bytesutil::to_unsafe_string(&line)
                 ));
             }
@@ -126,7 +128,8 @@ impl StreamTags {
     }
 
     /// Adds (name:value) tag to st.
-    pub fn add(&mut self, name: &str, value: &str) {
+    pub fn add(&mut self, name: &str, value: impl AsRef<[u8]>) {
+        let value = value.as_ref();
         if value.is_empty() {
             return;
         }
@@ -135,14 +138,14 @@ impl StreamTags {
 
         self.tags.push(Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.to_vec(),
         });
     }
 
     /// Marshals st in a canonical way.
     pub fn marshal_canonical(&mut self, dst: &mut Vec<u8>) {
         self.tags.sort_by(|a, b| {
-            (a.name.as_str(), a.value.as_str()).cmp(&(b.name.as_str(), b.value.as_str()))
+            (a.name.as_str(), a.value.as_slice()).cmp(&(b.name.as_str(), b.value.as_slice()))
         });
         self.marshal_canonical_internal(dst);
     }
@@ -152,7 +155,7 @@ impl StreamTags {
         encoding::marshal_var_uint64(dst, tags.len() as u64);
         for tag in tags {
             encoding::marshal_bytes(dst, tag.name.as_bytes());
-            encoding::marshal_bytes(dst, tag.value.as_bytes());
+            encoding::marshal_bytes(dst, &tag.value);
         }
     }
 
@@ -185,8 +188,7 @@ impl StreamTags {
             src = &src[n_size as usize..];
 
             let s_name = bytesutil::to_unsafe_string(name.unwrap_or_default());
-            let s_value = bytesutil::to_unsafe_string(value.unwrap_or_default());
-            self.add(s_name, s_value);
+            self.add(s_name, value.unwrap_or_default());
         }
 
         if !self.is_sorted() {
@@ -265,8 +267,8 @@ const ESCAPE_CHAR: u8 = 0;
 const TAG_SEPARATOR_CHAR: u8 = 1;
 const KV_SEPARATOR_CHAR: u8 = 2;
 
-pub fn marshal_tag_value(dst: &mut Vec<u8>, src: &str) {
-    let b = src.as_bytes();
+pub fn marshal_tag_value(dst: &mut Vec<u8>, src: &[u8]) {
+    let b = src;
     let n1 = b.iter().position(|&c| c == ESCAPE_CHAR);
     let n2 = b.iter().position(|&c| c == TAG_SEPARATOR_CHAR);
     let n3 = b.iter().position(|&c| c == KV_SEPARATOR_CHAR);
@@ -363,7 +365,7 @@ pub(crate) fn parse_stream_fields(dst: &mut Vec<Field>, s: &str) -> Result<(), S
 
         dst.push(Field {
             name: name.to_string(),
-            value,
+            value: value.into_bytes(),
         });
 
         if s.is_empty() {
@@ -371,7 +373,11 @@ pub(crate) fn parse_stream_fields(dst: &mut Vec<Field>, s: &str) -> Result<(), S
         }
         if !s.starts_with(',') {
             let f = dst.last().unwrap();
-            return Err(format!("missing ',' after {}={:?}", f.name, f.value));
+            return Err(format!(
+                "missing ',' after {}={:?}",
+                f.name,
+                String::from_utf8_lossy(&f.value)
+            ));
         }
         s = &s[1..];
     }

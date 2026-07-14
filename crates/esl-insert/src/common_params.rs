@@ -203,7 +203,7 @@ fn get_extra_fields(req: &Request) -> Result<Vec<Field>, String> {
             Some(n) if n > 0 && n != ef.len() - 1 => {
                 extra_fields.push(Field {
                     name: ef[..n].to_string(),
-                    value: ef[n + 1..].to_string(),
+                    value: ef.as_bytes()[n + 1..].to_vec(),
                 });
             }
             _ => {
@@ -260,7 +260,11 @@ pub fn extract_timestamp_from_fields(
             if f.name != *time_field {
                 continue;
             }
-            let nsecs = parse_timestamp(&f.value)
+            // R3: invalid UTF-8 fails the timestamp parse, matching Go's
+            // parse semantics on arbitrary bytes.
+            let nsecs = std::str::from_utf8(&f.value)
+                .map_err(|e| e.to_string())
+                .and_then(parse_timestamp)
                 .map_err(|err| format!("cannot parse timestamp from field {:?}: {err}", f.name))?;
             f.value.clear();
             let nsecs = if nsecs == 0 { now_unix_nanos() } else { nsecs };
@@ -659,7 +663,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -712,7 +716,7 @@ mod tests {
         // 2023-01-15T00:00:00Z == 1673740800 seconds.
         assert_eq!(ts, 1_673_740_800 * 1_000_000_000);
         // The matched time field value is cleared.
-        assert_eq!(fields[0].value, "");
+        assert_eq!(fields[0].value, b"");
     }
 
     #[test]
@@ -736,7 +740,7 @@ mod tests {
             for fld in fields.iter() {
                 if fld.name == time_field {
                     assert_eq!(
-                        fld.value, "",
+                        fld.value, b"",
                         "unexpected value for field {time_field}; got {:?}; want \"\"",
                         fld.value
                     );

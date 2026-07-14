@@ -122,7 +122,7 @@ impl PipeSampleProcessorShard {
         let mut rcs: Vec<ResultColumn> = Vec::with_capacity(cols.len());
         for &c in &cols {
             let name = br.column_name(c).to_string();
-            let v = br.column_get_value_at_row(c, row_idx).as_bytes().to_vec();
+            let v = br.column_get_value_at_row(c, row_idx).to_vec();
             rcs.push(ResultColumn {
                 name,
                 values: vec![v],

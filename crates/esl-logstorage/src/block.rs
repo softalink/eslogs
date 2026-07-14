@@ -348,28 +348,17 @@ impl Block {
         // unmarshal columns
         let cds = &bd.columns_data;
         self.resize_columns(cds.len());
-        let mut values_buf: Vec<Vec<u8>> = Vec::new();
         for (i, cd) in cds.iter().enumerate() {
             let c = &mut self.columns[i];
             c.name = sbu.copy_string(&cd.name);
-            values_buf.clear();
-            sbu.unmarshal(&mut values_buf, &cd.values_data, rows_count as u64)
-                .map_err(|err| format!("cannot unmarshal column {i}: {err}"))?;
-            vd.decode_inplace(&mut values_buf, cd.value_type, &cd.values_dict.values)
-                .map_err(|err| format!("cannot decode column values: {err}"))?;
-            // PORT NOTE: the strings block unmarshaler and the values decoder
-            // work on Vec<u8> values, while block columns store Strings, so
-            // the decoded buffers are converted (reusing their allocations).
-            // Go strings may hold arbitrary bytes; decoded log values are
-            // UTF-8 in practice, so a conversion failure is reported through
-            // the existing error path.
+            // Column values are raw bytes, so the decoded buffers are moved
+            // straight into c.values without any UTF-8 validation/allocation
+            // pass (Go strings are arbitrary bytes).
             c.values.clear();
-            c.values.reserve(values_buf.len());
-            for v in values_buf.drain(..) {
-                let s = String::from_utf8(v)
-                    .map_err(|err| format!("cannot decode column values: {err}"))?;
-                c.values.push(s);
-            }
+            sbu.unmarshal(&mut c.values, &cd.values_data, rows_count as u64)
+                .map_err(|err| format!("cannot unmarshal column {i}: {err}"))?;
+            vd.decode_inplace(&mut c.values, cd.value_type, &cd.values_dict.values)
+                .map_err(|err| format!("cannot decode column values: {err}"))?;
         }
 
         // unmarshal constColumns
@@ -467,7 +456,9 @@ pub struct Column {
     pub name: String,
 
     /// values is the values seen for the given log entries.
-    pub values: Vec<String>,
+    ///
+    /// PORT NOTE: values are raw bytes (Go strings are arbitrary bytes).
+    pub values: Vec<Vec<u8>>,
 }
 
 impl Column {
@@ -493,9 +484,9 @@ impl Column {
         true
     }
 
-    fn resize_values(&mut self, values_len: usize) -> &mut [String] {
+    fn resize_values(&mut self, values_len: usize) -> &mut [Vec<u8>] {
         self.values.clear();
-        self.values.resize_with(values_len, String::new);
+        self.values.resize_with(values_len, Vec::new);
         &mut self.values
     }
 
@@ -679,7 +670,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -730,7 +721,7 @@ mod tests {
             timestamps: vec![3, 5],
             columns: vec![Column {
                 name: "instance".to_string(),
-                values: vec!["host1".to_string(), "host2".to_string()],
+                values: vec![b"host1".to_vec(), b"host2".to_vec()],
             }],
             const_columns: vec![field("job", "foo")],
         };
@@ -748,11 +739,11 @@ mod tests {
             columns: vec![
                 Column {
                     name: "a".to_string(),
-                    values: vec!["".to_string(), "aaa".to_string(), "".to_string()],
+                    values: vec![b"".to_vec(), b"aaa".to_vec(), b"".to_vec()],
                 },
                 Column {
                     name: "msg".to_string(),
-                    values: vec!["foo".to_string(), "".to_string(), "".to_string()],
+                    values: vec![b"foo".to_vec(), b"".to_vec(), b"".to_vec()],
                 },
             ],
             const_columns: vec![field("b", "xyz")],
@@ -857,7 +848,7 @@ mod tests {
                         continue; // skip empty values
                     }
                     let key = get_canonical_column_name(&f.name);
-                    m.insert(key.to_string(), f.value.clone());
+                    m.insert(key.to_string(), String::from_utf8(f.value.clone()).unwrap());
                 }
 
                 total_size += json_object_size(&m) + 1; // +1 for newline if expected

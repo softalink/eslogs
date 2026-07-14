@@ -4,7 +4,6 @@
 
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 use esl_common::stringsutil::append_lowercase;
 
@@ -177,13 +176,11 @@ fn match_string_by_any_case_phrase(
     bm: &mut Bitmap,
     phrase_lowercase: &str,
 ) {
-    visit_values(bs, ch, bm, |v| {
-        match_any_case_phrase(to_unsafe_string(v), phrase_lowercase)
-    });
+    visit_values(bs, ch, bm, |v| match_any_case_phrase(v, phrase_lowercase));
 }
 
 /// Port of Go `matchAnyCasePhrase`.
-fn match_any_case_phrase(s: &str, phrase_lowercase: &str) -> bool {
+fn match_any_case_phrase(s: &[u8], phrase_lowercase: &str) -> bool {
     if phrase_lowercase.is_empty() {
         // Special case - empty phrase matches only empty string.
         return s.is_empty();
@@ -198,14 +195,16 @@ fn match_any_case_phrase(s: &str, phrase_lowercase: &str) -> bool {
     }
 
     // Slow path - convert s to lowercase before matching.
+    // Lossy decode matches Go's rune-wise lowercasing (strings.Map/ToLower):
+    // invalid bytes decode to U+FFFD before the case mapping is applied.
     let mut bb = Vec::new();
-    append_lowercase(&mut bb, s);
-    match_phrase(to_unsafe_string(&bb), phrase_lowercase)
+    append_lowercase(&mut bb, &String::from_utf8_lossy(s));
+    match_phrase(&bb, phrase_lowercase)
 }
 
 /// Port of Go `isASCIILowercase`.
-pub(crate) fn is_ascii_lowercase(s: &str) -> bool {
-    for &c in s.as_bytes() {
+pub(crate) fn is_ascii_lowercase(s: &[u8]) -> bool {
+    for &c in s {
         if c >= 0x80 || c.is_ascii_uppercase() {
             return false;
         }
@@ -220,7 +219,7 @@ mod tests {
     #[test]
     fn test_match_any_case_phrase() {
         fn f(s: &str, phrase_lowercase: &str, result_expected: bool) {
-            let result = match_any_case_phrase(s, phrase_lowercase);
+            let result = match_any_case_phrase(s.as_bytes(), phrase_lowercase);
             assert_eq!(
                 result, result_expected,
                 "s={s:?} phrase={phrase_lowercase:?}"

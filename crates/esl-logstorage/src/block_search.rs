@@ -295,12 +295,12 @@ impl<'a> BlockSearch<'a> {
     /// string when the column is not a const column.
     ///
     /// PORT NOTE: Go returns a `string` view into `ccsCache`; the port returns
-    /// an owned `String` so callers do not hold a borrow of `self` across other
-    /// accessor calls.
-    pub fn get_const_column_value(&mut self, name: &str) -> String {
+    /// owned bytes so callers do not hold a borrow of `self` across other
+    /// accessor calls (values are raw bytes; Go strings are arbitrary bytes).
+    pub fn get_const_column_value(&mut self, name: &str) -> Vec<u8> {
         let name = get_canonical_field_name(name);
         if self.is_hidden_field(name) {
-            return String::new();
+            return Vec::new();
         }
 
         if self.part_format_version() < 1 {
@@ -310,12 +310,12 @@ impl<'a> BlockSearch<'a> {
                     return cc.value.clone();
                 }
             }
-            return String::new();
+            return Vec::new();
         }
 
         let column_name_id = match self.get_column_name_id(name) {
             Some(id) => id,
-            None => return String::new(),
+            None => return Vec::new(),
         };
 
         for cc in &self.ccs_cache {
@@ -336,7 +336,7 @@ impl<'a> BlockSearch<'a> {
         };
         let cr = match cr {
             Some(cr) => cr,
-            None => return String::new(),
+            None => return Vec::new(),
         };
 
         self.ensure_columns_header_block();

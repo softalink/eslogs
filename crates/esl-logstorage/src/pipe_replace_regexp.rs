@@ -148,10 +148,19 @@ impl Pipe for PipeReplaceRegexp {
         let re = self.re.clone();
         let replacement = self.replacement.clone();
         let limit = self.limit;
-        let update_func: UpdateFunc = Arc::new(move |v: &str| {
+        let update_func: UpdateFunc = Arc::new(move |v: &[u8]| {
             let mut buf: Vec<u8> = Vec::new();
-            append_replace_regexp(&mut buf, v, &re, &replacement, limit);
-            String::from_utf8_lossy(&buf).into_owned()
+            match std::str::from_utf8(v) {
+                Ok(s) => append_replace_regexp(&mut buf, s, &re, &replacement, limit),
+                Err(_) => {
+                    // PORT NOTE: regex-on-invalid-utf8 is a documented residual —
+                    // the regex crate needs &str, so an invalid-UTF-8 value is
+                    // rewritten via its lossy view.
+                    let s = String::from_utf8_lossy(v);
+                    append_replace_regexp(&mut buf, &s, &re, &replacement, limit);
+                }
+            }
+            buf
         });
 
         new_pipe_update_processor(
@@ -281,7 +290,7 @@ mod tests {
                 let mut row = Vec::new();
                 for &c in &cols {
                     let name = br.column_name(c).to_string();
-                    let value = br.column_get_value_at_row(c, r).to_string();
+                    let value = br.column_get_value_at_row(c, r).to_vec();
                     if !value.is_empty() {
                         row.push(Field { name, value });
                     }
@@ -294,7 +303,7 @@ mod tests {
         }
     }
 
-    fn canon(mut row: Vec<Field>) -> Vec<(String, String)> {
+    fn canon(mut row: Vec<Field>) -> Vec<(String, Vec<u8>)> {
         row.sort_by(|a, b| a.name.cmp(&b.name));
         row.into_iter().map(|f| (f.name, f.value)).collect()
     }
@@ -302,11 +311,11 @@ mod tests {
     fn f(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
-    fn run(pipe: PipeReplaceRegexp, rows: Vec<Vec<Field>>) -> Vec<Vec<(String, String)>> {
+    fn run(pipe: PipeReplaceRegexp, rows: Vec<Vec<Field>>) -> Vec<Vec<(String, Vec<u8>)>> {
         let cap = Arc::new(Capture(Mutex::new(Vec::new())));
         let stop = Arc::new(AtomicBool::new(false));
         let pp = pipe.new_pipe_processor(1, stop, cap.clone() as Arc<dyn PipeProcessor>);
@@ -318,7 +327,7 @@ mod tests {
         out.into_iter().map(canon).collect()
     }
 
-    fn expected(rows: Vec<Vec<Field>>) -> Vec<Vec<(String, String)>> {
+    fn expected(rows: Vec<Vec<Field>>) -> Vec<Vec<(String, Vec<u8>)>> {
         rows.into_iter()
             .map(|r| canon(r.into_iter().filter(|f| !f.value.is_empty()).collect()))
             .collect()

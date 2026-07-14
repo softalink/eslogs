@@ -146,7 +146,7 @@ mod tests {
             for i in 0..n {
                 let mut fields = Vec::with_capacity(cols.len());
                 for (ci, &c) in cols.iter().enumerate() {
-                    let v = br.column_get_value_at_row(c, i).to_string();
+                    let v = br.column_get_value_at_row(c, i).to_vec();
                     fields.push(Field {
                         name: names[ci].clone(),
                         value: v,
@@ -177,7 +177,7 @@ mod tests {
         for _ in 0..3 {
             let mut br = block_from_rows(&[vec![Field {
                 name: "x".to_string(),
-                value: "1".to_string(),
+                value: b"1".to_vec(),
             }]]);
             pp.write_block(0, &mut br);
         }
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].len(), 1);
         assert_eq!(out[0][0].name, "blocks_count");
-        assert_eq!(out[0][0].value, "3");
+        assert_eq!(out[0][0].value, b"3");
     }
 
     #[test]
@@ -201,12 +201,12 @@ mod tests {
 
         let mut br0 = block_from_rows(&[vec![Field {
             name: "x".to_string(),
-            value: "1".to_string(),
+            value: b"1".to_vec(),
         }]]);
         pp.write_block(0, &mut br0);
         let mut br1 = block_from_rows(&[vec![Field {
             name: "x".to_string(),
-            value: "2".to_string(),
+            value: b"2".to_vec(),
         }]]);
         pp.write_block(1, &mut br1);
         pp.flush().unwrap();
@@ -214,6 +214,6 @@ mod tests {
         let out = sink.blocks.lock().unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0][0].name, "cnt");
-        assert_eq!(out[0][0].value, "2");
+        assert_eq!(out[0][0].value, b"2");
     }
 }

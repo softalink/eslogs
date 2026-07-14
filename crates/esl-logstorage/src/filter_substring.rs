@@ -5,7 +5,6 @@
 
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -152,9 +151,7 @@ pub(crate) fn match_string_by_substring(
         bm.reset_bits();
         return;
     }
-    visit_values(bs, ch, bm, |v| {
-        match_substring(to_unsafe_string(v), substring)
-    });
+    visit_values(bs, ch, bm, |v| match_substring(v, substring));
 }
 
 pub(crate) fn match_values_dict_by_substring(
@@ -195,7 +192,7 @@ pub(crate) fn match_uint8_by_substring(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint8_string(&part_path, &mut buf, v);
-        match_substring(to_unsafe_string(&buf), substring)
+        match_substring(&buf, substring)
     });
 }
 
@@ -224,7 +221,7 @@ pub(crate) fn match_uint16_by_substring(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint16_string(&part_path, &mut buf, v);
-        match_substring(to_unsafe_string(&buf), substring)
+        match_substring(&buf, substring)
     });
 }
 
@@ -253,7 +250,7 @@ pub(crate) fn match_uint32_by_substring(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint32_string(&part_path, &mut buf, v);
-        match_substring(to_unsafe_string(&buf), substring)
+        match_substring(&buf, substring)
     });
 }
 
@@ -282,7 +279,7 @@ pub(crate) fn match_uint64_by_substring(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint64_string(&part_path, &mut buf, v);
-        match_substring(to_unsafe_string(&buf), substring)
+        match_substring(&buf, substring)
     });
 }
 
@@ -313,7 +310,7 @@ pub(crate) fn match_int64_by_substring(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_int64_string(&part_path, &mut buf, v);
-        match_substring(to_unsafe_string(&buf), substring)
+        match_substring(&buf, substring)
     });
 }
 
@@ -346,7 +343,7 @@ pub(crate) fn match_float64_by_substring(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_float64_string(&part_path, &mut buf, v);
-        match_substring(to_unsafe_string(&buf), substring)
+        match_substring(&buf, substring)
     });
 }
 
@@ -368,7 +365,7 @@ pub(crate) fn match_ipv4_by_substring(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_ipv4_string(&part_path, &mut buf, v);
-        match_substring(to_unsafe_string(&buf), substring)
+        match_substring(&buf, substring)
     });
 }
 
@@ -390,12 +387,14 @@ pub(crate) fn match_timestamp_iso8601_by_substring(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_timestamp_iso8601_string(&part_path, &mut buf, v);
-        match_substring(to_unsafe_string(&buf), substring)
+        match_substring(&buf, substring)
     });
 }
 
 /// Port of Go `matchSubstring`.
-pub(crate) fn match_substring(s: &str, substring: &str) -> bool {
+///
+/// The haystack `s` is raw value bytes (Go strings are arbitrary bytes).
+pub(crate) fn match_substring(s: &[u8], substring: &str) -> bool {
     if substring.is_empty() {
         // Special case - empty substring matches anything.
         return true;
@@ -404,7 +403,7 @@ pub(crate) fn match_substring(s: &str, substring: &str) -> bool {
         // Fast path - the substring is too long.
         return false;
     }
-    s.contains(substring)
+    crate::filter_generic::index_bytes(s, substring.as_bytes()).is_some()
 }
 
 #[cfg(test)]
@@ -414,7 +413,7 @@ mod tests {
     #[test]
     fn test_match_substring() {
         fn f(s: &str, substring: &str, result_expected: bool) {
-            let result = match_substring(s, substring);
+            let result = match_substring(s.as_bytes(), substring);
             assert_eq!(result, result_expected, "s={s:?} substring={substring:?}");
         }
 

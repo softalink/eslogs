@@ -15,8 +15,8 @@ use crate::logsql::{append_json_string, get_bool, get_positive_int, parse_common
 
 /// Go `facetEntry`.
 struct FacetEntry {
-    value: String,
-    hits: String,
+    value: Vec<u8>,
+    hits: Vec<u8>,
 }
 
 /// Handles `/select/logsql/facets` (Go `ProcessFacetsRequest`).
@@ -83,9 +83,12 @@ pub fn process_facets_request(storage: &Arc<Storage>, req: &Request, w: &mut Res
         let hits = &columns[2].values;
 
         for i in 0..field_names.len() {
+            // Field NAMES are valid UTF-8 by construction (Field.name is
+            // String in the engine); lossy is a no-op safeguard on a name
+            // path. Values and hits are passed through as raw bytes.
             let field_name = String::from_utf8_lossy(&field_names[i]).into_owned();
-            let field_value = String::from_utf8_lossy(&field_values[i]).into_owned();
-            let hits_str = String::from_utf8_lossy(&hits[i]).into_owned();
+            let field_value = field_values[i].clone();
+            let hits_str = hits[i].clone();
 
             let mut m = m_cl.lock().unwrap();
             m.entry(field_name).or_default().push(FacetEntry {
@@ -175,9 +178,15 @@ fn add_facets_pipe(
 /// strings; hits always come from the facets pipe counters (plain decimal
 /// uint64), for which natural order equals numeric order, so the port compares
 /// parsed u64 values (falling back to byte order for non-numeric strings).
-fn hits_less_natural(a: &str, b: &str) -> bool {
-    match (a.parse::<u64>(), b.parse::<u64>()) {
-        (Ok(x), Ok(y)) => x < y,
+fn hits_less_natural(a: &[u8], b: &[u8]) -> bool {
+    let x = std::str::from_utf8(a)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let y = std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    match (x, y) {
+        (Some(x), Some(y)) => x < y,
         _ => a < b,
     }
 }
@@ -221,9 +230,9 @@ fn write_facets_line(dst: &mut Vec<u8>, k: &str, fes: &mut [FacetEntry]) {
             dst.push(b',');
         }
         dst.extend_from_slice(b"{\"field_value\":");
-        append_json_string(dst, fe.value.as_bytes());
+        append_json_string(dst, &fe.value);
         dst.extend_from_slice(b",\"hits\":");
-        dst.extend_from_slice(fe.hits.as_bytes());
+        dst.extend_from_slice(&fe.hits);
         dst.push(b'}');
     }
     dst.extend_from_slice(b"]}");
@@ -303,24 +312,24 @@ mod tests {
             "b".to_string(),
             vec![
                 FacetEntry {
-                    value: "y".to_string(),
-                    hits: "2".to_string(),
+                    value: b"y".to_vec(),
+                    hits: b"2".to_vec(),
                 },
                 FacetEntry {
-                    value: "x".to_string(),
-                    hits: "10".to_string(),
+                    value: b"x".to_vec(),
+                    hits: b"10".to_vec(),
                 },
                 FacetEntry {
-                    value: "w".to_string(),
-                    hits: "2".to_string(),
+                    value: b"w".to_vec(),
+                    hits: b"2".to_vec(),
                 },
             ],
         );
         m.insert(
             "a".to_string(),
             vec![FacetEntry {
-                value: "v".to_string(),
-                hits: "1".to_string(),
+                value: b"v".to_vec(),
+                hits: b"1".to_vec(),
             }],
         );
         let mut dst = Vec::new();

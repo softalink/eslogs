@@ -192,7 +192,7 @@ fn append_msg_fields(fields: &mut Vec<Field>, v: &json::Value) -> Result<(), Str
         json::Value::Str(val) => {
             fields.push(Field {
                 name: "_msg".to_string(),
-                value: val.clone(),
+                value: val.as_bytes().to_vec(),
             });
         }
         json::Value::Obj(obj) => {
@@ -203,14 +203,14 @@ fn append_msg_fields(fields: &mut Vec<Field>, v: &json::Value) -> Result<(), Str
                         let val = v.as_str().unwrap_or("");
                         fields.push(Field {
                             name: "_msg".to_string(),
-                            value: val.to_string(),
+                            value: val.as_bytes().to_vec(),
                         });
                     }
                     "status" => {
                         let val = v.as_str().unwrap_or("");
                         fields.push(Field {
                             name: "status".to_string(),
-                            value: val.to_string(),
+                            value: val.as_bytes().to_vec(),
                         });
                     }
                     "lamdba" => {
@@ -229,7 +229,7 @@ fn append_msg_fields(fields: &mut Vec<Field>, v: &json::Value) -> Result<(), Str
                             })?;
                             fields.push(Field {
                                 name: k.clone(),
-                                value: val.to_string(),
+                                value: val.as_bytes().to_vec(),
                             });
                         }
                     }
@@ -301,13 +301,13 @@ fn read_logs_request(
                                     // No tag value.
                                     fields.push(Field {
                                         name: pair.to_string(),
-                                        value: "no_label_value".to_string(),
+                                        value: b"no_label_value".to_vec(),
                                     });
                                 }
                                 Some(n) => {
                                     fields.push(Field {
                                         name: pair[..n].to_string(),
-                                        value: pair[n + 1..].to_string(),
+                                        value: pair.as_bytes()[n + 1..].to_vec(),
                                     });
                                 }
                             }
@@ -326,7 +326,7 @@ fn read_logs_request(
                     })?;
                     fields.push(Field {
                         name: k.clone(),
-                        value: val.to_string(),
+                        value: val.as_bytes().to_vec(),
                     });
                 }
             }

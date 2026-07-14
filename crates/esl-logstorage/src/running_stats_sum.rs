@@ -8,7 +8,7 @@ use crate::prefix_filter::Filter;
 use crate::rows::Field;
 use crate::running_stats_count::for_each_matching_field;
 use crate::stats_count::field_names_string;
-use crate::values_encoder::{marshal_float64_string, try_parse_float64};
+use crate::values_encoder::{marshal_float64_string, try_parse_float64_bytes};
 
 /// Running `sum(...)` stats function.
 pub struct RunningStatsSum {
@@ -44,7 +44,7 @@ pub(crate) struct RunningStatsSumProcessor {
 impl RunningStatsSumProcessor {
     pub(crate) fn update_running_stats(&mut self, sf: &RunningStatsSum, row: &[Field]) {
         for_each_matching_field(row, &sf.field_filters, |v| {
-            if let Some(f) = try_parse_float64(v) {
+            if let Some(f) = try_parse_float64_bytes(v) {
                 if self.sum.is_nan() {
                     self.sum = f;
                 } else {
@@ -54,12 +54,10 @@ impl RunningStatsSumProcessor {
         });
     }
 
-    pub(crate) fn get_running_stats(&self) -> String {
+    pub(crate) fn get_running_stats(&self) -> Vec<u8> {
         let mut dst = Vec::new();
         marshal_float64_string(&mut dst, self.sum);
-        // SAFETY-equivalent: marshal_float64_string only emits ASCII digits,
-        // '.', '-', or "NaN"/"+Inf"/"-Inf", so the bytes are valid UTF-8.
-        String::from_utf8(dst).unwrap()
+        dst
     }
 }
 
@@ -94,7 +92,7 @@ impl crate::pipe_running_stats::RunningStatsProcessor for RunningStatsSumProcess
         self.update_running_stats(sf, row)
     }
 
-    fn get_running_stats(&self) -> String {
+    fn get_running_stats(&self) -> Vec<u8> {
         self.get_running_stats()
     }
 }

@@ -141,18 +141,18 @@ impl PipeProcessor for PipeCoalesceProcessor {
 
         // Fill the result column.
         for row_idx in 0..br.rows_len() {
-            let mut value = String::new();
+            let mut value = Vec::new();
             for &c in &selected {
                 let v = br.column_get_value_at_row(c, row_idx);
                 if !v.is_empty() {
-                    value = v.to_string();
+                    value = v.to_vec();
                     break;
                 }
             }
             if value.is_empty() {
-                value = self.default_value.clone();
+                value = self.default_value.clone().into_bytes();
             }
-            shard.rc.add_value(value.as_bytes());
+            shard.rc.add_value(&value);
         }
 
         shard.rc.name = self.dst_field.clone();

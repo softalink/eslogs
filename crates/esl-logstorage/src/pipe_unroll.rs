@@ -196,7 +196,7 @@ impl PipeProcessor for PipeUnrollProcessor {
                     .enumerate()
                     .map(|(i, f)| Field {
                         name: f.clone(),
-                        value: String::from_utf8_lossy(&field_values[i][row_idx]).into_owned(),
+                        value: field_values[i][row_idx].clone(),
                     })
                     .collect();
                 out.push(build_row(&src_names, &src_values, row_idx, &extra));
@@ -234,11 +234,10 @@ impl PipeUnrollProcessor {
         out: &mut Vec<Vec<Field>>,
     ) {
         // Unroll each field value into its own list of elements.
-        let mut unrolled: Vec<Vec<String>> = Vec::with_capacity(self.fields.len());
+        let mut unrolled: Vec<Vec<Vec<u8>>> = Vec::with_capacity(self.fields.len());
         for fv in field_values {
-            let v = String::from_utf8_lossy(&fv[row_idx]);
             let mut arr = Vec::new();
-            unpack_json_array(&mut arr, &v);
+            unpack_json_array(&mut arr, &fv[row_idx]);
             unrolled.push(arr);
         }
 
@@ -288,7 +287,7 @@ fn build_row(
         .enumerate()
         .map(|(i, name)| Field {
             name: name.clone(),
-            value: String::from_utf8_lossy(&src_values[i][row_idx]).into_owned(),
+            value: src_values[i][row_idx].clone(),
         })
         .collect();
 
@@ -324,14 +323,14 @@ fn put_parser(p: fastjson::Parser) {
 /// Port of Go `unpackJSONArray`: appends the string representation of each
 /// element of the JSON array encoded in `s` to `dst`. Non-array inputs and
 /// parse errors append nothing.
-fn unpack_json_array(dst: &mut Vec<String>, s: &str) {
+fn unpack_json_array(dst: &mut Vec<Vec<u8>>, s: &[u8]) {
     let s = trim_json_whitespace(s);
-    if s.is_empty() || !s.starts_with('[') {
+    if s.is_empty() || !s.starts_with(b"[") {
         return;
     }
 
     let mut p = get_parser();
-    if let Ok(v) = p.parse(s.as_bytes())
+    if let Ok(v) = p.parse(s)
         && p.doc.value_type(v) == fastjson::JsonType::Array
     {
         let n = p.doc.array_len(v);
@@ -340,11 +339,11 @@ fn unpack_json_array(dst: &mut Vec<String>, s: &str) {
             if p.doc.value_type(e) == fastjson::JsonType::String {
                 let span = p.doc.string_span(e);
                 let sb = p.doc.str_bytes(span);
-                dst.push(String::from_utf8_lossy(sb).into_owned());
+                dst.push(sb.to_vec());
             } else {
                 let mut bb = Vec::new();
                 p.doc.marshal_value_to(e, &mut bb);
-                dst.push(String::from_utf8_lossy(&bb).into_owned());
+                dst.push(bb);
             }
         }
     }
@@ -352,8 +351,21 @@ fn unpack_json_array(dst: &mut Vec<String>, s: &str) {
 }
 
 /// Port of Go `trimJSONWhitespace`.
-fn trim_json_whitespace(s: &str) -> &str {
-    s.trim_matches(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r')
+fn trim_json_whitespace(mut s: &[u8]) -> &[u8] {
+    let is_ws = |b: u8| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r';
+    while let Some(&b) = s.first() {
+        if !is_ws(b) {
+            break;
+        }
+        s = &s[1..];
+    }
+    while let Some(&b) = s.last() {
+        if !is_ws(b) {
+            break;
+        }
+        s = &s[..s.len() - 1];
+    }
+    s
 }
 
 #[cfg(test)]
@@ -545,8 +557,10 @@ mod tests {
     fn test_unpack_json_array() {
         fn u(s: &str) -> Vec<String> {
             let mut dst = Vec::new();
-            unpack_json_array(&mut dst, s);
-            dst
+            unpack_json_array(&mut dst, s.as_bytes());
+            dst.into_iter()
+                .map(|v| String::from_utf8(v).unwrap())
+                .collect()
         }
 
         assert_eq!(u(""), Vec::<String>::new());

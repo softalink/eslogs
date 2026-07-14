@@ -64,10 +64,10 @@ impl Pipe for PipeDecolorize {
         // Port of Go's `updateFunc(a *arena, v string) string` which appends
         // `dropColorSequences(a.b, v)` to a pooled arena and returns the new
         // suffix. The Rust port drops the arena and returns an owned String.
-        let update_func = Arc::new(|v: &str| {
+        let update_func = Arc::new(|v: &[u8]| {
             let mut buf: Vec<u8> = Vec::new();
             drop_color_sequences(&mut buf, v);
-            String::from_utf8_lossy(&buf).into_owned()
+            buf
         });
 
         new_pipe_update_processor(update_func, pp_next, self.field.clone(), None, concurrency)

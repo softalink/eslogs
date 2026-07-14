@@ -5,7 +5,6 @@
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -200,14 +199,14 @@ fn match_string_by_ipv6_range(
     min_value: [u8; 16],
     max_value: [u8; 16],
 ) {
-    visit_values(bs, ch, bm, |v| {
-        match_ipv6_range(to_unsafe_string(v), min_value, max_value)
-    });
+    visit_values(bs, ch, bm, |v| match_ipv6_range(v, min_value, max_value));
 }
 
 /// Port of Go `matchIPv6Range`.
-pub(crate) fn match_ipv6_range(s: &str, min_value: [u8; 16], max_value: [u8; 16]) -> bool {
-    match try_parse_ipv6(s) {
+pub(crate) fn match_ipv6_range(s: &[u8], min_value: [u8; 16], max_value: [u8; 16]) -> bool {
+    // Invalid UTF-8 cannot be a valid IPv6 address, so the parse fails = no
+    // match, exactly like in Go.
+    match std::str::from_utf8(s).ok().and_then(try_parse_ipv6) {
         Some(ip) => !(ipv6_less(ip, min_value) || ipv6_less(max_value, ip)),
         None => false,
     }
@@ -271,13 +270,13 @@ mod tests {
     fn test_match_ipv6_range() {
         let min = ip6("::1");
         let max = ip6("::ff");
-        assert!(match_ipv6_range("::1", min, max));
-        assert!(match_ipv6_range("::80", min, max));
-        assert!(match_ipv6_range("::ff", min, max));
-        assert!(!match_ipv6_range("::0", min, max));
-        assert!(!match_ipv6_range("::100", min, max));
-        assert!(!match_ipv6_range("foobar", min, max));
-        assert!(!match_ipv6_range("", min, max));
+        assert!(match_ipv6_range(b"::1", min, max));
+        assert!(match_ipv6_range(b"::80", min, max));
+        assert!(match_ipv6_range(b"::ff", min, max));
+        assert!(!match_ipv6_range(b"::0", min, max));
+        assert!(!match_ipv6_range(b"::100", min, max));
+        assert!(!match_ipv6_range(b"foobar", min, max));
+        assert!(!match_ipv6_range(b"", min, max));
     }
 
     #[test]

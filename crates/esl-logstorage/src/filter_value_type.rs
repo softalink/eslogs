@@ -119,7 +119,7 @@ mod tests {
     fn test_match_row_by_field() {
         let fields = vec![Field {
             name: "foo".to_string(),
-            value: "bar".to_string(),
+            value: b"bar".to_vec(),
         }];
         let f = FilterValueType {
             value_type: "string".to_string(),

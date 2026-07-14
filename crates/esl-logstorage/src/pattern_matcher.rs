@@ -500,7 +500,7 @@ fn index_of(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Port of Go `utf8.DecodeRune` semantics for iterating runes from an
 /// arbitrary byte offset: invalid or truncated sequences decode as
 /// (U+FFFD, 1).
-fn decode_rune(b: &[u8]) -> (char, usize) {
+pub(crate) fn decode_rune(b: &[u8]) -> (char, usize) {
     let n = b.len().min(4);
     match std::str::from_utf8(&b[..n]) {
         Ok(s) => match s.chars().next() {

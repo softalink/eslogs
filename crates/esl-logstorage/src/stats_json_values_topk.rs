@@ -37,8 +37,8 @@ pub(crate) struct StatsJSONValuesTopkProcessor {
     /// Go's `h.entries`.
     pub(crate) entries: Vec<StatsJSONValuesSortedEntry>,
 
-    sort_columns: Vec<Vec<String>>,
-    sort_values_buf: Vec<String>,
+    sort_columns: Vec<Vec<Vec<u8>>>,
+    sort_values_buf: Vec<Vec<u8>>,
 
     // Captured config (see `crate::stats_json_values` docs).
     pub(crate) field_filters: Vec<String>,
@@ -52,11 +52,7 @@ impl StatsJSONValuesTopkProcessor {
         self.sort_columns.clear();
         for name in &names {
             let c = br.get_column_by_name(name);
-            let values: Vec<String> = br
-                .column_get_values(c)
-                .iter()
-                .map(|v| String::from_utf8_lossy(v).into_owned())
-                .collect();
+            let values: Vec<Vec<u8>> = br.column_get_values(c).to_vec();
             self.sort_columns.push(values);
         }
     }
@@ -151,7 +147,7 @@ impl StatsProcessor for StatsJSONValuesTopkProcessor {
             order.truncate(self.limit as usize);
         }
 
-        let values: Vec<String> = order
+        let values: Vec<Vec<u8>> = order
             .iter()
             .map(|&i| self.entries[i].value.clone())
             .collect();

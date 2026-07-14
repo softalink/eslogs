@@ -2189,10 +2189,15 @@ impl TailProcessor for LogFileProcessor {
                 }
                 Err(err) => {
                     ROWS_DROPPED_TOTAL_INVALID_CRI.inc();
-                    let pod =
-                        must_get_field_val_by_name(&self.common_fields, "kubernetes.pod_name");
-                    let namespace =
-                        must_get_field_val_by_name(&self.common_fields, "kubernetes.pod_namespace");
+                    // Display-only lossy conversions (R5): log message context.
+                    let pod = String::from_utf8_lossy(must_get_field_val_by_name(
+                        &self.common_fields,
+                        "kubernetes.pod_name",
+                    ));
+                    let namespace = String::from_utf8_lossy(must_get_field_val_by_name(
+                        &self.common_fields,
+                        "kubernetes.pod_namespace",
+                    ));
                     INVALID_CRI_LINE_LOGGER.errorf(format_args!(
                         "skipping invalid json-file log line {:?} from Pod {pod:?} in Namespace {namespace:?}: {err}; \
                          see https://docs.victoriametrics.com/victorialogs/vlagent/#troubleshooting for more details",
@@ -2209,9 +2214,15 @@ impl TailProcessor for LogFileProcessor {
                 ROWS_DROPPED_TOTAL_INVALID_CRI.inc();
                 self.partial_cri_stdout.reset();
                 self.partial_cri_stderr.reset();
-                let pod = must_get_field_val_by_name(&self.common_fields, "kubernetes.pod_name");
-                let namespace =
-                    must_get_field_val_by_name(&self.common_fields, "kubernetes.pod_namespace");
+                // Display-only lossy conversions (R5): log message context.
+                let pod = String::from_utf8_lossy(must_get_field_val_by_name(
+                    &self.common_fields,
+                    "kubernetes.pod_name",
+                ));
+                let namespace = String::from_utf8_lossy(must_get_field_val_by_name(
+                    &self.common_fields,
+                    "kubernetes.pod_namespace",
+                ));
                 INVALID_CRI_LINE_LOGGER.errorf(format_args!(
                     "skipping invalid CRI log line {:?} from Pod {pod:?} in Namespace {namespace:?}: {err}; \
                      see https://docs.victoriametrics.com/victorialogs/vlagent/#troubleshooting for more details",
@@ -2310,9 +2321,15 @@ impl LogFileProcessor {
             let size = state.size;
             state.reset();
             TOO_LONG_LINES_SKIPPED.inc();
-            let pod = must_get_field_val_by_name(&self.common_fields, "kubernetes.pod_name");
-            let namespace =
-                must_get_field_val_by_name(&self.common_fields, "kubernetes.pod_namespace");
+            // Display-only lossy conversions (R5): log message context.
+            let pod = String::from_utf8_lossy(must_get_field_val_by_name(
+                &self.common_fields,
+                "kubernetes.pod_name",
+            ));
+            let namespace = String::from_utf8_lossy(must_get_field_val_by_name(
+                &self.common_fields,
+                "kubernetes.pod_namespace",
+            ));
             LOG_LINE_EXCEEDS_MAX_LINE_SIZE_LOGGER.warnf(format_args!(
                 "skipping log entry from Pod {pod:?} in namespace {namespace:?}: entry size of {:.2} MiB exceeds the maximum allowed size of {} MiB",
                 size as f64 / 1024.0 / 1024.0,
@@ -2333,17 +2350,13 @@ impl LogFileProcessor {
 
         let (mut timestamp, ok) = parse_log_row_content(&mut parser, line);
         if !ok {
-            // PORT NOTE: Go aliases the raw line bytes as the `_msg` value
-            // (`bytesutil.ToUnsafeString`), so an unstructured container log
-            // line containing invalid UTF-8 is stored verbatim. The Rust
-            // `Field` value is a `String` (crate-wide decision), so each
-            // invalid sequence is U+FFFD-replaced instead: line bytes
-            // `b"a\xffb"` are stored by Go as `a\xffb` and by the port as
-            // `a\u{FFFD}b`. Closing this would require a String→bytes
-            // `Field` refactor.
+            // Go aliases the raw line bytes as the `_msg` value
+            // (`bytesutil.ToUnsafeString`); with byte-valued `Field`s the
+            // port stores an unstructured container log line containing
+            // invalid UTF-8 verbatim, exactly like Go.
             parser.fields_mut().push(Field {
                 name: "_msg".to_string(),
-                value: String::from_utf8_lossy(line).into_owned(),
+                value: line.to_vec(),
             });
         }
 
@@ -2421,7 +2434,12 @@ fn parse_log_row_content(p: &mut JSONParser, data: &[u8]) -> (i64, bool) {
             let n = field_index(p.fields(), get_time_fields());
             if n >= 0 {
                 let f = &mut p.fields_mut()[n as usize];
-                if let Some(v) = try_parse_timestamp_rfc3339_nano(&f.value) {
+                // R3: invalid UTF-8 fails the timestamp parse, matching Go's
+                // parse semantics on arbitrary bytes.
+                if let Some(v) = std::str::from_utf8(&f.value)
+                    .ok()
+                    .and_then(try_parse_timestamp_rfc3339_nano)
+                {
                     timestamp = v;
                     // Set the time field to empty string to ignore it during data ingestion.
                     f.value.clear();
@@ -2477,7 +2495,7 @@ fn try_parse_klog(mut dst: Vec<Field>, src: &str, current: i64) -> Option<(i64, 
     let mut src = &src[1..];
     dst.push(Field {
         name: "level".to_string(),
-        value: level.to_string(),
+        value: level.as_bytes().to_vec(),
     });
 
     // Parse timestamp (layout "0102 15:04:05.000000").
@@ -2509,7 +2527,7 @@ fn try_parse_klog(mut dst: Vec<Field>, src: &str, current: i64) -> Option<(i64, 
     src = &src[n + 1..];
     dst.push(Field {
         name: "thread_id".to_string(),
-        value: thread_id.to_string(),
+        value: thread_id.as_bytes().to_vec(),
     });
 
     // Parse file:line.
@@ -2525,7 +2543,7 @@ fn try_parse_klog(mut dst: Vec<Field>, src: &str, current: i64) -> Option<(i64, 
     src = &src[1..];
     dst.push(Field {
         name: "source_line".to_string(),
-        value: source_line.to_string(),
+        value: source_line.as_bytes().to_vec(),
     });
 
     // Parse log content.
@@ -2601,7 +2619,7 @@ fn try_parse_klog_content(mut dst: Vec<Field>, src: &str) -> Option<Vec<Field>> 
         // Fast path: message is not quoted and does not contain additional key="value" fields.
         dst.push(Field {
             name: "_msg".to_string(),
-            value: src.to_string(),
+            value: src.as_bytes().to_vec(),
         });
         return Some(dst);
     }
@@ -2612,7 +2630,7 @@ fn try_parse_klog_content(mut dst: Vec<Field>, src: &str) -> Option<Vec<Field>> 
     let mut src = &src[prefix.len()..];
     dst.push(Field {
         name: "_msg".to_string(),
-        value: msg,
+        value: msg.into_bytes(),
     });
 
     // Parse key="value" pairs.
@@ -2634,7 +2652,7 @@ fn try_parse_klog_content(mut dst: Vec<Field>, src: &str) -> Option<Vec<Field>> 
 
         dst.push(Field {
             name: key.to_string(),
-            value,
+            value: value.into_bytes(),
         });
     }
 
@@ -3032,7 +3050,7 @@ fn should_include_metadata_field(field: &str) -> bool {
 }
 
 /// Go `mustGetFieldValByName`.
-fn must_get_field_val_by_name<'a>(common_fields: &'a [Field], field_name: &str) -> &'a str {
+fn must_get_field_val_by_name<'a>(common_fields: &'a [Field], field_name: &str) -> &'a [u8] {
     match common_fields.iter().find(|f| f.name == field_name) {
         Some(f) => &f.value,
         None => panic!("BUG: cannot find field {field_name:?} in commonFields"),
@@ -3966,7 +3984,7 @@ mod tests {
         let storage = Arc::new(TestLogRowsStorage::default());
         let common_fields = vec![Field {
             name: "name".to_string(),
-            value: "benchmarkProcessor".to_string(),
+            value: b"benchmarkProcessor".to_vec(),
         }];
         let mut proc = new_log_file_processor(
             Arc::clone(&storage) as Arc<dyn LogRowsStorage>,

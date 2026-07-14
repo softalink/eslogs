@@ -124,7 +124,7 @@ impl StatsRowAnyProcessor {
         self.fields.clear();
         for &c in &cs {
             let name = br.column_name(c).to_string();
-            let value = br.column_get_value_at_row(c, row_index).to_string();
+            let value = br.column_get_value_at_row(c, row_index).to_vec();
             state_size_increase += (name.len() + value.len()) as i64;
             self.fields.push(Field { name, value });
         }
@@ -217,11 +217,11 @@ mod tests {
             fields: vec![
                 Field {
                     name: "foo".to_string(),
-                    value: "bar".to_string(),
+                    value: b"bar".to_vec(),
                 },
                 Field {
                     name: "abc".to_string(),
-                    value: "de".to_string(),
+                    value: b"de".to_vec(),
                 },
             ],
             ..Default::default()

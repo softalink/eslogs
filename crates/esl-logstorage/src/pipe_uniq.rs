@@ -26,8 +26,9 @@ use crate::block_result::{BlockResult, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
 use crate::values_encoder::{
-    ValueType, marshal_int64_string, marshal_uint64_string, try_parse_int64, try_parse_uint64,
-    unmarshal_int64, unmarshal_uint8, unmarshal_uint16, unmarshal_uint32, unmarshal_uint64,
+    ValueType, marshal_int64_string, marshal_uint64_string, try_parse_int64_bytes,
+    try_parse_uint64_bytes, unmarshal_int64, unmarshal_uint8, unmarshal_uint16, unmarshal_uint32,
+    unmarshal_uint64,
 };
 
 /// A faithful reimplementation of Go's `hitsMap`: hit counts keyed by the
@@ -54,25 +55,28 @@ impl HitsMap {
         (self.u64s.len() + self.negs.len() + self.strings.len()) as u64
     }
 
-    fn passes_filter(&self, v: &str) -> bool {
-        self.filter.is_empty() || v.contains(&self.filter)
+    fn passes_filter(&self, v: &[u8]) -> bool {
+        // Byte-native strings.Contains (Go operates on raw bytes).
+        self.filter.is_empty()
+            || v.windows(self.filter.len())
+                .any(|w| w == self.filter.as_bytes())
     }
 
-    pub(crate) fn update_state_generic(&mut self, v: &str, hits: u64) {
+    pub(crate) fn update_state_generic(&mut self, v: &[u8], hits: u64) {
         if !self.passes_filter(v) {
             return;
         }
-        if let Some(n) = try_parse_uint64(v) {
+        if let Some(n) = try_parse_uint64_bytes(v) {
             *self.u64s.entry(n).or_default() += hits;
             return;
         }
-        if v.as_bytes().first() == Some(&b'-')
-            && let Some(n) = try_parse_int64(v)
+        if v.first() == Some(&b'-')
+            && let Some(n) = try_parse_int64_bytes(v)
         {
             *self.negs.entry(n).or_default() += hits;
             return;
         }
-        *self.strings.entry(v.as_bytes().to_vec()).or_default() += hits;
+        *self.strings.entry(v.to_vec()).or_default() += hits;
     }
 
     pub(crate) fn update_state_string(&mut self, key: &[u8], hits: u64) {
@@ -108,10 +112,6 @@ impl HitsMap {
             *self.strings.entry(k.clone()).or_default() += *v;
         }
     }
-}
-
-fn bytes_to_str(b: &[u8]) -> &str {
-    std::str::from_utf8(b).unwrap_or("")
 }
 
 /// The `| uniq ...` pipe.
@@ -303,7 +303,7 @@ impl PipeUniqProcessor {
     ) {
         let c = br.get_column_by_name(column_name);
         if br.column_is_const(c) {
-            let v = br.column_get_value_at_row(c, 0).to_string();
+            let v = br.column_get_value_at_row(c, 0).to_vec();
             shard.m.update_state_generic(&v, br.rows_len() as u64);
             return;
         }
@@ -333,7 +333,7 @@ impl PipeUniqProcessor {
                 let values = br.column_get_values(c).to_vec();
                 for (i, v) in values.iter().enumerate() {
                     if need_hits || i == 0 || values[i - 1] != *v {
-                        shard.m.update_state_generic(bytes_to_str(v), 1);
+                        shard.m.update_state_generic(v, 1);
                     }
                 }
             }
@@ -520,7 +520,7 @@ mod tests {
                 for (ci, &c) in cols.iter().enumerate() {
                     fields.push(Field {
                         name: names[ci].clone(),
-                        value: br.column_get_value_at_row(c, i).to_string(),
+                        value: br.column_get_value_at_row(c, i).to_vec(),
                     });
                 }
                 out.push(fields);
@@ -534,7 +534,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -561,7 +561,10 @@ mod tests {
                 vec![field("x", "a")],
             ],
         );
-        let mut vals: Vec<String> = out.iter().map(|r| r[0].value.clone()).collect();
+        let mut vals: Vec<String> = out
+            .iter()
+            .map(|r| String::from_utf8(r[0].value.clone()).unwrap())
+            .collect();
         vals.sort();
         assert_eq!(vals, vec!["a", "b"]);
     }
@@ -580,9 +583,11 @@ mod tests {
         let mut got: Vec<(String, String)> = out
             .iter()
             .map(|r| {
-                let x = r.iter().find(|f| f.name == "x").unwrap().value.clone();
-                let h = r.iter().find(|f| f.name == "hits").unwrap().value.clone();
-                (x, h)
+                let get = |name: &str| {
+                    String::from_utf8(r.iter().find(|f| f.name == name).unwrap().value.clone())
+                        .unwrap()
+                };
+                (get("x"), get("hits"))
             })
             .collect();
         got.sort();
@@ -625,7 +630,10 @@ mod tests {
                 vec![field("x", "afoo")],
             ],
         );
-        let mut vals: Vec<String> = out.iter().map(|r| r[0].value.clone()).collect();
+        let mut vals: Vec<String> = out
+            .iter()
+            .map(|r| String::from_utf8(r[0].value.clone()).unwrap())
+            .collect();
         vals.sort();
         assert_eq!(vals, vec!["afoo", "foobar"]);
     }

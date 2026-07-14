@@ -128,7 +128,7 @@ impl PipeProcessor for PipeJSONArrayLenProcessor {
         let c = br.get_column_by_name(&self.field_name);
         if br.column_is_const(c) {
             // Fast path for const column.
-            let v = br.column_get_value_at_row(c, 0).to_string();
+            let v = br.column_get_value_at_row(c, 0).to_vec();
             let a_len = json_array_len(&v);
             let mut enc = Vec::new();
             marshal_uint64_string(&mut enc, a_len as u64);
@@ -142,11 +142,7 @@ impl PipeProcessor for PipeJSONArrayLenProcessor {
             br.add_result_column(std::mem::take(&mut shard.rc));
         } else {
             // Slow path for other columns.
-            let values: Vec<String> = br
-                .column_get_values(c)
-                .iter()
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .collect();
+            let values = br.column_get_values(c).to_vec();
             let mut v_encoded: Vec<u8> = Vec::new();
             for row_idx in 0..values.len() {
                 if row_idx == 0 || values[row_idx] != values[row_idx - 1] {
@@ -172,7 +168,7 @@ impl PipeProcessor for PipeJSONArrayLenProcessor {
 
 /// Port of Go's `shard.getEncodedLen`: encodes the array length as a float64
 /// value and tracks the running min/max.
-fn get_encoded_len(v: &str, min_value: &mut f64, max_value: &mut f64) -> Vec<u8> {
+fn get_encoded_len(v: &[u8], min_value: &mut f64, max_value: &mut f64) -> Vec<u8> {
     let a_len = json_array_len(v);
     let f = a_len as f64;
 
@@ -196,13 +192,13 @@ fn get_encoded_len(v: &str, min_value: &mut f64, max_value: &mut f64) -> Vec<u8>
 /// PORT NOTE: Go computes this via `len(unpackJSONArray(...))`, which lives in
 /// `pipe_unroll.go` (not part of this batch). The length is computed directly
 /// from the parsed `fastjson` document, which is behaviorally identical.
-fn json_array_len(v: &str) -> usize {
+fn json_array_len(v: &[u8]) -> usize {
     let s = trim_json_whitespace(v);
-    if s.is_empty() || !s.starts_with('[') {
+    if s.is_empty() || !s.starts_with(b"[") {
         return 0;
     }
     let mut p = get_parser();
-    let n = match p.parse(s.as_bytes()) {
+    let n = match p.parse(s) {
         Ok(root) => {
             if p.doc.value_type(root) == fastjson::JsonType::Array {
                 p.doc.array_len(root)
@@ -217,8 +213,21 @@ fn json_array_len(v: &str) -> usize {
 }
 
 /// Port of Go's `trimJSONWhitespace`.
-fn trim_json_whitespace(s: &str) -> &str {
-    s.trim_matches(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r')
+fn trim_json_whitespace(mut s: &[u8]) -> &[u8] {
+    let is_ws = |b: u8| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r';
+    while let Some(&b) = s.first() {
+        if !is_ws(b) {
+            break;
+        }
+        s = &s[1..];
+    }
+    while let Some(&b) = s.last() {
+        if !is_ws(b) {
+            break;
+        }
+        s = &s[..s.len() - 1];
+    }
+    s
 }
 
 #[cfg(test)]

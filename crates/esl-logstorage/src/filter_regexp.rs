@@ -4,7 +4,6 @@
 
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 use esl_common::regexutil::Regex;
 
@@ -71,6 +70,19 @@ impl FilterRegexp {
     }
 }
 
+/// Matches the raw value bytes `v` against `re`.
+///
+/// PORT NOTE: Go's regexp engine matches arbitrary bytes, while the port's
+/// `Regex::match_string` takes `&str`. Valid UTF-8 values match identically;
+/// invalid UTF-8 values fall back to matching the lossy-decoded string, which
+/// is a documented residual difference (regex-on-invalid-utf8) from Go.
+pub(crate) fn match_regexp_bytes(re: &Regex, v: &[u8]) -> bool {
+    match std::str::from_utf8(v) {
+        Ok(s) => re.match_string(s),
+        Err(_) => re.match_string(&String::from_utf8_lossy(v)),
+    }
+}
+
 impl FieldFilter for FilterRegexp {
     fn to_string(&self) -> String {
         format!("~{}", quote_token_if_needed(&self.re_str))
@@ -78,7 +90,7 @@ impl FieldFilter for FilterRegexp {
 
     fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
         let v = get_field_value_by_name(fields, field_name);
-        self.re.match_string(v)
+        match_regexp_bytes(&self.re, v)
     }
 
     fn apply_to_block_result_by_field(
@@ -87,7 +99,9 @@ impl FieldFilter for FilterRegexp {
         bm: &mut Bitmap,
         field_name: &str,
     ) {
-        apply_to_block_result_generic(br, bm, field_name, "", |v, _| self.re.match_string(v));
+        apply_to_block_result_generic(br, bm, field_name, "", |v, _| {
+            match_regexp_bytes(&self.re, v)
+        });
     }
 
     fn apply_to_block_search_by_field(
@@ -99,7 +113,7 @@ impl FieldFilter for FilterRegexp {
         // Verify whether filter matches const column.
         let v = bs.get_const_column_value(field_name);
         if !v.is_empty() {
-            if !self.re.match_string(&v) {
+            if !match_regexp_bytes(&self.re, &v) {
                 bm.reset_bits();
             }
             return;
@@ -153,7 +167,7 @@ fn match_timestamp_iso8601_by_regexp(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_timestamp_iso8601_string(&pp, &mut bb, v);
-        re.match_string(to_unsafe_string(&bb))
+        match_regexp_bytes(re, &bb)
     });
 }
 
@@ -172,7 +186,7 @@ fn match_ipv4_by_regexp(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_ipv4_string(&pp, &mut bb, v);
-        re.match_string(to_unsafe_string(&bb))
+        match_regexp_bytes(re, &bb)
     });
 }
 
@@ -191,7 +205,7 @@ fn match_float64_by_regexp(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_float64_string(&pp, &mut bb, v);
-        re.match_string(to_unsafe_string(&bb))
+        match_regexp_bytes(re, &bb)
     });
 }
 
@@ -203,7 +217,7 @@ fn match_values_dict_by_regexp(
 ) {
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
-        bb.push(u8::from(re.match_string(v)));
+        bb.push(u8::from(match_regexp_bytes(re, v)));
     }
     match_encoded_values_dict(bs, ch, bm, &bb);
 }
@@ -219,7 +233,7 @@ fn match_string_by_regexp(
         bm.reset_bits();
         return;
     }
-    visit_values(bs, ch, bm, |v| re.match_string(to_unsafe_string(v)));
+    visit_values(bs, ch, bm, |v| match_regexp_bytes(re, v));
 }
 
 fn match_uint8_by_regexp(
@@ -237,7 +251,7 @@ fn match_uint8_by_regexp(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_uint8_string(&pp, &mut bb, v);
-        re.match_string(to_unsafe_string(&bb))
+        match_regexp_bytes(re, &bb)
     });
 }
 
@@ -256,7 +270,7 @@ fn match_uint16_by_regexp(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_uint16_string(&pp, &mut bb, v);
-        re.match_string(to_unsafe_string(&bb))
+        match_regexp_bytes(re, &bb)
     });
 }
 
@@ -275,7 +289,7 @@ fn match_uint32_by_regexp(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_uint32_string(&pp, &mut bb, v);
-        re.match_string(to_unsafe_string(&bb))
+        match_regexp_bytes(re, &bb)
     });
 }
 
@@ -294,7 +308,7 @@ fn match_uint64_by_regexp(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_uint64_string(&pp, &mut bb, v);
-        re.match_string(to_unsafe_string(&bb))
+        match_regexp_bytes(re, &bb)
     });
 }
 
@@ -313,6 +327,6 @@ fn match_int64_by_regexp(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_int64_string(&pp, &mut bb, v);
-        re.match_string(to_unsafe_string(&bb))
+        match_regexp_bytes(re, &bb)
     });
 }

@@ -196,7 +196,7 @@ struct PipeExtractRegexpProcessor {
 struct PipeExtractRegexpProcessorShard {
     bm: Bitmap,
     result_columns: Vec<Option<ColRef>>,
-    result_values: Vec<String>,
+    result_values: Vec<Vec<u8>>,
     rcs: Vec<ResultColumn>,
     fields: Vec<String>,
 }
@@ -253,6 +253,9 @@ impl PipeProcessor for PipeExtractRegexpProcessor {
         }
 
         let c = br.get_column_by_name(&self.from_field);
+        // PORT NOTE: regex-on-invalid-utf8 is a documented residual — the regex
+        // crate needs &str, so invalid UTF-8 source values are matched (and
+        // rewritten) via their lossy view.
         let values: Vec<String> = br
             .column_get_values(c)
             .iter()
@@ -269,7 +272,7 @@ impl PipeProcessor for PipeExtractRegexpProcessor {
         }
 
         result_values.clear();
-        result_values.resize(nfields, String::new());
+        result_values.resize(nfields, Vec::new());
 
         let mut need_updates = true;
         let mut v_prev = String::new();
@@ -284,11 +287,11 @@ impl PipeProcessor for PipeExtractRegexpProcessor {
                         if re_fields[i].is_empty() {
                             continue;
                         }
-                        let mut val = std::mem::take(&mut fields[i]);
+                        let mut val = std::mem::take(&mut fields[i]).into_bytes();
                         let want_original = (val.is_empty() && self.skip_empty_results)
                             || self.keep_original_fields;
                         if let (true, Some(rc_col)) = (want_original, result_columns[i]) {
-                            let v_orig = br.column_get_value_at_row(rc_col, row_idx).to_string();
+                            let v_orig = br.column_get_value_at_row(rc_col, row_idx).to_vec();
                             if !v_orig.is_empty() {
                                 val = v_orig;
                             }
@@ -299,7 +302,7 @@ impl PipeProcessor for PipeExtractRegexpProcessor {
             } else {
                 for i in 0..nfields {
                     if let Some(rc_col) = result_columns[i] {
-                        result_values[i] = br.column_get_value_at_row(rc_col, row_idx).to_string();
+                        result_values[i] = br.column_get_value_at_row(rc_col, row_idx).to_vec();
                     }
                 }
                 need_updates = true;
@@ -307,7 +310,7 @@ impl PipeProcessor for PipeExtractRegexpProcessor {
 
             for i in 0..nfields {
                 if !re_fields[i].is_empty() {
-                    rcs[i].add_value(result_values[i].as_bytes());
+                    rcs[i].add_value(&result_values[i]);
                 }
             }
         }

@@ -23,7 +23,7 @@ struct StatsRow {
     name: String,
     labels: Vec<Field>,
     timestamp: i64,
-    value: String,
+    value: Vec<u8>,
 }
 
 /// Go `statsSeries` (the `key` lives as the map key / sort key).
@@ -36,7 +36,7 @@ struct StatsSeries {
 /// Go `statsPoint`.
 struct StatsPoint {
     timestamp: i64,
-    value: String,
+    value: Vec<u8>,
 }
 
 /// Go `histogramBucket`.
@@ -166,7 +166,7 @@ pub fn process_stats_query_request(storage: &Arc<Storage>, req: &Request, w: &mu
                 if label_fields.contains(&c.name) {
                     labels.push(Field {
                         name: c.name.clone(),
-                        value: String::from_utf8_lossy(&c.values[i]).into_owned(),
+                        value: c.values[i].clone(),
                     });
                 }
             }
@@ -176,25 +176,30 @@ pub fn process_stats_query_request(storage: &Arc<Storage>, req: &Request, w: &mu
                     continue;
                 }
 
-                let v = String::from_utf8_lossy(&c.values[i]).into_owned();
-                if is_histogram_value(&v) {
+                let v = c.values[i].clone();
+                // Histogram values are ASCII JSON; a value with invalid UTF-8
+                // simply is not a histogram (matches Go's semantics).
+                if let Some(vs) = std::str::from_utf8(&v)
+                    .ok()
+                    .filter(|s| is_histogram_value(s))
+                {
                     // Special case - the value is the result of histogram()
                     // stats function. Convert it to values for individual
                     // buckets.
-                    if let Ok(buckets) = parse_histogram_buckets(&v) {
+                    if let Ok(buckets) = parse_histogram_buckets(vs) {
                         let name = format!("{}_bucket", c.name);
                         let mut bucket_rows: Vec<StatsRow> = Vec::with_capacity(buckets.len());
                         for bucket in buckets {
                             let mut bucket_labels = labels.clone();
                             bucket_labels.push(Field {
                                 name: "vmrange".to_string(),
-                                value: bucket.vmrange,
+                                value: bucket.vmrange.into_bytes(),
                             });
                             bucket_rows.push(StatsRow {
                                 name: name.clone(),
                                 labels: bucket_labels,
                                 timestamp,
-                                value: bucket.hits.to_string(),
+                                value: bucket.hits.to_string().into_bytes(),
                             });
                         }
                         rows_cl.lock().unwrap().extend(bucket_rows);
@@ -318,8 +323,12 @@ pub fn process_stats_query_range_request(
             let mut labels: Vec<Field> = Vec::with_capacity(label_fields.len());
             for c in columns {
                 if c.name == "_time" {
-                    let v = String::from_utf8_lossy(&c.values[i]);
-                    if let Some(nsec) = try_parse_timestamp_rfc3339_nano(&v) {
+                    // R3: invalid UTF-8 fails the timestamp parse, exactly
+                    // like Go's parse on arbitrary bytes.
+                    if let Some(nsec) = std::str::from_utf8(&c.values[i])
+                        .ok()
+                        .and_then(try_parse_timestamp_rfc3339_nano)
+                    {
                         ts = nsec;
                         continue;
                     }
@@ -327,7 +336,7 @@ pub fn process_stats_query_range_request(
                 if label_fields.contains(&c.name) {
                     labels.push(Field {
                         name: c.name.clone(),
-                        value: String::from_utf8_lossy(&c.values[i]).into_owned(),
+                        value: c.values[i].clone(),
                     });
                 }
             }
@@ -338,22 +347,27 @@ pub fn process_stats_query_range_request(
                     continue;
                 }
 
-                let v = String::from_utf8_lossy(&c.values[i]).into_owned();
-                if is_histogram_value(&v) {
+                let v = c.values[i].clone();
+                // Histogram values are ASCII JSON; a value with invalid UTF-8
+                // simply is not a histogram (matches Go's semantics).
+                if let Some(vs) = std::str::from_utf8(&v)
+                    .ok()
+                    .filter(|s| is_histogram_value(s))
+                {
                     // Special case - the value is the result of histogram()
                     // stats function. Convert it to values for individual
                     // buckets.
-                    if let Ok(buckets) = parse_histogram_buckets(&v) {
+                    if let Ok(buckets) = parse_histogram_buckets(vs) {
                         let name = format!("{}_bucket", c.name);
                         for bucket in buckets {
                             let mut bucket_labels = labels.clone();
                             bucket_labels.push(Field {
                                 name: "vmrange".to_string(),
-                                value: bucket.vmrange,
+                                value: bucket.vmrange.into_bytes(),
                             });
                             let p = StatsPoint {
                                 timestamp: ts,
-                                value: bucket.hits.to_string(),
+                                value: bucket.hits.to_string().into_bytes(),
                             };
                             add_point(&m_cl, &name, column_idx, bucket_labels, p);
                         }
@@ -452,7 +466,7 @@ fn write_metric_object(dst: &mut Vec<u8>, name: &str, labels: &[Field]) {
         dst.push(b',');
         append_json_string(dst, label.name.as_bytes());
         dst.push(b':');
-        append_json_string(dst, label.value.as_bytes());
+        append_json_string(dst, &label.value);
     }
     dst.push(b'}');
 }
@@ -470,7 +484,7 @@ fn write_stats_query_response(dst: &mut Vec<u8>, rows: &[StatsRow]) {
         dst.extend_from_slice(b",\"value\":[");
         dst.extend_from_slice(format_timestamp_seconds(r.timestamp).as_bytes());
         dst.push(b',');
-        append_json_string(dst, r.value.as_bytes());
+        append_json_string(dst, &r.value);
         dst.extend_from_slice(b"]}");
     }
     dst.extend_from_slice(b"]}}");
@@ -494,7 +508,7 @@ fn write_stats_query_range_response(dst: &mut Vec<u8>, rows: &[(Vec<u8>, StatsSe
             dst.push(b'[');
             dst.extend_from_slice(format_timestamp_seconds(p.timestamp).as_bytes());
             dst.push(b',');
-            append_json_string(dst, p.value.as_bytes());
+            append_json_string(dst, &p.value);
             dst.push(b']');
         }
         dst.extend_from_slice(b"]}");
@@ -644,10 +658,10 @@ mod tests {
             name: "rows".to_string(),
             labels: vec![Field {
                 name: "host".to_string(),
-                value: "node-1".to_string(),
+                value: b"node-1".to_vec(),
             }],
             timestamp: 1_500_000_000_000_000_000,
-            value: "5".to_string(),
+            value: b"5".to_vec(),
         }];
         let mut dst = Vec::new();
         write_stats_query_response(&mut dst, &rows);

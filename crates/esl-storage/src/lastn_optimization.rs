@@ -54,7 +54,7 @@ pub fn run_optimized_last_n_results_query(
             .iter()
             .map(|f| BlockColumn {
                 name: f.name.clone(),
-                values: vec![f.value.clone().into_bytes()],
+                values: vec![f.value.clone()],
             })
             .collect();
         db.set_columns(columns);
@@ -218,7 +218,7 @@ fn get_log_rows_from_data_block(db: &mut DataBlock) -> Result<Vec<LogRow>, Strin
             if c.name == "_time" {
                 fields.push(Field {
                     name: "_time".to_string(),
-                    value: String::from_utf8_lossy(&c.values[i]).into_owned(),
+                    value: c.values[i].clone(),
                 });
             }
         }
@@ -228,7 +228,7 @@ fn get_log_rows_from_data_block(db: &mut DataBlock) -> Result<Vec<LogRow>, Strin
             }
             fields.push(Field {
                 name: c.name.clone(),
-                value: String::from_utf8_lossy(&c.values[i]).into_owned(),
+                value: c.values[i].clone(),
             });
         }
         lrs.push(LogRow { timestamp, fields });
@@ -281,7 +281,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -322,16 +322,19 @@ mod tests {
 
     /// Runs `query` through `crate::run_query` and returns `(seq, _time)`
     /// values of the returned rows in emission order.
-    fn run_collect(s: &Arc<Storage>, query: &str, timestamp: i64) -> Vec<(String, String)> {
+    /// `(seq, _time)` value bytes of one returned row.
+    type SeqTimeRow = (Vec<u8>, Vec<u8>);
+
+    fn run_collect(s: &Arc<Storage>, query: &str, timestamp: i64) -> Vec<SeqTimeRow> {
         let q = ParseQueryAtTimestamp(query, timestamp).unwrap();
-        let out: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let out: Arc<Mutex<Vec<SeqTimeRow>>> = Arc::new(Mutex::new(Vec::new()));
         let out_shared = Arc::clone(&out);
         let write_block: WriteDataBlockFn = Arc::new(move |_worker_id, db: &mut DataBlock| {
             let mut seqs = Vec::new();
             let mut times = Vec::new();
             for c in db.get_columns(false) {
                 for v in &c.values {
-                    let v = String::from_utf8_lossy(v).into_owned();
+                    let v = v.clone();
                     if c.name == "seq" {
                         seqs.push(v);
                     } else if c.name == "_time" {
@@ -391,8 +394,8 @@ mod tests {
         // 4 rows, limit 3: the initial probe returns < 2*limit rows.
         let (path, s, base) = open_with_rows("fast", 4);
         let rows = run_collect(&s, "* | sort by (_time) desc limit 3", base + 100);
-        let seqs: Vec<&str> = rows.iter().map(|(seq, _)| seq.as_str()).collect();
-        assert_eq!(seqs, vec!["3", "2", "1"]);
+        let seqs: Vec<&[u8]> = rows.iter().map(|(seq, _)| seq.as_slice()).collect();
+        assert_eq!(seqs, vec![b"3".as_slice(), b"2", b"1"]);
         s.must_close();
         esl_common::fs::must_remove_dir(&path);
     }
@@ -403,8 +406,8 @@ mod tests {
         // triggers the adaptive time-range narrowing.
         let (path, s, base) = open_with_rows("slow", 12);
         let rows = run_collect(&s, "* | sort by (_time) desc limit 3", base + 100);
-        let seqs: Vec<&str> = rows.iter().map(|(seq, _)| seq.as_str()).collect();
-        assert_eq!(seqs, vec!["11", "10", "9"]);
+        let seqs: Vec<&[u8]> = rows.iter().map(|(seq, _)| seq.as_slice()).collect();
+        assert_eq!(seqs, vec![b"11".as_slice(), b"10", b"9"]);
         s.must_close();
         esl_common::fs::must_remove_dir(&path);
     }
@@ -413,8 +416,8 @@ mod tests {
     fn test_run_query_last_n_with_offset() {
         let (path, s, base) = open_with_rows("offset", 12);
         let rows = run_collect(&s, "* | sort by (_time) desc offset 2 limit 3", base + 100);
-        let seqs: Vec<&str> = rows.iter().map(|(seq, _)| seq.as_str()).collect();
-        assert_eq!(seqs, vec!["9", "8", "7"]);
+        let seqs: Vec<&[u8]> = rows.iter().map(|(seq, _)| seq.as_slice()).collect();
+        assert_eq!(seqs, vec![b"9".as_slice(), b"8", b"7"]);
         s.must_close();
         esl_common::fs::must_remove_dir(&path);
     }

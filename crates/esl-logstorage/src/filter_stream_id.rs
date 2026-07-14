@@ -79,10 +79,7 @@ impl FilterStreamID {
         m: &HashSet<Vec<u8>>,
     ) {
         let values = br.column_get_values(r);
-        bm.for_each_set_bit(|idx| {
-            let v = to_unsafe_string(&values[idx]);
-            m.contains(v.as_bytes())
-        });
+        bm.for_each_set_bit(|idx| m.contains(&values[idx]));
     }
 }
 
@@ -177,7 +174,7 @@ impl Filter for FilterStreamID {
     fn match_row(&self, fields: &[Field]) -> bool {
         let m = self.get_stream_ids_map();
         let v = get_field_value_by_name(fields, "_stream_id");
-        m.contains(v.as_bytes())
+        m.contains(v)
     }
 
     fn apply_to_block_result(&self, br: &mut BlockResult, bm: &mut Bitmap) {
@@ -190,8 +187,8 @@ impl Filter for FilterStreamID {
 
         let r = br.get_column_by_name("_stream_id");
         if br.column_is_const(r) {
-            let v = br.column_get_value_at_row(r, 0).to_string();
-            if !m.contains(v.as_bytes()) {
+            let v = br.column_get_value_at_row(r, 0).to_vec();
+            if !m.contains(&v) {
                 bm.reset_bits();
             }
             return;

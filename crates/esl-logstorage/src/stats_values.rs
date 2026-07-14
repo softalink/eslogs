@@ -97,7 +97,7 @@ impl StatsValuesProcessor {
     fn update_stats_for_all_rows_column(&mut self, br: &mut BlockResult, r: ColRef) -> i64 {
         let rows = br.rows_len();
         if br.column_is_const(r) {
-            let v = br.column_get_value_at_row(r, 0).as_bytes().to_vec();
+            let v = br.column_get_value_at_row(r, 0).to_vec();
             let mut inc = v.len() as i64;
             for _ in 0..rows {
                 self.values.push(v.clone());
@@ -129,9 +129,9 @@ impl StatsValuesProcessor {
         row_idx: usize,
     ) -> i64 {
         let v = if br.column_is_const(r) {
-            br.column_get_value_at_row(r, 0).as_bytes().to_vec()
+            br.column_get_value_at_row(r, 0).to_vec()
         } else {
-            br.column_get_value_at_row(r, row_idx).as_bytes().to_vec()
+            br.column_get_value_at_row(r, row_idx).to_vec()
         };
         let inc = v.len() as i64;
         self.values.push(v);

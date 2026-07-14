@@ -6,7 +6,6 @@
 //! `match_*_by_range` block-search helpers reused by `filter_ipv4_range` and
 //! `filter_ipv6_range`.
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -197,9 +196,7 @@ pub(crate) fn match_string_by_range(
     min_value: f64,
     max_value: f64,
 ) {
-    visit_values(bs, ch, bm, |v| {
-        match_range(to_unsafe_string(v), min_value, max_value)
-    });
+    visit_values(bs, ch, bm, |v| match_range(v, min_value, max_value));
 }
 
 pub(crate) fn match_uint8_by_range(
@@ -388,8 +385,13 @@ pub(crate) fn match_ipv4_by_range(
 // ---------------------------------------------------------------------------
 
 /// Port of Go `matchRange`.
-pub(crate) fn match_range(s: &str, min_value: f64, max_value: f64) -> bool {
-    let f = parse_math_number(s);
+pub(crate) fn match_range(s: &[u8], min_value: f64, max_value: f64) -> bool {
+    // Invalid UTF-8 cannot parse as a number/timestamp/ipv4, so it yields NaN
+    // = no match, exactly like the failed parse in Go.
+    let f = match std::str::from_utf8(s) {
+        Ok(s) => parse_math_number(s),
+        Err(_) => f64::NAN,
+    };
     f >= min_value && f <= max_value
 }
 
@@ -487,13 +489,13 @@ mod tests {
 
     #[test]
     fn test_match_range() {
-        assert!(match_range("10", -10.0, 20.0));
-        assert!(match_range("10", 10.0, 10.0));
-        assert!(!match_range("10", 10.1, 20.0));
-        assert!(!match_range("abc", -1e18, 1e18));
-        assert!(match_range("10.5", 10.0, 11.0));
+        assert!(match_range(b"10", -10.0, 20.0));
+        assert!(match_range(b"10", 10.0, 10.0));
+        assert!(!match_range(b"10", 10.1, 20.0));
+        assert!(!match_range(b"abc", -1e18, 1e18));
+        assert!(match_range(b"10.5", 10.0, 11.0));
         // ipv4 parsed via parse_math_number
-        assert!(match_range("0.0.0.1", 1.0, 1.0));
+        assert!(match_range(b"0.0.0.1", 1.0, 1.0));
     }
 
     #[test]

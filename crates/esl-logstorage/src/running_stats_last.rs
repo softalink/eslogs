@@ -45,12 +45,12 @@ impl RunningStatsLast {
 /// Port of `runningStatsLastProcessor`.
 pub(crate) struct RunningStatsLastProcessor {
     offset: usize,
-    values: Vec<String>,
+    values: Vec<Vec<u8>>,
 }
 
 impl RunningStatsLastProcessor {
     pub(crate) fn update_running_stats(&mut self, sf: &RunningStatsLast, row: &[Field]) {
-        let mut value = String::new();
+        let mut value = Vec::new();
         for f in row {
             if f.name == sf.field_name {
                 value = f.value.clone();
@@ -65,9 +65,9 @@ impl RunningStatsLastProcessor {
         }
     }
 
-    pub(crate) fn get_running_stats(&self) -> String {
+    pub(crate) fn get_running_stats(&self) -> Vec<u8> {
         if self.values.len() <= self.offset {
-            return String::new();
+            return Vec::new();
         }
         self.values[self.values.len() - self.offset - 1].clone()
     }
@@ -104,7 +104,7 @@ impl crate::pipe_running_stats::RunningStatsProcessor for RunningStatsLastProces
         self.update_running_stats(sf, row)
     }
 
-    fn get_running_stats(&self) -> String {
+    fn get_running_stats(&self) -> Vec<u8> {
         self.get_running_stats()
     }
 }
@@ -116,7 +116,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -127,7 +127,7 @@ mod tests {
         for v in ["one", "two", "three"] {
             sp.update_running_stats(&sf, &[field("a", v)]);
         }
-        assert_eq!(sp.get_running_stats(), "three");
+        assert_eq!(sp.get_running_stats(), b"three");
     }
 
     #[test]
@@ -138,7 +138,7 @@ mod tests {
             sp.update_running_stats(&sf, &[field("a", v)]);
         }
         // offset 1 -> the row before last -> "r2"
-        assert_eq!(sp.get_running_stats(), "r2");
+        assert_eq!(sp.get_running_stats(), b"r2");
     }
 
     #[test]
@@ -146,7 +146,7 @@ mod tests {
         let sf = new_running_stats_last("a".to_string(), 5);
         let mut sp = sf.new_running_stats_processor();
         sp.update_running_stats(&sf, &[field("a", "r0")]);
-        assert_eq!(sp.get_running_stats(), "");
+        assert_eq!(sp.get_running_stats(), b"");
     }
 
     #[test]

@@ -113,7 +113,7 @@ impl PipeProcessor for PipeDropEmptyFieldsProcessor {
                 }
                 fields.push(Field {
                     name: names[i].clone(),
-                    value: String::from_utf8_lossy(v).into_owned(),
+                    value: v.clone(),
                 });
             }
             wctx.write_row(fields.as_slice());
@@ -190,7 +190,7 @@ impl PipeDropEmptyFieldsWriteContext {
 
         for (i, f) in fields.iter().enumerate() {
             let v = &f.value;
-            self.rcs[i].add_value(v.as_bytes());
+            self.rcs[i].add_value(v);
             self.values_len += v.len();
         }
 

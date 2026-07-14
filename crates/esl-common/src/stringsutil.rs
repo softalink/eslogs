@@ -33,6 +33,35 @@ pub fn json_string(s: &str) -> String {
     dst
 }
 
+/// Appends JSON-quoted `s` (raw bytes) to `dst`, like [`json_string`] but
+/// byte-oriented: the same ASCII escapes are applied and every byte >= 0x80 is
+/// passed through raw, exactly like Go `quicktemplate.AppendJSONString` (Go
+/// strings are arbitrary bytes). For valid UTF-8 input the output is identical
+/// to [`json_string`].
+pub fn json_string_bytes_append(dst: &mut Vec<u8>, s: &[u8]) {
+    dst.push(b'"');
+    for &b in s {
+        match b {
+            b'\n' => dst.extend_from_slice(b"\\n"),
+            b'\r' => dst.extend_from_slice(b"\\r"),
+            b'\t' => dst.extend_from_slice(b"\\t"),
+            0x08 => dst.extend_from_slice(b"\\b"),
+            0x0c => dst.extend_from_slice(b"\\f"),
+            b'"' => dst.extend_from_slice(b"\\\""),
+            b'\\' => dst.extend_from_slice(b"\\\\"),
+            b'<' => dst.extend_from_slice(b"\\u003c"),
+            b'\'' => dst.extend_from_slice(b"\\u0027"),
+            b if b < 0x20 => {
+                let mut buf = String::new();
+                write!(buf, "\\u{:04x}", b as u32).unwrap();
+                dst.extend_from_slice(buf.as_bytes());
+            }
+            b => dst.push(b),
+        }
+    }
+    dst.push(b'"');
+}
+
 /// Returns true if `a` is less than `b` using natural sort comparison.
 ///
 /// See <https://en.wikipedia.org/wiki/Natural_sort_order>

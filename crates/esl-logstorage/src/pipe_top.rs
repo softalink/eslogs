@@ -28,8 +28,9 @@ use crate::block_result::{BlockResult, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
 use crate::values_encoder::{
-    ValueType, marshal_int64_string, marshal_uint64_string, try_parse_int64, try_parse_uint64,
-    unmarshal_int64, unmarshal_uint8, unmarshal_uint16, unmarshal_uint32, unmarshal_uint64,
+    ValueType, marshal_int64_string, marshal_uint64_string, try_parse_int64_bytes,
+    try_parse_uint64_bytes, unmarshal_int64, unmarshal_uint8, unmarshal_uint16, unmarshal_uint32,
+    unmarshal_uint64,
 };
 
 const PIPE_TOP_DEFAULT_LIMIT: u64 = 10;
@@ -52,25 +53,28 @@ impl HitsMap {
         }
     }
 
-    fn passes_filter(&self, v: &str) -> bool {
-        self.filter.is_empty() || v.contains(&self.filter)
+    fn passes_filter(&self, v: &[u8]) -> bool {
+        // Byte-native strings.Contains (Go operates on raw bytes).
+        self.filter.is_empty()
+            || v.windows(self.filter.len())
+                .any(|w| w == self.filter.as_bytes())
     }
 
-    pub(crate) fn update_state_generic(&mut self, v: &str, hits: u64) {
+    pub(crate) fn update_state_generic(&mut self, v: &[u8], hits: u64) {
         if !self.passes_filter(v) {
             return;
         }
-        if let Some(n) = try_parse_uint64(v) {
+        if let Some(n) = try_parse_uint64_bytes(v) {
             *self.u64s.entry(n).or_default() += hits;
             return;
         }
-        if v.as_bytes().first() == Some(&b'-')
-            && let Some(n) = try_parse_int64(v)
+        if v.first() == Some(&b'-')
+            && let Some(n) = try_parse_int64_bytes(v)
         {
             *self.negs.entry(n).or_default() += hits;
             return;
         }
-        *self.strings.entry(v.as_bytes().to_vec()).or_default() += hits;
+        *self.strings.entry(v.to_vec()).or_default() += hits;
     }
 
     pub(crate) fn update_state_string(&mut self, key: &[u8], hits: u64) {
@@ -106,10 +110,6 @@ impl HitsMap {
             *self.strings.entry(k.clone()).or_default() += *v;
         }
     }
-}
-
-fn bytes_to_str(b: &[u8]) -> &str {
-    std::str::from_utf8(b).unwrap_or("")
 }
 
 /// One top entry: the value key and its hit count (Go `pipeTopEntry`).
@@ -313,7 +313,7 @@ impl PipeTopProcessor {
     fn update_single_column(&self, shard: &mut Shard, br: &mut BlockResult, field_name: &str) {
         let c = br.get_column_by_name(field_name);
         if br.column_is_const(c) {
-            let v = br.column_get_value_at_row(c, 0).to_string();
+            let v = br.column_get_value_at_row(c, 0).to_vec();
             let rows_len = br.rows_len() as u64;
             shard.hits_map().update_state_generic(&v, rows_len);
             return;
@@ -378,12 +378,12 @@ impl PipeTopProcessor {
                     if values[row_idx - 1] == values[row_idx] {
                         hits += 1;
                     } else {
-                        let v = bytes_to_str(&values[row_idx - 1]).to_string();
+                        let v = values[row_idx - 1].clone();
                         shard.hits_map().update_state_generic(&v, hits);
                         hits = 1;
                     }
                 }
-                let v = bytes_to_str(&values[values.len() - 1]).to_string();
+                let v = values[values.len() - 1].clone();
                 shard.hits_map().update_state_generic(&v, hits);
             }
         }
@@ -543,7 +543,7 @@ mod tests {
                 for (ci, &c) in cols.iter().enumerate() {
                     fields.push(Field {
                         name: names[ci].clone(),
-                        value: br.column_get_value_at_row(c, i).to_string(),
+                        value: br.column_get_value_at_row(c, i).to_vec(),
                     });
                 }
                 out.push(fields);
@@ -557,7 +557,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -576,7 +576,7 @@ mod tests {
     fn get<'a>(row: &'a [Field], name: &str) -> &'a str {
         row.iter()
             .find(|f| f.name == name)
-            .map(|f| f.value.as_str())
+            .map(|f| std::str::from_utf8(&f.value).unwrap())
             .unwrap_or("")
     }
 

@@ -33,7 +33,7 @@ impl LogfmtParser {
         f.name.clear();
         f.name.push_str(name);
         f.value.clear();
-        f.value.push_str(value);
+        f.value.extend_from_slice(value.as_bytes());
         self.fields.push(f);
     }
 

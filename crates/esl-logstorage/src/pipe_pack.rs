@@ -108,7 +108,7 @@ impl PipeProcessor for PipePackProcessor {
         for row_idx in 0..rows_len {
             shard.fields.clear();
             for (i, &c) in shard.cs.iter().enumerate() {
-                let v = br.column_get_value_at_row(c, row_idx).to_string();
+                let v = br.column_get_value_at_row(c, row_idx).to_vec();
                 shard.fields.push(Field {
                     name: shard.cs_names[i].clone(),
                     value: v,

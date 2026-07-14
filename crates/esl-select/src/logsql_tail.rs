@@ -186,7 +186,7 @@ fn json_rows(rows: &[Vec<Field>]) -> Vec<u8> {
         let f = &fields[0];
         append_json_string(&mut buf, f.name.as_bytes());
         buf.push(b':');
-        append_json_string(&mut buf, f.value.as_bytes());
+        append_json_string(&mut buf, &f.value);
         for f in &fields[1..] {
             if f.value.is_empty() {
                 continue;
@@ -194,7 +194,7 @@ fn json_rows(rows: &[Vec<Field>]) -> Vec<u8> {
             buf.push(b',');
             append_json_string(&mut buf, f.name.as_bytes());
             buf.push(b':');
-            append_json_string(&mut buf, f.value.as_bytes());
+            append_json_string(&mut buf, &f.value);
         }
         buf.extend_from_slice(b"}\n");
     }
@@ -230,8 +230,8 @@ struct TailProcessor {
 
 #[derive(Default)]
 struct TailState {
-    per_stream_rows: HashMap<String, Vec<LogRow>>,
-    last_timestamps: HashMap<String, i64>,
+    per_stream_rows: HashMap<Vec<u8>, Vec<LogRow>>,
+    last_timestamps: HashMap<Vec<u8>, i64>,
     err: Option<String>,
 }
 
@@ -266,10 +266,10 @@ impl TailProcessor {
         // Copy block rows to per_stream_rows.
         let columns = db.get_columns(self.need_sort_fields);
         for (i, &timestamp) in timestamps.iter().enumerate() {
-            let mut stream_id = String::new();
+            let mut stream_id = Vec::new();
             let mut fields = Vec::with_capacity(columns.len());
             for c in columns {
-                let value = String::from_utf8_lossy(&c.values[i]).into_owned();
+                let value = c.values[i].clone();
                 if c.name == "_stream_id" {
                     stream_id = value.clone();
                 }
@@ -330,32 +330,32 @@ mod tests {
             vec![
                 Field {
                     name: "_msg".to_string(),
-                    value: "hello".to_string(),
+                    value: b"hello".to_vec(),
                 },
                 Field {
                     name: "empty".to_string(),
-                    value: String::new(),
+                    value: Vec::new(),
                 },
                 Field {
                     name: "host".to_string(),
-                    value: "node-1".to_string(),
+                    value: b"node-1".to_vec(),
                 },
             ],
             // Leading empty-valued fields are skipped entirely.
             vec![
                 Field {
                     name: "lead".to_string(),
-                    value: String::new(),
+                    value: Vec::new(),
                 },
                 Field {
                     name: "k".to_string(),
-                    value: "v".to_string(),
+                    value: b"v".to_vec(),
                 },
             ],
             // Rows with no valued fields produce no output.
             vec![Field {
                 name: "only-empty".to_string(),
-                value: String::new(),
+                value: Vec::new(),
             }],
         ];
         assert_eq!(
@@ -440,11 +440,11 @@ mod tests {
                 let mut fields = vec![
                     Field {
                         name: "_msg".to_string(),
-                        value: "tail-late".to_string(),
+                        value: b"tail-late".to_vec(),
                     },
                     Field {
                         name: "host".to_string(),
-                        value: "node-1".to_string(),
+                        value: b"node-1".to_vec(),
                     },
                 ];
                 lr.must_add(tenant, unique_nsec(), &mut fields, -1);

@@ -234,7 +234,7 @@ fn parse_json_request<S: LogRowsStorage>(
             for (k, val) in labels {
                 fields_tmp.push(Field {
                     name: k.clone(),
-                    value: val.marshaled(),
+                    value: val.marshaled().into_bytes(),
                 });
             }
         }
@@ -279,7 +279,7 @@ fn parse_json_request<S: LogRowsStorage>(
                 for (k, val) in metadata {
                     fields_tmp.push(Field {
                         name: k.clone(),
-                        value: val.marshaled(),
+                        value: val.marshaled().into_bytes(),
                     });
                 }
             }
@@ -291,7 +291,7 @@ fn parse_json_request<S: LogRowsStorage>(
             let allow_msg_renaming = add_msg_field(
                 &mut fields_tmp,
                 msg_parser.as_mut(),
-                msg,
+                msg.as_bytes(),
                 preserve_keys,
                 msg_fields_prefix,
             );
@@ -321,13 +321,17 @@ fn parse_json_request<S: LogRowsStorage>(
 pub(crate) fn add_msg_field(
     fs: &mut Vec<Field>,
     msg_parser: Option<&mut JSONParser>,
-    msg_orig: &str,
+    msg_orig: &[u8],
     preserve_keys: &[&str],
     msg_fields_prefix: &str,
 ) -> bool {
-    // Log collectors can leave trailing whitespace.
-    let msg = msg_orig.trim();
-    let b = msg.as_bytes();
+    // Log collectors can leave trailing whitespace. Go TrimSpace trims
+    // Unicode whitespace; mirror it when the bytes are valid UTF-8 and fall
+    // back to ASCII trimming otherwise (an invalid sequence is not a space).
+    let b: &[u8] = match std::str::from_utf8(msg_orig) {
+        Ok(t) => t.trim().as_bytes(),
+        Err(_) => msg_orig.trim_ascii(),
+    };
 
     match msg_parser {
         Some(p) if b.len() >= 2 && b[0] == b'{' && b[b.len() - 1] == b'}' => {
@@ -339,7 +343,7 @@ pub(crate) fn add_msg_field(
             } else {
                 fs.push(Field {
                     name: "_msg".to_string(),
-                    value: msg_orig.to_string(),
+                    value: msg_orig.to_vec(),
                 });
                 false
             }
@@ -347,7 +351,7 @@ pub(crate) fn add_msg_field(
         _ => {
             fs.push(Field {
                 name: "_msg".to_string(),
-                value: msg_orig.to_string(),
+                value: msg_orig.to_vec(),
             });
             false
         }

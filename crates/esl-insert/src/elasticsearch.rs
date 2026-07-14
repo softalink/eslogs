@@ -285,7 +285,11 @@ fn extract_timestamp_from_fields(
             if f.name != *time_field {
                 continue;
             }
-            let timestamp = parse_elasticsearch_timestamp(&f.value)?;
+            // R3: invalid UTF-8 fails the timestamp parse, matching Go's
+            // parse semantics on arbitrary bytes.
+            let timestamp = std::str::from_utf8(&f.value)
+                .map_err(|e| e.to_string())
+                .and_then(parse_elasticsearch_timestamp)?;
             f.value.clear();
             return Ok(timestamp);
         }

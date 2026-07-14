@@ -5,7 +5,12 @@ use std::sync::Mutex;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::bitmap::Bitmap;
-use crate::tokenizer::{is_ascii, is_token_char, is_token_rune};
+use crate::pattern_matcher::decode_rune;
+use crate::tokenizer::{is_token_char, is_token_rune};
+
+fn is_ascii(b: &[u8]) -> bool {
+    b.is_ascii()
+}
 
 /// Extracts word tokens from a, hashes them and appends hashes to dst.
 ///
@@ -14,7 +19,7 @@ use crate::tokenizer::{is_ascii, is_token_char, is_token_rune};
 ///
 /// PORT NOTE: Go appends to `dst []uint64` and returns it; the port mutates
 /// `dst` in place.
-pub fn tokenize_hashes<S: AsRef<str>>(dst: &mut Vec<u64>, a: &[S]) {
+pub fn tokenize_hashes<S: AsRef<[u8]>>(dst: &mut Vec<u64>, a: &[S]) {
     let mut t = get_hash_tokenizer();
     for (i, s) in a.iter().enumerate() {
         let s = s.as_ref();
@@ -78,8 +83,9 @@ impl HashTokenizer {
         }
     }
 
-    /// Appends hashes for word tokens from s to dst, skipping already seen tokens.
-    pub fn tokenize_string(&mut self, dst: &mut Vec<u64>, s: &str) {
+    /// Appends hashes for word tokens from s to dst, skipping already seen
+    /// tokens. `s` is raw value bytes (Go strings are arbitrary bytes).
+    pub fn tokenize_string(&mut self, dst: &mut Vec<u64>, s: &[u8]) {
         if !is_ascii(s) {
             // Slow path - s contains unicode chars
             self.tokenize_string_unicode(dst, s);
@@ -87,7 +93,7 @@ impl HashTokenizer {
         }
 
         // Fast path for ASCII s
-        let b = s.as_bytes();
+        let b = s;
         let mut i = 0usize;
         while i < b.len() {
             // Search for the next token.
@@ -124,25 +130,34 @@ impl HashTokenizer {
         }
     }
 
-    fn tokenize_string_unicode(&mut self, dst: &mut Vec<u64>, s: &str) {
+    fn tokenize_string_unicode(&mut self, dst: &mut Vec<u64>, s: &[u8]) {
+        // Byte-native rune iteration with Go `utf8.DecodeRune` semantics:
+        // an invalid byte decodes as (U+FFFD, 1), which is not a token rune,
+        // so invalid bytes act as token separators - exactly like in Go.
         let mut s = s;
         while !s.is_empty() {
             // Search for the next token.
             let mut n = s.len();
-            for (offset, r) in s.char_indices() {
+            let mut offset = 0usize;
+            while offset < s.len() {
+                let (r, size) = decode_rune(&s[offset..]);
                 if is_token_rune(r) {
                     n = offset;
                     break;
                 }
+                offset += size;
             }
             s = &s[n..];
             // Search for the end of the token.
             let mut n = s.len();
-            for (offset, r) in s.char_indices() {
+            let mut offset = 0usize;
+            while offset < s.len() {
+                let (r, size) = decode_rune(&s[offset..]);
                 if !is_token_rune(r) {
                     n = offset;
                     break;
                 }
+                offset += size;
             }
             if n == 0 {
                 break;
@@ -157,8 +172,8 @@ impl HashTokenizer {
         }
     }
 
-    fn add_token(&mut self, token: &str) -> (u64, bool) {
-        let h = xxh64(token.as_bytes(), 0);
+    fn add_token(&mut self, token: &[u8]) -> (u64, bool) {
+        let h = xxh64(token, 0);
         let idx = (h % (self.buckets.len() as u64)) as usize;
 
         let b = &mut self.buckets[idx];

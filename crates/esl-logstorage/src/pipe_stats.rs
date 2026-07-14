@@ -57,7 +57,7 @@ use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::values_encoder::{
-    marshal_int64_string, marshal_uint64_string, try_parse_int64, try_parse_uint64,
+    marshal_int64_string, marshal_uint64_string, try_parse_int64_bytes, try_parse_uint64_bytes,
 };
 
 /// A single stats function to execute, its optional `if(...)` filter, and the
@@ -602,10 +602,6 @@ struct Shard {
     state_size_budget: i64,
 }
 
-fn bytes_to_str(b: &[u8]) -> &str {
-    std::str::from_utf8(b).unwrap_or("")
-}
-
 /// Resolves the group for a generic value, choosing the u64 / negative-i64 /
 /// string bucket exactly like Go's `getPipeStatsGroupGeneric`. Returns the
 /// group and the state-size charge for the budget when a new group is created
@@ -616,15 +612,14 @@ fn get_group_generic<'a>(
     funcs: &[PipeStatsFunc],
     v: &[u8],
 ) -> (&'a mut PipeStatsGroup, i64) {
-    let s = bytes_to_str(v);
-    if let Some(n) = try_parse_uint64(s) {
+    if let Some(n) = try_parse_uint64_bytes(v) {
         return match shard.groups_u64.entry(n) {
             Entry::Occupied(o) => (o.into_mut(), 0),
             Entry::Vacant(vac) => (vac.insert(new_group(funcs)), new_group_size_bytes(funcs)),
         };
     }
     if v.first() == Some(&b'-')
-        && let Some(n) = try_parse_int64(s)
+        && let Some(n) = try_parse_int64_bytes(v)
     {
         return match shard.groups_neg.entry(n) {
             Entry::Occupied(o) => (o.into_mut(), 0),
@@ -842,7 +837,7 @@ impl PipeStatsProcessor {
 
         if br.column_is_const(c) && !bucketed {
             // Fast path — a single constant value for the whole block.
-            let v = br.column_get_value_at_row(c, 0).as_bytes().to_vec();
+            let v = br.column_get_value_at_row(c, 0).to_vec();
             let (group, create_charge) = get_group_generic(shard, funcs, &v);
             let d = group.update_all_rows(funcs, bms, br, br_tmp);
             shard.state_size_budget -= d + create_charge;
@@ -1106,7 +1101,7 @@ mod tests {
                 for (ci, &c) in cols.iter().enumerate() {
                     fields.push(Field {
                         name: names[ci].clone(),
-                        value: br.column_get_value_at_row(c, i).to_string(),
+                        value: br.column_get_value_at_row(c, i).to_vec(),
                     });
                 }
                 out.push(fields);
@@ -1120,7 +1115,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -1182,7 +1177,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].len(), 1);
         assert_eq!(out[0][0].name, "rows");
-        assert_eq!(out[0][0].value, "3");
+        assert_eq!(out[0][0].value, b"3");
     }
 
     // `init_stats_rate_funcs` propagates the per-second step to rate() funcs so
@@ -1208,7 +1203,7 @@ mod tests {
         let out = run(&ps, blocks);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0][0].name, "r");
-        assert_eq!(out[0][0].value, "1");
+        assert_eq!(out[0][0].value, b"1");
     }
 
     // An explicit `_time` bucket wins over the query-range step
@@ -1242,7 +1237,7 @@ mod tests {
             .iter()
             .find_map(|row| row.iter().find(|f| f.name == "r"))
             .expect("rate column present");
-        assert_eq!(r.value, "2");
+        assert_eq!(r.value, b"2");
     }
 
     // Global count over zero rows must still emit a single `0` row.
@@ -1251,7 +1246,7 @@ mod tests {
         let ps = new_pipe_stats(vec![], vec![count_func("rows")]).unwrap();
         let out = run(&ps, vec![]);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0][0].value, "0");
+        assert_eq!(out[0][0].value, b"0");
     }
 
     #[test]
@@ -1266,10 +1261,10 @@ mod tests {
         out.sort_by(|r1, r2| r1[0].value.cmp(&r2[0].value));
         assert_eq!(out.len(), 2);
         assert_eq!(out[0][0].name, "host");
-        assert_eq!(out[0][0].value, "a");
-        assert_eq!(out[0][1].value, "2");
-        assert_eq!(out[1][0].value, "b");
-        assert_eq!(out[1][1].value, "1");
+        assert_eq!(out[0][0].value, b"a");
+        assert_eq!(out[0][1].value, b"2");
+        assert_eq!(out[1][0].value, b"b");
+        assert_eq!(out[1][1].value, b"1");
     }
 
     #[test]
@@ -1297,14 +1292,14 @@ mod tests {
         });
         assert_eq!(out.len(), 2);
         // a/x → 15
-        assert_eq!(out[0][0].value, "a");
-        assert_eq!(out[0][1].value, "x");
+        assert_eq!(out[0][0].value, b"a");
+        assert_eq!(out[0][1].value, b"x");
         assert_eq!(out[0][2].name, "s");
-        assert_eq!(out[0][2].value, "15");
+        assert_eq!(out[0][2].value, b"15");
         // b/y → 3
-        assert_eq!(out[1][0].value, "b");
-        assert_eq!(out[1][1].value, "y");
-        assert_eq!(out[1][2].value, "3");
+        assert_eq!(out[1][0].value, b"b");
+        assert_eq!(out[1][1].value, b"y");
+        assert_eq!(out[1][2].value, b"3");
     }
 
     #[test]
@@ -1323,8 +1318,8 @@ mod tests {
         pp.flush().unwrap();
         let out = sink.blocks.lock().unwrap();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0][0].value, "5");
-        assert_eq!(out[0][1].value, "3");
+        assert_eq!(out[0][0].value, b"5");
+        assert_eq!(out[0][1].value, b"3");
     }
 
     fn pipe_new(

@@ -1236,6 +1236,10 @@ fn process_uncompressed_stream<P: SyslogLogMessageProcessor>(
             Some(loc) => (0, Some(Arc::clone(loc))),
             None => (GLOBAL_TIMEZONE_OFFSET_SECS.load(Ordering::SeqCst), None),
         };
+        // PORT NOTE: the esl-logstorage syslog parser API takes &str, so a
+        // syslog line with invalid UTF-8 is U+FFFD-replaced here (Go parses
+        // the raw bytes). Closing this requires a bytes-based syslog parser
+        // in esl-logstorage.
         let line = String::from_utf8_lossy(&slr.line);
         process_line(
             &line,
@@ -1475,7 +1479,10 @@ fn parse_extra_fields(s: &str) -> Result<Vec<Field>, String> {
             p.skip_ws();
             p.expect(b':')?;
             p.skip_ws();
-            let value = p.parse_string()?;
+            // NOTE: the scanner input is a `&str` flag value, so escape
+            // decoding produces valid UTF-8 by construction; converting the
+            // decoded String to bytes is lossless.
+            let value = p.parse_string()?.into_bytes();
             // Go decodes into map[string]string: a duplicate key overwrites.
             if let Some(f) = fields.iter_mut().find(|f| f.name == name) {
                 f.value = value;

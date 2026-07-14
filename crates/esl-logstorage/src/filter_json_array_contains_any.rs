@@ -6,8 +6,6 @@
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
-
 use crate::bitmap::Bitmap;
 use crate::block_header::ColumnHeader;
 use crate::block_result::BlockResult;
@@ -115,7 +113,7 @@ impl FieldFilter for FilterJSONArrayContainsAny {
 
         let r = br.get_column_by_name(field_name);
         if br.column_is_const(r) {
-            let v = br.column_get_value_at_row(r, 0).to_string();
+            let v = br.column_get_value_at_row(r, 0).to_vec();
             if !match_json_array_contains_any(&v, &self.values, tokenss) {
                 bm.reset_bits();
             }
@@ -134,11 +132,7 @@ impl FieldFilter for FilterJSONArrayContainsAny {
             ValueType::STRING | ValueType::DICT => {
                 let values = br.column_get_values(r);
                 bm.for_each_set_bit(|idx| {
-                    match_json_array_contains_any(
-                        to_unsafe_string(&values[idx]),
-                        &self.values,
-                        tokenss,
-                    )
+                    match_json_array_contains_any(&values[idx], &self.values, tokenss)
                 });
             }
             _ => bm.reset_bits(),
@@ -178,7 +172,7 @@ impl FieldFilter for FilterJSONArrayContainsAny {
                 }
                 let tokenss = &self.get_tokens().0;
                 visit_values(bs, &ch, bm, |v| {
-                    match_json_array_contains_any(to_unsafe_string(v), &self.values, tokenss)
+                    match_json_array_contains_any(v, &self.values, tokenss)
                 });
             }
             ValueType::DICT => {
@@ -213,7 +207,9 @@ fn match_any_tokens_hashess(
 }
 
 /// Port of Go `matchJSONArrayContainsAny`.
-fn match_json_array_contains_any(s: &str, values: &[String], tokenss: &[Vec<String>]) -> bool {
+///
+/// The haystack `s` is raw value bytes (Go strings are arbitrary bytes).
+fn match_json_array_contains_any(s: &[u8], values: &[String], tokenss: &[Vec<String>]) -> bool {
     if s.is_empty() {
         // Fast path for empty strings.
         return false;
@@ -221,7 +217,7 @@ fn match_json_array_contains_any(s: &str, values: &[String], tokenss: &[Vec<Stri
 
     let s = trim_json_whitespace(s);
 
-    if !s.starts_with('[') {
+    if !s.starts_with(b"[") {
         // Fast path - s is not a JSON array.
         return false;
     }
@@ -238,8 +234,8 @@ fn match_json_array_contains_any(s: &str, values: &[String], tokenss: &[Vec<Stri
     ok
 }
 
-fn json_array_contains_any_slow(p: &mut fastjson::Parser, s: &str, values: &[String]) -> bool {
-    let v = match p.parse(s.as_bytes()) {
+fn json_array_contains_any_slow(p: &mut fastjson::Parser, s: &[u8], values: &[String]) -> bool {
+    let v = match p.parse(s) {
         Ok(v) => v,
         Err(_) => return false,
     };
@@ -255,8 +251,8 @@ fn json_array_contains_any_slow(p: &mut fastjson::Parser, s: &str, values: &[Str
         match p.doc.value_type(e) {
             fastjson::JsonType::String => {
                 let span = p.doc.string_span(e);
-                let sv = to_unsafe_string(p.doc.str_bytes(span));
-                if values.iter().any(|x| x.as_str() == sv) {
+                let sv = p.doc.str_bytes(span);
+                if values.iter().any(|x| x.as_bytes() == sv) {
                     return true;
                 }
             }
@@ -266,8 +262,7 @@ fn json_array_contains_any_slow(p: &mut fastjson::Parser, s: &str, values: &[Str
             | fastjson::JsonType::Null => {
                 let mut bb = Vec::new();
                 p.doc.marshal_value_to(e, &mut bb);
-                let sv = to_unsafe_string(&bb);
-                if values.iter().any(|x| x.as_str() == sv) {
+                if values.iter().any(|x| x.as_bytes() == bb) {
                     return true;
                 }
             }
@@ -279,18 +274,23 @@ fn json_array_contains_any_slow(p: &mut fastjson::Parser, s: &str, values: &[Str
 }
 
 /// Port of Go `matchAnyTokenss`.
-fn match_any_tokenss(s: &str, tokenss: &[Vec<String>]) -> bool {
+fn match_any_tokenss(s: &[u8], tokenss: &[Vec<String>]) -> bool {
     tokenss.iter().any(|tokens| match_all_substrings(s, tokens))
 }
 
 /// Port of Go `matchAllSubstrings`.
-fn match_all_substrings(s: &str, tokens: &[String]) -> bool {
-    tokens.iter().all(|token| s.contains(token.as_str()))
+fn match_all_substrings(s: &[u8], tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .all(|token| crate::filter_generic::index_bytes(s, token.as_bytes()).is_some())
 }
 
 /// Port of Go `trimJSONWhitespace`.
-fn trim_json_whitespace(s: &str) -> &str {
-    s.trim_matches(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r')
+fn trim_json_whitespace(s: &[u8]) -> &[u8] {
+    let is_ws = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r');
+    let start = s.iter().position(|&c| !is_ws(c)).unwrap_or(s.len());
+    let end = s.iter().rposition(|&c| !is_ws(c)).map_or(start, |i| i + 1);
+    &s[start..end]
 }
 
 #[cfg(test)]
@@ -308,7 +308,7 @@ mod tests {
                 tokenss.push(toks.into_iter().map(|s| s.to_string()).collect());
             }
 
-            let result = match_json_array_contains_any(s, &values, &tokenss);
+            let result = match_json_array_contains_any(s.as_bytes(), &values, &tokenss);
             assert_eq!(result, result_expected, "s={s:?} values={values:?}");
         }
 

@@ -99,8 +99,8 @@ impl StatsProcessor for StatsHistogramProcessor {
         let c = br.get_column_by_name(&self.field_name);
 
         if br.column_is_const(c) {
-            let v = br.column_get_value_at_row(c, 0).to_string();
-            if let Some(f) = try_parse_number(&v) {
+            let f = try_parse_number_bytes(br.column_get_value_at_row(c, 0));
+            if let Some(f) = f {
                 for _ in 0..br.rows_len() {
                     self.h.update(f);
                 }
@@ -142,13 +142,9 @@ impl StatsProcessor for StatsHistogramProcessor {
         } else if vt == ValueType::IPV4 || vt == ValueType::TIMESTAMP_ISO8601 {
             // skip ipv4/iso8601 values, since they cannot be represented as numbers
         } else {
-            let values: Vec<String> = br
-                .column_get_values(c)
-                .iter()
-                .map(|v| String::from_utf8_lossy(v).into_owned())
-                .collect();
-            for v in &values {
-                if let Some(f) = try_parse_number(v) {
+            let values = br.column_get_values(c);
+            for v in values {
+                if let Some(f) = try_parse_number_bytes(v) {
                     self.h.update(f);
                 }
             }
@@ -166,8 +162,8 @@ impl StatsProcessor for StatsHistogramProcessor {
         let c = br.get_column_by_name(&self.field_name);
 
         if br.column_is_const(c) {
-            let v = br.column_get_value_at_row(c, 0).to_string();
-            if let Some(f) = try_parse_number(&v) {
+            let f = try_parse_number_bytes(br.column_get_value_at_row(c, 0));
+            if let Some(f) = f {
                 self.h.update(f);
             }
             return 0;
@@ -195,8 +191,8 @@ impl StatsProcessor for StatsHistogramProcessor {
         } else if vt == ValueType::IPV4 || vt == ValueType::TIMESTAMP_ISO8601 {
             // skip ipv4/iso8601 values, since they cannot be represented as numbers
         } else {
-            let v = br.column_get_value_at_row(c, row_index).to_string();
-            if let Some(f) = try_parse_number(&v) {
+            let f = try_parse_number_bytes(br.column_get_value_at_row(c, row_index));
+            if let Some(f) = f {
                 self.h.update(f);
             }
         }
@@ -309,7 +305,7 @@ impl StatsProcessor for StatsHistogramProcessor {
 }
 
 // Go `tryParseNumber` (block_result.go): shared port lives in `pipe_math.rs`.
-use crate::pipe_math::try_parse_number;
+use crate::pipe_math::try_parse_number_bytes;
 
 // ---------------------------------------------------------------------------
 // metrics.Histogram port (see module docs).
@@ -477,7 +473,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 

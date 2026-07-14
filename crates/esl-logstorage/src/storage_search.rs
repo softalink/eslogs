@@ -340,8 +340,8 @@ fn try_parse_timestamps(dst: &mut Vec<i64>, values: &[Vec<u8>]) -> bool {
 /// A value together with the number of hits for it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ValueWithHits {
-    /// The value.
-    pub value: String,
+    /// The value (raw bytes; Go strings are arbitrary bytes).
+    pub value: Vec<u8>,
     /// The number of hits for the value.
     pub hits: u64,
 }
@@ -349,7 +349,7 @@ pub struct ValueWithHits {
 impl ValueWithHits {
     /// Appends the marshaled `self` to `dst`.
     pub fn marshal(&self, dst: &mut Vec<u8>) {
-        encoding::marshal_bytes(dst, self.value.as_bytes());
+        encoding::marshal_bytes(dst, &self.value);
         encoding::marshal_uint64(dst, self.hits);
     }
 
@@ -366,7 +366,7 @@ impl ValueWithHits {
             _ => return Err("cannot unmarshal value".to_string()),
         };
         let mut src = &src[n as usize..];
-        self.value = to_unsafe_string(value).to_string();
+        self.value = value.to_vec();
 
         if src.len() < 8 {
             return Err("cannot unmarshal hits".to_string());
@@ -424,14 +424,18 @@ pub fn parse_stream_fields(mut dst: Vec<Field>, s: &str) -> Result<Vec<Field>, S
 
         dst.push(Field {
             name: name.to_string(),
-            value: value.clone(),
+            value: value.into_bytes(),
         });
 
         if s.is_empty() {
             return Ok(dst);
         }
         if !s.starts_with(',') {
-            return Err(format!("missing ',' after {name}={value:?}"));
+            let f = dst.last().unwrap();
+            return Err(format!(
+                "missing ',' after {name}={:?}",
+                String::from_utf8_lossy(&f.value)
+            ));
         }
         s = &s[1..];
     }
@@ -1181,9 +1185,15 @@ impl Storage {
         let streams =
             self.get_streams(tenant_ids, q, hidden_fields_filters, u64::MAX, cancel, qs)?;
 
-        let mut m: HashMap<String, u64> = HashMap::new();
+        let mut m: HashMap<Vec<u8>, u64> = HashMap::new();
         for_each_stream_field(&streams, |f, hits| {
-            if !filter.is_empty() && !f.value.contains(filter) {
+            // Byte-wise substring check (Go strings.Contains is a byte search).
+            if !filter.is_empty()
+                && !f
+                    .value
+                    .windows(filter.len())
+                    .any(|w| w == filter.as_bytes())
+            {
                 return;
             }
 
@@ -1303,10 +1313,10 @@ impl Storage {
 
             let mut values_with_hits = Vec::with_capacity(column_values.len());
             for i in 0..column_values.len() {
-                let hits_str = String::from_utf8_lossy(&column_hits[i]);
-                let hits = crate::values_encoder::try_parse_uint64(&hits_str).unwrap_or(0);
+                let hits =
+                    crate::values_encoder::try_parse_uint64_bytes(&column_hits[i]).unwrap_or(0);
                 values_with_hits.push(ValueWithHits {
-                    value: String::from_utf8_lossy(&column_values[i]).into_owned(),
+                    value: column_values[i].clone(),
                     hits,
                 });
             }
@@ -1589,7 +1599,7 @@ fn get_rows(
                     continue;
                 }
                 let name = c.name.clone();
-                let value = String::from_utf8_lossy(v).into_owned();
+                let value = v.clone();
                 block_size +=
                     (name.len() + value.len()) as i64 + 2 * std::mem::size_of::<String>() as i64;
                 fields.push(Field { name, value });
@@ -1796,10 +1806,13 @@ pub(crate) fn init_subqueries(
 }
 
 /// Port of Go `toValuesWithHits` (`map[string]*uint64` becomes an owned map).
-fn to_values_with_hits(m: HashMap<String, u64>) -> Vec<ValueWithHits> {
+fn to_values_with_hits<K: Into<Vec<u8>>>(m: HashMap<K, u64>) -> Vec<ValueWithHits> {
     let mut results: Vec<ValueWithHits> = m
         .into_iter()
-        .map(|(value, hits)| ValueWithHits { value, hits })
+        .map(|(value, hits)| ValueWithHits {
+            value: value.into(),
+            hits,
+        })
         .collect();
     crate::pipe_field_values_local::sort_values_with_hits(&mut results);
     results
@@ -1809,7 +1822,12 @@ fn to_values_with_hits(m: HashMap<String, u64>) -> Vec<ValueWithHits> {
 /// `{name="value",...}` stream names in `streams`.
 fn for_each_stream_field(streams: &[ValueWithHits], mut f: impl FnMut(&Field, u64)) {
     for vh in streams {
-        let Ok(fields) = parse_stream_fields(Vec::new(), &vh.value) else {
+        // Stream names are rendered `{k="v",...}` text; a non-UTF-8 stream
+        // name cannot be parsed, so it is skipped like any malformed name.
+        let Ok(name) = std::str::from_utf8(&vh.value) else {
+            continue;
+        };
+        let Ok(fields) = parse_stream_fields(Vec::new(), name) else {
             continue;
         };
         let hits = vh.hits;
@@ -2113,11 +2131,11 @@ mod tests {
             let mut fields = vec![
                 Field {
                     name: "_msg".to_string(),
-                    value: msg.to_string(),
+                    value: msg.as_bytes().to_vec(),
                 },
                 Field {
                     name: "host".to_string(),
-                    value: "node-1".to_string(),
+                    value: b"node-1".to_vec(),
                 },
             ];
             lr.must_add(tenant, base + i as i64, &mut fields, -1);
@@ -2186,11 +2204,11 @@ mod tests {
             let mut fields = vec![
                 Field {
                     name: "_msg".to_string(),
-                    value: msg.to_string(),
+                    value: msg.as_bytes().to_vec(),
                 },
                 Field {
                     name: "host".to_string(),
-                    value: "node-1".to_string(),
+                    value: b"node-1".to_vec(),
                 },
             ];
             lr.must_add(tenant, base + (i as i64) * 1_000_000, &mut fields, -1);
@@ -2277,7 +2295,9 @@ mod tests {
             .expect("get_field_names slow filtered");
         assert_eq!(fast_filtered, slow_filtered);
         assert!(
-            fast_filtered.iter().all(|vh| vh.value.contains("_stream")),
+            fast_filtered
+                .iter()
+                .all(|vh| vh.value.windows("_stream".len()).any(|w| w == b"_stream")),
             "filtered names must contain the filter substring"
         );
 
@@ -2503,7 +2523,7 @@ mod tests {
         fn field(name: &str, value: &str) -> Field {
             Field {
                 name: name.to_string(),
-                value: value.to_string(),
+                value: value.as_bytes().to_vec(),
             }
         }
 
@@ -2544,7 +2564,7 @@ mod tests {
     fn test_storage_run_query_values_with_hits() {
         fn vh(value: &str, hits: u64) -> ValueWithHits {
             ValueWithHits {
-                value: value.to_string(),
+                value: value.as_bytes().to_vec(),
                 hits,
             }
         }
@@ -3071,7 +3091,7 @@ mod tests {
     #[test]
     fn test_value_with_hits_marshal_unmarshal() {
         let vh = ValueWithHits {
-            value: "foo".to_string(),
+            value: b"foo".to_vec(),
             hits: 1234,
         };
         let mut data = Vec::new();
@@ -3189,7 +3209,7 @@ mod tests {
                 for (row_id, v) in c.values.iter().enumerate() {
                     rows[row_id].push(Field {
                         name: c.name.clone(),
-                        value: String::from_utf8_lossy(v).into_owned(),
+                        value: v.clone(),
                     });
                 }
             }
@@ -3248,11 +3268,11 @@ mod tests {
                 fields.clear();
                 fields.push(Field {
                     name: "host".to_string(),
-                    value: format!("host-{stream_id}"),
+                    value: format!("host-{stream_id}").into_bytes(),
                 });
                 fields.push(Field {
                     name: "app".to_string(),
-                    value: format!("app-{}", 200 + stream_id),
+                    value: format!("app-{}", 200 + stream_id).into_bytes(),
                 });
                 for tenant_id in tenant_ids {
                     for day_id in 0..DAYS {
@@ -3260,15 +3280,16 @@ mod tests {
                             name: "_msg".to_string(),
                             value: format!(
                                 "value #{row_id} at the day {day_id} for the tenantID={tenant_id} and streamID={stream_id}"
-                            ),
+                            )
+                            .into_bytes(),
                         });
                         fields.push(Field {
                             name: "row_id".to_string(),
-                            value: format!("{row_id}"),
+                            value: format!("{row_id}").into_bytes(),
                         });
                         fields.push(Field {
                             name: "tenant_id".to_string(),
-                            value: tenant_id.to_string(),
+                            value: tenant_id.to_string().into_bytes(),
                         });
                         let timestamp = now - day_id * NSECS_PER_DAY;
                         lr.must_add(*tenant_id, timestamp, &mut fields, -1);

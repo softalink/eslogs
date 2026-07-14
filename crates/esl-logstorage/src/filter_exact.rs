@@ -6,7 +6,6 @@
 
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::encoding;
 use esl_common::panicf;
 
@@ -74,7 +73,7 @@ impl FieldFilter for FilterExact {
 
     fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
         let v = get_field_value_by_name(fields, field_name);
-        v == self.value
+        v == self.value.as_bytes()
     }
 
     fn apply_to_block_result_by_field(
@@ -88,7 +87,7 @@ impl FieldFilter for FilterExact {
         let r = br.get_column_by_name(field_name);
         if br.column_is_const(r) {
             let v = br.column_get_value_at_row(r, 0);
-            if v != value {
+            if v != value.as_bytes() {
                 bm.reset_bits();
             }
             return;
@@ -205,7 +204,7 @@ impl FieldFilter for FilterExact {
 
         let v = bs.get_const_column_value(field_name);
         if !v.is_empty() {
-            if value != v {
+            if value.as_bytes() != v.as_slice() {
                 bm.reset_bits();
             }
             return;
@@ -255,7 +254,7 @@ pub(crate) fn match_column_by_exact_value(
     value: &str,
 ) {
     let values = br.column_get_values(r);
-    bm.for_each_set_bit(|idx| to_unsafe_string(&values[idx]) == value);
+    bm.for_each_set_bit(|idx| values[idx].as_slice() == value.as_bytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -327,7 +326,7 @@ pub(crate) fn match_values_dict_by_exact_value(
 ) {
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
-        bb.push(u8::from(v == value));
+        bb.push(u8::from(v.as_slice() == value.as_bytes()));
     }
     match_encoded_values_dict(bs, ch, bm, &bb);
 }
@@ -343,7 +342,7 @@ pub(crate) fn match_string_by_exact_value(
         bm.reset_bits();
         return;
     }
-    visit_values(bs, ch, bm, |v| to_unsafe_string(v) == value);
+    visit_values(bs, ch, bm, |v| v == value.as_bytes());
 }
 
 pub(crate) fn match_uint8_by_exact_value(

@@ -21,7 +21,7 @@ use crate::pipe::PipeProcessor;
 use crate::prefix_filter;
 
 /// Rewrites a field value. Port of Go's `updateFunc`.
-pub(crate) type UpdateFunc = Arc<dyn Fn(&str) -> String + Send + Sync>;
+pub(crate) type UpdateFunc = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // IfFilter (Go `ifFilter`)
@@ -181,17 +181,16 @@ impl PipeProcessor for PipeUpdateProcessor {
         let values: Vec<Vec<u8>> = br.column_get_values(c).to_vec();
 
         let mut need_updates = true;
-        let mut v_prev = String::new();
-        let mut v_new = String::new();
+        let mut v_prev: Vec<u8> = Vec::new();
+        let mut v_new: Vec<u8> = Vec::new();
         for (row_idx, v_bytes) in values.iter().enumerate() {
-            let v = String::from_utf8_lossy(v_bytes);
             if !has_iff || shard.bm.is_set_bit(row_idx) {
-                if need_updates || v_prev != v {
-                    v_prev = v.to_string();
+                if need_updates || &v_prev != v_bytes {
+                    v_prev = v_bytes.clone();
                     need_updates = false;
-                    v_new = (self.update_func)(&v);
+                    v_new = (self.update_func)(v_bytes);
                 }
-                shard.rc.add_value(v_new.as_bytes());
+                shard.rc.add_value(&v_new);
             } else {
                 shard.rc.add_value(v_bytes);
             }
@@ -251,7 +250,7 @@ pub(crate) mod test_utils {
                 for (name, col) in names.iter().zip(column_values.iter()) {
                     row.push(Field {
                         name: name.clone(),
-                        value: String::from_utf8_lossy(&col[i]).into_owned(),
+                        value: col[i].clone(),
                     });
                 }
                 out.push(row);
@@ -358,7 +357,7 @@ pub(crate) mod test_utils {
                 row.iter()
                     .map(|(n, v)| Field {
                         name: n.to_string(),
-                        value: v.to_string(),
+                        value: v.as_bytes().to_vec(),
                     })
                     .collect()
             })

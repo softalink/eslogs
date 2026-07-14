@@ -15,7 +15,10 @@ pub struct Field {
     pub name: String,
 
     /// Value is the value of the field.
-    pub value: String,
+    ///
+    /// PORT NOTE: Go strings are arbitrary bytes; the value is stored as raw
+    /// bytes so invalid UTF-8 survives ingestion/queries byte-identically.
+    pub value: Vec<u8>,
 }
 
 impl Field {
@@ -40,7 +43,7 @@ impl Field {
         if marshal_field_name {
             encoding::marshal_bytes(dst, self.name.as_bytes());
         }
-        encoding::marshal_bytes(dst, self.value.as_bytes());
+        encoding::marshal_bytes(dst, &self.value);
     }
 
     /// Unmarshals f from src and returns the remaining tail.
@@ -74,8 +77,7 @@ impl Field {
         }
         src = &src[n_size as usize..];
         self.value.clear();
-        self.value
-            .push_str(bytesutil::to_unsafe_string(value.unwrap_or_default()));
+        self.value.extend_from_slice(value.unwrap_or_default());
 
         Ok(src)
     }
@@ -88,7 +90,7 @@ impl Field {
         };
         dst.extend_from_slice(stringsutil::json_string(name).as_bytes());
         dst.push(b':');
-        dst.extend_from_slice(stringsutil::json_string(&self.value).as_bytes());
+        stringsutil::json_string_bytes_append(dst, &self.value);
     }
 
     pub fn marshal_to_logfmt(&self, dst: &mut Vec<u8>) {
@@ -100,9 +102,9 @@ impl Field {
         dst.extend_from_slice(name.as_bytes());
         dst.push(b'=');
         if needs_logfmt_quoting(&self.value) {
-            dst.extend_from_slice(stringsutil::json_string(&self.value).as_bytes());
+            stringsutil::json_string_bytes_append(dst, &self.value);
         } else {
-            dst.extend_from_slice(self.value.as_bytes());
+            dst.extend_from_slice(&self.value);
         }
     }
 
@@ -113,7 +115,7 @@ impl Field {
     }
 
     pub fn indexdb_marshal(&self, dst: &mut Vec<u8>) {
-        stream_tags::marshal_tag_value(dst, &self.name);
+        stream_tags::marshal_tag_value(dst, self.name.as_bytes());
         stream_tags::marshal_tag_value(dst, &self.value);
     }
 
@@ -132,7 +134,7 @@ impl Field {
         let src = stream_tags::unmarshal_tag_value(&mut buf, src)
             .map_err(|err| format!("cannot unmarshal value: {err}"))?;
         self.value.clear();
-        self.value.push_str(bytesutil::to_unsafe_string(&buf));
+        self.value.extend_from_slice(&buf);
 
         Ok(src)
     }
@@ -143,57 +145,58 @@ impl fmt::Display for Field {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut x = Vec::new();
         self.marshal_to_json(&mut x);
-        f.write_str(bytesutil::to_unsafe_string(&x))
+        // Display-only: the value may hold arbitrary bytes, so a lossy view
+        // is used instead of a panicking unsafe-string view.
+        f.write_str(&String::from_utf8_lossy(&x))
     }
 }
 
-pub fn get_field_value_by_name<'a>(fields: &'a [Field], name: &str) -> &'a str {
+pub fn get_field_value_by_name<'a>(fields: &'a [Field], name: &str) -> &'a [u8] {
     for f in fields {
         if f.name == name {
             return &f.value;
         }
     }
-    ""
+    b""
 }
 
-fn needs_logfmt_quoting(s: &str) -> bool {
-    s.chars().any(is_logfmt_special_char)
+fn needs_logfmt_quoting(s: &[u8]) -> bool {
+    // A byte needs quoting iff it is an ASCII control/space, '"' or '\\';
+    // bytes >= 0x80 never need quoting, so the byte scan matches the previous
+    // char-based scan for valid UTF-8 and extends it to arbitrary bytes.
+    s.iter().any(|&b| is_logfmt_special_byte(b))
 }
 
-fn is_logfmt_special_char(c: char) -> bool {
-    if c as u32 <= 0x20 {
-        return true;
-    }
-    matches!(c, '"' | '\\')
+fn is_logfmt_special_byte(b: u8) -> bool {
+    b <= 0x20 || b == b'"' || b == b'\\'
 }
 
 /// Appends the Go `strconv.Quote` representation of s to dst.
 ///
 /// PORT NOTE: replaces `strconv.AppendQuote`. Like esl-common's `go_quote`,
 /// printable non-ASCII characters are kept as-is instead of `\u`-escaping
-/// non-printable runes the way Go does; stream tag values are printable text.
-fn append_quote(dst: &mut Vec<u8>, s: &str) {
+/// non-printable runes the way Go does; bytes >= 0x80 (including invalid
+/// UTF-8, which Go would escape as `\xNN`) are passed through raw — stream
+/// tag values are validated printable text before reaching here.
+fn append_quote(dst: &mut Vec<u8>, s: &[u8]) {
     dst.push(b'"');
-    for c in s.chars() {
-        match c {
-            '"' => dst.extend_from_slice(b"\\\""),
-            '\\' => dst.extend_from_slice(b"\\\\"),
-            '\x07' => dst.extend_from_slice(b"\\a"),
-            '\x08' => dst.extend_from_slice(b"\\b"),
-            '\x0c' => dst.extend_from_slice(b"\\f"),
-            '\n' => dst.extend_from_slice(b"\\n"),
-            '\r' => dst.extend_from_slice(b"\\r"),
-            '\t' => dst.extend_from_slice(b"\\t"),
-            '\x0b' => dst.extend_from_slice(b"\\v"),
-            c if (c as u32) < 0x20 || c == '\x7f' => {
+    for &b in s {
+        match b {
+            b'"' => dst.extend_from_slice(b"\\\""),
+            b'\\' => dst.extend_from_slice(b"\\\\"),
+            0x07 => dst.extend_from_slice(b"\\a"),
+            0x08 => dst.extend_from_slice(b"\\b"),
+            0x0c => dst.extend_from_slice(b"\\f"),
+            b'\n' => dst.extend_from_slice(b"\\n"),
+            b'\r' => dst.extend_from_slice(b"\\r"),
+            b'\t' => dst.extend_from_slice(b"\\t"),
+            0x0b => dst.extend_from_slice(b"\\v"),
+            b if b < 0x20 || b == 0x7f => {
                 let mut buf = String::new();
-                write!(buf, "\\x{:02x}", c as u32).unwrap();
+                write!(buf, "\\x{b:02x}").unwrap();
                 dst.extend_from_slice(buf.as_bytes());
             }
-            c => {
-                let mut buf = [0u8; 4];
-                dst.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            }
+            b => dst.push(b),
         }
     }
     dst.push(b'"');
@@ -348,13 +351,13 @@ impl Rows {
             &mut tmp_fields.fields,
             drop_filter_fields,
             "_stream",
-            stream,
+            stream.as_bytes(),
         );
         add_field_if_needed(
             &mut tmp_fields.fields,
             drop_filter_fields,
             "_stream_id",
-            stream_id,
+            stream_id.as_bytes(),
         );
         let tmp_fields_base_len = tmp_fields.fields.len();
 
@@ -380,7 +383,7 @@ impl Rows {
                     &mut bb,
                     src_timestamp,
                 );
-                tmp_fields.add("_time", std::str::from_utf8(&bb).unwrap());
+                tmp_fields.add("_time", &bb);
             }
 
             for f in &self.rows[offset + i] {
@@ -428,13 +431,13 @@ fn add_field_if_needed(
     dst: &mut Vec<Field>,
     pf: &crate::prefix_filter::Filter,
     name: &str,
-    value: &str,
+    value: &[u8],
 ) {
     let name = crate::log_rows::get_canonical_column_name(name);
     if pf.match_string(name) {
         dst.push(Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.to_vec(),
         });
     }
 }
@@ -468,10 +471,10 @@ impl Fields {
     }
 
     /// Adds (name, value) field to f.
-    pub fn add(&mut self, name: &str, value: &str) {
+    pub fn add(&mut self, name: &str, value: impl AsRef<[u8]>) {
         self.fields.push(Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_ref().to_vec(),
         });
     }
 }
@@ -501,7 +504,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -562,6 +565,37 @@ mod tests {
                 field("  \u{1b}[11m ", "АБв"),
             ],
             "{\"foo\\nbar\":\"  \\u001b[32m \",\"  \\u001b[11m \":\"АБв\"}",
+        );
+    }
+
+    #[test]
+    fn test_marshal_fields_to_json_invalid_utf8_passthrough() {
+        // Values are raw bytes (Go strings are arbitrary bytes): invalid
+        // UTF-8 must pass through JSON marshaling byte-identically.
+        let fields = [Field {
+            name: "foo".to_string(),
+            value: b"a\xff\xfeb".to_vec(),
+        }];
+        let mut result = Vec::new();
+        marshal_fields_to_json(&mut result, &fields);
+        assert_eq!(result, b"{\"foo\":\"a\xff\xfeb\"}".to_vec());
+    }
+
+    #[test]
+    fn test_field_marshal_unmarshal_invalid_utf8_roundtrip() {
+        let f = Field {
+            name: "foo".to_string(),
+            value: b"a\xff\xfeb".to_vec(),
+        };
+        let mut data = Vec::new();
+        f.marshal(&mut data, true);
+
+        let mut f2 = Field::default();
+        let tail = f2.unmarshal_inplace(&data, true).unwrap();
+        assert!(tail.is_empty(), "unexpected tail after unmarshal");
+        assert_eq!(
+            f2, f,
+            "invalid UTF-8 value must round-trip byte-identically"
         );
     }
 

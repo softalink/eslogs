@@ -330,11 +330,14 @@ impl HitsMap {
         !key.contains(&self.filter)
     }
 
-    fn need_skip_key_string(&self, key: &str) -> bool {
+    fn need_skip_key_string(&self, key: &[u8]) -> bool {
         if self.filter.is_empty() {
             return false;
         }
-        !key.contains(&self.filter)
+        // Byte-wise substring check (Go strings.Contains is a byte search);
+        // works for arbitrary value bytes.
+        let f = self.filter.as_bytes();
+        !key.windows(f.len()).any(|w| w == f)
     }
 
     /// Adds `hits` for the given non-negative integer, returning the added
@@ -378,8 +381,7 @@ impl HitsMap {
     /// Adds `hits` for the given raw string key, returning the added state size
     /// in bytes (0 when the value already existed or was filtered).
     pub fn update_state_string(&mut self, key: &[u8], hits: u64) -> i64 {
-        let key_str = to_unsafe_string(key);
-        if self.need_skip_key_string(key_str) {
+        if self.need_skip_key_string(key) {
             return 0;
         }
         if let Some(p) = self.strings.get_mut(key) {

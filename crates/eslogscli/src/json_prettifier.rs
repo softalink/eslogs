@@ -305,7 +305,10 @@ fn read_next_json_object<R: BufRead>(d: &mut JsonDecoder<R>) -> Result<Vec<Field
             }
         };
 
-        fields.push(Field { name: key, value });
+        fields.push(Field {
+            name: key,
+            value: value.into_bytes(),
+        });
     }
 }
 
@@ -318,7 +321,7 @@ fn write_logfmt_object(w: &mut Vec<u8>, fields: &[Field]) -> io::Result<()> {
 fn write_compact_object(w: &mut Vec<u8>, fields: &[Field]) -> io::Result<()> {
     if fields.len() == 1 {
         // Just write field value as is without name
-        w.extend_from_slice(fields[0].value.as_bytes());
+        w.extend_from_slice(&fields[0].value);
         w.push(b'\n');
         return Ok(());
     }
@@ -329,9 +332,9 @@ fn write_compact_object(w: &mut Vec<u8>, fields: &[Field]) -> io::Result<()> {
         } else {
             (&fields[1], &fields[0])
         };
-        w.extend_from_slice(first.value.as_bytes());
+        w.extend_from_slice(&first.value);
         w.push(b'\t');
-        w.extend_from_slice(second.value.as_bytes());
+        w.extend_from_slice(&second.value);
         w.push(b'\n');
         return Ok(());
     }
@@ -367,7 +370,9 @@ fn write_newline_if_needed(w: &mut Vec<u8>, is_multiline: bool) {
 
 fn write_json_object_key_value(w: &mut Vec<u8>, f: &Field, is_multiline: bool) {
     let key = get_json_string(&f.name);
-    let value = get_json_string(&f.value);
+    // Display-only lossy conversion (R5): this is the CLI pretty-printer, and
+    // Go's encoding/json likewise coerces invalid UTF-8 to U+FFFD on output.
+    let value = get_json_string(&String::from_utf8_lossy(&f.value));
     if is_multiline {
         w.extend_from_slice(b"  ");
         w.extend_from_slice(key.as_bytes());
@@ -417,7 +422,7 @@ mod tests {
             .iter()
             .map(|(name, value)| Field {
                 name: name.to_string(),
-                value: value.to_string(),
+                value: value.as_bytes().to_vec(),
             })
             .collect()
     }

@@ -23,7 +23,6 @@
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::encoding;
 use esl_common::stringsutil;
 
@@ -62,6 +61,20 @@ pub(crate) fn less_string(a: &str, b: &str) -> bool {
         return fa < fb;
     }
     stringsutil::less_natural(a, b)
+}
+
+/// Byte-native wrapper around [`less_string`] for raw log field values (Go
+/// strings are arbitrary bytes). Valid-UTF-8 values order exactly like
+/// [`less_string`]; invalid UTF-8 fails every numeric parse (as in Go) and
+/// falls back to plain byte ordering, which matches Go string ordering.
+pub(crate) fn less_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a == b {
+        return false;
+    }
+    match (std::str::from_utf8(a), std::str::from_utf8(b)) {
+        (Ok(sa), Ok(sb)) => less_string(sa, sb),
+        _ => a < b,
+    }
 }
 
 /// Port of `tryParseNumber` (`block_result.go`).
@@ -209,7 +222,7 @@ impl StatsFunc for StatsMin {
     fn new_stats_processor(&self) -> Box<dyn StatsProcessor> {
         Box::new(StatsMinProcessor {
             field_filters: self.field_filters.clone(),
-            min: String::new(),
+            min: Vec::new(),
             has_items: false,
         })
     }
@@ -218,21 +231,21 @@ impl StatsFunc for StatsMin {
 /// Port of `statsMinProcessor`.
 pub(crate) struct StatsMinProcessor {
     field_filters: Vec<String>,
-    min: String,
+    min: Vec<u8>,
     has_items: bool,
 }
 
 impl StatsMinProcessor {
-    fn needs_update_state(&self, v: &str) -> bool {
-        !self.has_items || less_string(v, &self.min)
+    fn needs_update_state(&self, v: &[u8]) -> bool {
+        !self.has_items || less_bytes(v, &self.min)
     }
 
-    fn set_state(&mut self, v: &str) {
-        self.min = v.to_owned();
+    fn set_state(&mut self, v: &[u8]) {
+        self.min = v.to_vec();
         self.has_items = true;
     }
 
-    fn update_state_string(&mut self, v: &str) {
+    fn update_state_string(&mut self, v: &[u8]) {
         if self.needs_update_state(v) {
             self.set_state(v);
         }
@@ -246,9 +259,8 @@ impl StatsProcessor for StatsMinProcessor {
         for c in cols {
             let values = br.column_get_values(c);
             for v in values {
-                let s = to_unsafe_string(v);
-                if self.needs_update_state(s) {
-                    self.set_state(s);
+                if self.needs_update_state(v) {
+                    self.set_state(v);
                 }
             }
         }
@@ -290,7 +302,7 @@ impl StatsProcessor for StatsMinProcessor {
             return;
         }
         dst.push(1);
-        encoding::marshal_bytes(dst, self.min.as_bytes());
+        encoding::marshal_bytes(dst, &self.min);
     }
 
     fn import_state(&mut self, src: &[u8], _stop: Option<&AtomicBool>) -> Result<i64, String> {
@@ -305,10 +317,10 @@ impl StatsProcessor for StatsMinProcessor {
             if n <= 0 {
                 return Err("cannot unmarshal min value".to_string());
             }
-            self.min = to_unsafe_string(min_value.unwrap_or_default()).to_owned();
+            self.min = min_value.unwrap_or_default().to_vec();
             src = &src[n as usize..];
         } else {
-            self.min = String::new();
+            self.min = Vec::new();
         }
 
         if !src.is_empty() {
@@ -322,7 +334,7 @@ impl StatsProcessor for StatsMinProcessor {
     }
 
     fn finalize_stats(&self, _sf: &dyn StatsFunc, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
-        dst.extend_from_slice(self.min.as_bytes());
+        dst.extend_from_slice(&self.min);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -342,7 +354,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 

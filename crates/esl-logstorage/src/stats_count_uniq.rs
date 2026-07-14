@@ -50,7 +50,6 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::encoding::{
     marshal_bytes, marshal_uint64, marshal_var_uint64, unmarshal_bytes, unmarshal_uint64,
     unmarshal_var_uint64,
@@ -62,7 +61,7 @@ use crate::filter_generic::quote_field_filter_if_needed;
 use crate::prefix_filter::Filter;
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::values_encoder::{
-    ValueType, try_parse_int64, try_parse_uint64, unmarshal_int64, unmarshal_uint8,
+    ValueType, try_parse_int64_bytes, try_parse_uint64_bytes, unmarshal_int64, unmarshal_uint8,
     unmarshal_uint16, unmarshal_uint32, unmarshal_uint64 as decode_uint64,
 };
 
@@ -512,16 +511,16 @@ impl StatsCountUniqProcessor {
         self.shards.as_mut().unwrap()[idx].update_state_negative_int64(n)
     }
 
-    fn update_state_generic(&mut self, v: &str) -> i64 {
-        if let Some(n) = try_parse_uint64(v) {
+    fn update_state_generic(&mut self, v: &[u8]) -> i64 {
+        if let Some(n) = try_parse_uint64_bytes(v) {
             return self.update_state_uint64(n);
         }
-        if v.starts_with('-')
-            && let Some(n) = try_parse_int64(v)
+        if v.first() == Some(&b'-')
+            && let Some(n) = try_parse_int64_bytes(v)
         {
             return self.update_state_negative_int64(n);
         }
-        self.update_state_string(v.as_bytes())
+        self.update_state_string(v)
     }
 
     fn update_state_int64(&mut self, n: i64) -> i64 {
@@ -634,7 +633,7 @@ impl StatsCountUniqProcessor {
             }
             // PORT NOTE: v borrows br; update_state_generic reads it but only
             // stores clones into self, so holding the borrow is sound.
-            let v = v.to_string();
+            let v = v.to_vec();
             return self.update_state_generic(&v);
         }
         match br.column_value_type(r) {
@@ -702,8 +701,7 @@ impl StatsCountUniqProcessor {
                     if i > 0 && values[i - 1] == values[i] {
                         continue;
                     }
-                    let v = to_unsafe_string(&values[i]).to_string();
-                    inc += self.update_state_generic(&v);
+                    inc += self.update_state_generic(&values[i]);
                 }
                 inc
             }
@@ -726,7 +724,7 @@ impl StatsCountUniqProcessor {
             if v.is_empty() {
                 return 0;
             }
-            let v = v.to_string();
+            let v = v.to_vec();
             return self.update_state_generic(&v);
         }
         match br.column_value_type(r) {
@@ -755,7 +753,7 @@ impl StatsCountUniqProcessor {
                 if v.is_empty() {
                     return 0;
                 }
-                let v = v.to_string();
+                let v = v.to_vec();
                 self.update_state_generic(&v)
             }
         }
@@ -841,7 +839,7 @@ impl StatsProcessor for StatsCountUniqProcessor {
             if !v.is_empty() {
                 all_empty = false;
             }
-            marshal_bytes(&mut key_buf, v.as_bytes());
+            marshal_bytes(&mut key_buf, v);
         }
         let inc = if all_empty {
             0

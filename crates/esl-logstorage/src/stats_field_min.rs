@@ -16,13 +16,12 @@
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::encoding;
 
 use crate::block_result::BlockResult;
 use crate::prefix_filter::Filter;
 use crate::stats::{StatsFunc, StatsProcessor};
-use crate::stats_min::less_string;
+use crate::stats_min::less_bytes;
 use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{
     marshal_timestamp_rfc3339_nano_string, try_parse_timestamp_rfc3339_nano,
@@ -67,8 +66,8 @@ impl StatsFunc for StatsFieldMin {
         Box::new(StatsFieldMinProcessor {
             src_field: self.src_field.clone(),
             field_name: self.field_name.clone(),
-            min: String::new(),
-            value: String::new(),
+            min: Vec::new(),
+            value: Vec::new(),
         })
     }
 }
@@ -77,21 +76,21 @@ impl StatsFunc for StatsFieldMin {
 pub(crate) struct StatsFieldMinProcessor {
     src_field: String,
     field_name: String,
-    min: String,
-    value: String,
+    min: Vec<u8>,
+    value: Vec<u8>,
 }
 
 impl StatsFieldMinProcessor {
-    fn need_update_state_string(&self, v: &str) -> bool {
+    fn need_update_state_string(&self, v: &[u8]) -> bool {
         if v.is_empty() {
             return false;
         }
-        self.min.is_empty() || less_string(v, &self.min)
+        self.min.is_empty() || less_bytes(v, &self.min)
     }
 
     fn update_state(
         &mut self,
-        v: &str,
+        v: &[u8],
         br: &mut BlockResult,
         field_name: &str,
         row_idx: usize,
@@ -102,10 +101,10 @@ impl StatsFieldMinProcessor {
         let mut delta = 0i64;
         delta -= self.min.len() as i64;
         delta += v.len() as i64;
-        self.min = v.to_owned();
+        self.min = v.to_vec();
 
         let c = br.get_column_by_name(field_name);
-        let value = br.column_get_value_at_row(c, row_idx).to_owned();
+        let value = br.column_get_value_at_row(c, row_idx).to_vec();
         delta -= self.value.len() as i64;
         delta += value.len() as i64;
         self.value = value;
@@ -126,21 +125,23 @@ impl StatsProcessor for StatsFieldMinProcessor {
             // Go fast path: take the block minimum from `getMinTimestamp` and
             // read the companion field at row 0 (Go's quirk — not the row
             // holding the minimum).
-            let timestamp = try_parse_timestamp_rfc3339_nano(&self.min).unwrap_or(i64::MAX);
+            let timestamp = std::str::from_utf8(&self.min)
+                .ok()
+                .and_then(try_parse_timestamp_rfc3339_nano)
+                .unwrap_or(i64::MAX);
             let min_timestamp = br.get_min_timestamp(timestamp);
             if min_timestamp >= timestamp {
                 return 0;
             }
             let mut b = Vec::new();
             marshal_timestamp_rfc3339_nano_string(&mut b, min_timestamp);
-            let v = to_unsafe_string(&b).to_owned();
-            return self.update_state(&v, br, &field_name, 0);
+            return self.update_state(&b, br, &field_name, 0);
         }
 
         let src_vals: Vec<Vec<u8>> = br.column_get_values(c_src).to_vec();
         let mut inc = 0i64;
         for (i, v) in src_vals.iter().enumerate() {
-            inc += self.update_state(to_unsafe_string(v), br, &field_name, i);
+            inc += self.update_state(v, br, &field_name, i);
         }
         inc
     }
@@ -169,8 +170,8 @@ impl StatsProcessor for StatsFieldMinProcessor {
     }
 
     fn export_state(&self, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
-        encoding::marshal_bytes(dst, self.min.as_bytes());
-        encoding::marshal_bytes(dst, self.value.as_bytes());
+        encoding::marshal_bytes(dst, &self.min);
+        encoding::marshal_bytes(dst, &self.value);
     }
 
     fn import_state(&mut self, src: &[u8], _stop: Option<&AtomicBool>) -> Result<i64, String> {
@@ -179,14 +180,14 @@ impl StatsProcessor for StatsFieldMinProcessor {
             return Err("cannot unmarshal minValue".to_string());
         }
         let mut src = &src[n as usize..];
-        self.min = to_unsafe_string(min_value.unwrap_or_default()).to_owned();
+        self.min = min_value.unwrap_or_default().to_vec();
 
         let (value, n) = encoding::unmarshal_bytes(src);
         if n <= 0 {
             return Err("cannot unmarshal value".to_string());
         }
         src = &src[n as usize..];
-        self.value = to_unsafe_string(value.unwrap_or_default()).to_owned();
+        self.value = value.unwrap_or_default().to_vec();
 
         if !src.is_empty() {
             return Err(format!(
@@ -199,7 +200,7 @@ impl StatsProcessor for StatsFieldMinProcessor {
     }
 
     fn finalize_stats(&self, _sf: &dyn StatsFunc, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
-        dst.extend_from_slice(self.value.as_bytes());
+        dst.extend_from_slice(&self.value);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -217,7 +218,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 

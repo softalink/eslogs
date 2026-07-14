@@ -20,7 +20,7 @@ use crate::stats_count::{field_names_string, is_single_field};
 pub(crate) fn for_each_matching_field(
     fields: &[Field],
     field_filters: &[String],
-    mut callback: impl FnMut(&str),
+    mut callback: impl FnMut(&[u8]),
 ) {
     if is_single_field(field_filters) {
         // Fast path for a single field.
@@ -33,7 +33,7 @@ pub(crate) fn for_each_matching_field(
             }
         }
         if !found {
-            callback("");
+            callback(b"");
         }
         return;
     }
@@ -99,8 +99,8 @@ impl RunningStatsCountProcessor {
         }
     }
 
-    pub(crate) fn get_running_stats(&self) -> String {
-        self.rows_count.to_string()
+    pub(crate) fn get_running_stats(&self) -> Vec<u8> {
+        self.rows_count.to_string().into_bytes()
     }
 }
 
@@ -135,7 +135,7 @@ impl crate::pipe_running_stats::RunningStatsProcessor for RunningStatsCountProce
         self.update_running_stats(sf, row)
     }
 
-    fn get_running_stats(&self) -> String {
+    fn get_running_stats(&self) -> Vec<u8> {
         self.get_running_stats()
     }
 }

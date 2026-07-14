@@ -163,7 +163,7 @@ fn parse_protobuf_request<S: LogRowsStorage>(
     };
 
     let mut push_logs =
-        |timestamp: i64, line: &str, fs: &mut Vec<Field>, stream_fields_len: usize| {
+        |timestamp: i64, line: &[u8], fs: &mut Vec<Field>, stream_fields_len: usize| {
             let ts = if timestamp == 0 {
                 now_unix_nanos()
             } else {
@@ -213,7 +213,7 @@ fn parse_protobuf_request<S: LogRowsStorage>(
 /// See <https://github.com/grafana/loki/blob/ada4b7b8713385fbe9f5984a5a0aaaddf1a7b851/pkg/push/push.proto#L14>
 fn decode_push_request<F>(src: &[u8], push_logs: &mut F) -> Result<(), String>
 where
-    F: FnMut(i64, &str, &mut Vec<Field>, usize),
+    F: FnMut(i64, &[u8], &mut Vec<Field>, usize),
 {
     // message PushRequest {
     //   repeated Stream streams = 1;
@@ -237,7 +237,7 @@ where
 
 fn decode_stream<F>(src: &[u8], push_logs: &mut F) -> Result<(), String>
 where
-    F: FnMut(i64, &str, &mut Vec<Field>, usize),
+    F: FnMut(i64, &[u8], &mut Vec<Field>, usize),
 {
     // message Stream {
     //   string labels = 1;
@@ -248,15 +248,18 @@ where
     // port uses a local Vec<Field> like the JSON path in loki.rs.
     let mut fs: Vec<Field> = Vec::new();
 
-    // PORT NOTE: get_string_lossy mirrors Go's raw-byte GetString: invalid
-    // UTF-8 in the labels string is U+FFFD-replaced instead of rejecting the
-    // request (Go keeps the raw bytes; see easyproto::get_string_lossy).
-    let labels = easyproto::get_string_lossy(src, 1)
+    // Go's GetString aliases the raw wire bytes; the byte-valued Field port
+    // reads the labels as raw bytes so label values with invalid UTF-8 are
+    // preserved verbatim.
+    let labels = easyproto::get_bytes(src, 1)
         .map_err(|err| format!("cannot read labels: {err}"))?
         .ok_or_else(|| "missing labels".to_string())?;
-    let labels = labels.as_ref();
-    parse_prom_labels(&mut fs, labels)
-        .map_err(|err| format!("cannot parse labels {labels:?}: {err}"))?;
+    parse_prom_labels(&mut fs, labels).map_err(|err| {
+        format!(
+            "cannot parse labels {:?}: {err}",
+            String::from_utf8_lossy(labels)
+        )
+    })?;
     let stream_fields_len = fs.len();
 
     let mut fc = easyproto::FieldContext::default();
@@ -281,7 +284,7 @@ where
 
 fn decode_entry<F>(src: &[u8], fs: &mut Vec<Field>, push_logs: &mut F) -> Result<(), String>
 where
-    F: FnMut(i64, &str, &mut Vec<Field>, usize),
+    F: FnMut(i64, &[u8], &mut Vec<Field>, usize),
 {
     // message Entry {
     //   Timestamp timestamp = 1;
@@ -290,7 +293,7 @@ where
     // }
 
     let mut timestamp: i64 = 0;
-    let mut line: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed("");
+    let mut line: &[u8] = b"";
 
     let stream_fields_len = fs.len();
 
@@ -309,12 +312,9 @@ where
                     .map_err(|err| format!("cannot unmarshal Timestamp: {err}"))?;
             }
             2 => {
-                // PORT NOTE: string_lossy mirrors Go's raw-byte String():
-                // invalid UTF-8 in the log line is U+FFFD-replaced instead of
-                // rejecting the request (Go keeps the raw bytes).
-                line = fc
-                    .string_lossy()
-                    .ok_or_else(|| "cannot read Line".to_string())?;
+                // Go's String() aliases the raw wire bytes; read the log line
+                // as raw bytes so invalid UTF-8 is ingested verbatim.
+                line = fc.bytes().ok_or_else(|| "cannot read Line".to_string())?;
             }
             3 => {
                 let data = fc
@@ -327,7 +327,7 @@ where
         }
     }
 
-    push_logs(timestamp, &line, fs, stream_fields_len);
+    push_logs(timestamp, line, fs, stream_fields_len);
 
     Ok(())
 }
@@ -338,21 +338,22 @@ fn decode_label_pair(src: &[u8], fs: &mut Vec<Field>) -> Result<(), String> {
     //   string value = 2;
     // }
 
-    // PORT NOTE: get_string_lossy mirrors Go's raw-byte GetString: invalid
-    // UTF-8 in a structured-metadata name/value is U+FFFD-replaced instead of
-    // rejecting the request (Go keeps the raw bytes).
+    // PORT NOTE: get_string_lossy mirrors Go's raw-byte GetString for the
+    // field NAME (Field.name stays String, so an invalid-UTF-8 name is
+    // U+FFFD-replaced instead of rejecting the request); the VALUE is read as
+    // raw bytes and preserved verbatim like Go.
     let name = easyproto::get_string_lossy(src, 1)
         .map_err(|err| format!("cannot read name: {err}"))?
         .ok_or_else(|| "missing name".to_string())?;
 
-    let value = easyproto::get_string_lossy(src, 2)
+    let value = easyproto::get_bytes(src, 2)
         .map_err(|err| format!("cannot read value: {err}"))?
         .ok_or_else(|| "missing value".to_string())?;
 
     if !name.is_empty() && !value.is_empty() {
         fs.push(Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.to_vec(),
         });
     }
 
@@ -401,36 +402,53 @@ fn decode_timestamp(src: &[u8]) -> Result<i64, String> {
 ///
 /// See test data of promtail for examples:
 /// <https://github.com/grafana/loki/blob/a24ef7b206e0ca63ee74ca6ecb0a09b745cd2258/pkg/push/types_test.go>
-fn parse_prom_labels(fs: &mut Vec<Field>, s: &str) -> Result<(), String> {
+fn parse_prom_labels(fs: &mut Vec<Field>, s: &[u8]) -> Result<(), String> {
+    // Go TrimSpace trims Unicode whitespace; mirror it when the bytes are
+    // valid UTF-8 and fall back to ASCII trimming otherwise (Go stops
+    // trimming at the first invalid sequence too, since it is not a space).
+    let s = match std::str::from_utf8(s) {
+        Ok(t) => t.trim().as_bytes(),
+        Err(_) => s.trim_ascii(),
+    };
+    // Display-only lossy conversions below (R5): `s` may hold raw bytes; the
+    // parsed values themselves are passed through verbatim.
+    let d = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
     // Make sure s is wrapped into `{...}`
-    let s = s.trim();
     if s.len() < 2 {
-        return Err(format!("too short string to parse: {s:?}"));
+        return Err(format!("too short string to parse: {:?}", d(s)));
     }
-    if !s.starts_with('{') {
-        return Err(format!("missing `{{` at the beginning of {s:?}"));
+    if !s.starts_with(b"{") {
+        return Err(format!("missing `{{` at the beginning of {:?}", d(s)));
     }
-    if !s.ends_with('}') {
-        return Err(format!("missing `}}` at the end of {s:?}"));
+    if !s.ends_with(b"}") {
+        return Err(format!("missing `}}` at the end of {:?}", d(s)));
     }
     let mut s = &s[1..s.len() - 1];
 
     while !s.is_empty() {
         // Parse label name
         let n = s
-            .find('=')
-            .ok_or_else(|| format!("cannot find `=` char for label value at {s}"))?;
+            .iter()
+            .position(|&c| c == b'=')
+            .ok_or_else(|| format!("cannot find `=` char for label value at {}", d(s)))?;
         let name = &s[..n];
         s = &s[n + 1..];
 
         // Parse label value
-        let (value, qs_len) = unquote_prefix(s)
-            .map_err(|err| format!("cannot parse value for label {name:?} at {s}: {err}"))?;
+        let (value, qs_len) = unquote_prefix(s).map_err(|err| {
+            format!(
+                "cannot parse value for label {:?} at {}: {err}",
+                d(name),
+                d(s)
+            )
+        })?;
         s = &s[qs_len..];
 
-        // Append the found field to dst.
+        // Append the found field to dst. The label NAME becomes Field.name
+        // (a String), so an invalid-UTF-8 name is U+FFFD-replaced; the value
+        // bytes are preserved verbatim.
         fs.push(Field {
-            name: name.to_string(),
+            name: d(name),
             value,
         });
 
@@ -438,11 +456,11 @@ fn parse_prom_labels(fs: &mut Vec<Field>, s: &str) -> Result<(), String> {
         if s.is_empty() {
             break;
         }
-        match s.strip_prefix(',') {
+        match s.strip_prefix(b",") {
             Some(tail) => {
-                s = tail.strip_prefix(' ').unwrap_or(tail);
+                s = tail.strip_prefix(b" ").unwrap_or(tail);
             }
-            None => return Err(format!("missing `,` char at {s}")),
+            None => return Err(format!("missing `,` char at {}", d(s))),
         }
     }
     Ok(())
@@ -455,16 +473,12 @@ fn parse_prom_labels(fs: &mut Vec<Field>, s: &str) -> Result<(), String> {
 /// double-quoted strings are supported (Prometheus label values are always
 /// double-quoted). Escapes decode to raw bytes exactly like Go's
 /// `strconv.UnquoteChar` (`\xHH`/`\NNN` octal emit the single byte, `\u`/`\U`
-/// emit the rune's UTF-8), so any value whose decoded bytes are valid UTF-8 —
-/// including UTF-8 spelled via `\x` escapes like `\xc3\xa9` → `é` — matches
-/// Go byte-for-byte. Divergence (Field values are Rust `String`s, which must
-/// hold valid UTF-8): when the decoded bytes are NOT valid UTF-8, Go stores
-/// the raw bytes while the port U+FFFD-replaces each invalid sequence (e.g.
-/// `"\xff"` → Go `0xFF`, port `"\u{FFFD}"`). A String→bytes Field refactor
-/// would close this.
-fn unquote_prefix(s: &str) -> Result<(String, usize), String> {
+/// emit the rune's UTF-8), so the decoded bytes match Go byte-for-byte —
+/// including values that are NOT valid UTF-8 (e.g. `"\xff"` → raw `0xFF`),
+/// which the byte-valued `Field` now stores verbatim.
+fn unquote_prefix(s: &[u8]) -> Result<(Vec<u8>, usize), String> {
     const ERR: &str = "invalid syntax";
-    let b = s.as_bytes();
+    let b = s;
     if b.first() != Some(&b'"') {
         return Err(ERR.to_string());
     }
@@ -473,8 +487,6 @@ fn unquote_prefix(s: &str) -> Result<(String, usize), String> {
     while i < b.len() {
         match b[i] {
             b'"' => {
-                let out = String::from_utf8(out)
-                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                 return Ok((out, i + 1));
             }
             b'\n' => return Err(ERR.to_string()),
@@ -534,8 +546,8 @@ fn unquote_prefix(s: &str) -> Result<(String, usize), String> {
                 }
             }
             c => {
-                // s is a &str, so unescaped bytes are already valid UTF-8;
-                // copy them through unchanged (Go copies runes the same way).
+                // Unescaped bytes are copied through unchanged (Go copies
+                // the raw bytes the same way).
                 out.push(c);
                 i += 1;
             }
@@ -705,7 +717,10 @@ mod tests {
     fn format_labels(fs: &[Field]) -> String {
         let a: Vec<String> = fs
             .iter()
-            .map(|f| format!("{}={}", f.name, quote(&f.value)))
+            .map(|f| {
+                let v = std::str::from_utf8(&f.value).expect("test label values are UTF-8");
+                format!("{}={}", f.name, quote(v))
+            })
             .collect();
         format!("{{{}}}", a.join(", "))
     }
@@ -714,7 +729,7 @@ mod tests {
     fn test_parse_prom_labels_success() {
         fn f(s: &str) {
             let mut fs: Vec<Field> = Vec::new();
-            if let Err(err) = parse_prom_labels(&mut fs, s) {
+            if let Err(err) = parse_prom_labels(&mut fs, s.as_bytes()) {
                 panic!("unexpected error: {err}");
             }
             let result = format_labels(&fs);
@@ -731,7 +746,7 @@ mod tests {
     fn test_parse_prom_labels_failure() {
         fn f(s: &str) {
             let mut fs: Vec<Field> = Vec::new();
-            if parse_prom_labels(&mut fs, s).is_ok() {
+            if parse_prom_labels(&mut fs, s.as_bytes()).is_ok() {
                 panic!("expecting non-nil error for {s:?}");
             }
         }
@@ -748,32 +763,31 @@ mod tests {
     }
 
     // PORT-ONLY TEST: pins the strconv.Unquote escape semantics of
-    // unquote_prefix. `\xHH`/octal escapes decode to raw bytes like Go, so
-    // UTF-8 spelled via `\x` matches Go byte-for-byte; decoded bytes that are
-    // NOT valid UTF-8 are U+FFFD-replaced where Go keeps the raw bytes (see
-    // the PORT NOTE on unquote_prefix).
+    // unquote_prefix. `\xHH`/octal escapes decode to raw bytes like Go —
+    // including bytes that are NOT valid UTF-8, which are preserved verbatim
+    // (see the PORT NOTE on unquote_prefix).
     #[test]
     fn test_unquote_prefix_escapes() {
-        fn f(quoted: &str, want: &str) {
-            let (got, n) = unquote_prefix(quoted).unwrap();
+        fn f(quoted: &str, want: &[u8]) {
+            let (got, n) = unquote_prefix(quoted.as_bytes()).unwrap();
             assert_eq!(got, want, "unexpected unquoted value for {quoted:?}");
             assert_eq!(n, quoted.len(), "unexpected consumed length");
         }
 
         // \x escapes composing valid UTF-8 match Go exactly.
-        f(r#""\xc3\xa9""#, "é");
+        f(r#""\xc3\xa9""#, "é".as_bytes());
         // Octal escapes composing valid UTF-8 match Go exactly.
-        f(r#""\303\251""#, "é");
+        f(r#""\303\251""#, "é".as_bytes());
         // \u/\U escapes.
-        f(r#""é \U0001F600""#, "é 😀");
-        // Lone invalid byte: Go stores raw 0xFF, the port replaces it.
-        f(r#""\xff""#, "\u{FFFD}");
+        f(r#""é \U0001F600""#, "é 😀".as_bytes());
+        // Lone invalid byte: stored raw exactly like Go.
+        f(r#""\xff""#, b"\xff");
 
         // Go errors on octal values > 255, on surrogate \u escapes, and on
         // \' inside double-quoted strings.
-        assert!(unquote_prefix(r#""\400""#).is_err());
-        assert!(unquote_prefix(r#""\ud800""#).is_err());
-        assert!(unquote_prefix(r#""don\'t""#).is_err());
+        assert!(unquote_prefix(br#""\400""#).is_err());
+        assert!(unquote_prefix(br#""\ud800""#).is_err());
+        assert!(unquote_prefix(br#""don\'t""#).is_err());
     }
 
     /// Mirrors Go `TestParseProtobufRequest_Success`: marshal a pushRequest
@@ -829,8 +843,9 @@ mod tests {
         let mut rows: Vec<(i64, String, String, usize)> = Vec::new();
         decode_push_request(
             &data,
-            &mut |ts, line, fs: &mut Vec<Field>, stream_fields_len| {
-                rows.push((ts, line.to_string(), format_labels(fs), stream_fields_len));
+            &mut |ts, line: &[u8], fs: &mut Vec<Field>, stream_fields_len| {
+                let line = String::from_utf8(line.to_vec()).expect("test lines are UTF-8");
+                rows.push((ts, line, format_labels(fs), stream_fields_len));
             },
         )
         .unwrap();
@@ -893,7 +908,7 @@ mod tests {
 
     #[test]
     fn test_decode_push_request_failure() {
-        let mut noop = |_: i64, _: &str, _: &mut Vec<Field>, _: usize| {};
+        let mut noop = |_: i64, _: &[u8], _: &mut Vec<Field>, _: usize| {};
         // Garbage protobuf data.
         assert!(decode_push_request(&[0xff, 0xff, 0xff], &mut noop).is_err());
         // Stream with invalid labels.
@@ -968,8 +983,9 @@ mod tests {
         assert_eq!(decoded, data);
 
         let mut lines = Vec::new();
-        decode_push_request(&decoded, &mut |ts, line, _: &mut Vec<Field>, _| {
-            lines.push((ts, line.to_string()));
+        decode_push_request(&decoded, &mut |ts, line: &[u8], _: &mut Vec<Field>, _| {
+            let line = String::from_utf8(line.to_vec()).expect("test lines are UTF-8");
+            lines.push((ts, line));
         })
         .unwrap();
         assert_eq!(lines, vec![(1577836800000000001, "compressed".to_string())]);

@@ -333,9 +333,6 @@ impl Indexdb {
             let value = value.expect("FATAL: cannot unmarshal tag value from StreamTags canonical");
             src = &src[value_len as usize..];
 
-            let name = std::str::from_utf8(name).expect("FATAL: non-utf8 tag name");
-            let value = std::str::from_utf8(value).expect("FATAL: non-utf8 tag value");
-
             let mut buf = Vec::new();
             marshal_common_prefix(&mut buf, NS_PREFIX_TAG_TO_STREAM_IDS, tenant_id);
             stream_tags::marshal_tag_value(&mut buf, name);
@@ -616,8 +613,8 @@ impl IndexSearch {
 
         self.kb.clear();
         marshal_common_prefix(&mut self.kb, NS_PREFIX_TAG_TO_STREAM_IDS, tenant_id);
-        stream_tags::marshal_tag_value(&mut self.kb, tag_name);
-        stream_tags::marshal_tag_value(&mut self.kb, tag_value);
+        stream_tags::marshal_tag_value(&mut self.kb, tag_name.as_bytes());
+        stream_tags::marshal_tag_value(&mut self.kb, tag_value.as_bytes());
         let prefix_len = self.kb.len();
         self.ts.seek(&self.kb);
         while self.ts.next_item() {
@@ -694,7 +691,7 @@ impl IndexSearch {
 
         self.kb.clear();
         marshal_common_prefix(&mut self.kb, NS_PREFIX_TAG_TO_STREAM_IDS, tenant_id);
-        stream_tags::marshal_tag_value(&mut self.kb, tag_name);
+        stream_tags::marshal_tag_value(&mut self.kb, tag_name.as_bytes());
         let prefix_len = self.kb.len();
         self.ts.seek(&self.kb);
         while self.ts.next_item() {
@@ -731,7 +728,7 @@ impl IndexSearch {
 
         self.kb.clear();
         marshal_common_prefix(&mut self.kb, NS_PREFIX_TAG_TO_STREAM_IDS, tenant_id);
-        stream_tags::marshal_tag_value(&mut self.kb, tag_name);
+        stream_tags::marshal_tag_value(&mut self.kb, tag_name.as_bytes());
         let prefix_len = self.kb.len();
         self.ts.seek(&self.kb);
         while self.ts.next_item() {

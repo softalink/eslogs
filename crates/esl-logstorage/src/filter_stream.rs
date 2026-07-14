@@ -6,7 +6,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -81,7 +80,7 @@ impl FilterStream {
         f: &StreamFilter,
     ) {
         let values = br.column_get_values(r);
-        bm.for_each_set_bit(|idx| f.match_stream_name(to_unsafe_string(&values[idx])));
+        bm.for_each_set_bit(|idx| f.match_stream_name(&values[idx]));
     }
 }
 
@@ -106,7 +105,7 @@ impl Filter for FilterStream {
 
         let r = br.get_column_by_name("_stream");
         if br.column_is_const(r) {
-            let v = br.column_get_value_at_row(r, 0).to_string();
+            let v = br.column_get_value_at_row(r, 0).to_vec();
             if !self.f.match_stream_name(&v) {
                 bm.reset_bits();
             }

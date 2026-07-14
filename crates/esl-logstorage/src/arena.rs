@@ -62,29 +62,16 @@ impl Arena {
         &self.b[ab_len..]
     }
 
-    /// Copies b into the arena and returns the copy as a string.
-    ///
-    /// PORT NOTE: Go reinterprets the copied bytes via
-    /// `bytesutil.ToUnsafeString`, so invalid UTF-8 passes through as raw
-    /// bytes. A Rust `&str` cannot hold those bytes, so each invalid sequence
-    /// is copied U+FFFD-replaced instead (`b"a\xffb"` → Go `a\xffb`, port
-    /// `a\u{FFFD}b`; the arena then holds the replaced bytes, not the input
-    /// bytes). All in-tree callers pass valid UTF-8 (`copy_string`), where
-    /// the two behaviors are byte-identical.
-    pub fn copy_bytes_to_string(&mut self, b: &[u8]) -> &str {
-        if std::str::from_utf8(b).is_ok() {
-            return bytesutil::to_unsafe_string(self.copy_bytes(b));
-        }
-        let s = String::from_utf8_lossy(b);
-        let ab_len = self.b.len();
-        self.b.extend_from_slice(s.as_bytes());
-        bytesutil::to_unsafe_string(&self.b[ab_len..])
-    }
-
     /// Copies s into the arena and returns the copy.
+    ///
+    /// PORT NOTE: byte-first arena API. Field values are raw bytes in the
+    /// port and must go through [`Arena::copy_bytes`], which preserves them
+    /// verbatim (Go's `copyBytesToString` merely reinterprets those bytes as
+    /// a Go string, so `copy_bytes` is the faithful equivalent). This str
+    /// helper exists only for names and other genuinely-textual data; the
+    /// copy is valid UTF-8 by construction since the input is a `&str`.
     pub fn copy_string(&mut self, s: &str) -> &str {
-        let b = bytesutil::to_unsafe_bytes(s);
-        self.copy_bytes_to_string(b)
+        bytesutil::to_unsafe_string(self.copy_bytes(s.as_bytes()))
     }
 
     /// Allocates size bytes in the arena and returns them for writing.
@@ -200,14 +187,14 @@ mod tests {
     }
 
     // PORT-ONLY TEST: upstream has no invalid-UTF-8 coverage. Pins the
-    // copy_bytes_to_string divergence: Go returns the raw bytes viewed as a
-    // string; the port U+FFFD-replaces invalid sequences (and never panics).
+    // byte-preserving behavior of copy_bytes: invalid UTF-8 passes through
+    // verbatim, matching Go's raw-bytes semantics.
     #[test]
-    fn test_arena_copy_bytes_to_string_invalid_utf8() {
+    fn test_arena_copy_bytes_invalid_utf8_preserved() {
         let mut a = get_arena();
-        assert_eq!(a.copy_bytes_to_string(b"a\xffb"), "a\u{FFFD}b");
-        // Valid UTF-8 is copied byte-identical.
-        assert_eq!(a.copy_bytes_to_string("é 😀".as_bytes()), "é 😀");
+        assert_eq!(a.copy_bytes(b"a\xffb"), b"a\xffb");
+        // Valid UTF-8 is copied byte-identical through the str helper.
+        assert_eq!(a.copy_string("é 😀"), "é 😀");
         put_arena(a);
     }
 }

@@ -30,11 +30,11 @@ use crate::values_encoder::{
 /// Port of Go's `statsJSONValuesSortedEntry`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StatsJSONValuesSortedEntry {
-    /// The JSON-encoded value itself.
-    pub(crate) value: String,
+    /// The JSON-encoded value itself (raw bytes; log values are arbitrary bytes).
+    pub(crate) value: Vec<u8>,
 
     /// Values for the sort fields, used for sorting.
-    pub(crate) sort_values: Vec<String>,
+    pub(crate) sort_values: Vec<Vec<u8>>,
 }
 
 impl StatsJSONValuesSortedEntry {
@@ -44,14 +44,14 @@ impl StatsJSONValuesSortedEntry {
     pub(crate) fn size_bytes(&self) -> i64 {
         std::mem::size_of::<Self>() as i64
             + self.value.len() as i64
-            + std::mem::size_of::<String>() as i64 * self.sort_values.capacity() as i64
+            + std::mem::size_of::<Vec<u8>>() as i64 * self.sort_values.capacity() as i64
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(value: &str, sort_values: Vec<String>) -> Self {
         Self {
-            value: value.to_string(),
-            sort_values,
+            value: value.as_bytes().to_vec(),
+            sort_values: sort_values.into_iter().map(String::into_bytes).collect(),
         }
     }
 }
@@ -60,24 +60,23 @@ impl StatsJSONValuesSortedEntry {
 pub(crate) fn new_stats_json_values_sorted_entry(
     br: &mut BlockResult,
     cs: &[ColRef],
-    sort_values: &[String],
+    sort_values: &[Vec<u8>],
     row_idx: usize,
 ) -> StatsJSONValuesSortedEntry {
     let fields: Vec<Field> = cs
         .iter()
         .map(|&c| {
             let name = br.column_name(c).to_string();
-            let value = br.column_get_value_at_row(c, row_idx).to_string();
+            let value = br.column_get_value_at_row(c, row_idx).to_vec();
             Field { name, value }
         })
         .collect();
 
     let mut buf = Vec::new();
     marshal_fields_to_json(&mut buf, &fields);
-    let value = String::from_utf8_lossy(&buf).into_owned();
 
     StatsJSONValuesSortedEntry {
-        value,
+        value: buf,
         sort_values: sort_values.to_vec(),
     }
 }
@@ -89,8 +88,8 @@ pub(crate) struct StatsJSONValuesSortedProcessor {
 
     pub(crate) entries: Vec<StatsJSONValuesSortedEntry>,
 
-    sort_columns: Vec<Vec<String>>,
-    sort_values_buf: Vec<String>,
+    sort_columns: Vec<Vec<Vec<u8>>>,
+    sort_values_buf: Vec<Vec<u8>>,
 
     // Captured config (see `crate::stats_json_values` docs).
     pub(crate) field_filters: Vec<String>,
@@ -103,11 +102,7 @@ impl StatsJSONValuesSortedProcessor {
         self.sort_columns.clear();
         for name in &names {
             let c = br.get_column_by_name(name);
-            let values: Vec<String> = br
-                .column_get_values(c)
-                .iter()
-                .map(|v| String::from_utf8_lossy(v).into_owned())
-                .collect();
+            let values: Vec<Vec<u8>> = br.column_get_values(c).to_vec();
             self.sort_columns.push(values);
         }
     }
@@ -179,7 +174,7 @@ impl StatsProcessor for StatsJSONValuesSortedProcessor {
             )
         });
 
-        let values: Vec<String> = order
+        let values: Vec<Vec<u8>> = order
             .iter()
             .map(|&i| self.entries[i].value.clone())
             .collect();
@@ -192,7 +187,7 @@ impl StatsProcessor for StatsJSONValuesSortedProcessor {
 }
 
 /// Total ordering derived from [`stats_json_values_less`], for sorting.
-pub(crate) fn less_to_ordering(sfs: &[BySortField], a: &[String], b: &[String]) -> Ordering {
+pub(crate) fn less_to_ordering(sfs: &[BySortField], a: &[Vec<u8>], b: &[Vec<u8>]) -> Ordering {
     if stats_json_values_less(sfs, a, b) {
         Ordering::Less
     } else if stats_json_values_less(sfs, b, a) {
@@ -203,18 +198,31 @@ pub(crate) fn less_to_ordering(sfs: &[BySortField], a: &[String], b: &[String]) 
 }
 
 /// Port of Go's `statsJSONValuesLess`.
-pub(crate) fn stats_json_values_less(sfs: &[BySortField], a: &[String], b: &[String]) -> bool {
+pub(crate) fn stats_json_values_less(sfs: &[BySortField], a: &[Vec<u8>], b: &[Vec<u8>]) -> bool {
     for (i, sf) in sfs.iter().enumerate() {
         let (sa, sb) = (&a[i], &b[i]);
         if sa == sb {
             continue;
         }
-        if less_string(sa, sb) {
+        if less_bytes(sa, sb) {
             return !sf.is_desc;
         }
         return sf.is_desc;
     }
     false
+}
+
+/// Byte-native wrapper around [`less_string`]: valid-UTF-8 values order like
+/// [`less_string`]; invalid UTF-8 fails every parse (as in Go) and falls back
+/// to plain byte ordering, which equals Go string ordering.
+fn less_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a == b {
+        return false;
+    }
+    match (std::str::from_utf8(a), std::str::from_utf8(b)) {
+        (Ok(sa), Ok(sb)) => less_string(sa, sb),
+        _ => a < b,
+    }
 }
 
 /// Port of Go's `lessString` (`pipe_sort_topk.go`).
@@ -312,9 +320,9 @@ pub(crate) fn stats_json_values_sorted_marshal_state(
 ) {
     encoding::marshal_var_uint64(dst, entries.len() as u64);
     for e in entries {
-        encoding::marshal_bytes(dst, e.value.as_bytes());
+        encoding::marshal_bytes(dst, &e.value);
         for v in &e.sort_values {
-            encoding::marshal_bytes(dst, v.as_bytes());
+            encoding::marshal_bytes(dst, v);
         }
     }
 }
@@ -341,7 +349,7 @@ pub(crate) fn stats_json_values_sorted_unmarshal_state(
             _ => return Err("cannot unmarshal value".to_string()),
         };
         src = &src[n as usize..];
-        let value = String::from_utf8_lossy(v).into_owned();
+        let value = v.to_vec();
 
         let mut sort_values = Vec::with_capacity(sort_fields_len);
         for _ in 0..sort_fields_len {
@@ -351,7 +359,7 @@ pub(crate) fn stats_json_values_sorted_unmarshal_state(
                 _ => return Err("cannot unmarshal sort value".to_string()),
             };
             src = &src[n as usize..];
-            sort_values.push(String::from_utf8_lossy(v).into_owned());
+            sort_values.push(v.to_vec());
         }
 
         let e = StatsJSONValuesSortedEntry { value, sort_values };

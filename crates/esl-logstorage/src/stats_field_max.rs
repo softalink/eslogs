@@ -14,13 +14,12 @@
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::encoding;
 
 use crate::block_result::BlockResult;
 use crate::prefix_filter::Filter;
 use crate::stats::{StatsFunc, StatsProcessor};
-use crate::stats_min::less_string;
+use crate::stats_min::less_bytes;
 use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{
     marshal_timestamp_rfc3339_nano_string, try_parse_timestamp_rfc3339_nano,
@@ -65,8 +64,8 @@ impl StatsFunc for StatsFieldMax {
         Box::new(StatsFieldMaxProcessor {
             src_field: self.src_field.clone(),
             field_name: self.field_name.clone(),
-            max: String::new(),
-            value: String::new(),
+            max: Vec::new(),
+            value: Vec::new(),
         })
     }
 }
@@ -75,21 +74,21 @@ impl StatsFunc for StatsFieldMax {
 pub(crate) struct StatsFieldMaxProcessor {
     src_field: String,
     field_name: String,
-    max: String,
-    value: String,
+    max: Vec<u8>,
+    value: Vec<u8>,
 }
 
 impl StatsFieldMaxProcessor {
-    fn need_update_state_string(&self, v: &str) -> bool {
+    fn need_update_state_string(&self, v: &[u8]) -> bool {
         if v.is_empty() {
             return false;
         }
-        self.max.is_empty() || less_string(&self.max, v)
+        self.max.is_empty() || less_bytes(&self.max, v)
     }
 
     fn update_state(
         &mut self,
-        v: &str,
+        v: &[u8],
         br: &mut BlockResult,
         field_name: &str,
         row_idx: usize,
@@ -100,10 +99,10 @@ impl StatsFieldMaxProcessor {
         let mut delta = 0i64;
         delta -= self.max.len() as i64;
         delta += v.len() as i64;
-        self.max = v.to_owned();
+        self.max = v.to_vec();
 
         let c = br.get_column_by_name(field_name);
-        let value = br.column_get_value_at_row(c, row_idx).to_owned();
+        let value = br.column_get_value_at_row(c, row_idx).to_vec();
         delta -= self.value.len() as i64;
         delta += value.len() as i64;
         self.value = value;
@@ -124,22 +123,24 @@ impl StatsProcessor for StatsFieldMaxProcessor {
             // Go fast path: take the block maximum from `getMaxTimestamp` and
             // read the companion field at the last row (Go's quirk — not the
             // row holding the maximum).
-            let timestamp = try_parse_timestamp_rfc3339_nano(&self.max).unwrap_or(i64::MIN);
+            let timestamp = std::str::from_utf8(&self.max)
+                .ok()
+                .and_then(try_parse_timestamp_rfc3339_nano)
+                .unwrap_or(i64::MIN);
             let max_timestamp = br.get_max_timestamp(timestamp);
             if max_timestamp <= timestamp {
                 return 0;
             }
             let mut b = Vec::new();
             marshal_timestamp_rfc3339_nano_string(&mut b, max_timestamp);
-            let v = to_unsafe_string(&b).to_owned();
             let last_row = br.rows_len() - 1;
-            return self.update_state(&v, br, &field_name, last_row);
+            return self.update_state(&b, br, &field_name, last_row);
         }
 
         let src_vals: Vec<Vec<u8>> = br.column_get_values(c_src).to_vec();
         let mut inc = 0i64;
         for (i, v) in src_vals.iter().enumerate() {
-            inc += self.update_state(to_unsafe_string(v), br, &field_name, i);
+            inc += self.update_state(v, br, &field_name, i);
         }
         inc
     }
@@ -168,8 +169,8 @@ impl StatsProcessor for StatsFieldMaxProcessor {
     }
 
     fn export_state(&self, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
-        encoding::marshal_bytes(dst, self.max.as_bytes());
-        encoding::marshal_bytes(dst, self.value.as_bytes());
+        encoding::marshal_bytes(dst, &self.max);
+        encoding::marshal_bytes(dst, &self.value);
     }
 
     fn import_state(&mut self, src: &[u8], _stop: Option<&AtomicBool>) -> Result<i64, String> {
@@ -178,14 +179,14 @@ impl StatsProcessor for StatsFieldMaxProcessor {
             return Err("cannot unmarshal maxValue".to_string());
         }
         let mut src = &src[n as usize..];
-        self.max = to_unsafe_string(max_value.unwrap_or_default()).to_owned();
+        self.max = max_value.unwrap_or_default().to_vec();
 
         let (value, n) = encoding::unmarshal_bytes(src);
         if n <= 0 {
             return Err("cannot unmarshal value".to_string());
         }
         src = &src[n as usize..];
-        self.value = to_unsafe_string(value.unwrap_or_default()).to_owned();
+        self.value = value.unwrap_or_default().to_vec();
 
         if !src.is_empty() {
             return Err(format!(
@@ -198,7 +199,7 @@ impl StatsProcessor for StatsFieldMaxProcessor {
     }
 
     fn finalize_stats(&self, _sf: &dyn StatsFunc, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
-        dst.extend_from_slice(self.value.as_bytes());
+        dst.extend_from_slice(&self.value);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -216,7 +217,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 

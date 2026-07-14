@@ -130,7 +130,7 @@ impl Filter for FilterEqField {
         let c_other = br.get_column_by_name(&self.other_field_name);
 
         if br.column_is_const(c) && br.column_is_const(c_other) {
-            let v = br.column_get_value_at_row(c, 0).to_string();
+            let v = br.column_get_value_at_row(c, 0).to_vec();
             let v_other = br.column_get_value_at_row(c_other, 0);
             if v != v_other {
                 bm.reset_bits();
@@ -250,7 +250,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 

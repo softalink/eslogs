@@ -350,24 +350,32 @@ what remains in section (a) is confirmed-present divergence.
 
 **Input handling edge cases (esl-logstorage)**
 
-- `json_parser.rs:322` — invalid UTF-8 in ingested data becomes `U+FFFD`
-  (Rust `from_utf8_lossy`) where Go preserves the raw bytes
-  (`bytesutil.ToUnsafeString`). The same raw-byte-vs-lossy divergence recurs
-  across the ingestion surface: `arena.rs:67` (lossy — does **not** panic, and
-  never triggers in-tree since all callers pass a valid `&str`),
-  `esl-insert/src/journald.rs:394`, `esl-insert/src/loki_protobuf.rs`
-  (`get_string_lossy`/`unquote_prefix` at :254/:316/:344/:477),
-  `esl-agent/src/filecollector.rs:918`,
-  `esl-agent/src/kubernetescollector.rs:2346/:2449/:2748`,
-  `esl-common/src/easyproto.rs` (`string()` :314 / `get_string` :610 **reject**
-  invalid UTF-8 where Go accepts it — reachable via the OTLP ingest path;
-  `string_lossy`/`get_string_lossy`/`bytes` are the opt-in raw alternatives).
+- Field **values** are now raw bytes end-to-end (`rows::Field.value: Vec<u8>`,
+  `block::Column.values: Vec<Vec<u8>>`), matching Go's arbitrary-byte strings:
+  invalid UTF-8 survives ingest→storage→filter→query-result byte-identically
+  (round-trip tests at every layer + a jsonline e2e). The block-level filter
+  matchers, tokenizer/bloom hashing, and phrase-boundary checks are byte-native
+  ports of the Go code (incl. Go's `RuneError` boundary special-case); the
+  jsonline/elasticsearch/splunk/journald/loki-protobuf/OTLP/datadog/native/
+  internal ingest paths and the tail/stats/facets/lastn output paths preserve
+  bytes; OTLP now reads value paths via byte accessors where it previously
+  **rejected** invalid UTF-8. Remaining lossy (each PORT-NOTEd in place):
+  field **names** stay `String` (invalid UTF-8 in a name becomes `U+FFFD` where
+  Go keeps raw bytes); the **syslog** message line
+  (`esl-insert/src/syslog_listeners.rs:1243` — `syslog_parser::parse` takes
+  `&str`); `in(<subquery>)` values (`GetFieldValuesFn` returns `Vec<String>`,
+  `storage_search.rs:1537`); `_stream`/`_stream_id` rendering (validated
+  printable text); regex matching on invalid-UTF-8 values falls back to a lossy
+  view; `any_case` filters lossy-lowercase — which IS Go (`strings.ToLower`
+  maps invalid bytes to `U+FFFD`).
 - `pattern.rs:373` — `extract` pattern `\x`/octal escapes ≥0x80 are
   UTF-8-encoded instead of emitting the raw byte.
 - `parser/query.rs` `string_range` — the upper-bound sentinel is `U+10FFFF`×4
-  vs Go's `0xFF`×4, so a `string_range` filter's *matching* differs for stored
-  byte values in `0xF5..0xFF` (rendering is unaffected — the sentinel never
-  appears in `String()`).
+  vs Go's `0xFF`×4. With values now raw bytes this is genuinely reachable: a
+  stored value starting with a byte in `0xF5..0xFF` matches `>foo` in Go but
+  not here (rendering is unaffected — the sentinel never appears in
+  `String()`). Follow-up: store `FilterStringRange` bounds as bytes so the
+  sentinel can be `0xFF`×4.
 - `syslog_parser.rs`, `esl-insert/src/syslog_listeners.rs` — a named IANA
   `-syslog.timezone` (e.g. `America/New_York`) is now supported on Unix: it is
   loaded DST-aware from the system zoneinfo database (`crate::tzdata`) and the

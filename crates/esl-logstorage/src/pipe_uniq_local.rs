@@ -277,7 +277,7 @@ mod tests {
                 for (ci, &c) in cols.iter().enumerate() {
                     fields.push(Field {
                         name: names[ci].clone(),
-                        value: br.column_get_value_at_row(c, i).to_string(),
+                        value: br.column_get_value_at_row(c, i).to_vec(),
                     });
                 }
                 out.push(fields);
@@ -291,7 +291,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -312,7 +312,7 @@ mod tests {
     fn find<'a>(row: &'a [Field], name: &str) -> &'a str {
         row.iter()
             .find(|f| f.name == name)
-            .map(|f| f.value.as_str())
+            .map(|f| std::str::from_utf8(&f.value).unwrap())
             .unwrap_or("")
     }
 

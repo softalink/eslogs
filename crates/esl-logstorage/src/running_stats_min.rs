@@ -9,7 +9,7 @@
 use crate::prefix_filter::Filter;
 use crate::rows::Field;
 use crate::running_stats_count::for_each_matching_field;
-use crate::stats_min::{field_names_string, less_string};
+use crate::stats_min::{field_names_string, less_bytes};
 
 /// Running `min(...)` stats function.
 pub struct RunningStatsMin {
@@ -43,7 +43,7 @@ impl RunningStatsMin {
 /// Port of `runningStatsMinProcessor`.
 #[derive(Default)]
 pub(crate) struct RunningStatsMinProcessor {
-    min: String,
+    min: Vec<u8>,
     has_items: bool,
 }
 
@@ -55,13 +55,13 @@ impl RunningStatsMinProcessor {
                 self.has_items = true;
                 return;
             }
-            if less_string(v, &self.min) {
+            if less_bytes(v, &self.min) {
                 self.min = v.to_owned();
             }
         });
     }
 
-    pub(crate) fn get_running_stats(&self) -> String {
+    pub(crate) fn get_running_stats(&self) -> Vec<u8> {
         self.min.clone()
     }
 }
@@ -97,7 +97,7 @@ impl crate::pipe_running_stats::RunningStatsProcessor for RunningStatsMinProcess
         self.update_running_stats(sf, row)
     }
 
-    fn get_running_stats(&self) -> String {
+    fn get_running_stats(&self) -> Vec<u8> {
         self.get_running_stats()
     }
 }
@@ -109,7 +109,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -120,7 +120,7 @@ mod tests {
         for v in ["5", "3", "8", "1", "9"] {
             sp.update_running_stats(&sf, &[field("a", v)]);
         }
-        assert_eq!(sp.get_running_stats(), "1");
+        assert_eq!(sp.get_running_stats(), b"1");
     }
 
     #[test]

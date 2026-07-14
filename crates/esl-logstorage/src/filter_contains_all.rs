@@ -4,7 +4,6 @@
 
 use std::collections::HashSet;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -57,7 +56,7 @@ pub(crate) fn new_filter_contains_all_query(
 }
 
 /// Port of Go `matchAllPhrases`.
-fn match_all_phrases<S: AsRef<str>>(v: &str, phrases: &[S]) -> bool {
+fn match_all_phrases<S: AsRef<str>>(v: &[u8], phrases: &[S]) -> bool {
     for phrase in phrases {
         let phrase = phrase.as_ref();
         if phrase.is_empty() {
@@ -75,7 +74,7 @@ impl FilterContainsAll {
     fn match_column_by_string_values(&self, br: &mut BlockResult, bm: &mut Bitmap, r: ColRef) {
         let phrases = &self.values.values;
         let values = br.column_get_values(r);
-        bm.for_each_set_bit(|idx| match_all_phrases(to_unsafe_string(&values[idx]), phrases));
+        bm.for_each_set_bit(|idx| match_all_phrases(&values[idx], phrases));
     }
 }
 
@@ -113,8 +112,8 @@ impl FieldFilter for FilterContainsAll {
 
         let r = br.get_column_by_name(field_name);
         if br.column_is_const(r) {
-            let v = br.column_get_value_at_row(r, 0).to_string();
-            if !match_all_phrases(&v, &self.values.values) {
+            let v = br.column_get_value_at_row(r, 0);
+            if !match_all_phrases(v, &self.values.values) {
                 bm.reset_bits();
             }
             return;
@@ -186,7 +185,7 @@ impl FieldFilter for FilterContainsAll {
             None => {
                 // Fast path - there are no matching columns. It matches anything
                 // only for the empty phrase.
-                if !match_all_phrases("", &self.values.values) {
+                if !match_all_phrases(b"", &self.values.values) {
                     bm.reset_bits();
                 }
                 return;
@@ -292,7 +291,7 @@ fn match_all_phrases_string(
         return;
     }
     let values = bs.get_values_for_column(ch);
-    bm.for_each_set_bit(|idx| match_all_phrases(to_unsafe_string(&values[idx]), phrases));
+    bm.for_each_set_bit(|idx| match_all_phrases(&values[idx], phrases));
 }
 
 fn match_all_phrases_int64(
@@ -313,7 +312,7 @@ fn match_all_phrases_int64(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_int64_string(&pp, &mut bb, v);
-        match_all_phrases(to_unsafe_string(&bb), phrases)
+        match_all_phrases(&bb, phrases)
     });
 }
 
@@ -335,7 +334,7 @@ fn match_all_phrases_float64(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_float64_string(&pp, &mut bb, v);
-        match_all_phrases(to_unsafe_string(&bb), phrases)
+        match_all_phrases(&bb, phrases)
     });
 }
 
@@ -357,7 +356,7 @@ fn match_all_phrases_ipv4(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_ipv4_string(&pp, &mut bb, v);
-        match_all_phrases(to_unsafe_string(&bb), phrases)
+        match_all_phrases(&bb, phrases)
     });
 }
 
@@ -379,7 +378,7 @@ fn match_all_phrases_timestamp_iso8601(
     visit_values(bs, ch, bm, |v| {
         let mut bb = Vec::new();
         to_timestamp_iso8601_string(&pp, &mut bb, v);
-        match_all_phrases(to_unsafe_string(&bb), phrases)
+        match_all_phrases(&bb, phrases)
     });
 }
 

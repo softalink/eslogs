@@ -201,6 +201,67 @@ mod tests {
         s.must_close();
     }
 
+    /// End-to-end raw-byte preservation: a jsonline field value containing
+    /// invalid UTF-8 must round-trip through storage bit-identically (Go
+    /// strings are arbitrary bytes; the port must not U+FFFD-replace them).
+    #[test]
+    fn test_jsonline_invalid_utf8_value_roundtrip() {
+        use std::sync::{Arc, Mutex};
+
+        use esl_logstorage::parser::ParseQuery;
+        use esl_logstorage::storage_search::{DataBlock, WriteDataBlockFn};
+        use esl_logstorage::tenant_id::TenantID;
+
+        let s = open_temp_storage("jsonline-rawbytes");
+        let cp = CommonParams::empty();
+        let mut lmp = cp.new_log_message_processor(&s, "test");
+
+        // The _msg value contains the invalid UTF-8 byte 0xFF (raw bytes, not
+        // a str literal).
+        let body = b"{\"_msg\":\"a\xff b\"}\n".to_vec();
+        let mut cur = Cursor::new(body);
+        let no_fields: [&str; 0] = [];
+        let res = process_stream_internal(
+            "test",
+            &mut cur,
+            &["_time"],
+            &no_fields,
+            &no_fields,
+            &mut lmp,
+        );
+        assert!(res.is_ok(), "unexpected error: {res:?}");
+        lmp.close();
+        assert_eq!(rows_count(&s), 1, "expected 1 row ingested");
+
+        // Query the row back and verify the _msg bytes are exactly the
+        // ingested raw bytes (no U+FFFD replacement anywhere in the path).
+        let q = ParseQuery("*").expect("parse query");
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let write: WriteDataBlockFn = Arc::new(move |_wid, db: &mut DataBlock| {
+            for c in db.get_columns(false) {
+                if c.name == "_msg" {
+                    for v in &c.values {
+                        cap.lock().unwrap().push(v.clone());
+                    }
+                }
+            }
+        });
+        s.run_query(&[TenantID::default()], &q, write)
+            .expect("run_query");
+
+        let vals = captured.lock().unwrap();
+        assert_eq!(vals.len(), 1, "expected exactly one _msg value");
+        assert_eq!(
+            vals[0],
+            b"a\xff b",
+            "raw bytes must round-trip verbatim; got {:?}",
+            String::from_utf8_lossy(&vals[0])
+        );
+        drop(vals);
+        s.must_close();
+    }
+
     #[test]
     fn test_jsonline_skips_blank_lines() {
         let s = open_temp_storage("jsonline-blank");

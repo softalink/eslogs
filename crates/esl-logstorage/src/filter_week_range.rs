@@ -47,8 +47,12 @@ pub(crate) fn new_filter_week_range(
 }
 
 impl FilterWeekRange {
-    fn match_timestamp_string(&self, v: &str) -> bool {
-        match try_parse_timestamp_rfc3339_nano(v) {
+    fn match_timestamp_string(&self, v: &[u8]) -> bool {
+        // Invalid UTF-8 fails the parse = no match, same as Go's parse failure.
+        match std::str::from_utf8(v)
+            .ok()
+            .and_then(try_parse_timestamp_rfc3339_nano)
+        {
             Some(timestamp) => self.match_timestamp_value(timestamp),
             None => false,
         }

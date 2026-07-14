@@ -19,8 +19,9 @@ use crate::block_result::{BlockResult, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
 use crate::values_encoder::{
-    ValueType, marshal_int64_string, marshal_uint64_string, try_parse_int64, try_parse_uint64,
-    unmarshal_int64, unmarshal_uint8, unmarshal_uint16, unmarshal_uint32, unmarshal_uint64,
+    ValueType, marshal_int64_string, marshal_uint64_string, try_parse_int64_bytes,
+    try_parse_uint64_bytes, unmarshal_int64, unmarshal_uint8, unmarshal_uint16, unmarshal_uint32,
+    unmarshal_uint64,
 };
 
 const PIPE_FACETS_DEFAULT_LIMIT: u64 = 10;
@@ -48,18 +49,18 @@ impl HitsMap {
         (self.u64s.len() + self.negs.len() + self.strings.len()) as u64
     }
 
-    fn update_state_generic(&mut self, v: &str, hits: u64) {
-        if let Some(n) = try_parse_uint64(v) {
+    fn update_state_generic(&mut self, v: &[u8], hits: u64) {
+        if let Some(n) = try_parse_uint64_bytes(v) {
             *self.u64s.entry(n).or_default() += hits;
             return;
         }
-        if v.as_bytes().first() == Some(&b'-')
-            && let Some(n) = try_parse_int64(v)
+        if v.first() == Some(&b'-')
+            && let Some(n) = try_parse_int64_bytes(v)
         {
             *self.negs.entry(n).or_default() += hits;
             return;
         }
-        *self.strings.entry(v.as_bytes().to_vec()).or_default() += hits;
+        *self.strings.entry(v.to_vec()).or_default() += hits;
     }
 
     fn update_state_uint64(&mut self, n: u64, hits: u64) {
@@ -144,7 +145,7 @@ impl FieldHits {
     }
 }
 
-fn update_state_generic(fhs: &mut FieldHits, v: &str, hits: u64, max_value_len: u64) {
+fn update_state_generic(fhs: &mut FieldHits, v: &[u8], hits: u64, max_value_len: u64) {
     if v.is_empty() {
         // Empty per-field values cannot be counted meaningfully (blocks without
         // the field are not included), so they are ignored.
@@ -314,7 +315,7 @@ impl PipeFacetsProcessor {
         }
 
         if br.column_is_const(c) {
-            let v = br.column_get_value_at_row(c, 0).to_string();
+            let v = br.column_get_value_at_row(c, 0).to_vec();
             let rows_len = br.rows_len() as u64;
             let fhs = shard.get_field_hits(&name);
             update_state_generic(fhs, &v, rows_len, max_value_len);
@@ -353,7 +354,7 @@ impl PipeFacetsProcessor {
                 // DICT and STRING (and everything else) go per-row.
                 let rows_len = br.rows_len();
                 for i in 0..rows_len {
-                    let v = br.column_get_value_at_row(c, i).to_string();
+                    let v = br.column_get_value_at_row(c, i).to_vec();
                     let fhs = shard.get_field_hits(&name);
                     update_state_generic(fhs, &v, 1, max_value_len);
                 }
@@ -506,7 +507,7 @@ mod tests {
                 for (ci, &c) in cols.iter().enumerate() {
                     fields.push(Field {
                         name: names[ci].clone(),
-                        value: br.column_get_value_at_row(c, i).to_string(),
+                        value: br.column_get_value_at_row(c, i).to_vec(),
                     });
                 }
                 out.push(fields);
@@ -520,7 +521,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -537,19 +538,10 @@ mod tests {
     }
 
     fn triple(r: &[Field]) -> (String, String, String) {
-        (
-            r.iter()
-                .find(|f| f.name == "field_name")
-                .unwrap()
-                .value
-                .clone(),
-            r.iter()
-                .find(|f| f.name == "field_value")
-                .unwrap()
-                .value
-                .clone(),
-            r.iter().find(|f| f.name == "hits").unwrap().value.clone(),
-        )
+        let get = |name: &str| {
+            String::from_utf8(r.iter().find(|f| f.name == name).unwrap().value.clone()).unwrap()
+        };
+        (get("field_name"), get("field_value"), get("hits"))
     }
 
     #[test]
@@ -596,7 +588,7 @@ mod tests {
         for r in &out {
             assert_ne!(
                 r.iter().find(|f| f.name == "field_name").unwrap().value,
-                "k"
+                b"k"
             );
         }
     }
@@ -633,7 +625,7 @@ mod tests {
         for r in &out {
             assert_ne!(
                 r.iter().find(|f| f.name == "field_name").unwrap().value,
-                "x"
+                b"x"
             );
         }
     }

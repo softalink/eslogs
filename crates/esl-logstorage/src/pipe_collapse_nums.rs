@@ -126,15 +126,13 @@ impl Pipe for PipeCollapseNums {
         let is_prettify = self.is_prettify;
         // PORT NOTE: Go threads a pooled `arena` through `updateFunc`; the Rust
         // port returns an owned `String` (see pipe_update.rs module docs).
-        let update_func: crate::pipe_update::UpdateFunc = Arc::new(move |v: &str| {
+        let update_func: crate::pipe_update::UpdateFunc = Arc::new(move |v: &[u8]| {
             let mut b = Vec::new();
-            append_collapse_nums(&mut b, v.as_bytes());
+            append_collapse_nums(&mut b, v);
             if is_prettify {
                 b = prettify_collapsed_nums(&b);
             }
-            // Input is valid UTF-8; collapsing only rewrites ASCII digit/hex
-            // runs and copies other bytes verbatim, so the result is UTF-8.
-            String::from_utf8_lossy(&b).into_owned()
+            b
         });
 
         new_pipe_update_processor(

@@ -5,7 +5,6 @@
 
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -72,11 +71,7 @@ impl FilterLeField {
 
         let mut src_idx = 0;
         bm.for_each_set_bit(|_| {
-            let ok = le_values_string(
-                to_unsafe_string(&values[src_idx]),
-                to_unsafe_string(&values_other[src_idx]),
-                exclude,
-            );
+            let ok = le_values_string(&values[src_idx], &values_other[src_idx], exclude);
             src_idx += 1;
             ok
         });
@@ -115,13 +110,7 @@ impl FilterLeField {
         let exclude = self.exclude_equal_values;
         let ve: Vec<Vec<u8>> = bs.get_values_for_column(ch).to_vec();
         let ve_other: Vec<Vec<u8>> = bs.get_values_for_column(ch_other).to_vec();
-        bm.for_each_set_bit(|idx| {
-            le_values_string(
-                to_unsafe_string(&ve[idx]),
-                to_unsafe_string(&ve_other[idx]),
-                exclude,
-            )
-        });
+        bm.for_each_set_bit(|idx| le_values_string(&ve[idx], &ve_other[idx], exclude));
     }
 
     fn apply_filter_int64(
@@ -199,7 +188,7 @@ impl Filter for FilterLeField {
         let c_other = br.get_column_by_name(&self.other_field_name);
 
         if br.column_is_const(c) && br.column_is_const(c_other) {
-            let v = br.column_get_value_at_row(c, 0).to_string();
+            let v = br.column_get_value_at_row(c, 0).to_vec();
             let v_other = br.column_get_value_at_row(c_other, 0);
             if !le_values_string(&v, v_other, exclude) {
                 bm.reset_bits();
@@ -314,13 +303,7 @@ fn apply_filter_le_string(
 ) {
     let values: Vec<Vec<u8>> = br.column_get_values(c).to_vec();
     let values_other: Vec<Vec<u8>> = br.column_get_values(c_other).to_vec();
-    bm.for_each_set_bit(|idx| {
-        le_values_string(
-            to_unsafe_string(&values[idx]),
-            to_unsafe_string(&values_other[idx]),
-            exclude,
-        )
-    });
+    bm.for_each_set_bit(|idx| le_values_string(&values[idx], &values_other[idx], exclude));
 }
 
 fn apply_filter_le_uint(
@@ -338,13 +321,7 @@ fn apply_filter_le_uint(
         .column_get_values_encoded(c_other)
         .map(<[Vec<u8>]>::to_vec)
         .unwrap_or_default();
-    bm.for_each_set_bit(|idx| {
-        le_values_string(
-            to_unsafe_string(&ve[idx]),
-            to_unsafe_string(&ve_other[idx]),
-            exclude,
-        )
-    });
+    bm.for_each_set_bit(|idx| le_values_string(&ve[idx], &ve_other[idx], exclude));
 }
 
 fn apply_filter_le_int64(
@@ -396,11 +373,13 @@ fn apply_filter_le_float64(
 // ---------------------------------------------------------------------------
 
 /// Port of Go `leValuesString`: numeric comparison when both parse as numbers,
-/// else plain string comparison.
-pub(crate) fn le_values_string(a: &str, b: &str, exclude_equal_values: bool) -> bool {
-    let f_a = parse_math_number(a);
+/// else plain string comparison (`&[u8]` Ord equals Go string order).
+pub(crate) fn le_values_string(a: &[u8], b: &[u8], exclude_equal_values: bool) -> bool {
+    // Invalid UTF-8 cannot be a valid number, so the checked parse fails
+    // exactly like Go's parseMathNumber on such bytes.
+    let f_a = std::str::from_utf8(a).map_or(f64::NAN, parse_math_number);
     if !f_a.is_nan() {
-        let f_b = parse_math_number(b);
+        let f_b = std::str::from_utf8(b).map_or(f64::NAN, parse_math_number);
         if !f_b.is_nan() {
             return if exclude_equal_values {
                 f_a < f_b
@@ -433,7 +412,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -452,20 +431,20 @@ mod tests {
     #[test]
     fn test_le_values_string_numeric() {
         // both numeric -> numeric compare
-        assert!(le_values_string("9", "10", false));
-        assert!(le_values_string("9", "10", true));
-        assert!(le_values_string("10", "10", false));
-        assert!(!le_values_string("10", "10", true));
-        assert!(!le_values_string("11", "10", false));
+        assert!(le_values_string(b"9", b"10", false));
+        assert!(le_values_string(b"9", b"10", true));
+        assert!(le_values_string(b"10", b"10", false));
+        assert!(!le_values_string(b"10", b"10", true));
+        assert!(!le_values_string(b"11", b"10", false));
     }
 
     #[test]
     fn test_le_values_string_lexicographic() {
         // non-numeric -> string compare
-        assert!(le_values_string("abc", "abd", false));
-        assert!(!le_values_string("abd", "abc", false));
-        assert!(le_values_string("abc", "abc", false));
-        assert!(!le_values_string("abc", "abc", true));
+        assert!(le_values_string(b"abc", b"abd", false));
+        assert!(!le_values_string(b"abd", b"abc", false));
+        assert!(le_values_string(b"abc", b"abc", false));
+        assert!(!le_values_string(b"abc", b"abc", true));
     }
 
     #[test]

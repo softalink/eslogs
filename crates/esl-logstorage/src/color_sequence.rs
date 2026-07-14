@@ -1,8 +1,16 @@
 //! Port of EsLogs `lib/logstorage/color_sequence.go`.
 
 /// Returns true if s contains ANSI color escape sequences.
-pub fn has_color_sequences(s: &str) -> bool {
-    s.contains("\x1b[")
+///
+/// PORT NOTE: byte-native (values are raw bytes); ANSI escape sequences are
+/// pure ASCII byte patterns, so scanning bytes matches the Go behavior.
+pub fn has_color_sequences(s: &[u8]) -> bool {
+    find_csi(s).is_some()
+}
+
+/// Position of the first `ESC [` (CSI) introducer in s.
+fn find_csi(s: &[u8]) -> Option<usize> {
+    s.windows(2).position(|w| w == b"\x1b[")
 }
 
 /// Removes ANSI escape sequences from src and appends the result to dst.
@@ -10,15 +18,16 @@ pub fn has_color_sequences(s: &str) -> bool {
 /// See <https://en.wikipedia.org/wiki/ANSI_escape_code>
 ///
 /// PORT NOTE: Go appends to and returns `dst []byte`; the port mutates
-/// `dst: &mut Vec<u8>` in place.
-pub fn drop_color_sequences(dst: &mut Vec<u8>, src: &str) {
+/// `dst: &mut Vec<u8>` in place. Bytes outside escape sequences (including
+/// invalid UTF-8) pass through unchanged.
+pub fn drop_color_sequences(dst: &mut Vec<u8>, src: &[u8]) {
     let mut src = src;
     loop {
-        let Some(n) = src.find("\x1b[") else {
-            dst.extend_from_slice(src.as_bytes());
+        let Some(n) = find_csi(src) else {
+            dst.extend_from_slice(src);
             return;
         };
-        dst.extend_from_slice(&src.as_bytes()[..n]);
+        dst.extend_from_slice(&src[..n]);
         src = &src[n + 2..];
 
         src = skip_ansi_sequence(src);
@@ -26,11 +35,8 @@ pub fn drop_color_sequences(dst: &mut Vec<u8>, src: &str) {
 }
 
 /// Skips non-ansi escape sequence at the beginning of s and returns the position of the first byte after it.
-///
-/// PORT NOTE: the scan advances only over ASCII bytes, so the returned slice
-/// always starts at a valid UTF-8 char boundary.
-fn skip_ansi_sequence(s: &str) -> &str {
-    let b = s.as_bytes();
+fn skip_ansi_sequence(s: &[u8]) -> &[u8] {
+    let b = s;
     let mut n = 0;
 
     // Skip optional parameter bytes after CSI (control sequence introducer).
@@ -73,7 +79,7 @@ mod tests {
     #[test]
     fn test_has_color_sequences() {
         fn f(s: &str, result_expected: bool) {
-            let result = has_color_sequences(s);
+            let result = has_color_sequences(s.as_bytes());
             assert_eq!(
                 result, result_expected,
                 "unexpected result; got {result}; want {result_expected}"
@@ -92,7 +98,7 @@ mod tests {
     fn test_drop_color_sequences() {
         fn f(s: &str, result_expected: &str) {
             let mut result = Vec::new();
-            drop_color_sequences(&mut result, s);
+            drop_color_sequences(&mut result, s.as_bytes());
             assert_eq!(
                 result,
                 result_expected.as_bytes(),

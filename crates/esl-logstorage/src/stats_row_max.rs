@@ -7,14 +7,13 @@
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::encoding;
 
 use crate::block_result::BlockResult;
 use crate::prefix_filter::{self, Filter};
 use crate::rows::{Field, marshal_fields_to_json};
 use crate::stats::{StatsFunc, StatsProcessor};
-use crate::stats_min::{field_names_string, get_matching_columns, less_string};
+use crate::stats_min::{field_names_string, get_matching_columns, less_bytes};
 use crate::stats_row_any::{fields_state_size, marshal_fields, unmarshal_fields};
 use crate::stream_filter::quote_token_if_needed;
 
@@ -67,7 +66,7 @@ impl StatsFunc for StatsRowMax {
         Box::new(StatsRowMaxProcessor {
             src_field: self.src_field.clone(),
             field_filters: self.field_filters.clone(),
-            max: String::new(),
+            max: Vec::new(),
             fields: Vec::new(),
         })
     }
@@ -77,21 +76,21 @@ impl StatsFunc for StatsRowMax {
 pub(crate) struct StatsRowMaxProcessor {
     src_field: String,
     field_filters: Vec<String>,
-    max: String,
+    max: Vec<u8>,
     fields: Vec<Field>,
 }
 
 impl StatsRowMaxProcessor {
-    fn need_update_state_string(&self, v: &str) -> bool {
+    fn need_update_state_string(&self, v: &[u8]) -> bool {
         if v.is_empty() {
             return false;
         }
-        self.max.is_empty() || less_string(&self.max, v)
+        self.max.is_empty() || less_bytes(&self.max, v)
     }
 
     fn update_state(
         &mut self,
-        v: &str,
+        v: &[u8],
         br: &mut BlockResult,
         field_filters: &[String],
         row_idx: usize,
@@ -102,7 +101,7 @@ impl StatsRowMaxProcessor {
         let mut delta = 0i64;
         delta -= self.max.len() as i64;
         delta += v.len() as i64;
-        self.max = v.to_owned();
+        self.max = v.to_vec();
 
         for f in &self.fields {
             delta -= (f.name.len() + f.value.len()) as i64;
@@ -128,7 +127,7 @@ impl StatsProcessor for StatsRowMaxProcessor {
         let src_vals: Vec<Vec<u8>> = br.column_get_values(c_src).to_vec();
         let mut inc = 0i64;
         for (i, v) in src_vals.iter().enumerate() {
-            inc += self.update_state(to_unsafe_string(v), br, &filters, i);
+            inc += self.update_state(v, br, &filters, i);
         }
         inc
     }
@@ -157,7 +156,7 @@ impl StatsProcessor for StatsRowMaxProcessor {
     }
 
     fn export_state(&self, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
-        encoding::marshal_bytes(dst, self.max.as_bytes());
+        encoding::marshal_bytes(dst, &self.max);
         marshal_fields(dst, &self.fields);
     }
 
@@ -167,7 +166,7 @@ impl StatsProcessor for StatsRowMaxProcessor {
             return Err("cannot read maxValue".to_string());
         }
         let src = &src[n as usize..];
-        self.max = to_unsafe_string(max_value.unwrap_or_default()).to_owned();
+        self.max = max_value.unwrap_or_default().to_vec();
 
         let (fields, tail) =
             unmarshal_fields(src).map_err(|e| format!("cannot unmarshal fields: {e}"))?;
@@ -200,7 +199,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 

@@ -57,7 +57,7 @@ pub trait RunningStatsProcessor: Send {
     fn update_running_stats(&mut self, sf: &dyn RunningStatsFunc, row: &[Field]);
 
     /// Returns the current running-stats value (Go `getRunningStats`).
-    fn get_running_stats(&self) -> String;
+    fn get_running_stats(&self) -> Vec<u8>;
 }
 
 /// A running-stats function to execute and the name of its output field.
@@ -192,7 +192,7 @@ impl PipeProcessor for PipeRunningStatsProcessor {
             for (ci, &c) in cols.iter().enumerate() {
                 fields.push(Field {
                     name: names[ci].clone(),
-                    value: br.column_get_value_at_row(c, i).to_string(),
+                    value: br.column_get_value_at_row(c, i).to_vec(),
                 });
             }
             shard.push(fields);
@@ -204,13 +204,14 @@ impl PipeProcessor for PipeRunningStatsProcessor {
             let mut key = Vec::new();
             for bf in self.by_fields.iter() {
                 let v = get_field_value_by_name(row, bf);
-                marshal_bytes(&mut key, v.as_bytes());
+                marshal_bytes(&mut key, v);
             }
             key
         };
 
         // key -> Vec<(timestamp, fields)>
-        let mut m: HashMap<Vec<u8>, Vec<(String, Vec<Field>)>> = HashMap::new();
+        type GroupedRows = Vec<(Vec<u8>, Vec<Field>)>;
+        let mut m: HashMap<Vec<u8>, GroupedRows> = HashMap::new();
         for shard in &self.shards {
             let mut rows = shard.lock().unwrap();
             for row in rows.drain(..) {
@@ -218,7 +219,7 @@ impl PipeProcessor for PipeRunningStatsProcessor {
                     return Ok(());
                 }
                 let key = get_key(&row);
-                let timestamp = get_field_value_by_name(&row, "_time").to_string();
+                let timestamp = get_field_value_by_name(&row, "_time").to_vec();
                 m.entry(key).or_default().push((timestamp, row));
             }
         }
@@ -302,7 +303,7 @@ impl RunningStatsWriter {
                 .collect();
         }
         for (i, f) in row.iter().enumerate() {
-            self.rcs[i].add_value(f.value.as_bytes());
+            self.rcs[i].add_value(&f.value);
             self.values_len += f.value.len();
         }
         self.rows_count += 1;
@@ -356,7 +357,7 @@ mod tests {
                 for (ci, &c) in cols.iter().enumerate() {
                     fields.push(Field {
                         name: names[ci].clone(),
-                        value: br.column_get_value_at_row(c, i).to_string(),
+                        value: br.column_get_value_at_row(c, i).to_vec(),
                     });
                 }
                 out.push(fields);
@@ -370,12 +371,12 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
     fn field_value<'a>(row: &'a [Field], name: &str) -> &'a str {
-        get_field_value_by_name(row, name)
+        std::str::from_utf8(get_field_value_by_name(row, name)).unwrap()
     }
 
     #[test]

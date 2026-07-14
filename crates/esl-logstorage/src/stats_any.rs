@@ -3,7 +3,6 @@
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::encoding;
 
 use crate::block_result::BlockResult;
@@ -33,7 +32,7 @@ impl StatsFunc for StatsAny {
 
     fn new_stats_processor(&self) -> Box<dyn StatsProcessor> {
         Box::new(StatsAnyProcessor {
-            value: String::new(),
+            value: Vec::new(),
             field_name: self.field_name.clone(),
         })
     }
@@ -41,7 +40,7 @@ impl StatsFunc for StatsAny {
 
 #[derive(Default, PartialEq, Debug)]
 pub(crate) struct StatsAnyProcessor {
-    value: String,
+    value: Vec<u8>,
     field_name: String,
 }
 
@@ -53,7 +52,7 @@ impl StatsAnyProcessor {
             return 0;
         }
         let n = v.len();
-        self.value = v.to_string();
+        self.value = v.to_vec();
         n as i64
     }
 }
@@ -89,7 +88,7 @@ impl StatsProcessor for StatsAnyProcessor {
     }
 
     fn export_state(&self, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
-        encoding::marshal_bytes(dst, self.value.as_bytes());
+        encoding::marshal_bytes(dst, &self.value);
     }
 
     fn import_state(&mut self, src: &[u8], _stop: Option<&AtomicBool>) -> Result<i64, String> {
@@ -98,7 +97,7 @@ impl StatsProcessor for StatsAnyProcessor {
             return Err("cannot unmarshal value".to_string());
         }
         let src = &src[n as usize..];
-        self.value = to_unsafe_string(value.unwrap_or_default()).to_string();
+        self.value = value.unwrap_or_default().to_vec();
         if !src.is_empty() {
             return Err(format!(
                 "unexpected non-empty tail left; len(tail)={}",
@@ -109,7 +108,7 @@ impl StatsProcessor for StatsAnyProcessor {
     }
 
     fn finalize_stats(&self, _sf: &dyn StatsFunc, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
-        dst.extend_from_slice(self.value.as_bytes());
+        dst.extend_from_slice(&self.value);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -140,7 +139,7 @@ mod tests {
 
         // non-zero state
         let sap = StatsAnyProcessor {
-            value: "foobar".to_string(),
+            value: b"foobar".to_vec(),
             ..Default::default()
         };
         f(&sap, 7);

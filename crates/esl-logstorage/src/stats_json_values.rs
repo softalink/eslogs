@@ -153,7 +153,7 @@ impl StatsFunc for StatsJSONValues {
 /// Port of Go's `statsJSONValuesProcessor`.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct StatsJSONValuesProcessor {
-    pub(crate) entries: Vec<String>,
+    pub(crate) entries: Vec<Vec<u8>>,
 
     fields_buf: Vec<Field>,
 
@@ -187,16 +187,15 @@ impl StatsJSONValuesProcessor {
             .iter()
             .map(|&c| {
                 let name = br.column_name(c).to_string();
-                let value = br.column_get_value_at_row(c, row_idx).to_string();
+                let value = br.column_get_value_at_row(c, row_idx).to_vec();
                 Field { name, value }
             })
             .collect();
 
         let mut buf = Vec::new();
         marshal_fields_to_json(&mut buf, &self.fields_buf);
-        let value = String::from_utf8_lossy(&buf).into_owned();
-        let delta = std::mem::size_of::<String>() as i64 + value.len() as i64;
-        self.entries.push(value);
+        let delta = std::mem::size_of::<Vec<u8>>() as i64 + buf.len() as i64;
+        self.entries.push(buf);
         delta
     }
 }
@@ -243,7 +242,7 @@ impl StatsProcessor for StatsJSONValuesProcessor {
     fn export_state(&self, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
         encoding::marshal_var_uint64(dst, self.entries.len() as u64);
         for v in &self.entries {
-            encoding::marshal_bytes(dst, v.as_bytes());
+            encoding::marshal_bytes(dst, v);
         }
     }
 
@@ -255,7 +254,7 @@ impl StatsProcessor for StatsJSONValuesProcessor {
         let mut src = &src[n as usize..];
 
         let mut entries = Vec::with_capacity(entries_len as usize);
-        let mut state_size_increase = std::mem::size_of::<String>() as i64 * entries_len as i64;
+        let mut state_size_increase = std::mem::size_of::<Vec<u8>>() as i64 * entries_len as i64;
         for _ in 0..entries_len {
             let (v, n) = encoding::unmarshal_bytes(src);
             let v = match v {
@@ -265,7 +264,7 @@ impl StatsProcessor for StatsJSONValuesProcessor {
             src = &src[n as usize..];
 
             state_size_increase += v.len() as i64;
-            entries.push(String::from_utf8_lossy(v).into_owned());
+            entries.push(v.to_vec());
         }
         if !src.is_empty() {
             return Err(format!(
@@ -295,16 +294,16 @@ impl StatsProcessor for StatsJSONValuesProcessor {
 /// Appends the JSON array of pre-marshaled `items` to `dst`.
 ///
 /// PORT NOTE: port of `marshalJSONValues` (`stats_uniq_values.go`); see module docs.
-pub(crate) fn marshal_json_values(dst: &mut Vec<u8>, items: &[String]) {
+pub(crate) fn marshal_json_values(dst: &mut Vec<u8>, items: &[Vec<u8>]) {
     if items.is_empty() {
         dst.extend_from_slice(b"[]");
         return;
     }
     dst.push(b'[');
-    dst.extend_from_slice(items[0].as_bytes());
+    dst.extend_from_slice(&items[0]);
     for item in &items[1..] {
         dst.push(b',');
-        dst.extend_from_slice(item.as_bytes());
+        dst.extend_from_slice(item);
     }
     dst.push(b']');
 }
@@ -375,7 +374,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -529,7 +528,7 @@ mod tests {
 
         // non-empty state
         let mut sjp = StatsJSONValuesProcessor::new();
-        sjp.entries = vec!["foo".to_string(), "bar".to_string(), "baz".to_string()];
+        sjp.entries = vec![b"foo".to_vec(), b"bar".to_vec(), b"baz".to_vec()];
         check(&sjp, 13);
     }
 

@@ -5,7 +5,6 @@
 
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -129,7 +128,7 @@ impl FieldFilter for FilterSequence {
             None => {
                 // Fast path - there are no matching columns. It matches
                 // anything only for empty phrase.
-                if !match_sequence("", &phrases) {
+                if !match_sequence(b"", &phrases) {
                     bm.reset_bits();
                 }
                 return;
@@ -179,7 +178,7 @@ pub(crate) fn match_timestamp_iso8601_by_sequence(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_timestamp_iso8601_string(&part_path, &mut buf, v);
-        match_sequence(to_unsafe_string(&buf), phrases)
+        match_sequence(&buf, phrases)
     });
 }
 
@@ -202,7 +201,7 @@ pub(crate) fn match_ipv4_by_sequence(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_ipv4_string(&part_path, &mut buf, v);
-        match_sequence(to_unsafe_string(&buf), phrases)
+        match_sequence(&buf, phrases)
     });
 }
 
@@ -221,7 +220,7 @@ pub(crate) fn match_float64_by_sequence(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_float64_string(&part_path, &mut buf, v);
-        match_sequence(to_unsafe_string(&buf), phrases)
+        match_sequence(&buf, phrases)
     });
 }
 
@@ -249,7 +248,7 @@ pub(crate) fn match_string_by_sequence(
         bm.reset_bits();
         return;
     }
-    visit_values(bs, ch, bm, |v| match_sequence(to_unsafe_string(v), phrases));
+    visit_values(bs, ch, bm, |v| match_sequence(v, phrases));
 }
 
 pub(crate) fn match_uint8_by_sequence(
@@ -323,7 +322,9 @@ pub(crate) fn match_int64_by_sequence(
 }
 
 /// Port of Go `matchSequence`.
-pub(crate) fn match_sequence<S: AsRef<str>>(s: &str, phrases: &[S]) -> bool {
+///
+/// The haystack `s` is raw value bytes (Go strings are arbitrary bytes).
+pub(crate) fn match_sequence<S: AsRef<str>>(s: &[u8], phrases: &[S]) -> bool {
     let mut s = s;
     for phrase in phrases {
         let phrase = phrase.as_ref();
@@ -342,7 +343,7 @@ mod tests {
     #[test]
     fn test_match_sequence() {
         fn f(s: &str, phrases: &[&str], result_expected: bool) {
-            let result = match_sequence(s, phrases);
+            let result = match_sequence(s.as_bytes(), phrases);
             assert_eq!(result, result_expected, "s={s:?} phrases={phrases:?}");
         }
 

@@ -3,7 +3,6 @@
 //! `FilterLenRange` matches field values whose length (in runes) is within
 //! `[min_len, max_len]`.
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -122,7 +121,7 @@ impl FieldFilter for FilterLenRange {
             Some(ch) => clone_column_header(ch),
             None => {
                 // Fast path - there are no matching columns.
-                if !match_len_range("", min_len, max_len) {
+                if !match_len_range(b"", min_len, max_len) {
                     bm.reset_bits();
                 }
                 return;
@@ -172,7 +171,7 @@ fn match_ipv4_by_len_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_ipv4_string(&part_path, &mut bb, v);
-        match_len_range(to_unsafe_string(&bb), min_len, max_len)
+        match_len_range(&bb, min_len, max_len)
     });
 }
 
@@ -191,7 +190,7 @@ fn match_float64_by_len_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_float64_string(&part_path, &mut bb, v);
-        match_len_range(to_unsafe_string(&bb), min_len, max_len)
+        match_len_range(&bb, min_len, max_len)
     });
 }
 
@@ -216,9 +215,7 @@ fn match_string_by_len_range(
     min_len: u64,
     max_len: u64,
 ) {
-    visit_values(bs, ch, bm, |v| {
-        match_len_range(to_unsafe_string(v), min_len, max_len)
-    });
+    visit_values(bs, ch, bm, |v| match_len_range(v, min_len, max_len));
 }
 
 fn match_uint8_by_len_range(
@@ -240,7 +237,7 @@ fn match_uint8_by_len_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint8_string(&part_path, &mut bb, v);
-        match_len_range(to_unsafe_string(&bb), min_len, max_len)
+        match_len_range(&bb, min_len, max_len)
     });
 }
 
@@ -263,7 +260,7 @@ fn match_uint16_by_len_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint16_string(&part_path, &mut bb, v);
-        match_len_range(to_unsafe_string(&bb), min_len, max_len)
+        match_len_range(&bb, min_len, max_len)
     });
 }
 
@@ -286,7 +283,7 @@ fn match_uint32_by_len_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint32_string(&part_path, &mut bb, v);
-        match_len_range(to_unsafe_string(&bb), min_len, max_len)
+        match_len_range(&bb, min_len, max_len)
     });
 }
 
@@ -309,7 +306,7 @@ fn match_uint64_by_len_range(
     let mut bb = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint64_string(&part_path, &mut bb, v);
-        match_len_range(to_unsafe_string(&bb), min_len, max_len)
+        match_len_range(&bb, min_len, max_len)
     });
 }
 
@@ -341,7 +338,7 @@ fn match_int64_by_len_range(
     let part_path = bs.part_path();
     visit_values(bs, ch, bm, |v| {
         to_int64_string(&part_path, &mut bb, v);
-        match_len_range(to_unsafe_string(&bb), min_len, max_len)
+        match_len_range(&bb, min_len, max_len)
     });
 }
 
@@ -350,8 +347,17 @@ fn match_int64_by_len_range(
 // ---------------------------------------------------------------------------
 
 /// Port of Go `matchLenRange` (length measured in unicode runes).
-pub(crate) fn match_len_range(s: &str, min_len: u64, max_len: u64) -> bool {
-    let s_len = s.chars().count() as u64;
+///
+/// Counts runes with Go `utf8.RuneCountInString` semantics: each invalid byte
+/// counts as one rune (`decode_rune` returns `(U+FFFD, 1)` on invalid input).
+pub(crate) fn match_len_range(s: &[u8], min_len: u64, max_len: u64) -> bool {
+    let mut s_len = 0u64;
+    let mut i = 0;
+    while i < s.len() {
+        let (_, n) = crate::pattern_matcher::decode_rune(&s[i..]);
+        i += n;
+        s_len += 1;
+    }
     s_len >= min_len && s_len <= max_len
 }
 
@@ -373,14 +379,14 @@ mod tests {
 
     #[test]
     fn test_match_len_range() {
-        assert!(match_len_range("", 0, 0));
-        assert!(!match_len_range("", 1, 10));
-        assert!(match_len_range("foo", 3, 3));
-        assert!(match_len_range("foo", 1, 5));
-        assert!(!match_len_range("foo", 4, 5));
-        assert!(!match_len_range("foobar", 1, 5));
+        assert!(match_len_range(b"", 0, 0));
+        assert!(!match_len_range(b"", 1, 10));
+        assert!(match_len_range(b"foo", 3, 3));
+        assert!(match_len_range(b"foo", 1, 5));
+        assert!(!match_len_range(b"foo", 4, 5));
+        assert!(!match_len_range(b"foobar", 1, 5));
         // rune counting for multi-byte
-        assert!(match_len_range("привет", 6, 6));
-        assert!(!match_len_range("привет", 12, 12));
+        assert!(match_len_range("привет".as_bytes(), 6, 6));
+        assert!(!match_len_range("привет".as_bytes(), 12, 12));
     }
 }

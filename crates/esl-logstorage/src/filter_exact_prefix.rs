@@ -4,7 +4,6 @@
 
 use std::sync::OnceLock;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::panicf;
 
 use crate::bitmap::Bitmap;
@@ -102,7 +101,7 @@ impl FieldFilter for FilterExactPrefix {
             Some(ch) => clone_column_header(ch),
             None => {
                 // Fast path - there are no matching columns.
-                if !match_exact_prefix("", &prefix) {
+                if !match_exact_prefix(b"", &prefix) {
                     bm.reset_bits();
                 }
                 return;
@@ -151,7 +150,7 @@ pub(crate) fn match_timestamp_iso8601_by_exact_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_timestamp_iso8601_string(&part_path, &mut buf, v);
-        match_exact_prefix(to_unsafe_string(&buf), prefix)
+        match_exact_prefix(&buf, prefix)
     });
 }
 
@@ -176,7 +175,7 @@ pub(crate) fn match_ipv4_by_exact_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_ipv4_string(&part_path, &mut buf, v);
-        match_exact_prefix(to_unsafe_string(&buf), prefix)
+        match_exact_prefix(&buf, prefix)
     });
 }
 
@@ -201,7 +200,7 @@ pub(crate) fn match_float64_by_exact_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_float64_string(&part_path, &mut buf, v);
-        match_exact_prefix(to_unsafe_string(&buf), prefix)
+        match_exact_prefix(&buf, prefix)
     });
 }
 
@@ -229,9 +228,7 @@ pub(crate) fn match_string_by_exact_prefix(
         bm.reset_bits();
         return;
     }
-    visit_values(bs, ch, bm, |v| {
-        match_exact_prefix(to_unsafe_string(v), prefix)
-    });
+    visit_values(bs, ch, bm, |v| match_exact_prefix(v, prefix));
 }
 
 pub(crate) fn match_uint8_by_exact_prefix(
@@ -248,7 +245,7 @@ pub(crate) fn match_uint8_by_exact_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint8_string(&part_path, &mut buf, v);
-        match_exact_prefix(to_unsafe_string(&buf), prefix)
+        match_exact_prefix(&buf, prefix)
     });
 }
 
@@ -266,7 +263,7 @@ pub(crate) fn match_uint16_by_exact_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint16_string(&part_path, &mut buf, v);
-        match_exact_prefix(to_unsafe_string(&buf), prefix)
+        match_exact_prefix(&buf, prefix)
     });
 }
 
@@ -284,7 +281,7 @@ pub(crate) fn match_uint32_by_exact_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint32_string(&part_path, &mut buf, v);
-        match_exact_prefix(to_unsafe_string(&buf), prefix)
+        match_exact_prefix(&buf, prefix)
     });
 }
 
@@ -302,7 +299,7 @@ pub(crate) fn match_uint64_by_exact_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_uint64_string(&part_path, &mut buf, v);
-        match_exact_prefix(to_unsafe_string(&buf), prefix)
+        match_exact_prefix(&buf, prefix)
     });
 }
 
@@ -336,7 +333,7 @@ pub(crate) fn match_int64_by_exact_prefix(
     let mut buf = Vec::new();
     visit_values(bs, ch, bm, |v| {
         to_int64_string(&part_path, &mut buf, v);
-        match_exact_prefix(to_unsafe_string(&buf), prefix)
+        match_exact_prefix(&buf, prefix)
     });
 }
 
@@ -367,6 +364,6 @@ pub(crate) fn match_min_max_exact_prefix(
 }
 
 /// Port of Go `matchExactPrefix`.
-pub(crate) fn match_exact_prefix(s: &str, prefix: &str) -> bool {
-    s.starts_with(prefix)
+pub(crate) fn match_exact_prefix(s: &[u8], prefix: &str) -> bool {
+    s.starts_with(prefix.as_bytes())
 }

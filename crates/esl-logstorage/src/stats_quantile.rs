@@ -20,13 +20,12 @@
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::encoding;
 
 use crate::block_result::BlockResult;
 use crate::prefix_filter::{self, Filter};
 use crate::stats::{StatsFunc, StatsProcessor};
-use crate::stats_min::{field_names_string, get_matching_columns, less_string};
+use crate::stats_min::{field_names_string, get_matching_columns, less_bytes};
 use crate::values_encoder::try_parse_float64;
 
 const MAX_HISTOGRAM_SAMPLES: usize = 10_000;
@@ -81,41 +80,41 @@ fn get_random_uint32() -> u32 {
 /// Port of Go's `histogram`.
 #[derive(Default)]
 pub(crate) struct Histogram {
-    a: Vec<String>,
-    min: String,
-    max: String,
+    a: Vec<Vec<u8>>,
+    min: Vec<u8>,
+    max: Vec<u8>,
     count: u64,
     rng: Rng,
 }
 
 impl Histogram {
     /// Port of `histogram.update`.
-    pub(crate) fn update(&mut self, v: &str) -> i64 {
-        if self.count == 0 || less_string(v, &self.min) {
-            self.min = v.to_owned();
+    pub(crate) fn update(&mut self, v: &[u8]) -> i64 {
+        if self.count == 0 || less_bytes(v, &self.min) {
+            self.min = v.to_vec();
         }
-        if self.count == 0 || less_string(&self.max, v) {
-            self.max = v.to_owned();
+        if self.count == 0 || less_bytes(&self.max, v) {
+            self.max = v.to_vec();
         }
 
         self.count += 1;
         if self.a.len() < MAX_HISTOGRAM_SAMPLES {
             if !self.a.is_empty() && self.a[self.a.len() - 1] == v {
-                self.a.push(v.to_owned());
+                self.a.push(v.to_vec());
                 // PORT NOTE: Go returns unsafe.Sizeof(string)=16; this uses
-                // Rust's size_of::<String>() (allocator accounting only).
-                return std::mem::size_of::<String>() as i64;
+                // Rust's size_of::<Vec<u8>>() (allocator accounting only).
+                return std::mem::size_of::<Vec<u8>>() as i64;
             }
-            let v_copy = v.to_owned();
+            let v_copy = v.to_vec();
             let n = v_copy.len();
             self.a.push(v_copy);
-            return (n + std::mem::size_of::<String>()) as i64;
+            return (n + std::mem::size_of::<Vec<u8>>()) as i64;
         }
 
         let n = self.rng.uint32n(self.count as u32) as usize;
         if n < self.a.len() && self.a[n] != v {
             let prev_len = self.a[n].len();
-            let v_copy = v.to_owned();
+            let v_copy = v.to_vec();
             let new_len = v_copy.len();
             self.a[n] = v_copy;
             return new_len as i64 - prev_len as i64;
@@ -137,10 +136,10 @@ impl Histogram {
         }
 
         self.a.extend_from_slice(&src.a);
-        if less_string(&src.min, &self.min) {
+        if less_bytes(&src.min, &self.min) {
             self.min = src.min.clone();
         }
-        if less_string(&self.max, &src.max) {
+        if less_bytes(&self.max, &src.max) {
             self.max = src.max.clone();
         }
         self.count += src.count;
@@ -150,10 +149,10 @@ impl Histogram {
     pub(crate) fn export_state(&self, dst: &mut Vec<u8>) {
         encoding::marshal_var_uint64(dst, self.a.len() as u64);
         for v in &self.a {
-            encoding::marshal_bytes(dst, v.as_bytes());
+            encoding::marshal_bytes(dst, v);
         }
-        encoding::marshal_bytes(dst, self.min.as_bytes());
-        encoding::marshal_bytes(dst, self.max.as_bytes());
+        encoding::marshal_bytes(dst, &self.min);
+        encoding::marshal_bytes(dst, &self.max);
         encoding::marshal_var_uint64(dst, self.count);
     }
 
@@ -166,14 +165,14 @@ impl Histogram {
         let mut src = &src[n as usize..];
 
         let mut a = Vec::with_capacity(items_len as usize);
-        let mut state_size = std::mem::size_of::<String>() * items_len as usize;
+        let mut state_size = std::mem::size_of::<Vec<u8>>() * items_len as usize;
         for _ in 0..items_len {
             let (value, n) = encoding::unmarshal_bytes(src);
             if n <= 0 {
                 return Err("cannot read value".to_string());
             }
             src = &src[n as usize..];
-            let value = to_unsafe_string(value.unwrap_or_default()).to_owned();
+            let value = value.unwrap_or_default().to_vec();
             state_size += value.len();
             a.push(value);
         }
@@ -184,7 +183,7 @@ impl Histogram {
             return Err("cannot read min value".to_string());
         }
         src = &src[n as usize..];
-        self.min = to_unsafe_string(min_value.unwrap_or_default()).to_owned();
+        self.min = min_value.unwrap_or_default().to_vec();
         state_size += self.min.len();
 
         let (max_value, n) = encoding::unmarshal_bytes(src);
@@ -192,7 +191,7 @@ impl Histogram {
             return Err("cannot read max value".to_string());
         }
         src = &src[n as usize..];
-        self.max = to_unsafe_string(max_value.unwrap_or_default()).to_owned();
+        self.max = max_value.unwrap_or_default().to_vec();
         state_size += self.max.len();
 
         let (count, n) = encoding::unmarshal_var_uint64(src);
@@ -213,9 +212,9 @@ impl Histogram {
     }
 
     /// Port of `histogram.quantile`.
-    pub(crate) fn quantile(&self, phi: f64) -> String {
+    pub(crate) fn quantile(&self, phi: f64) -> Vec<u8> {
         if self.a.is_empty() {
-            return String::new();
+            return Vec::new();
         }
         if self.a.len() == 1 {
             return self.a[0].clone();
@@ -229,9 +228,9 @@ impl Histogram {
 
         let mut sorted = self.a.clone();
         sorted.sort_by(|x, y| {
-            if less_string(x, y) {
+            if less_bytes(x, y) {
                 std::cmp::Ordering::Less
-            } else if less_string(y, x) {
+            } else if less_bytes(y, x) {
                 std::cmp::Ordering::Greater
             } else {
                 std::cmp::Ordering::Equal
@@ -330,7 +329,7 @@ impl StatsProcessor for StatsQuantileProcessor {
         for c in cols {
             let values = br.column_get_values(c);
             for v in values {
-                inc += self.h.update(to_unsafe_string(v));
+                inc += self.h.update(v);
             }
         }
         inc
@@ -369,7 +368,7 @@ impl StatsProcessor for StatsQuantileProcessor {
 
     fn finalize_stats(&self, _sf: &dyn StatsFunc, dst: &mut Vec<u8>, _stop: Option<&AtomicBool>) {
         let q = self.h.quantile(self.phi);
-        dst.extend_from_slice(q.as_bytes());
+        dst.extend_from_slice(&q);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -387,7 +386,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -452,12 +451,15 @@ mod tests {
     fn test_histogram_reservoir_caps_at_max_samples() {
         let mut h = Histogram::default();
         for i in 0..(MAX_HISTOGRAM_SAMPLES + 100) {
-            h.update(&format!("v{i:06}"));
+            h.update(format!("v{i:06}").as_bytes());
         }
         assert_eq!(h.a.len(), MAX_HISTOGRAM_SAMPLES);
         assert_eq!(h.count, (MAX_HISTOGRAM_SAMPLES + 100) as u64);
-        assert_eq!(h.min, "v000000");
-        assert_eq!(h.max, format!("v{:06}", MAX_HISTOGRAM_SAMPLES + 99));
+        assert_eq!(h.min, b"v000000");
+        assert_eq!(
+            h.max,
+            format!("v{:06}", MAX_HISTOGRAM_SAMPLES + 99).into_bytes()
+        );
     }
 
     #[test]

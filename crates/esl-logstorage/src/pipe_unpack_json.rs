@@ -173,7 +173,7 @@ impl Pipe for PipeUnpackJSON {
         let preserve_keys = self.preserve_keys.clone();
         let unpack_json: UnpackFunc = Box::new(move |uctx, s| {
             let s = trim_json_whitespace(s);
-            if s.is_empty() || !s.starts_with('{') {
+            if s.is_empty() || !s.starts_with(b"{") {
                 // This isn't a JSON object.
                 return;
             }
@@ -183,7 +183,7 @@ impl Pipe for PipeUnpackJSON {
             // Rust wrapper uses `consts::MAX_FIELD_NAME_SIZE` (128). This only
             // affects flattened keys longer than 128 bytes, which are otherwise
             // identical.
-            match p.parse_log_message(s.as_bytes(), &preserve, "") {
+            match p.parse_log_message(s, &preserve, "") {
                 Err(_) => {
                     for filter in &field_filters {
                         if !prefix_filter::is_wildcard_filter(filter) {
@@ -225,8 +225,21 @@ impl Pipe for PipeUnpackJSON {
 }
 
 /// Port of Go's `trimJSONWhitespace`.
-fn trim_json_whitespace(s: &str) -> &str {
-    s.trim_matches(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r')
+fn trim_json_whitespace(mut s: &[u8]) -> &[u8] {
+    let is_ws = |b: u8| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r';
+    while let Some(&b) = s.first() {
+        if !is_ws(b) {
+            break;
+        }
+        s = &s[1..];
+    }
+    while let Some(&b) = s.last() {
+        if !is_ws(b) {
+            break;
+        }
+        s = &s[..s.len() - 1];
+    }
+    s
 }
 
 /// Port of Go's `fieldNamesString`.

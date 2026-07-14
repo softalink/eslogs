@@ -171,7 +171,7 @@ impl FieldsUnpackerContext {
     }
 
     /// Adds a field, applying the configured field prefix to its name.
-    pub(crate) fn add_field(&mut self, name: &str, value: &str) {
+    pub(crate) fn add_field(&mut self, name: &str, value: impl AsRef<[u8]>) {
         let name_copy = if self.field_prefix.is_empty() {
             name.to_string()
         } else {
@@ -179,7 +179,7 @@ impl FieldsUnpackerContext {
         };
         self.fields.push(Field {
             name: name_copy,
-            value: value.to_string(),
+            value: value.as_ref().to_vec(),
         });
     }
 }
@@ -277,9 +277,9 @@ impl PipeUnpackWriteContext {
         for i in 0..cs_src_len {
             let v = br_src
                 .column_get_value_at_row(self.cs_src[i], row_idx)
-                .to_string();
+                .to_vec();
             self.values_len += v.len();
-            self.rcs[i].add_value(v.as_bytes());
+            self.rcs[i].add_value(&v);
         }
         for (i, f) in extra_fields.iter().enumerate() {
             let mut v = f.value.clone();
@@ -293,13 +293,13 @@ impl PipeUnpackWriteContext {
             if let Some(idx) = idx {
                 let v_orig = br_src
                     .column_get_value_at_row(self.cs_src[idx], row_idx)
-                    .to_string();
+                    .to_vec();
                 if !v_orig.is_empty() {
                     v = v_orig;
                 }
             }
             self.values_len += v.len();
-            self.rcs[cs_src_len + i].add_value(v.as_bytes());
+            self.rcs[cs_src_len + i].add_value(&v);
         }
 
         self.rows_count += 1;
@@ -338,7 +338,7 @@ fn get_block_result_column_idx_by_name(names: &[String], name: &str) -> Option<u
 // ---------------------------------------------------------------------------
 
 /// The unpack function applied to each source value (Go `unpackFunc`).
-pub(crate) type UnpackFunc = Box<dyn Fn(&mut FieldsUnpackerContext, &str) + Send + Sync>;
+pub(crate) type UnpackFunc = Box<dyn Fn(&mut FieldsUnpackerContext, &[u8]) + Send + Sync>;
 
 /// Port of Go's `pipeUnpackProcessor` plus `newPipeUnpackProcessor`.
 pub(crate) struct PipeUnpackProcessor {
@@ -417,7 +417,7 @@ impl PipeProcessor for PipeUnpackProcessor {
         let c = br.get_column_by_name(&self.from_field);
         let rows_len = br.rows_len();
         if br.column_is_const(c) {
-            let v = br.column_get_value_at_row(c, 0).to_string();
+            let v = br.column_get_value_at_row(c, 0).to_vec();
             shard.uctx.reset_fields();
             (self.unpack_func)(&mut shard.uctx, &v);
             let fields = std::mem::take(&mut shard.uctx.fields);
@@ -429,12 +429,8 @@ impl PipeProcessor for PipeUnpackProcessor {
                 }
             }
         } else {
-            let values: Vec<String> = br
-                .column_get_values(c)
-                .iter()
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .collect();
-            let mut v_prev = String::new();
+            let values = br.column_get_values(c).to_vec();
+            let mut v_prev: Vec<u8> = Vec::new();
             let mut had_unpacks = false;
             let mut fields: Vec<Field> = Vec::new();
             for (row_idx, v) in values.iter().enumerate() {
@@ -486,7 +482,7 @@ pub(crate) mod test_utils {
     pub(crate) fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -505,14 +501,9 @@ pub(crate) mod test_utils {
         fn write_block(&self, _worker_id: usize, br: &mut BlockResult) {
             let cs = br.get_columns();
             let names: Vec<String> = cs.iter().map(|&c| br.column_name(c).to_string()).collect();
-            let mut column_values: Vec<Vec<String>> = Vec::with_capacity(cs.len());
+            let mut column_values: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cs.len());
             for &c in &cs {
-                column_values.push(
-                    br.column_get_values(c)
-                        .iter()
-                        .map(|b| String::from_utf8_lossy(b).into_owned())
-                        .collect(),
-                );
+                column_values.push(br.column_get_values(c).to_vec());
             }
             let mut out = self.result_rows.lock().unwrap();
             for i in 0..br.rows_len() {
@@ -566,7 +557,7 @@ pub(crate) mod test_utils {
                 }
             }
             for (i, f) in row.iter().enumerate() {
-                self.rcs[i].add_value(f.value.as_bytes());
+                self.rcs[i].add_value(&f.value);
             }
             self.rows_count += 1;
             if self.next_rand().is_multiple_of(5) {
@@ -591,13 +582,13 @@ pub(crate) mod test_utils {
         a.name.cmp(&b.name).then_with(|| a.value.cmp(&b.value))
     }
 
-    fn row_key(row: &[Field]) -> String {
-        let mut s = String::new();
+    fn row_key(row: &[Field]) -> Vec<u8> {
+        let mut s = Vec::new();
         for f in row {
-            s.push_str(&f.name);
-            s.push('\u{0}');
-            s.push_str(&f.value);
-            s.push('\u{1}');
+            s.extend_from_slice(f.name.as_bytes());
+            s.push(0);
+            s.extend_from_slice(&f.value);
+            s.push(1);
         }
         s
     }

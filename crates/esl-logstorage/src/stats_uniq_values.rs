@@ -33,11 +33,10 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
-use esl_common::bytesutil::to_unsafe_string;
 use esl_common::encoding::{
     marshal_bytes, marshal_var_uint64, unmarshal_bytes, unmarshal_var_uint64,
 };
-use esl_common::stringsutil::{json_string, less_natural};
+use esl_common::stringsutil::{json_string_bytes_append, less_natural};
 
 use crate::block_result::{BlockResult, ColRef};
 use crate::prefix_filter::{Filter, is_wildcard_filter, match_filters};
@@ -97,10 +96,10 @@ pub(crate) fn marshal_json_array(dst: &mut Vec<u8>, items: &[Vec<u8>]) {
         return;
     }
     dst.push(b'[');
-    dst.extend_from_slice(json_string(to_unsafe_string(&items[0])).as_bytes());
+    json_string_bytes_append(dst, &items[0]);
     for item in &items[1..] {
         dst.push(b',');
-        dst.extend_from_slice(json_string(to_unsafe_string(item)).as_bytes());
+        json_string_bytes_append(dst, item);
     }
     dst.push(b']');
 }
@@ -149,11 +148,16 @@ pub(crate) fn less_string(a: &str, b: &str) -> bool {
 /// Sorts `a` in place using [`less_string`] (Go `sortStrings`).
 pub(crate) fn sort_strings(a: &mut [Vec<u8>]) {
     a.sort_by(|x, y| {
-        let xs = to_unsafe_string(x);
-        let ys = to_unsafe_string(y);
-        if xs == ys {
-            std::cmp::Ordering::Equal
-        } else if less_string(xs, ys) {
+        if x == y {
+            return std::cmp::Ordering::Equal;
+        }
+        // Checked UTF-8 views: values with invalid UTF-8 fail every typed
+        // parse in Go too, so they fall back to plain byte ordering.
+        let less = match (std::str::from_utf8(x), std::str::from_utf8(y)) {
+            (Ok(xs), Ok(ys)) => less_string(xs, ys),
+            _ => x < y,
+        };
+        if less {
             std::cmp::Ordering::Less
         } else {
             std::cmp::Ordering::Greater
@@ -311,7 +315,7 @@ impl StatsUniqValuesProcessor {
 
     fn update_stats_for_all_rows_column(&mut self, br: &mut BlockResult, r: ColRef) -> i64 {
         if br.column_is_const(r) {
-            let v = br.column_get_value_at_row(r, 0).as_bytes().to_vec();
+            let v = br.column_get_value_at_row(r, 0).to_vec();
             return self.update_state(&v);
         }
         // Slow path (also covers DICT — see module PORT NOTE): unique values
@@ -334,10 +338,10 @@ impl StatsUniqValuesProcessor {
         row_idx: usize,
     ) -> i64 {
         if br.column_is_const(r) {
-            let v = br.column_get_value_at_row(r, 0).as_bytes().to_vec();
+            let v = br.column_get_value_at_row(r, 0).to_vec();
             return self.update_state(&v);
         }
-        let v = br.column_get_value_at_row(r, row_idx).as_bytes().to_vec();
+        let v = br.column_get_value_at_row(r, row_idx).to_vec();
         self.update_state(&v)
     }
 
@@ -488,7 +492,10 @@ mod tests {
                 s.split(',').map(|p| p.as_bytes().to_vec()).collect()
             };
             sort_strings(&mut a);
-            let joined: Vec<&str> = a.iter().map(|v| to_unsafe_string(v)).collect();
+            let joined: Vec<&str> = a
+                .iter()
+                .map(|v| esl_common::bytesutil::to_unsafe_string(v))
+                .collect();
             assert_eq!(joined.join(","), expected);
         }
 

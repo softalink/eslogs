@@ -322,7 +322,7 @@ impl PipeProcessor for PipeStreamContextProcessor {
             for j in 0..cs.len() {
                 fields.push(Field {
                     name: names[j].clone(),
-                    value: String::from_utf8_lossy(&col_values[j][i]).into_owned(),
+                    value: col_values[j][i].clone(),
                 });
             }
             let row = StreamContextRow { timestamp, fields };
@@ -772,19 +772,19 @@ fn new_delimiter_row_fields(r: &StreamContextRow, stream_id: &str) -> Vec<Field>
     vec![
         Field {
             name: "_time".to_string(),
-            value: String::from_utf8_lossy(&time_buf).into_owned(),
+            value: time_buf,
         },
         Field {
             name: "_stream_id".to_string(),
-            value: stream_id.to_string(),
+            value: stream_id.as_bytes().to_vec(),
         },
         Field {
             name: "_stream".to_string(),
-            value: get_field_value_by_name(&r.fields, "_stream").to_string(),
+            value: get_field_value_by_name(&r.fields, "_stream").to_vec(),
         },
         Field {
             name: "_msg".to_string(),
-            value: "---".to_string(),
+            value: b"---".to_vec(),
         },
     ]
 }
@@ -948,7 +948,7 @@ fn copy_row_at_idx(br: &mut BlockResult, row_idx: usize, row_timestamp: i64) -> 
     let names: Vec<String> = cs.iter().map(|&c| br.column_name(c).to_string()).collect();
     let mut fields = Vec::with_capacity(cs.len());
     for (k, &c) in cs.iter().enumerate() {
-        let v = br.column_get_value_at_row(c, row_idx).to_string();
+        let v = br.column_get_value_at_row(c, row_idx).to_vec();
         fields.push(Field {
             name: names[k].clone(),
             value: v,
@@ -1007,7 +1007,7 @@ impl WriteContext {
         }
 
         for (i, f) in row_fields.iter().enumerate() {
-            self.rcs[i].add_value(f.value.as_bytes());
+            self.rcs[i].add_value(&f.value);
             self.values_len += f.value.len();
         }
 
@@ -1182,7 +1182,7 @@ mod tests {
             timestamp: ts,
             fields: vec![Field {
                 name: "_msg".into(),
-                value: ts.to_string(),
+                value: ts.to_string().into_bytes(),
             }],
         };
         // Leading empty window is dropped; the second window's rows that are
@@ -1216,9 +1216,9 @@ mod tests {
         let fields = new_delimiter_row_fields(&r, "stream-42");
         let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["_time", "_stream_id", "_stream", "_msg"]);
-        assert_eq!(get_field_value_by_name(&fields, "_stream_id"), "stream-42");
-        assert_eq!(get_field_value_by_name(&fields, "_stream"), "{app=\"x\"}");
-        assert_eq!(get_field_value_by_name(&fields, "_msg"), "---");
+        assert_eq!(get_field_value_by_name(&fields, "_stream_id"), b"stream-42");
+        assert_eq!(get_field_value_by_name(&fields, "_stream"), b"{app=\"x\"}");
+        assert_eq!(get_field_value_by_name(&fields, "_msg"), b"---");
         assert!(!get_field_value_by_name(&fields, "_time").is_empty());
     }
 
@@ -1258,7 +1258,7 @@ mod tests {
         assert_eq!(s1_ts, vec![10, 30]);
         assert_eq!(
             get_field_value_by_name(&shard.m["s2"][0].fields, "_msg"),
-            "b"
+            b"b"
         );
     }
 
@@ -1345,7 +1345,7 @@ mod tests {
                 timestamp: 20,
                 fields: vec![Field {
                     name: "_msg".to_string(),
-                    value: "b".to_string(),
+                    value: b"b".to_vec(),
                 }],
             }],
         );

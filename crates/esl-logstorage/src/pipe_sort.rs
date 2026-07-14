@@ -403,10 +403,10 @@ pub(crate) fn create_float64_values(values: &[Vec<u8>]) -> Vec<f64> {
 }
 
 /// Go `marshalJSONKeyValue`.
-pub(crate) fn marshal_json_key_value(dst: &mut Vec<u8>, k: &str, v: &str) {
+pub(crate) fn marshal_json_key_value(dst: &mut Vec<u8>, k: &str, v: &[u8]) {
     dst.extend_from_slice(json_string(k).as_bytes());
     dst.push(b':');
-    dst.extend_from_slice(json_string(v).as_bytes());
+    esl_common::stringsutil::json_string_bytes_append(dst, v);
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +464,7 @@ impl PipeSortProcessor {
             for row in 0..rows_len {
                 let mut bb: Vec<u8> = Vec::new();
                 for (i, cv) in col_values.iter().enumerate() {
-                    marshal_json_key_value(&mut bb, &names[i], bytes_str(&cv[row]));
+                    marshal_json_key_value(&mut bb, &names[i], &cv[row]);
                     bb.push(b',');
                 }
                 values.push(bb);

@@ -10,7 +10,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use esl_common::logger::{LogThrottler, with_throttler};
-use esl_common::{bytesutil, encoding, slicesutil};
+use esl_common::{encoding, slicesutil};
 
 use crate::color_sequence::{drop_color_sequences, has_color_sequences};
 use crate::consts::{MAX_COLUMNS_PER_BLOCK, MAX_FIELD_NAME_SIZE, MAX_UNCOMPRESSED_BLOCK_SIZE};
@@ -238,11 +238,18 @@ impl LogRows {
             for i in 0..fields.len() {
                 match fields[i].name.as_str() {
                     "_stream" => {
-                        if let Err(err) = st.unmarshal_string_inplace(&fields[i].value) {
+                        // The _stream value is a rendered `{k="v",...}` string;
+                        // invalid UTF-8 is a malformed stream string, routed
+                        // through the same parse-error path.
+                        let parse_result = match std::str::from_utf8(&fields[i].value) {
+                            Ok(s) => st.unmarshal_string_inplace(s),
+                            Err(err) => Err(err.to_string()),
+                        };
+                        if let Err(err) = parse_result {
                             let line = fields_to_json_string(fields);
                             INVALID_STREAM_TAGS_LOGGER.warnf(format_args!(
                                 "cannot parse _stream={}: {err}; skipping the log entry; log entry: {line}",
-                                fields[i].value
+                                String::from_utf8_lossy(&fields[i].value)
                             ));
                             put_stream_tags(st);
                             return;
@@ -251,7 +258,7 @@ impl LogRows {
                             let line = fields_to_json_string(fields);
                             INVALID_STREAM_TAGS_LOGGER.warnf(format_args!(
                                 "invalid _stream={}: {err}; skipping the log entry; log entry: {line}",
-                                fields[i].value
+                                String::from_utf8_lossy(&fields[i].value)
                             ));
                             put_stream_tags(st);
                             return;
@@ -357,7 +364,7 @@ impl LogRows {
         if !has_msg_field && !self.default_msg_value.is_empty() {
             row.push(Field {
                 name: String::new(),
-                value: self.default_msg_value.clone(),
+                value: self.default_msg_value.clone().into_bytes(),
             });
         }
 
@@ -437,10 +444,10 @@ impl LogRows {
             }
             match prev_field {
                 Some(prev) if prev.value == f.value => {
-                    dst_field.value.push_str(&f.value);
+                    dst_field.value.extend_from_slice(&f.value);
                 }
                 _ => {
-                    dst_field.value.push_str(&f.value);
+                    dst_field.value.extend_from_slice(&f.value);
                     if must_copy_fields {
                         self.a_size_bytes += f.value.len();
                     }
@@ -454,9 +461,7 @@ impl LogRows {
                         // Go appends the decolorized value to the arena in
                         // addition to the original copy above.
                         self.a_size_bytes += b.len();
-                        // Dropping whole ESC..terminator sequences from a
-                        // valid UTF-8 string keeps it valid UTF-8.
-                        dst_field.value = bytesutil::to_unsafe_string(&b).to_string();
+                        dst_field.value = b;
                     }
                 }
             }
@@ -477,16 +482,18 @@ impl LogRows {
         let mut fields: Vec<Field> = self.rows[idx].clone();
         fields.push(Field {
             name: "_time".to_string(),
-            value: bytesutil::to_unsafe_string(&time_buf).to_string(),
+            value: time_buf,
         });
         fields.push(Field {
             name: "_stream".to_string(),
-            value: stream_tags,
+            value: stream_tags.into_bytes(),
         });
         sort_fields_by_name(&mut fields);
         let mut line = Vec::new();
         marshal_fields_to_json(&mut line, &fields);
-        bytesutil::to_unsafe_string(&line).to_string()
+        // Display-only representation: values may hold arbitrary bytes, so a
+        // lossy conversion is used instead of a panicking unsafe-string view.
+        String::from_utf8_lossy(&line).into_owned()
     }
 }
 
@@ -550,7 +557,9 @@ pub(crate) fn get_canonical_column_name(field_name: &str) -> &str {
 fn fields_to_json_string(fields: &[Field]) -> String {
     let mut line = Vec::new();
     marshal_fields_to_json(&mut line, fields);
-    bytesutil::to_unsafe_string(&line).to_string()
+    // Display-only (throttled warning messages): values may hold arbitrary
+    // bytes, so a lossy conversion is used.
+    String::from_utf8_lossy(&line).into_owned()
 }
 
 /// Returns LogRows from the pool for the given stream_fields.
@@ -803,7 +812,7 @@ pub fn estimated_json_row_len(fields: &[Field]) -> usize {
 /// Returns an approximate length of the field with the given name and value if represented as JSON.
 ///
 /// The field name must be in raw form (e.g., "" to "_msg") before passing.
-pub(crate) fn estimated_json_field_len(name: &str, value: &str) -> usize {
+pub(crate) fn estimated_json_field_len(name: &str, value: &[u8]) -> usize {
     r#","":"""#.len() + name.len() + value.len()
 }
 
@@ -949,7 +958,7 @@ mod tests {
     fn field(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
@@ -1292,7 +1301,7 @@ mod tests {
         encoding::marshal_var_uint64(&mut dst, tags.len() as u64);
         for tag in &tags {
             encoding::marshal_bytes(&mut dst, tag.name.as_bytes());
-            encoding::marshal_bytes(&mut dst, tag.value.as_bytes());
+            encoding::marshal_bytes(&mut dst, &tag.value);
         }
         dst
     }

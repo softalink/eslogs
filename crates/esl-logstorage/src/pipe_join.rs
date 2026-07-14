@@ -88,19 +88,19 @@ fn build_join_map(
     prefix: &str,
 ) -> HashMap<Vec<u8>, Vec<Vec<Field>>> {
     let mut m: HashMap<Vec<u8>, Vec<Vec<Field>>> = HashMap::with_capacity(rows.len());
-    let mut by_values: Vec<String> = Vec::new();
+    let mut by_values: Vec<Vec<u8>> = Vec::new();
     let mut tmp_buf: Vec<u8> = Vec::new();
     for row in rows {
         by_values.clear();
         for bf in by_fields {
-            let mut v = "";
+            let mut v: &[u8] = b"";
             for f in row {
                 if f.name == *bf {
-                    v = f.value.as_str();
+                    v = &f.value;
                     break;
                 }
             }
-            by_values.push(v.to_string());
+            by_values.push(v.to_vec());
         }
 
         let mut fields: Vec<Field> = Vec::new();
@@ -127,9 +127,9 @@ fn build_join_map(
 
 /// Port of Go `marshalStrings` (defined in `storage_search.go`; inlined here as
 /// it is not yet exported by a ported module). Appends length-prefixed strings.
-fn marshal_strings(dst: &mut Vec<u8>, a: &[String]) {
+fn marshal_strings(dst: &mut Vec<u8>, a: &[Vec<u8>]) {
     for s in a {
-        encoding::marshal_bytes(dst, s.as_bytes());
+        encoding::marshal_bytes(dst, s);
     }
 }
 
@@ -301,7 +301,7 @@ struct PipeJoinProcessor {
 #[derive(Default)]
 struct PipeJoinProcessorShard {
     wctx: PipeJoinWriteContext,
-    by_values: Vec<String>,
+    by_values: Vec<Vec<u8>>,
     tmp_buf: Vec<u8>,
 }
 
@@ -330,7 +330,7 @@ impl PipeProcessor for PipeJoinProcessor {
             .collect();
 
         shard.by_values.clear();
-        shard.by_values.resize(self.by_fields.len(), String::new());
+        shard.by_values.resize(self.by_fields.len(), Vec::new());
 
         let rows_len = br.rows_len();
         for row_idx in 0..rows_len {
@@ -339,7 +339,7 @@ impl PipeProcessor for PipeJoinProcessor {
             }
             for (j, &c) in cs.iter().enumerate() {
                 if let Some(c_idx) = by_values_idxs[j] {
-                    shard.by_values[c_idx] = br.column_get_value_at_row(c, row_idx).to_string();
+                    shard.by_values[c_idx] = br.column_get_value_at_row(c, row_idx).to_vec();
                 }
             }
 
@@ -465,9 +465,9 @@ impl PipeJoinWriteContext {
         for i in 0..cs_src_len {
             let v = br_src
                 .column_get_value_at_row(self.cs_src[i], row_idx)
-                .to_string();
+                .to_vec();
             self.values_len += v.len();
-            self.rcs[i].add_value(v.as_bytes());
+            self.rcs[i].add_value(&v);
         }
         for (i, f) in extra_fields.iter().enumerate() {
             let mut v = f.value.clone();
@@ -476,13 +476,13 @@ impl PipeJoinWriteContext {
             {
                 let v_orig = br_src
                     .column_get_value_at_row(self.cs_src[idx], row_idx)
-                    .to_string();
+                    .to_vec();
                 if !v_orig.is_empty() {
                     v = v_orig;
                 }
             }
             self.values_len += v.len();
-            self.rcs[cs_src_len + i].add_value(v.as_bytes());
+            self.rcs[cs_src_len + i].add_value(&v);
         }
 
         self.rows_count += 1;

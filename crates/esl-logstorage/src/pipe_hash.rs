@@ -116,12 +116,12 @@ impl PipeProcessor for PipeHashProcessor {
         let c = br.get_column_by_name(&self.field_name);
         if br.column_is_const(c) {
             // Fast path for const column.
-            let v = br.column_get_value_at_row(c, 0).to_string();
-            let f = get_float64_compatible_hash(v.as_bytes());
+            let v = br.column_get_value_at_row(c, 0).to_vec();
+            let f = get_float64_compatible_hash(&v);
             let mut b: Vec<u8> = Vec::new();
             marshal_float64_string(&mut b, f);
             shard.rc.reset();
-            br.add_const_column(&self.result_field, &String::from_utf8_lossy(&b));
+            br.add_const_column(&self.result_field, &b);
         } else {
             // Slow path for other columns.
             let values: Vec<Vec<u8>> = br.column_get_values(c).to_vec();

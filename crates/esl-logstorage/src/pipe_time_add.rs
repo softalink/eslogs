@@ -120,8 +120,11 @@ impl PipeProcessor for PipeTimeAddProcessor {
             for row_idx in 0..rows_len {
                 // Own the value so the mutable borrow of `br` is released before
                 // touching the locked shard.
-                let v = br.column_get_value_at_row(c, row_idx).to_string();
-                match try_parse_timestamp_rfc3339_nano(&v) {
+                let v = br.column_get_value_at_row(c, row_idx).to_vec();
+                match std::str::from_utf8(&v)
+                    .ok()
+                    .and_then(try_parse_timestamp_rfc3339_nano)
+                {
                     Some(ts) => {
                         let ts = sub_int64_no_overflow(ts, self.offset);
                         let buf_len = shard.buf.len();
@@ -129,7 +132,7 @@ impl PipeProcessor for PipeTimeAddProcessor {
                         shard.rc.add_value(&shard.buf[buf_len..]);
                     }
                     None => {
-                        shard.rc.add_value(v.as_bytes());
+                        shard.rc.add_value(&v);
                     }
                 }
             }

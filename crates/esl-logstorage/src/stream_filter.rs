@@ -26,11 +26,17 @@ pub struct StreamFilter {
 }
 
 impl StreamFilter {
-    pub fn match_stream_name(&self, s: &str) -> bool {
+    pub fn match_stream_name(&self, s: &[u8]) -> bool {
+        // Go parses the stream name via strconv.UnquoteChar, which maps invalid
+        // UTF-8 bytes rune-wise to U+FFFD (utf8.DecodeRuneInString), so a lossy
+        // view reproduces Go for the quoted tag-value portions. (Residual: Go
+        // keeps raw bytes in the tag-NAME portion; canonical stream names are
+        // strconv.Quote output and never contain invalid UTF-8 there.)
+        let s = String::from_utf8_lossy(s);
         let mut sn = get_stream_name();
 
         let mut result = false;
-        if sn.parse(s) {
+        if sn.parse(&s) {
             for of in &self.or_filters {
                 let mut match_and_filters = true;
                 for tf in &of.tag_filters {
@@ -295,7 +301,7 @@ impl StreamName {
 
             self.tags.push(Field {
                 name: name.to_string(),
-                value,
+                value: value.into_bytes(),
             });
 
             if s.is_empty() {
@@ -312,10 +318,10 @@ impl StreamName {
     fn matches(&self, tf: &StreamTagFilter) -> bool {
         let v = self.get_tag_value_by_tag_name(&tf.tag_name);
         match tf.op.as_str() {
-            "=" => v == tf.value,
-            "!=" => v != tf.value,
-            "=~" => tf.regexp.as_ref().unwrap().match_string(v),
-            "!~" => !tf.regexp.as_ref().unwrap().match_string(v),
+            "=" => v == tf.value.as_bytes(),
+            "!=" => v != tf.value.as_bytes(),
+            "=~" => tf.regexp.as_ref().unwrap().match_string(tag_value_str(v)),
+            "!~" => !tf.regexp.as_ref().unwrap().match_string(tag_value_str(v)),
             _ => {
                 esl_common::panicf!("BUG: unexpected tagFilter operation: {}", go_quote(&tf.op));
                 false
@@ -323,14 +329,23 @@ impl StreamName {
         }
     }
 
-    fn get_tag_value_by_tag_name(&self, name: &str) -> &str {
+    fn get_tag_value_by_tag_name(&self, name: &str) -> &[u8] {
         for t in &self.tags {
             if t.name == name {
                 return &t.value;
             }
         }
-        ""
+        b""
     }
+}
+
+/// Checked `&str` view of a parsed stream tag value for regexp matching.
+///
+/// The tags are produced by `go_unquote` (a `String`), so the value is always
+/// valid UTF-8 and the fallback is unreachable; it is kept for safety and
+/// returns an empty match input rather than panicking.
+fn tag_value_str(v: &[u8]) -> &str {
+    std::str::from_utf8(v).unwrap_or("")
 }
 
 // ---------------------------------------------------------------------------
@@ -949,7 +964,7 @@ mod tests {
     fn test_stream_filter_match_stream_name() {
         let f = |filter: &str, stream_name: &str, result_expected: bool| {
             let sf = must_new_test_stream_filter(filter);
-            let result = sf.match_stream_name(stream_name);
+            let result = sf.match_stream_name(stream_name.as_bytes());
             assert_eq!(
                 result, result_expected,
                 "unexpected result for matching {stream_name} against {sf}; got {result}; want {result_expected}"

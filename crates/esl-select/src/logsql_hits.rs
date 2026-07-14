@@ -111,18 +111,28 @@ pub fn process_hits_request(storage: &Arc<Storage>, req: &Request, w: &mut Respo
         let field_columns = &columns[1..columns.len() - 1];
 
         for i in 0..rows_count {
-            let ts_str = String::from_utf8_lossy(&timestamp_values[i]);
-            let Some(timestamp_nsec) = try_parse_timestamp_rfc3339_nano(&ts_str) else {
-                esl_common::panicf!("BUG: cannot parse timestamp={ts_str:?}");
+            // R3: checked UTF-8 view before parsing; both values are
+            // engine-generated (RFC3339 timestamp and decimal hits), so a
+            // parse failure is a bug either way.
+            let Some(timestamp_nsec) = std::str::from_utf8(&timestamp_values[i])
+                .ok()
+                .and_then(try_parse_timestamp_rfc3339_nano)
+            else {
+                esl_common::panicf!(
+                    "BUG: cannot parse timestamp={:?}",
+                    String::from_utf8_lossy(&timestamp_values[i])
+                );
                 unreachable!()
             };
-            let hits_str = String::from_utf8_lossy(&hits_values[i]);
-            let hits: u64 = match hits_str.parse() {
-                Ok(v) => v,
-                Err(e) => {
-                    esl_common::panicf!("BUG: cannot parse hitsStr={hits_str:?}: {e}");
-                    unreachable!()
-                }
+            let Some(hits) = std::str::from_utf8(&hits_values[i])
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                esl_common::panicf!(
+                    "BUG: cannot parse hitsStr={:?}",
+                    String::from_utf8_lossy(&hits_values[i])
+                );
+                unreachable!()
             };
 
             let mut key = Vec::new();

@@ -144,11 +144,10 @@ impl PipeProcessor for PipeLenProcessor {
         let c = br.get_column_by_name(&self.field_name);
         if br.column_is_const(c) {
             // Fast path for const column.
-            let v = br.column_get_value_at_row(c, 0).to_string();
+            let v = br.column_get_value_at_row(c, 0).to_vec();
             let mut buf = Vec::new();
             marshal_uint64_string(&mut buf, v.len() as u64);
-            let len_str = String::from_utf8(buf).unwrap();
-            br.add_const_column(&self.result_field, &len_str);
+            br.add_const_column(&self.result_field, &buf);
         } else {
             // Slow path for other columns.
             let values = br.column_get_values(c).to_vec();

@@ -122,6 +122,11 @@ impl PipeProcessor for PipeUnpackWordsProcessor {
             .init(worker_id, self.pp_next.clone(), false, false, br);
 
         let c = br.get_column_by_name(&self.src_field);
+        // PORT NOTE: the tokenizer operates on &str. Invalid UTF-8 bytes are
+        // never token chars in Go (utf8.RuneError is not a letter/digit), so
+        // tokenizing the lossy view yields the same token set as Go's
+        // byte-wise tokenizer; the dedup comparison on lossy views is likewise
+        // output-equivalent.
         let values: Vec<String> = br
             .column_get_values(c)
             .iter()
@@ -132,7 +137,7 @@ impl PipeProcessor for PipeUnpackWordsProcessor {
         let keep_duplicate_tokens = !self.drop_duplicates;
         let mut field = [Field {
             name: self.dst_field.clone(),
-            value: String::new(),
+            value: Vec::new(),
         }];
         for row_idx in 0..values.len() {
             if row_idx == 0 || values[row_idx] != values[row_idx - 1] {
@@ -142,7 +147,7 @@ impl PipeProcessor for PipeUnpackWordsProcessor {
                 let items: Vec<Vec<u8>> = words.iter().map(|w| w.as_bytes().to_vec()).collect();
                 let mut buf = Vec::new();
                 marshal_json_array(&mut buf, &items);
-                field[0].value = String::from_utf8_lossy(&buf).into_owned();
+                field[0].value = buf;
             }
             shard.wctx.write_row(br, row_idx, &field);
         }

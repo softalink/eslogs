@@ -19,7 +19,7 @@ use esl_common::easyproto;
 use esl_common::flagutil::{Bytes, Flag};
 use esl_common::httpserver::{Request, ResponseWriter};
 use esl_common::metrics::{Counter, Summary};
-use esl_common::stringsutil::json_string;
+use esl_common::stringsutil::json_string_bytes_append;
 
 use esl_logstorage::rows::{Field, Fields, get_fields, put_fields, rename_field};
 
@@ -364,14 +364,16 @@ fn decode_instrumentation_scope(src: &[u8], fs: &mut Fields) -> Result<(), Strin
     //   repeated KeyValue attributes = 3;
     // }
 
-    let name = easyproto::get_string(src, 1)
+    // Field VALUE paths: read as raw bytes so invalid UTF-8 is ingested
+    // verbatim like Go instead of erroring.
+    let name = easyproto::get_bytes(src, 1)
         .map_err(|err| format!("cannot read name: {err}"))?
-        .unwrap_or("unknown");
+        .unwrap_or(b"unknown");
     fs.add("scope.name", name);
 
-    let version = easyproto::get_string(src, 2)
+    let version = easyproto::get_bytes(src, 2)
         .map_err(|err| format!("cannot read version: {err}"))?
-        .unwrap_or("unknown");
+        .unwrap_or(b"unknown");
     fs.add("scope.version", version);
 
     let mut fc = easyproto::FieldContext::default();
@@ -392,7 +394,7 @@ fn decode_instrumentation_scope(src: &[u8], fs: &mut Fields) -> Result<(), Strin
     Ok(())
 }
 
-fn decode_log_record(src: &[u8], fs: &mut Fields) -> Result<(String, i64), String> {
+fn decode_log_record(src: &[u8], fs: &mut Fields) -> Result<(Vec<u8>, i64), String> {
     // See https://github.com/open-telemetry/opentelemetry-proto/blob/a5f0eac5b802f7ae51dfe41e5116fe5548955e64/opentelemetry/proto/logs/v1/logs.proto#L136
     //
     // message LogRecord {
@@ -409,9 +411,9 @@ fn decode_log_record(src: &[u8], fs: &mut Fields) -> Result<(String, i64), Strin
 
     let mut time_unix_nano = 0u64;
     let mut observed_time_unix_nano = 0u64;
-    let mut severity_text = "";
+    let mut severity_text: &[u8] = b"";
     let mut severity_number = 0i32;
-    let mut event_name = "";
+    let mut event_name: &[u8] = b"";
 
     let mut fc = easyproto::FieldContext::default();
     let mut src = src;
@@ -436,8 +438,9 @@ fn decode_log_record(src: &[u8], fs: &mut Fields) -> Result<(String, i64), Strin
                     .ok_or_else(|| "cannot read severity number".to_string())?;
             }
             3 => {
+                // Field VALUE path: raw bytes, ingested verbatim like Go.
                 severity_text = fc
-                    .string()
+                    .bytes()
                     .ok_or_else(|| "cannot read severity string".to_string())?;
             }
             5 => {
@@ -469,8 +472,9 @@ fn decode_log_record(src: &[u8], fs: &mut Fields) -> Result<(String, i64), Strin
                 fs.add("span_id", &span_id_hex);
             }
             12 => {
+                // Field VALUE path: raw bytes, ingested verbatim like Go.
                 event_name = fc
-                    .string()
+                    .bytes()
                     .ok_or_else(|| "cannot read event_name".to_string())?;
             }
             _ => {}
@@ -481,7 +485,7 @@ fn decode_log_record(src: &[u8], fs: &mut Fields) -> Result<(String, i64), Strin
     fs.add("severity_number", &severity_number_str);
 
     if severity_text.is_empty() {
-        severity_text = format_severity(severity_number);
+        severity_text = format_severity(severity_number).as_bytes();
     }
     fs.add("severity_text", severity_text);
 
@@ -493,7 +497,7 @@ fn decode_log_record(src: &[u8], fs: &mut Fields) -> Result<(String, i64), Strin
         now_unix_nanos()
     };
 
-    Ok((event_name.to_string(), timestamp))
+    Ok((event_name.to_vec(), timestamp))
 }
 
 fn decode_key_value(src: &[u8], fs: &mut Fields, field_name_prefix: &str) -> Result<(), String> {
@@ -553,8 +557,9 @@ fn decode_any_value(src: &[u8], fs: &mut Fields, field_name: &str) -> Result<(),
             .map_err(|err| format!("cannot read the next field: {err}"))?;
         match fc.field_num {
             1 => {
+                // Field VALUE path: raw bytes, ingested verbatim like Go.
                 let string_value = fc
-                    .string()
+                    .bytes()
                     .ok_or_else(|| "cannot read StringValue".to_string())?;
                 fs.add(field_name, string_value);
             }
@@ -686,7 +691,9 @@ enum JsonValue {
     Bool(bool),
     Int(i64),
     Double(f64),
-    Str(String),
+    /// Raw string bytes (Go strings are arbitrary bytes); preserved verbatim
+    /// through the JSON encoding like Go fastjson.
+    Str(Vec<u8>),
     Arr(Vec<JsonValue>),
     Obj(Vec<(String, JsonValue)>),
 }
@@ -704,34 +711,34 @@ impl JsonValue {
         }
     }
 
-    fn marshal_to(&self, dst: &mut String) {
+    fn marshal_to(&self, dst: &mut Vec<u8>) {
         match self {
-            JsonValue::Null => dst.push_str("null"),
-            JsonValue::Bool(b) => dst.push_str(if *b { "true" } else { "false" }),
-            JsonValue::Int(i) => dst.push_str(&format_int(*i)),
-            JsonValue::Double(f) => dst.push_str(&format_float(*f)),
-            JsonValue::Str(s) => dst.push_str(&json_string(s)),
+            JsonValue::Null => dst.extend_from_slice(b"null"),
+            JsonValue::Bool(b) => dst.extend_from_slice(if *b { b"true" } else { b"false" }),
+            JsonValue::Int(i) => dst.extend_from_slice(format_int(*i).as_bytes()),
+            JsonValue::Double(f) => dst.extend_from_slice(format_float(*f).as_bytes()),
+            JsonValue::Str(s) => json_string_bytes_append(dst, s),
             JsonValue::Arr(items) => {
-                dst.push('[');
+                dst.push(b'[');
                 for (i, v) in items.iter().enumerate() {
                     if i > 0 {
-                        dst.push(',');
+                        dst.push(b',');
                     }
                     v.marshal_to(dst);
                 }
-                dst.push(']');
+                dst.push(b']');
             }
             JsonValue::Obj(entries) => {
-                dst.push('{');
+                dst.push(b'{');
                 for (i, (k, v)) in entries.iter().enumerate() {
                     if i > 0 {
-                        dst.push(',');
+                        dst.push(b',');
                     }
-                    dst.push_str(&json_string(k));
-                    dst.push(':');
+                    json_string_bytes_append(dst, k.as_bytes());
+                    dst.push(b':');
                     v.marshal_to(dst);
                 }
-                dst.push('}');
+                dst.push(b'}');
             }
         }
     }
@@ -787,10 +794,11 @@ fn decode_any_value_to_json(src: &[u8]) -> Result<JsonValue, String> {
             .map_err(|err| format!("cannot read the next field: {err}"))?;
         match fc.field_num {
             1 => {
+                // Field VALUE path: raw bytes, preserved verbatim like Go.
                 let string_value = fc
-                    .string()
+                    .bytes()
                     .ok_or_else(|| "cannot read StringValue".to_string())?;
-                return Ok(JsonValue::Str(string_value.to_string()));
+                return Ok(JsonValue::Str(string_value.to_vec()));
             }
             2 => {
                 let bool_value = fc
@@ -834,7 +842,7 @@ fn decode_any_value_to_json(src: &[u8]) -> Result<JsonValue, String> {
                     .bytes()
                     .ok_or_else(|| "cannot read BytesValue".to_string())?;
                 let v = format_base64(bytes_value);
-                return Ok(JsonValue::Str(v));
+                return Ok(JsonValue::Str(v.into_bytes()));
             }
             _ => {}
         }
@@ -971,9 +979,9 @@ fn format_base64(src: &[u8]) -> String {
     out
 }
 
-/// Encodes a [`JsonValue`] as a compact JSON string (Go `fb.encodeJSONValue`).
-fn encode_json_value(v: &JsonValue) -> String {
-    let mut out = String::new();
+/// Encodes a [`JsonValue`] as compact JSON bytes (Go `fb.encodeJSONValue`).
+fn encode_json_value(v: &JsonValue) -> Vec<u8> {
+    let mut out = Vec::new();
     v.marshal_to(&mut out);
     out
 }
@@ -1349,7 +1357,7 @@ mod tests {
 
         fn value(&mut self) -> JsonValue {
             match self.b[self.i] {
-                b'"' => JsonValue::Str(self.string()),
+                b'"' => JsonValue::Str(self.string().into_bytes()),
                 b'{' => self.object(),
                 b'[' => self.array(),
                 b't' => {
@@ -1494,7 +1502,8 @@ mod tests {
 
     fn str_value(v: &JsonValue, what: &str) -> String {
         match v {
-            JsonValue::Str(s) => s.clone(),
+            // Test fixtures are ASCII-only, so this cannot fail.
+            JsonValue::Str(s) => String::from_utf8(s.clone()).expect("ASCII test fixture"),
             _ => panic!("expected JSON string for {what}"),
         }
     }

@@ -133,10 +133,10 @@ impl Pipe for PipeReplace {
         let old_substr = self.old_substr.clone().into_bytes();
         let new_substr = self.new_substr.clone().into_bytes();
         let limit = self.limit;
-        let update_func: UpdateFunc = Arc::new(move |v: &str| {
+        let update_func: UpdateFunc = Arc::new(move |v: &[u8]| {
             let mut buf: Vec<u8> = Vec::new();
-            append_replace(&mut buf, v.as_bytes(), &old_substr, &new_substr, limit);
-            String::from_utf8_lossy(&buf).into_owned()
+            append_replace(&mut buf, v, &old_substr, &new_substr, limit);
+            buf
         });
 
         new_pipe_update_processor(
@@ -265,7 +265,7 @@ mod tests {
                 let mut row = Vec::new();
                 for &c in &cols {
                     let name = br.column_name(c).to_string();
-                    let value = br.column_get_value_at_row(c, r).to_string();
+                    let value = br.column_get_value_at_row(c, r).to_vec();
                     if !value.is_empty() {
                         row.push(Field { name, value });
                     }
@@ -278,12 +278,12 @@ mod tests {
         }
     }
 
-    fn canon(mut row: Vec<Field>) -> Vec<(String, String)> {
+    fn canon(mut row: Vec<Field>) -> Vec<(String, Vec<u8>)> {
         row.sort_by(|a, b| a.name.cmp(&b.name));
         row.into_iter().map(|f| (f.name, f.value)).collect()
     }
 
-    fn run(pipe: PipeReplace, rows: Vec<Vec<Field>>) -> Vec<Vec<(String, String)>> {
+    fn run(pipe: PipeReplace, rows: Vec<Vec<Field>>) -> Vec<Vec<(String, Vec<u8>)>> {
         let cap = Arc::new(Capture(Mutex::new(Vec::new())));
         let stop = Arc::new(AtomicBool::new(false));
         let pp = pipe.new_pipe_processor(1, stop, cap.clone() as Arc<dyn PipeProcessor>);
@@ -298,11 +298,11 @@ mod tests {
     fn f(name: &str, value: &str) -> Field {
         Field {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
         }
     }
 
-    fn expected(rows: Vec<Vec<Field>>) -> Vec<Vec<(String, String)>> {
+    fn expected(rows: Vec<Vec<Field>>) -> Vec<Vec<(String, Vec<u8>)>> {
         rows.into_iter()
             .map(|r| canon(r.into_iter().filter(|f| !f.value.is_empty()).collect()))
             .collect()

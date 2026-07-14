@@ -147,8 +147,18 @@ impl Pipe for PipeUnpackSyslog {
         let unpack_syslog: UnpackFunc = Box::new(move |uctx, s| {
             let year = current_year();
             let mut p = get_syslog_parser(year, offset_secs);
-            let s = s.trim_start_matches([' ', '\t', '\n', '\r']);
-            p.parse(s);
+            let mut s = s;
+            while let Some(&b) = s.first() {
+                if !matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+                    break;
+                }
+                s = &s[1..];
+            }
+            // PORT NOTE: the syslog parser operates on &str; invalid UTF-8 input
+            // extracts no fields (Go parses raw bytes — documented residual).
+            if let Ok(s) = std::str::from_utf8(s) {
+                p.parse(s);
+            }
             for f in &p.fields {
                 uctx.add_field(&f.name, &f.value);
             }

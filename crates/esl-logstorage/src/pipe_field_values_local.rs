@@ -13,7 +13,7 @@ use crate::block_result::{BlockResult, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
 use crate::stream_filter::quote_token_if_needed;
-use crate::values_encoder::{marshal_uint64_string, try_parse_uint64};
+use crate::values_encoder::{marshal_uint64_string, try_parse_uint64_bytes};
 
 /// Port of Go `ValueWithHits` — declared in `storage_search.go` upstream; the
 /// canonical port lives in [`crate::storage_search`] and is re-used here.
@@ -118,16 +118,15 @@ impl PipeProcessor for PipeFieldValuesLocalProcessor {
 
         let mut shard = self.shards[worker_id].lock().unwrap();
         for (i, value) in values.iter().enumerate() {
-            let hits_str = String::from_utf8_lossy(&hits[i]);
-            let hits64 = try_parse_uint64(&hits_str).unwrap_or_else(|| {
+            let hits64 = try_parse_uint64_bytes(&hits[i]).unwrap_or_else(|| {
                 panic!(
                     "BUG: unexpected hits received from the remote storage for {:?}: {:?}; it must be uint64",
                     String::from_utf8_lossy(value),
-                    hits_str,
+                    String::from_utf8_lossy(&hits[i]),
                 )
             });
             shard.vhs.push(ValueWithHits {
-                value: String::from_utf8_lossy(value).into_owned(),
+                value: value.clone(),
                 hits: hits64,
             });
         }
@@ -147,8 +146,7 @@ impl PipeProcessor for PipeFieldValuesLocalProcessor {
         for vh in &result {
             let mut hits_buf = Vec::new();
             marshal_uint64_string(&mut hits_buf, vh.hits);
-            let hits_str = String::from_utf8_lossy(&hits_buf).into_owned();
-            wctx.write_row(&[vh.value.clone(), hits_str]);
+            wctx.write_row(&[vh.value.clone(), hits_buf]);
         }
         wctx.flush();
 
@@ -180,7 +178,7 @@ pub fn merge_values_with_hits(
     reset_hits_on_limit_exceeded: bool,
 ) -> Vec<ValueWithHits> {
     let mut need_reset_hits = false;
-    let mut m: HashMap<String, u64> = HashMap::new();
+    let mut m: HashMap<Vec<u8>, u64> = HashMap::new();
     for vhs in &a {
         if !need_reset_hits && has_zero_hits(vhs) {
             need_reset_hits = true;
@@ -217,12 +215,20 @@ pub fn merge_values_with_hits(
 pub(crate) fn sort_values_with_hits(vhs: &mut [ValueWithHits]) {
     vhs.sort_by(|a, b| {
         if a.hits == b.hits {
-            if less_natural(&a.value, &b.value) {
-                std::cmp::Ordering::Less
-            } else if less_natural(&b.value, &a.value) {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
+            // PORT NOTE: Go's lessNatural operates on raw bytes; the Rust
+            // helper needs &str, so invalid-UTF-8 values fall back to plain
+            // byte ordering (identical for valid UTF-8).
+            match (std::str::from_utf8(&a.value), std::str::from_utf8(&b.value)) {
+                (Ok(av), Ok(bv)) => {
+                    if less_natural(av, bv) {
+                        std::cmp::Ordering::Less
+                    } else if less_natural(bv, av) {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                }
+                _ => a.value.cmp(&b.value),
             }
         } else {
             b.hits.cmp(&a.hits)
@@ -273,9 +279,9 @@ impl<'a> PipeFixedFieldsWriteContext<'a> {
         }
     }
 
-    fn write_row(&mut self, row_values: &[String]) {
+    fn write_row(&mut self, row_values: &[Vec<u8>]) {
         for (i, v) in row_values.iter().enumerate() {
-            self.rcs[i].add_value(v.as_bytes());
+            self.rcs[i].add_value(v);
             self.values_len += v.len();
         }
         self.rows_count += 1;
@@ -320,7 +326,7 @@ mod tests {
 
     fn vh(value: &str, hits: u64) -> ValueWithHits {
         ValueWithHits {
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
             hits,
         }
     }
