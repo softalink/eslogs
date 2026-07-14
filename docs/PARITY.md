@@ -370,12 +370,6 @@ what remains in section (a) is confirmed-present divergence.
   maps invalid bytes to `U+FFFD`).
 - `pattern.rs:373` — `extract` pattern `\x`/octal escapes ≥0x80 are
   UTF-8-encoded instead of emitting the raw byte.
-- `parser/query.rs` `string_range` — the upper-bound sentinel is `U+10FFFF`×4
-  vs Go's `0xFF`×4. With values now raw bytes this is genuinely reachable: a
-  stored value starting with a byte in `0xF5..0xFF` matches `>foo` in Go but
-  not here (rendering is unaffected — the sentinel never appears in
-  `String()`). Follow-up: store `FilterStringRange` bounds as bytes so the
-  sentinel can be `0xFF`×4.
 - `syslog_parser.rs`, `esl-insert/src/syslog_listeners.rs` — a named IANA
   `-syslog.timezone` (e.g. `America/New_York`) is now supported on Unix: it is
   loaded DST-aware from the system zoneinfo database (`crate::tzdata`) and the

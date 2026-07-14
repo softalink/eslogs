@@ -186,14 +186,10 @@ pub(crate) const RESERVED_KEYWORDS: &[&str] = &[
     "as",
 ];
 
-/// Maximum string range value (Go package-level `maxStringRangeValue`,
-/// deferred from `filter_string_range.rs` to this port).
-///
-/// PORT NOTE: Go uses `string([]byte{255,255,255,255})` — four raw `0xFF`
-/// bytes, which is byte-wise greater than any valid UTF-8 string and serves as
-/// a `+∞` sentinel for `foo:>value` string-range upper bounds. A Rust `&str`
-/// cannot hold `0xFF` bytes, so the max codepoint (`U+10FFFF`, encoded
-/// `F4 8F BF BF`) is used instead. This only affects `filter_string_range`
-/// *matching* (execution), not `String()` round-trips (the sentinel never
-/// appears in the string representation).
-pub(crate) const MAX_STRING_RANGE_VALUE: &str = "\u{10FFFF}\u{10FFFF}\u{10FFFF}\u{10FFFF}";
+/// Maximum string range value (Go package-level `maxStringRangeValue` =
+/// `string([]byte{255,255,255,255})`): four raw `0xFF` bytes, byte-wise
+/// greater than any stored value, serving as a `+∞` sentinel for `foo:>value`
+/// string-range upper bounds. Field values and the string-range bounds are raw
+/// bytes, so the sentinel is Go's exact bytes (it never appears in the
+/// `String()` representation).
+pub(crate) const MAX_STRING_RANGE_VALUE: &[u8] = b"\xff\xff\xff\xff";

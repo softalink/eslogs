@@ -3,9 +3,9 @@
 //! `FilterStringRange` matches the string range `[min_value..max_value)` — the
 //! min is included, the max is excluded.
 //!
-//! PORT NOTE: Go's package-level `maxStringRangeValue = string([]byte{255,255,
-//! 255,255})` is deferred to the parser port (its only consumer, `parser.go`);
-//! it is not valid UTF-8 and is unused by the filter logic here.
+//! The range bounds are raw bytes, like Go strings, so the parser's
+//! `MAX_STRING_RANGE_VALUE` sentinel is Go's exact
+//! `maxStringRangeValue = string([]byte{255,255,255,255})`.
 
 use esl_common::panicf;
 
@@ -33,23 +33,25 @@ use crate::values_encoder::ValueType;
 ///
 /// Example LogsQL: `string_range(minValue, maxValue)`.
 pub(crate) struct FilterStringRange {
-    pub(crate) min_value: String,
-    pub(crate) max_value: String,
+    /// Raw-byte bounds (Go strings are arbitrary bytes; the `>`/`>=` forms use
+    /// the non-UTF-8 `MAX_STRING_RANGE_VALUE` sentinel as the max).
+    pub(crate) min_value: Vec<u8>,
+    pub(crate) max_value: Vec<u8>,
     pub(crate) string_repr: String,
 }
 
 /// Builds a string-range filter for `field_name`.
 pub(crate) fn new_filter_string_range(
     field_name: &str,
-    min_value: &str,
-    max_value: &str,
+    min_value: impl AsRef<[u8]>,
+    max_value: impl AsRef<[u8]>,
     string_repr: &str,
 ) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterStringRange {
-            min_value: min_value.to_string(),
-            max_value: max_value.to_string(),
+            min_value: min_value.as_ref().to_vec(),
+            max_value: max_value.as_ref().to_vec(),
             string_repr: string_repr.to_string(),
         }),
     )
@@ -146,10 +148,10 @@ fn match_timestamp_iso8601_by_string_range(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    min_value: &str,
-    max_value: &str,
+    min_value: &[u8],
+    max_value: &[u8],
 ) {
-    if min_value > "9" || max_value < "0" {
+    if min_value > b"9" as &[u8] || max_value < b"0" as &[u8] {
         bm.reset_bits();
         return;
     }
@@ -165,10 +167,10 @@ fn match_ipv4_by_string_range(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    min_value: &str,
-    max_value: &str,
+    min_value: &[u8],
+    max_value: &[u8],
 ) {
-    if min_value > "9" || max_value < "0" {
+    if min_value > b"9" as &[u8] || max_value < b"0" as &[u8] {
         bm.reset_bits();
         return;
     }
@@ -184,10 +186,10 @@ fn match_float64_by_string_range(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    min_value: &str,
-    max_value: &str,
+    min_value: &[u8],
+    max_value: &[u8],
 ) {
-    if min_value > "9" || max_value < "+" {
+    if min_value > b"9" as &[u8] || max_value < b"+" as &[u8] {
         bm.reset_bits();
         return;
     }
@@ -203,8 +205,8 @@ fn match_values_dict_by_string_range(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    min_value: &str,
-    max_value: &str,
+    min_value: &[u8],
+    max_value: &[u8],
 ) {
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
@@ -217,8 +219,8 @@ fn match_string_by_string_range(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    min_value: &str,
-    max_value: &str,
+    min_value: &[u8],
+    max_value: &[u8],
 ) {
     visit_values(bs, ch, bm, |v| match_string_range(v, min_value, max_value));
 }
@@ -227,10 +229,10 @@ fn match_uint8_by_string_range(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    min_value: &str,
-    max_value: &str,
+    min_value: &[u8],
+    max_value: &[u8],
 ) {
-    if min_value > "9" || max_value < "0" {
+    if min_value > b"9" as &[u8] || max_value < b"0" as &[u8] {
         bm.reset_bits();
         return;
     }
@@ -246,10 +248,10 @@ fn match_uint16_by_string_range(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    min_value: &str,
-    max_value: &str,
+    min_value: &[u8],
+    max_value: &[u8],
 ) {
-    if min_value > "9" || max_value < "0" {
+    if min_value > b"9" as &[u8] || max_value < b"0" as &[u8] {
         bm.reset_bits();
         return;
     }
@@ -265,10 +267,10 @@ fn match_uint32_by_string_range(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    min_value: &str,
-    max_value: &str,
+    min_value: &[u8],
+    max_value: &[u8],
 ) {
-    if min_value > "9" || max_value < "0" {
+    if min_value > b"9" as &[u8] || max_value < b"0" as &[u8] {
         bm.reset_bits();
         return;
     }
@@ -284,10 +286,10 @@ fn match_uint64_by_string_range(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    min_value: &str,
-    max_value: &str,
+    min_value: &[u8],
+    max_value: &[u8],
 ) {
-    if min_value > "9" || max_value < "0" {
+    if min_value > b"9" as &[u8] || max_value < b"0" as &[u8] {
         bm.reset_bits();
         return;
     }
@@ -303,10 +305,12 @@ fn match_int64_by_string_range(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    min_value: &str,
-    max_value: &str,
+    min_value: &[u8],
+    max_value: &[u8],
 ) {
-    if (min_value != "-" && min_value > "9") || (max_value != "-" && max_value < "0") {
+    if (min_value != b"-" && min_value > b"9" as &[u8])
+        || (max_value != b"-" && max_value < b"0" as &[u8])
+    {
         bm.reset_bits();
         return;
     }
@@ -322,8 +326,8 @@ fn match_int64_by_string_range(
 ///
 /// PORT NOTE: Go compares plain strings by byte order; `&[u8]` `Ord` is the
 /// same byte-wise lexicographic order, so `>=`/`<` match exactly.
-pub(crate) fn match_string_range(s: &[u8], min_value: &str, max_value: &str) -> bool {
-    s >= min_value.as_bytes() && s < max_value.as_bytes()
+pub(crate) fn match_string_range(s: &[u8], min_value: &[u8], max_value: &[u8]) -> bool {
+    s >= min_value && s < max_value
 }
 
 #[cfg(test)]
@@ -332,13 +336,33 @@ mod tests {
 
     #[test]
     fn test_match_string_range() {
-        assert!(match_string_range(b"abc", "abc", "abd"));
-        assert!(!match_string_range(b"abd", "abc", "abd")); // max excluded
-        assert!(!match_string_range(b"abb", "abc", "abd"));
-        assert!(match_string_range(b"10", "0", "9a"));
-        assert!(!match_string_range(b"", "a", "z"));
+        assert!(match_string_range(b"abc", b"abc", b"abd"));
+        assert!(!match_string_range(b"abd", b"abc", b"abd")); // max excluded
+        assert!(!match_string_range(b"abb", b"abc", b"abd"));
+        assert!(match_string_range(b"10", b"0", b"9a"));
+        assert!(!match_string_range(b"", b"a", b"z"));
         // included min, excluded max
-        assert!(match_string_range(b"a", "a", "b"));
-        assert!(!match_string_range(b"b", "a", "b"));
+        assert!(match_string_range(b"a", b"a", b"b"));
+        assert!(!match_string_range(b"b", b"a", b"b"));
+    }
+
+    #[test]
+    fn test_max_string_range_sentinel_matches_high_bytes() {
+        use crate::parser::MAX_STRING_RANGE_VALUE;
+        // Go's maxStringRangeValue is 0xFF x4: a stored raw-byte value starting
+        // with a byte in 0xF5..0xFF (invalid UTF-8, now representable) is below
+        // the sentinel and therefore matches `foo:>bar` like in Go.
+        assert!(match_string_range(
+            b"\xfa\x01",
+            b"bar",
+            MAX_STRING_RANGE_VALUE
+        ));
+        assert!(match_string_range(b"\xfe", b"", MAX_STRING_RANGE_VALUE));
+        // The sentinel itself is excluded (max-exclusive range).
+        assert!(!match_string_range(
+            b"\xff\xff\xff\xff",
+            b"",
+            MAX_STRING_RANGE_VALUE
+        ));
     }
 }
