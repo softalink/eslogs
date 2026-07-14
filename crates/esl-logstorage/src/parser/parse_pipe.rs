@@ -445,8 +445,10 @@ fn parse_pipe_extract(lex: &mut Lexer) -> Result<BoxPipe, String> {
     expect_keyword(lex, &["extract"], "extract")?;
     lex.next_token();
     let iff = parse_optional_if(lex)?;
+    // Read the pattern token as raw bytes so a `\xNN` escape in the pattern
+    // literal denotes a raw byte (Go strconv.Unquote), like Go's extract.
     let pattern_str = lex
-        .next_compound_token()
+        .next_compound_token_bytes()
         .map_err(|e| format!("cannot read 'pattern': {e}"))?;
     let mut from_field = b"_msg".to_vec();
     if lex.is_keyword(&["from"]) {

@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use crate::html_entities::{LONGEST_ENTITY_WITHOUT_SEMICOLON, lookup_entity, lookup_entity2};
+use crate::logfmt_parser::trim_space_bytes;
 use crate::pattern_matcher::decode_rune;
 use crate::prefix_filter;
 
@@ -73,7 +74,7 @@ impl Clone for Pattern {
     }
 }
 
-pub(crate) fn parse_pattern(s: &str) -> Result<Pattern, String> {
+pub(crate) fn parse_pattern(s: &[u8]) -> Result<Pattern, String> {
     let steps = parse_pattern_steps(s)?;
 
     // Verify that prefixes are non-empty between fields. The first prefix may be empty.
@@ -115,7 +116,8 @@ pub(crate) fn parse_pattern(s: &str) -> Result<Pattern, String> {
     }
     if fields.is_empty() {
         return Err(format!(
-            "pattern {s:?} must contain at least a single named field in the form <field_name>"
+            "pattern {:?} must contain at least a single named field in the form <field_name>",
+            String::from_utf8_lossy(s)
         ));
     }
 
@@ -261,44 +263,40 @@ pub(crate) fn try_unquote_string(s: &str, opt: &str) -> Option<(String, usize)> 
     }
 }
 
-pub(crate) fn parse_pattern_steps(s: &str) -> Result<Vec<PatternStep>, String> {
+pub(crate) fn parse_pattern_steps(s: &[u8]) -> Result<Vec<PatternStep>, String> {
     let mut steps = parse_pattern_steps_internal(s)?;
 
-    // unescape prefixes
+    // unescape prefixes (byte-native: raw bytes in the pattern literal survive)
     for step in &mut steps {
-        // Prefixes are slices of the pattern text (`&str`), so they are valid
-        // UTF-8 at this point; the byte type matches Go's byte-level matching.
-        let prefix = std::str::from_utf8(&step.prefix)
-            .expect("BUG: pattern prefixes come from the pattern text, which is valid UTF-8");
-        step.prefix = html_unescape_string(prefix).into_bytes();
+        step.prefix = html_unescape_bytes(&step.prefix);
     }
 
     // extract options part from fields
     for step in &mut steps {
         let field = std::mem::take(&mut step.field);
-        // Pattern text is a &str slice, so the field bytes are valid UTF-8.
-        let mut fs: &str = std::str::from_utf8(&field)
-            .expect("BUG: pattern fields come from the pattern text, which is valid UTF-8");
-        if let Some(n) = fs.find(':') {
-            step.field_opt = fs[..n].trim().to_string();
+        // The `:` option delimiter is ASCII; the option name is an ASCII
+        // keyword (Go's field options), so a checked view is exact.
+        let mut fs: &[u8] = &field;
+        if let Some(n) = fs.iter().position(|&c| c == b':') {
+            step.field_opt = String::from_utf8_lossy(trim_space_bytes(&fs[..n])).into_owned();
             fs = &fs[n + 1..];
         }
-        step.field = fs.trim().as_bytes().to_vec();
+        step.field = trim_space_bytes(fs).to_vec();
     }
 
     Ok(steps)
 }
 
-fn parse_pattern_steps_internal(s: &str) -> Result<Vec<PatternStep>, String> {
+fn parse_pattern_steps_internal(s: &[u8]) -> Result<Vec<PatternStep>, String> {
     if s.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut steps = Vec::new();
 
-    let Some(n) = s.find('<') else {
+    let Some(n) = s.iter().position(|&c| c == b'<') else {
         steps.push(PatternStep {
-            prefix: s.as_bytes().to_vec(),
+            prefix: s.to_vec(),
             ..Default::default()
         });
         return Ok(steps);
@@ -306,28 +304,28 @@ fn parse_pattern_steps_internal(s: &str) -> Result<Vec<PatternStep>, String> {
     let mut prefix = &s[..n];
     let mut s = &s[n + 1..];
     loop {
-        let Some(n) = s.find('>') else {
-            return Err(format!("missing '>' for <{s}"));
+        let Some(n) = s.iter().position(|&c| c == b'>') else {
+            return Err(format!("missing '>' for <{}", String::from_utf8_lossy(s)));
         };
         let mut field = &s[..n];
         s = &s[n + 1..];
 
-        if field == "_" || field == "*" {
-            field = "";
+        if field == b"_" || field == b"*" {
+            field = b"";
         }
         steps.push(PatternStep {
-            prefix: prefix.as_bytes().to_vec(),
-            field: field.as_bytes().to_vec(),
+            prefix: prefix.to_vec(),
+            field: field.to_vec(),
             field_opt: String::new(),
         });
         if s.is_empty() {
             break;
         }
 
-        match s.find('<') {
+        match s.iter().position(|&c| c == b'<') {
             None => {
                 steps.push(PatternStep {
-                    prefix: s.as_bytes().to_vec(),
+                    prefix: s.to_vec(),
                     ..Default::default()
                 });
                 break;
@@ -610,12 +608,15 @@ fn unhex(b: u8) -> Option<u32> {
 // two-codepoint entities) live in `crate::html_entities`.
 // ---------------------------------------------------------------------------
 
-fn html_unescape_string(s: &str) -> String {
-    let Some(i) = s.find('&') else {
-        return s.to_string();
+/// Byte-native HTML entity unescaping (Go `html.UnescapeString` over raw
+/// bytes): entities are ASCII, so non-entity bytes — including invalid UTF-8 —
+/// pass through verbatim, letting an `extract` pattern literal carry raw bytes.
+fn html_unescape_bytes(s: &[u8]) -> Vec<u8> {
+    let Some(i) = s.iter().position(|&c| c == b'&') else {
+        return s.to_vec();
     };
 
-    let mut b = s.as_bytes().to_vec();
+    let mut b = s.to_vec();
     let (mut dst, mut src) = unescape_entity(&mut b, i, i);
     while src < b.len() {
         let i = if b[src] == b'&' {
@@ -634,7 +635,7 @@ fn html_unescape_string(s: &str) -> String {
         (dst, src) = unescape_entity(&mut b, dst + i, src + i);
     }
     b.truncate(dst);
-    String::from_utf8(b).expect("BUG: html_unescape_string produced invalid UTF-8")
+    b
 }
 
 /// Port of Go `html.unescapeEntity` (non-attribute mode): `b[src]` is known
@@ -796,7 +797,7 @@ mod tests {
                 }
             };
 
-            let mut ptn = parse_pattern(pattern_str)
+            let mut ptn = parse_pattern(pattern_str.as_bytes())
                 .unwrap_or_else(|e| panic!("cannot parse {pattern_str:?}: {e}"));
             ptn.apply(s.as_bytes());
             check_fields(&ptn);
@@ -856,7 +857,7 @@ mod tests {
 
     /// Byte-native `apply` helper for inputs/outputs that are not valid UTF-8.
     fn apply_bytes(pattern_str: &str, s: &[u8], results_expected: &[&[u8]]) {
-        let mut ptn = parse_pattern(pattern_str)
+        let mut ptn = parse_pattern(pattern_str.as_bytes())
             .unwrap_or_else(|e| panic!("cannot parse {pattern_str:?}: {e}"));
         ptn.apply(s);
         assert_eq!(ptn.fields.len(), results_expected.len());
@@ -868,6 +869,21 @@ mod tests {
                 fld.name, results_expected[i]
             );
         }
+    }
+
+    /// A raw byte in the pattern LITERAL prefix (reachable now that the extract
+    /// pipe reads its pattern token as bytes) matches a raw byte in the value,
+    /// like Go — and does NOT match the UTF-8 encoding of that scalar.
+    #[test]
+    fn test_pattern_raw_byte_prefix_literal() {
+        let mut ptn = parse_pattern(b"a\xffb<x>").expect("parse raw-byte pattern");
+        ptn.apply(b"a\xffbVALUE");
+        assert_eq!(ptn.fields.len(), 1);
+        assert_eq!(ptn.field_value(&ptn.fields[0]), b"VALUE");
+        // The UTF-8 encoding of U+00FF (0xC3 0xBF) must NOT match the raw 0xFF.
+        let mut ptn2 = parse_pattern(b"a\xffb<x>").expect("parse raw-byte pattern");
+        ptn2.apply("a\u{ff}bVALUE".as_bytes());
+        assert!(ptn2.fields.is_empty() || ptn2.field_value(&ptn2.fields[0]).is_empty());
     }
 
     /// Go's `strconv.Unquote` emits the RAW byte for `\xNN`/octal
@@ -923,7 +939,7 @@ mod tests {
     #[test]
     fn test_parse_pattern_failure() {
         fn f(pattern_str: &str) {
-            let ptn = parse_pattern(pattern_str);
+            let ptn = parse_pattern(pattern_str.as_bytes());
             assert!(
                 ptn.is_err(),
                 "expecting error when parsing {pattern_str:?}; got {ptn:?}"
@@ -947,7 +963,7 @@ mod tests {
     #[test]
     fn test_parse_pattern_steps_success() {
         fn f(s: &str, steps_expected: &[PatternStep]) {
-            let steps = parse_pattern_steps(s)
+            let steps = parse_pattern_steps(s.as_bytes())
                 .unwrap_or_else(|e| panic!("unexpected error when parsing {s:?}: {e}"));
             assert_eq!(
                 steps, steps_expected,
@@ -1011,7 +1027,7 @@ mod tests {
     #[test]
     fn test_parse_pattern_steps_failure() {
         fn f(s: &str) {
-            let steps = parse_pattern_steps(s);
+            let steps = parse_pattern_steps(s.as_bytes());
             assert!(
                 steps.is_err(),
                 "expecting non-nil error when parsing {s:?}; got steps: {steps:?}"
@@ -1028,10 +1044,12 @@ mod tests {
     #[test]
     fn test_html_unescape_string() {
         fn f(html: &str, unescaped: &str) {
-            let got = html_unescape_string(html);
+            let got = html_unescape_bytes(html.as_bytes());
             assert_eq!(
-                got, unescaped,
-                "unexpected unescape result for {html:?}; got {got:?}; want {unescaped:?}"
+                got,
+                unescaped.as_bytes(),
+                "unexpected unescape result for {html:?}; got {:?}; want {unescaped:?}",
+                String::from_utf8_lossy(&got)
             );
         }
 

@@ -67,7 +67,7 @@ impl PipeFormat {
         iff: Option<Arc<IfFilter>>,
     ) -> Result<Self, String> {
         let format_str = format_str.into();
-        let steps = parse_pattern_steps(&format_str)
+        let steps = parse_pattern_steps(format_str.as_bytes())
             .map_err(|e| format!("cannot parse 'pattern' {format_str:?}: {e}"))?;
 
         // Verify that all the fields mentioned in the format pattern do not end with '*'.

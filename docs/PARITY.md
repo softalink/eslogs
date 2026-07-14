@@ -360,10 +360,13 @@ what remains in section (a) is confirmed-present divergence.
   the redundant `_bytes` lookup twins consolidated into single byte APIs) — a
   quoted `"\xff"` name matches an ingested raw-byte name end-to-end, and name
   rendering quotes invalid bytes as `\xNN` like Go's `needQuoteToken`
-  (`RuneError` ⇒ quoted). Residuals (each PORT-NOTEd): the cluster netselect
-  form channel rejects non-UTF-8 field-name args (String-typed multipart seam;
-  single-node is fully raw-byte); `extract`-pipe PATTERN literals and
-  `re()`/`pattern_match*` args stay scalar/`&str`-bound (str-native engines).
+  (`RuneError` ⇒ quoted). The `extract`-pipe PATTERN is byte-native too
+  (`parse_pattern(&[u8])`, token read via `next_compound_token_bytes`), so a
+  `\xNN` escape in an extract pattern literal denotes a raw byte and matches raw
+  value bytes. Residuals (each PORT-NOTEd): the cluster netselect form channel
+  rejects non-UTF-8 field-name args (String-typed multipart seam; single-node is
+  fully raw-byte); `re()`/`pattern_match*` pattern *text* stays scalar/`&str`
+  (str-native engines — the matched *values* are byte-native).
 
 **Input handling edge cases (esl-logstorage)**
 

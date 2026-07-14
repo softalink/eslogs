@@ -15,7 +15,6 @@ use crate::pattern::{Pattern, parse_pattern};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::pipe_unpack::IfFilter;
 use crate::prefix_filter;
-use crate::stream_filter::quote_token_if_needed;
 
 /// Port of Go's `shouldDenyOverwrittenField` (from `pipe_update.go`).
 pub(crate) fn should_deny_overwritten_field(
@@ -30,7 +29,9 @@ pub(crate) fn should_deny_overwritten_field(
 pub(crate) struct PipeExtract {
     from_field: Vec<u8>,
     ptn: Pattern,
-    pattern_str: String,
+    /// Raw-byte pattern text (Go strings are arbitrary bytes), so a `\xNN`
+    /// escape in the pattern literal denotes a raw byte like Go.
+    pattern_str: Vec<u8>,
     keep_original_fields: bool,
     skip_empty_results: bool,
     iff: Option<IfFilter>,
@@ -39,18 +40,23 @@ pub(crate) struct PipeExtract {
 /// Constructs a `PipeExtract`, parsing `pattern_str` via [`parse_pattern`] (Go
 /// `parsePipeExtract`; lexer parsing of the surrounding pipe is deferred).
 pub(crate) fn new_pipe_extract(
-    pattern_str: &str,
+    pattern_str: impl AsRef<[u8]>,
     from_field: impl Into<Vec<u8>>,
     keep_original_fields: bool,
     skip_empty_results: bool,
     iff: Option<IfFilter>,
 ) -> Result<PipeExtract, String> {
-    let ptn = parse_pattern(pattern_str)
-        .map_err(|e| format!("cannot parse 'pattern' {pattern_str:?}: {e}"))?;
+    let pattern_str = pattern_str.as_ref();
+    let ptn = parse_pattern(pattern_str).map_err(|e| {
+        format!(
+            "cannot parse 'pattern' {:?}: {e}",
+            String::from_utf8_lossy(pattern_str)
+        )
+    })?;
     Ok(PipeExtract {
         from_field: from_field.into(),
         ptn,
-        pattern_str: pattern_str.to_string(),
+        pattern_str: pattern_str.to_vec(),
         keep_original_fields,
         skip_empty_results,
         iff,
@@ -103,7 +109,10 @@ impl Pipe for PipeExtract {
         if let Some(iff) = &self.iff {
             s += &format!(" {iff}");
         }
-        s += &format!(" {}", quote_token_if_needed(&self.pattern_str));
+        s += &format!(
+            " {}",
+            crate::parser::quote_token_bytes_if_needed(&self.pattern_str)
+        );
         if !crate::filter_generic::is_msg_field_name(&self.from_field) {
             s += &format!(
                 " from {}",
