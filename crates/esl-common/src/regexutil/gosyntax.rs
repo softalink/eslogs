@@ -619,28 +619,14 @@ fn escape(b: &mut String, r: i32, force: bool) {
     }
 }
 
-/// PORT NOTE: approximation of Go's `unicode.IsPrint` (categories L, M, N,
-/// P, S plus ASCII space). It is exact for Latin-1; above that it treats any
-/// non-control (Cc), non-whitespace code point as printable, because Rust
-/// std exposes no general-category tables. Concretely: Cf format chars
-/// (e.g. U+200B ZERO WIDTH SPACE) and unassigned code points serialize raw
-/// where Go writes `\x{200b}`. This affects only the simplified-suffix TEXT
-/// (an internal intermediate); both forms parse back to the same tree and
-/// compile to the same matcher, so match results are unaffected.
+/// Go `unicode.IsPrint` (== `strconv.IsPrint`), exact across the full range via
+/// the ported `strconv` printable tables — so the simplified-suffix `String()`
+/// escapes format/unassigned code points (e.g. `\x{200b}`) exactly like Go.
 fn is_print(r: i32) -> bool {
     if r < 0 {
         return false;
     }
-    if r < 0x100 {
-        if (0x20..=0x7e).contains(&r) {
-            return true;
-        }
-        return (0xa1..=0xff).contains(&r) && r != 0xad;
-    }
-    match char::from_u32(r as u32) {
-        None => false,
-        Some(c) => !c.is_control() && !c.is_whitespace(),
-    }
+    crate::strconv_isprint::is_print(r as u32)
 }
 
 /// Reports whether `r` is in the class (which must be cleaned).

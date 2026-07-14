@@ -1134,11 +1134,10 @@ pub(crate) mod fastjson {
             return;
         }
 
-        // Slow path.
-        // PORT NOTE: approximates Go strconv.AppendQuote: ASCII control chars
-        // use the same escapes, but printable non-ASCII runes are kept raw
-        // instead of consulting unicode.IsPrint, and invalid bytes become
-        // \xHH. Only reachable for JSON object keys containing escapes.
+        // Slow path — Go strconv.AppendQuote: ASCII control chars use the same
+        // two-char escapes; a non-ASCII rune is kept raw when strconv.IsPrint,
+        // else \uXXXX (BMP) / \UXXXXXXXX (astral); an invalid byte becomes \xHH.
+        // Only reachable for JSON object keys containing escapes.
         dst.push(b'"');
         let mut i = 0;
         while i < s.len() {
@@ -1162,22 +1161,23 @@ pub(crate) mod fastjson {
                 i += 1;
             } else {
                 let n = (s.len() - i).min(4);
-                match std::str::from_utf8(&s[i..i + n]) {
-                    Ok(st) => {
-                        let c = st.chars().next().expect("BUG: non-empty valid UTF-8");
-                        let mut tmp = [0u8; 4];
-                        dst.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
-                        i += c.len_utf8();
-                    }
+                let valid_char = match std::str::from_utf8(&s[i..i + n]) {
+                    Ok(st) => st.chars().next(),
                     Err(e) if e.valid_up_to() > 0 => {
-                        let st = std::str::from_utf8(&s[i..i + e.valid_up_to()])
-                            .expect("BUG: valid prefix");
-                        let c = st.chars().next().expect("BUG: non-empty valid UTF-8");
-                        let mut tmp = [0u8; 4];
-                        dst.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+                        std::str::from_utf8(&s[i..i + e.valid_up_to()])
+                            .expect("BUG: valid prefix")
+                            .chars()
+                            .next()
+                    }
+                    Err(_) => None,
+                };
+                match valid_char {
+                    Some(c) => {
+                        append_quoted_rune(dst, c);
                         i += c.len_utf8();
                     }
-                    Err(_) => {
+                    None => {
+                        // Invalid byte -> \xHH (Go RuneError, width 1).
                         dst.extend_from_slice(format!("\\x{ch:02x}").as_bytes());
                         i += 1;
                     }
@@ -1185,6 +1185,23 @@ pub(crate) mod fastjson {
             }
         }
         dst.push(b'"');
+    }
+
+    /// Appends a non-ASCII rune to `dst` the way Go `strconv.AppendQuote`
+    /// does: raw when `strconv.IsPrint`, else `\uXXXX` (BMP) / `\UXXXXXXXX`
+    /// (astral) with lowercase hex.
+    fn append_quoted_rune(dst: &mut Vec<u8>, c: char) {
+        if esl_common::strconv_isprint::is_print_char(c) {
+            let mut tmp = [0u8; 4];
+            dst.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+            return;
+        }
+        let r = c as u32;
+        if r < 0x10000 {
+            dst.extend_from_slice(format!("\\u{r:04x}").as_bytes());
+        } else {
+            dst.extend_from_slice(format!("\\U{r:08x}").as_bytes());
+        }
     }
 
     fn has_special_chars(s: &[u8]) -> bool {

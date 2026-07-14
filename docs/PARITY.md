@@ -339,13 +339,14 @@ what remains in section (a) is confirmed-present divergence.
 
 **LogsQL text rendering / round-trip (esl-logstorage)**
 
-- `json_parser.rs:1147` — re-quoted JSON object keys on the slow escape path
-  keep non-printable non-ASCII runes raw where Go's `strconv.AppendQuote`
-  `\uXXXX`-escapes them (reachable when a key both needs escaping and holds a
-  non-printable non-ASCII rune).
-- `stream_filter.rs` — `is_go_print` approximates `unicode.IsPrint`
-  (format/surrogate/private-use/unassigned code points render raw where Go
-  escapes them). The LogsQL lexer carries a Go-exact raw-byte token payload
+- `strconv_isprint.rs` — Go's `strconv.IsPrint` (== `unicode.IsPrint`) is
+  ported exactly via the compact `strconv` printable tables (generated from the
+  Go toolchain's `isprint.go`, cross-checked over all 0x0..=0x10FFFF against the
+  reference `strconv.IsPrint`). So the three printable-rune escaping sites now
+  match Go precisely: JSON object-key re-quoting (`strconv.AppendQuote` —
+  non-printable non-ASCII runes `\uXXXX`/`\UXXXXXXXX`-escape), `go_quote`
+  (stream-filter/token rendering), and the simplified-regex `String()`.
+- `stream_filter.rs` — the LogsQL lexer carries a Go-exact raw-byte token payload
   (`Lexer.token_bytes`, `strconv.Unquote` semantics: double-quoted `\xNN`≥0x80
   IS the raw byte), consumed by the phrase-filter family
   (`phrase`/`exact`/`prefix`/`exact_prefix`/`seq`/`i()`) end-to-end with
@@ -473,12 +474,10 @@ what remains in section (a) is confirmed-present divergence.
   zoneinfo database via `crate::tzdata` and the offset is looked up per log
   timestamp, so DST is honored; only Windows named zones remain unsupported, as
   the port does not bundle tzdata.)
-- `regexutil/gosyntax.rs:607` — the simplified-regex `String()` escapes via a
-  looser `is_print` than Go's `unicode.IsPrint`, so the serialized (internal)
-  suffix text differs for format/exotic code points; matches are unaffected —
-  both re-parse to the same matcher. `regexutil.rs:461/:597` — `MustCompile`
-  returns an error instead of panicking (deliberate: no `expect`-panic API).
-  (`\p{...}` classes are now accepted and `\b` is ASCII like Go.)
+- `regexutil.rs:461/:597` — `MustCompile` returns an error instead of panicking
+  (deliberate: no `expect`-panic API). (`\p{...}` classes are now accepted and
+  `\b` is ASCII like Go. The simplified-regex `String()` printable-rune escaping
+  now matches Go exactly — see the `strconv.IsPrint` note below.)
 - `regexutil` (invalid-UTF-8 haystacks) — regex matching runs on raw value
   bytes via `regex::bytes::Regex` (Go `regexp` matches byte payloads too), so
   valid-UTF-8 haystacks and literal/positive-class matching over invalid bytes

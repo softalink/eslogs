@@ -28,6 +28,7 @@ pub mod procutil;
 pub mod pushmetrics;
 pub mod regexutil;
 pub mod slicesutil;
+pub mod strconv_isprint;
 pub mod stringsutil;
 pub mod timerpool;
 pub mod timeutil;

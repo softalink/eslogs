@@ -918,11 +918,10 @@ fn append_escaped_rune(out: &mut String, c: char, quote: char) {
     }
 }
 
-/// PORT NOTE: approximation of Go `unicode.IsPrint` for non-ASCII runes
-/// (Rust std has no direct equivalent): control chars and non-ASCII
-/// whitespace are treated as non-printable.
+/// Go `unicode.IsPrint` (== `strconv.IsPrint`), exact across the full range via
+/// the ported `strconv` printable tables.
 fn is_go_print(c: char) -> bool {
-    !c.is_control() && !c.is_whitespace()
+    esl_common::strconv_isprint::is_print_char(c)
 }
 
 // PORT NOTE: the private `go_quoted_prefix` / `go_unquote` / `go_unquote_char`
@@ -987,6 +986,16 @@ pub(crate) fn must_new_test_stream_filter(s: &str) -> StreamFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_go_quote_isprint_escaping() {
+        // Verified against the Go toolchain's strconv.Quote: format/zero-width
+        // code points escape as \uXXXX; letters and marks stay raw.
+        assert_eq!(go_quote("\u{200b}"), "\"\\u200b\""); // ZERO WIDTH SPACE (Cf)
+        assert_eq!(go_quote("\u{200e}"), "\"\\u200e\""); // LEFT-TO-RIGHT MARK (Cf)
+        assert_eq!(go_quote("\u{4e2d}"), "\"\u{4e2d}\""); // 中 (Lo) — raw
+        assert_eq!(go_quote("\u{e0100}"), "\"\u{e0100}\""); // VS-17 (Mn) — raw
+    }
 
     /// PORT-ONLY TEST: a double-quoted `\xff`-style escape in a stream tag
     /// value denotes the raw byte 0xFF (Go strconv.Unquote), both in the
