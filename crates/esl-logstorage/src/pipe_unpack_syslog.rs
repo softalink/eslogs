@@ -154,11 +154,7 @@ impl Pipe for PipeUnpackSyslog {
                 }
                 s = &s[1..];
             }
-            // PORT NOTE: the syslog parser operates on &str; invalid UTF-8 input
-            // extracts no fields (Go parses raw bytes — documented residual).
-            if let Ok(s) = std::str::from_utf8(s) {
-                p.parse(s);
-            }
+            p.parse(s);
             for f in &p.fields {
                 uctx.add_field(&f.name, &f.value);
             }

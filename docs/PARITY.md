@@ -359,15 +359,19 @@ what remains in section (a) is confirmed-present divergence.
   jsonline/elasticsearch/splunk/journald/loki-protobuf/OTLP/datadog/native/
   internal ingest paths and the tail/stats/facets/lastn output paths preserve
   bytes; OTLP now reads value paths via byte accessors where it previously
-  **rejected** invalid UTF-8. Remaining lossy (each PORT-NOTEd in place):
-  field **names** stay `String` (invalid UTF-8 in a name becomes `U+FFFD` where
-  Go keeps raw bytes); the **syslog** message line
-  (`esl-insert/src/syslog_listeners.rs:1243` — `syslog_parser::parse` takes
-  `&str`); `in(<subquery>)` values (`GetFieldValuesFn` returns `Vec<String>`,
-  `storage_search.rs:1537`); `_stream`/`_stream_id` rendering (validated
-  printable text); regex matching on invalid-UTF-8 values falls back to a lossy
-  view; `any_case` filters lossy-lowercase — which IS Go (`strings.ToLower`
-  maps invalid bytes to `U+FFFD`).
+  **rejected** invalid UTF-8. The syslog parse chain is byte-native too
+  (`syslog_parser::parse(&[u8])`, listeners pass raw framed bytes,
+  `unpack_syslog` unpacks stored bytes directly), so invalid UTF-8 in syslog
+  message content is preserved verbatim. Remaining lossy (each PORT-NOTEd in
+  place): field **names** stay `String` (invalid UTF-8 in a name becomes
+  `U+FFFD` where Go keeps raw bytes — incl. RFC5424 SD param names and CEF
+  extension keys); the RFC5424 **SD block** is parsed through a lossy view
+  (fires only on invalid UTF-8 inside `[...]`); `in(<subquery>)` values
+  (`GetFieldValuesFn` returns `Vec<String>`, `storage_search.rs:1537`);
+  `_stream`/`_stream_id` rendering (validated printable text); regex matching
+  on invalid-UTF-8 values falls back to a lossy view; `any_case` filters
+  lossy-lowercase — which IS Go (`strings.ToLower` maps invalid bytes to
+  `U+FFFD`).
 - `pattern.rs:373` — `extract` pattern `\x`/octal escapes ≥0x80 are
   UTF-8-encoded instead of emitting the raw byte.
 - `syslog_parser.rs`, `esl-insert/src/syslog_listeners.rs` — a named IANA

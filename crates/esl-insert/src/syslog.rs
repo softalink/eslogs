@@ -54,7 +54,7 @@ impl<S: LogRowsStorage> SyslogLogMessageProcessor for LogMessageProcessor<'_, S>
 /// timestamp parsed from the message. When `remote_ip` is non-empty it is added
 /// as `remote_ip`, and as `hostname` when the message lacks one.
 pub fn process_line<P: SyslogLogMessageProcessor + ?Sized>(
-    line: &str,
+    line: &[u8],
     current_year: i64,
     timezone_offset_secs: i64,
     timezone: Option<Arc<Location>>,
@@ -75,8 +75,12 @@ pub fn process_line<P: SyslogLogMessageProcessor + ?Sized>(
             Ok(nsecs) => nsecs,
             Err(err) => {
                 put_syslog_parser(p);
+                // Display-only lossy rendering of the raw line in the error
+                // message (matches Go's %q-style quoting intent); the parsed
+                // field values keep the raw bytes.
                 return Err(format!(
-                    "cannot get timestamp from syslog line {line:?}: {err}"
+                    "cannot get timestamp from syslog line {:?}: {err}",
+                    String::from_utf8_lossy(line)
                 ));
             }
         }
@@ -116,7 +120,7 @@ mod tests {
         let mut lmp = cp.new_log_message_processor(&s, "test");
 
         // RFC5424 line; use_local_timestamp=true forces the current time.
-        let line = "<165>1 2023-01-01T00:00:00.000Z myhost myapp 1 - - hello world";
+        let line = b"<165>1 2023-01-01T00:00:00.000Z myhost myapp 1 - - hello world";
         let res = process_line(line, 2024, 0, None, true, "", &mut lmp);
         assert!(res.is_ok(), "unexpected error: {res:?}");
 

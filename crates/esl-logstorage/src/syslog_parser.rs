@@ -10,7 +10,7 @@ use crate::json_parser::{JSONParser, get_json_parser, put_json_parser};
 use crate::logfmt_parser::LogfmtParser;
 use crate::rows::Field;
 use crate::values_encoder::{
-    marshal_timestamp_rfc3339_nano_string, marshal_uint64_string, try_parse_uint64,
+    marshal_timestamp_rfc3339_nano_string, marshal_uint64_string, try_parse_uint64_bytes,
 };
 
 /// Returns syslog parser from the pool.
@@ -119,7 +119,7 @@ impl SyslogParser {
         // call (their reset methods are private), so nothing else is needed.
     }
 
-    pub fn add_message_field(&mut self, s: &str) {
+    pub fn add_message_field(&mut self, s: &[u8]) {
         let fields_len = self.fields.len();
         if !self.parse_special_message(s) {
             self.fields.truncate(fields_len);
@@ -127,23 +127,23 @@ impl SyslogParser {
         }
     }
 
-    fn parse_special_message(&mut self, s: &str) -> bool {
-        if let Some(cef_str) = s.strip_prefix("CEF:") {
+    fn parse_special_message(&mut self, s: &[u8]) -> bool {
+        if let Some(cef_str) = s.strip_prefix(b"CEF:".as_slice()) {
             return self.parse_cef_message(cef_str);
         }
-        if let Some(cee_str) = s.strip_prefix("@cee:") {
+        if let Some(cee_str) = s.strip_prefix(b"@cee:".as_slice()) {
             return self.parse_cee_message(cee_str);
         }
         false
     }
 
     /// Parses CEE message. See <https://cee.mitre.org/language/1.0-beta1/clt.html#syslog>
-    fn parse_cee_message(&mut self, s: &str) -> bool {
+    fn parse_cee_message(&mut self, s: &[u8]) -> bool {
         let mut jp = match self.json_parser.take() {
             Some(jp) => jp,
             None => get_json_parser(),
         };
-        let ok = jp.parse_log_message(s.as_bytes(), &[], "").is_ok();
+        let ok = jp.parse_log_message(s, &[], "").is_ok();
         if ok {
             self.fields.extend_from_slice(jp.fields());
         }
@@ -160,7 +160,7 @@ impl SyslogParser {
     }
 
     /// Parses syslog message from s into p.fields.
-    pub fn parse(&mut self, s: &str) {
+    pub fn parse(&mut self, s: &[u8]) {
         self.reset_fields();
 
         if s.is_empty() {
@@ -168,14 +168,14 @@ impl SyslogParser {
             return;
         }
 
-        if !s.starts_with('<') {
+        if s[0] != b'<' {
             self.parse_no_header(s);
             return;
         }
 
         // parse priority
         let s = &s[1..];
-        let n = match s.find('>') {
+        let n = match index_byte(s, b'>') {
             Some(n) => n,
             None => {
                 // Cannot parse priority
@@ -186,7 +186,7 @@ impl SyslogParser {
         let s = &s[n + 1..];
 
         self.add_field("priority", priority_str);
-        let priority = match try_parse_uint64(priority_str) {
+        let priority = match try_parse_uint64_bytes(priority_str) {
             Some(priority) => priority,
             None => {
                 // Cannot parse priority
@@ -213,18 +213,18 @@ impl SyslogParser {
         self.parse_no_header(s);
     }
 
-    fn parse_no_header(&mut self, s: &str) {
+    fn parse_no_header(&mut self, s: &[u8]) {
         if s.is_empty() {
             return;
         }
-        if let Some(tail) = s.strip_prefix("1 ") {
+        if let Some(tail) = s.strip_prefix(b"1 ".as_slice()) {
             self.parse_rfc5424(tail);
         } else {
             self.parse_rfc3164(s);
         }
     }
 
-    fn parse_rfc5424(&mut self, s: &str) {
+    fn parse_rfc5424(&mut self, s: &[u8]) {
         // See https://datatracker.ietf.org/doc/html/rfc5424
 
         self.add_field("format", "rfc5424");
@@ -236,7 +236,7 @@ impl SyslogParser {
         let mut s = s;
 
         // Parse timestamp
-        let n = match s.find(' ') {
+        let n = match index_byte(s, b' ') {
             Some(n) => n,
             None => {
                 self.add_field("timestamp", s);
@@ -247,7 +247,7 @@ impl SyslogParser {
         s = &s[n + 1..];
 
         // Parse hostname
-        let n = match s.find(' ') {
+        let n = match index_byte(s, b' ') {
             Some(n) => n,
             None => {
                 self.add_field("hostname", s);
@@ -258,7 +258,7 @@ impl SyslogParser {
         s = &s[n + 1..];
 
         // Parse app-name
-        let n = match s.find(' ') {
+        let n = match index_byte(s, b' ') {
             Some(n) => n,
             None => {
                 self.add_field("app_name", s);
@@ -269,7 +269,7 @@ impl SyslogParser {
         s = &s[n + 1..];
 
         // Parse procid
-        let n = match s.find(' ') {
+        let n = match index_byte(s, b' ') {
             Some(n) => n,
             None => {
                 self.add_field("proc_id", s);
@@ -280,7 +280,7 @@ impl SyslogParser {
         s = &s[n + 1..];
 
         // Parse msgID
-        let n = match s.find(' ') {
+        let n = match index_byte(s, b' ') {
             Some(n) => n,
             None => {
                 self.add_field("msg_id", s);
@@ -301,11 +301,11 @@ impl SyslogParser {
         self.add_message_field(s);
     }
 
-    fn parse_rfc5424_sd<'a>(&mut self, s: &'a str) -> (&'a str, bool) {
-        if let Some(tail) = s.strip_prefix("- ") {
+    fn parse_rfc5424_sd<'a>(&mut self, s: &'a [u8]) -> (&'a [u8], bool) {
+        if let Some(tail) = s.strip_prefix(b"- ".as_slice()) {
             return (tail, true);
         }
-        if s.starts_with("@cee:") {
+        if s.starts_with(b"@cee:") {
             return (s, true);
         }
 
@@ -316,54 +316,56 @@ impl SyslogParser {
                 return (tail, false);
             }
             s = tail;
-            if let Some(tail) = s.strip_prefix(' ') {
+            if let Some(tail) = s.strip_prefix(b" ".as_slice()) {
                 return (tail, true);
             }
         }
     }
 
-    fn parse_rfc5424_sd_line<'a>(&mut self, s: &'a str) -> (&'a str, bool) {
-        if s.is_empty() || !s.starts_with('[') {
+    fn parse_rfc5424_sd_line<'a>(&mut self, s: &'a [u8]) -> (&'a [u8], bool) {
+        if s.is_empty() || s[0] != b'[' {
             return (s, false);
         }
         let s = &s[1..];
 
-        let n = match s.find([' ', ']']) {
+        let n = match s.iter().position(|&b| b == b' ' || b == b']') {
             Some(n) => n,
             None => return (s, false),
         };
         let mut sd_id = &s[..n];
         let s = &s[n..];
 
-        if let Some(n) = sd_id.find('=') {
+        if let Some(n) = index_byte(sd_id, b'=') {
             // Special case when sdID contains `key=value`
-            self.add_field(&sd_id[..n], &sd_id[n + 1..]);
-            sd_id = "";
+            // PORT NOTE: the key becomes a field NAME; Go allows raw bytes in
+            // names, but names stay String in this port — lossy-decoded here
+            // (the VALUE keeps the raw bytes).
+            self.add_field(&String::from_utf8_lossy(&sd_id[..n]), &sd_id[n + 1..]);
+            sd_id = b"";
         }
 
         // Parse structured data
-        let b = s.as_bytes();
         let mut i = 0;
-        while i < b.len() && (b[i] != b']' || (i > 0 && b[i - 1] == b'\\')) {
+        while i < s.len() && (s[i] != b']' || (i > 0 && s[i - 1] == b'\\')) {
             // skip whitespace
-            if b[i] == b' ' {
+            if s[i] == b' ' {
                 i += 1;
                 continue;
             }
 
             // Parse name
-            let n = match s[i..].find('=') {
+            let n = match index_byte(&s[i..], b'=') {
                 Some(n) => n,
                 None => return (s, false),
             };
             i += n + 1;
 
             // Parse value
-            if b[i] == b'"' {
+            if s[i] == b'"' {
                 let mut valid = false;
                 i += 1;
-                while i < b.len() {
-                    if b[i] == b'"' && b[i - 1] != b'\\' {
+                while i < s.len() {
+                    if s[i] == b'"' && s[i - 1] != b'\\' {
                         valid = true;
                         break;
                     }
@@ -374,7 +376,7 @@ impl SyslogParser {
                 }
                 i += 1;
             } else {
-                let n = match s[i..].find([' ', ']']) {
+                let n = match s[i..].iter().position(|&b| b == b' ' || b == b']') {
                     Some(n) => n,
                     None => return (s, false),
                 };
@@ -387,15 +389,25 @@ impl SyslogParser {
 
         // PORT NOTE: Go unescapes `\]` (allowed in rfc5424, but breaks strings
         // unquoting) with a cached strings.Replacer; str::replace is used here.
-        let sd_value = s[..i].trim().replace("\\]", "]");
+        //
+        // PORT NOTE: the SD block is handed to LogfmtParser, whose unquoting
+        // helpers (shared with pattern/stream_tags/storage_search) operate on
+        // &str; the SD block gets a checked &str view with a lossy fallback
+        // for the SD block ONLY (SD is rarely non-ASCII). This is the single
+        // residual non-byte-exact path in the syslog parse chain.
+        let sd_block = String::from_utf8_lossy(&s[..i]);
+        let sd_value = sd_block.trim().replace("\\]", "]");
         self.sd_parser.parse(&sd_value);
         if self.sd_parser.fields.is_empty() {
             // Special case when structured data doesn't contain any fields
             if !sd_id.is_empty() {
-                self.add_field(sd_id, "");
+                self.add_field(&String::from_utf8_lossy(sd_id), "");
             }
         } else {
             let sd_fields = std::mem::take(&mut self.sd_parser.fields);
+            // PORT NOTE: sd_id becomes part of field NAMES (String in this
+            // port) — lossy-decoded; SD param values flow through sd_parser.
+            let sd_id = String::from_utf8_lossy(sd_id);
             for f in &sd_fields {
                 if sd_id.is_empty() {
                     self.add_field(&f.name, &f.value);
@@ -411,7 +423,7 @@ impl SyslogParser {
         (&s[i + 1..], true)
     }
 
-    fn parse_rfc3164(&mut self, s: &str) {
+    fn parse_rfc3164(&mut self, s: &[u8]) {
         // See https://datatracker.ietf.org/doc/html/rfc3164
 
         self.add_field("format", "rfc3164");
@@ -424,17 +436,17 @@ impl SyslogParser {
         }
 
         let mut s = s;
-        if s.as_bytes()[10] != b'T' {
+        if s[10] != b'T' {
             // len("2006-01-02") == 10
             // Parse RFC3164 timestamp.
-            if !s.is_char_boundary(n) || !self.try_parse_timestamp_rfc3164(&s[..n]) {
+            if !self.try_parse_timestamp_rfc3164(&s[..n]) {
                 self.add_message_field(s);
                 return;
             }
         } else {
             // Parse RFC3339 timestamp.
             // See https://github.com/VictoriaMetrics/VictoriaLogs/issues/303
-            n = match s.find(' ') {
+            n = match index_byte(s, b' ') {
                 Some(n) => n,
                 None => {
                     self.add_message_field(s);
@@ -448,7 +460,7 @@ impl SyslogParser {
         }
         s = &s[n..];
 
-        if s.is_empty() || !s.starts_with(' ') {
+        if s.is_empty() || s[0] != b' ' {
             // Missing space after the time field
             if !s.is_empty() {
                 self.add_message_field(s);
@@ -458,13 +470,13 @@ impl SyslogParser {
         s = &s[1..];
 
         // Parse hostname
-        match s.find(' ') {
+        match index_byte(s, b' ') {
             None => {
                 // If there is no space, the remainder could be either hostname or tag.
                 // Detect common tag patterns (contains ':' or '['). If detected, skip hostname assignment
                 // and let the tag parsing below handle it.
                 let candidate = s;
-                if candidate.contains([':', '[']) {
+                if candidate.iter().any(|&b| b == b':' || b == b'[') {
                     // no hostname; continue without consuming s
                 } else {
                     self.add_field("hostname", s);
@@ -473,7 +485,7 @@ impl SyslogParser {
             }
             Some(n) => {
                 let candidate = &s[..n];
-                if candidate.contains([':', '[']) {
+                if candidate.iter().any(|&b| b == b':' || b == b'[') {
                     // The token after timestamp looks like a tag (e.g. "app[pid]:").
                     // Treat as missing hostname and do not consume it; proceed to tag parsing with s unchanged.
                 } else {
@@ -484,7 +496,7 @@ impl SyslogParser {
         }
 
         // Parse tag (aka app_name)
-        let n = match s.find(['[', ':', ' ']) {
+        let n = match s.iter().position(|&b| b == b'[' || b == b':' || b == b' ') {
             Some(n) => n,
             None => {
                 self.add_field("app_name", s);
@@ -499,9 +511,9 @@ impl SyslogParser {
         if s.is_empty() {
             return;
         }
-        if s.starts_with('[') {
+        if s[0] == b'[' {
             s = &s[1..];
-            let n = match s.find(']') {
+            let n = match index_byte(s, b']') {
                 Some(n) => n,
                 None => return,
             };
@@ -510,11 +522,11 @@ impl SyslogParser {
         }
 
         // Skip optional ': ' in front of message
-        s = s.strip_prefix(':').unwrap_or(s);
-        s = s.strip_prefix(' ').unwrap_or(s);
+        s = s.strip_prefix(b":".as_slice()).unwrap_or(s);
+        s = s.strip_prefix(b" ".as_slice()).unwrap_or(s);
 
         if !s.is_empty() {
-            if app_name == "CEF" {
+            if app_name == b"CEF" {
                 let fields_len = self.fields.len();
                 if self.parse_cef_message(s) {
                     return;
@@ -526,7 +538,7 @@ impl SyslogParser {
     }
 
     /// Parses CEF message. See <https://www.microfocus.com/documentation/arcsight/arcsight-smartconnectors-8.3/cef-implementation-standard/Content/CEF/Chapter%201%20What%20is%20CEF.htm>
-    fn parse_cef_message(&mut self, s: &str) -> bool {
+    fn parse_cef_message(&mut self, s: &[u8]) -> bool {
         // PORT NOTE: Go unrolls the seven header fields; the loop below adds
         // them in the same order with identical semantics.
         let mut s = s;
@@ -543,7 +555,7 @@ impl SyslogParser {
                 Some(n) => n,
                 None => return false,
             };
-            self.add_field(name, unescape_cef_value(&s[..n]).as_bytes());
+            self.add_field(name, unescape_cef_value(&s[..n]));
             s = &s[n + 1..];
         }
 
@@ -551,7 +563,7 @@ impl SyslogParser {
         self.parse_cef_extension(s)
     }
 
-    fn parse_cef_extension(&mut self, s: &str) -> bool {
+    fn parse_cef_extension(&mut self, s: &[u8]) -> bool {
         if s.is_empty() {
             return true;
         }
@@ -562,7 +574,13 @@ impl SyslogParser {
                 Some(n) => n,
                 None => return false,
             };
-            let key_name = format!("cef.extension.{}", unescape_cef_value(&s[..n]));
+            // PORT NOTE: CEF extension keys become field NAMES; Go allows raw
+            // bytes in names, but names stay String in this port —
+            // lossy-decoded (extension VALUES keep the raw bytes).
+            let key_name = format!(
+                "cef.extension.{}",
+                String::from_utf8_lossy(&unescape_cef_value(&s[..n]))
+            );
             s = &s[n + 1..];
 
             // Parse key value
@@ -574,11 +592,11 @@ impl SyslogParser {
                 }
             };
 
-            let n = match s[..n].rfind(' ') {
+            let n = match s[..n].iter().rposition(|&b| b == b' ') {
                 Some(n) => n,
                 None => return false,
             };
-            self.add_field(&key_name, unescape_cef_value(&s[..n]).as_bytes());
+            self.add_field(&key_name, unescape_cef_value(&s[..n]));
             s = &s[n + 1..];
         }
     }
@@ -594,7 +612,7 @@ impl SyslogParser {
         }
     }
 
-    fn try_parse_timestamp_rfc3164(&mut self, s: &str) -> bool {
+    fn try_parse_timestamp_rfc3164(&mut self, s: &[u8]) -> bool {
         let (month, day, hour, minute, second) = match parse_time_stamp(s) {
             Some(parts) => parts,
             None => return false,
@@ -622,7 +640,12 @@ impl SyslogParser {
         true
     }
 
-    fn try_parse_timestamp_rfc3339_nano(&mut self, s: &str) -> bool {
+    fn try_parse_timestamp_rfc3339_nano(&mut self, s: &[u8]) -> bool {
+        // A valid RFC 3339 timestamp is ASCII: invalid UTF-8 fails the parse
+        // exactly like Go's parse fails on non-ASCII bytes in a timestamp.
+        let Ok(s) = std::str::from_utf8(s) else {
+            return false;
+        };
         let nsecs = match crate::values_encoder::try_parse_timestamp_rfc3339_nano(s) {
             Some(nsecs) => nsecs,
             None => return false,
@@ -690,8 +713,7 @@ const TIME_STAMP_LEN: usize = 15;
 /// PORT NOTE: replaces Go's time.Parse(time.Stamp, s): month names are matched
 /// case-insensitively and the parsed components are range-checked the same way
 /// (the day is validated against year 0, which is a leap year, like in Go).
-fn parse_time_stamp(s: &str) -> Option<(i64, i64, i64, i64, i64)> {
-    let b = s.as_bytes();
+fn parse_time_stamp(b: &[u8]) -> Option<(i64, i64, i64, i64, i64)> {
     if b.len() != TIME_STAMP_LEN {
         return None;
     }
@@ -768,8 +790,12 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn next_unescaped_char(s: &str, c: u8) -> Option<usize> {
-    let b = s.as_bytes();
+/// Go's `strings.IndexByte`.
+fn index_byte(s: &[u8], c: u8) -> Option<usize> {
+    s.iter().position(|&b| b == c)
+}
+
+fn next_unescaped_char(b: &[u8], c: u8) -> Option<usize> {
     let mut offset = 0;
     loop {
         let n = b[offset..].iter().position(|&x| x == c)?;
@@ -782,15 +808,14 @@ fn next_unescaped_char(s: &str, c: u8) -> Option<usize> {
     }
 }
 
-fn unescape_cef_value(s: &str) -> Cow<'_, str> {
-    let bytes = s.as_bytes();
-    let mut n = match bytes.iter().position(|&c| c == b'\\') {
+fn unescape_cef_value(s: &[u8]) -> Cow<'_, [u8]> {
+    let mut n = match s.iter().position(|&c| c == b'\\') {
         Some(n) => n,
         None => return Cow::Borrowed(s),
     };
 
     let mut b: Vec<u8> = Vec::with_capacity(s.len());
-    let mut rest = bytes;
+    let mut rest = s;
     loop {
         b.extend_from_slice(&rest[..n]);
         n += 1;
@@ -813,7 +838,7 @@ fn unescape_cef_value(s: &str) -> Cow<'_, str> {
             }
         };
     }
-    Cow::Owned(String::from_utf8(b).expect("BUG: unescaped CEF value must remain valid UTF-8"))
+    Cow::Owned(b)
 }
 
 fn prev_backslashes_count(b: &[u8], offset: usize) -> usize {
@@ -843,7 +868,7 @@ mod tests {
             // 2021 is in the past, so the "adjust to previous year" branch does
             // not fire (fasttime::unix_timestamp() is later).
             let mut p = get_syslog_parser_with_location(2021, Arc::clone(&loc));
-            p.parse(line);
+            p.parse(line.as_bytes());
             let ts = p
                 .fields
                 .iter()
@@ -873,7 +898,7 @@ mod tests {
             const CURRENT_YEAR: i64 = 2024;
             let mut p = get_syslog_parser(CURRENT_YEAR, 0);
 
-            p.parse(s);
+            p.parse(s.as_bytes());
             let mut result = Vec::new();
             marshal_fields_to_logfmt(&mut result, &p.fields);
             assert_eq!(
@@ -1174,6 +1199,37 @@ mod tests {
         );
     }
 
+    /// PORT-only test (no Go counterpart): Go strings are arbitrary bytes, so
+    /// invalid UTF-8 in syslog message content is preserved verbatim. The
+    /// byte-native parse chain must do the same instead of U+FFFD-replacing.
+    #[test]
+    fn test_syslog_parser_preserves_invalid_utf8_in_message() {
+        fn message_of(line: &[u8]) -> Vec<u8> {
+            let mut p = get_syslog_parser(2024, 0);
+            p.parse(line);
+            let msg = p
+                .fields
+                .iter()
+                .find(|f| f.name == "message")
+                .map(|f| f.value.clone())
+                .expect("missing message field");
+            put_syslog_parser(p);
+            msg
+        }
+
+        // RFC 3164: the raw 0xFF byte must survive into the message value.
+        assert_eq!(
+            message_of(b"<13>Jan  2 15:04:05 host app: msg \xff raw"),
+            b"msg \xff raw".to_vec()
+        );
+
+        // RFC 5424 variant.
+        assert_eq!(
+            message_of(b"<165>1 2023-06-03T17:42:32.123456789Z host app 123 ID47 - msg \xff raw"),
+            b"msg \xff raw".to_vec()
+        );
+    }
+
     /// PORT-only test (no Go counterpart): TestSyslogParser passes
     /// *time.Location but only ever uses time.UTC. This exercises the
     /// fixed-offset timezone parameter, the previous-year adjustment for
@@ -1184,7 +1240,7 @@ mod tests {
         fn f(current_year: i64, timezone_offset_secs: i64, s: &str, expected: &str) {
             let mut p = get_syslog_parser(current_year, timezone_offset_secs);
 
-            p.parse(s);
+            p.parse(s.as_bytes());
             let mut result = Vec::new();
             marshal_fields_to_logfmt(&mut result, &p.fields);
             assert_eq!(

@@ -1236,13 +1236,8 @@ fn process_uncompressed_stream<P: SyslogLogMessageProcessor>(
             Some(loc) => (0, Some(Arc::clone(loc))),
             None => (GLOBAL_TIMEZONE_OFFSET_SECS.load(Ordering::SeqCst), None),
         };
-        // PORT NOTE: the esl-logstorage syslog parser API takes &str, so a
-        // syslog line with invalid UTF-8 is U+FFFD-replaced here (Go parses
-        // the raw bytes). Closing this requires a bytes-based syslog parser
-        // in esl-logstorage.
-        let line = String::from_utf8_lossy(&slr.line);
         process_line(
-            &line,
+            &slr.line,
             current_year,
             timezone_offset_secs,
             timezone,
