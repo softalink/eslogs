@@ -746,8 +746,7 @@ impl IndexSearch {
                 }
             };
             if !has_prev_match || tag_value != prev_matching_tag_value {
-                let value_str = std::str::from_utf8(&tag_value).expect("FATAL: non-utf8 tag value");
-                if !re.match_string(value_str) {
+                if !re.match_bytes(&tag_value) {
                     continue;
                 }
                 prev_matching_tag_value.clear();

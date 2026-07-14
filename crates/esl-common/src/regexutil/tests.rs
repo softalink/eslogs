@@ -699,3 +699,90 @@ fn test_simplify_regex_unicode() {
     // as Go's SimplifyRegex output.
     f("(?i)[\u{1F80}]", "", "(?i:\u{1F80})");
 }
+
+// ---------------------------------------------------------------------------
+// Raw-byte matching (regex::bytes migration).
+// ---------------------------------------------------------------------------
+
+/// Behavior probe pinning `regex::bytes` semantics on invalid-UTF-8 haystacks
+/// against Go's `regexp` (which decodes each invalid byte as U+FFFD via
+/// `utf8.DecodeRune`). Documented residual: rune-oriented constructs (`.`,
+/// negated classes, a literal `\x{FFFD}`) do NOT match invalid bytes here,
+/// while Go matches them as U+FFFD. Literal and positive-class matching is
+/// byte-exact and identical to Go. See the module-level PORT NOTE.
+#[test]
+fn test_bytes_regex_invalid_utf8_probe() {
+    fn m(pat: &str, hay: &[u8]) -> bool {
+        regex::bytes::Regex::new(pat).unwrap().is_match(hay)
+    }
+
+    // Byte-exact literal matching through surrounding invalid bytes:
+    // identical to Go.
+    assert!(m("abc", b"\xffabc\xff"));
+    assert!(m("^a", b"a\xff"));
+    assert!(m("c$", b"\xffc"));
+    // Positive ASCII classes skip invalid bytes exactly like Go.
+    assert!(m("[a-c]+", b"a\xffb"));
+    // A real (well-formed) U+FFFD in the haystack matches `.` like Go.
+    assert!(m("a.c", "a\u{FFFD}c".as_bytes()));
+
+    // Residual divergences (Go: all of these match, decoding \xff/\x80 as
+    // U+FFFD; regex::bytes Unicode mode: rune-oriented constructs only match
+    // well-formed UTF-8):
+    assert!(!m("a.c", b"a\xffc")); // Go: true
+    assert!(!m("(?s)a.c", b"a\xffc")); // Go: true
+    assert!(!m("a[^b]c", b"a\xffc")); // Go: true
+    assert!(!m("a\u{FFFD}c", b"a\xffc")); // Go: true
+    assert!(!m("a.c", b"a\x80c")); // Go: true
+    assert!(!m("(?s)^a.*c$", b"a\xff\xffc")); // Go: true
+}
+
+#[test]
+fn test_regex_match_bytes() {
+    fn f(expr: &str, s: &[u8], result_expected: bool) {
+        let r = Regex::new(expr).unwrap_or_else(|err| panic!("cannot parse {expr:?}: {err}"));
+        let result = r.match_bytes(s);
+        assert_eq!(
+            result, result_expected,
+            "unexpected result when matching {s:?} against regex={expr:?}; got {result}; want {result_expected}"
+        );
+    }
+
+    // match_bytes agrees with match_string on valid UTF-8.
+    f("foo.*", b"afoo", true);
+    f("foo.*", b"abc", false);
+
+    // Raw (invalid-UTF-8) bytes around/inside values; literal matching is
+    // byte-exact, like Go.
+    f("foo", b"\xfffoo\xfe", true); // prefix-only fast path (contains)
+    f("bar|baz", b"\xff baz \xfe", true); // or-values fast path
+    f("bar|baz", b"\xff bazz \xfe", true); // contains semantics
+    f("bar|qux", b"\xff baz \xfe", false);
+    f("foo.+", b"pre foo\xff", true); // prefix + ".+" fast path over a raw byte
+    f(".*text.*", b"\xfftext\xff", true); // substr fast path
+    f("x=[0-9]+", b"\xff x=123;\xfe", true); // slow path (suffix_re) on raw bytes
+    f("x=[0-9]+", b"\xff x=;\xfe", false);
+}
+
+#[test]
+fn test_prom_regex_match_bytes() {
+    fn f(expr: &str, s: &[u8], result_expected: bool) {
+        let pr = PromRegex::new(expr).expect("unexpected error");
+        let result = pr.match_bytes(s);
+        assert_eq!(
+            result, result_expected,
+            "unexpected result when matching {s:?} against {expr:?}; got {result}; want {result_expected}"
+        );
+    }
+
+    // Anchored semantics on raw bytes.
+    f("foo", b"foo", true);
+    f("foo", b"foo\xff", false); // trailing raw byte breaks the exact match
+    f("foo.*", b"foo\xff", true); // "prefix.*" fast path admits raw bytes
+    f("foo.+", b"foo\xff", true);
+    f("foo|bar", b"bar", true);
+    f("foo|bar", b"bar\xff", false);
+    f(".*text.*", b"\xfftext\xff", true); // ".*substr.*" fast path
+    f(".+text.+", b"\xfftext\xff", true);
+    f(".+text.+", b"text\xff", false);
+}

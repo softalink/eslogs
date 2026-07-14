@@ -22,6 +22,19 @@
 //!   the matcher (`ascii_word_boundaries`), matching Go's ASCII-only word
 //!   boundaries.
 //! - Lookarounds and backreferences are unsupported in both Go and Rust.
+//!
+//! PORT NOTE (byte matching / invalid UTF-8 haystacks): matching is done with
+//! [`regex::bytes::Regex`] on raw value bytes, mirroring Go's `regexp` which
+//! matches `[]byte`/`string` payloads byte-wise. For valid-UTF-8 haystacks the
+//! two engines agree exactly. For haystacks containing invalid UTF-8 there is
+//! one narrow residual: Go decodes each invalid byte as U+FFFD
+//! (`utf8.DecodeRune`), so rune-oriented constructs (`.`, negated classes,
+//! `\p{...}`, a literal `\x{FFFD}`) match such bytes; `regex::bytes` in its
+//! default Unicode mode only lets rune-oriented constructs match well-formed
+//! UTF-8 sequences, so they simply fail to match invalid bytes. Literal and
+//! positive-class matching is byte-exact and identical, and payload bytes are
+//! never lossily transcoded. See `tests::test_bytes_regex_invalid_utf8_probe`
+//! for the pinned behavior.
 
 mod goclass;
 mod gofold;
@@ -475,7 +488,9 @@ pub struct PromRegex {
     /// PORT NOTE: Go wraps this in bytesutil.FastStringMatcher (a cache of
     /// match results); `lib/bytesutil` is not ported yet, so the anchored
     /// regexp is matched directly. Performance-only divergence.
-    re_suffix: regex::Regex,
+    /// Byte-matching (`regex::bytes`) like Go's regexp; see the module-level
+    /// PORT NOTE on invalid-UTF-8 haystacks.
+    re_suffix: regex::bytes::Regex,
 }
 
 impl PromRegex {
@@ -504,8 +519,8 @@ impl PromRegex {
         // caller instead of a panic (the query still fails at the same
         // user-visible point, with a different message).
         let suffix_expr = format!("^(?:{suffix})$");
-        let re_suffix =
-            regex::Regex::new(&ascii_word_boundaries(&suffix_expr)).map_err(|e| e.to_string())?;
+        let re_suffix = regex::bytes::Regex::new(&ascii_word_boundaries(&suffix_expr))
+            .map_err(|e| e.to_string())?;
         Ok(PromRegex {
             expr_str: expr.to_string(),
             prefix,
@@ -524,13 +539,22 @@ impl PromRegex {
     /// The regex is automatically anchored to the beginning and to the end
     /// of the matching string with '^' and '$'.
     pub fn match_string(&self, s: &str) -> bool {
+        self.match_bytes(s.as_bytes())
+    }
+
+    /// Returns true if the raw bytes `s` match the regex (Go matches
+    /// `string`/`[]byte` payloads byte-wise; this is the primary matcher).
+    ///
+    /// The regex is automatically anchored to the beginning and to the end
+    /// of the matching string with '^' and '$'.
+    pub fn match_bytes(&self, s: &[u8]) -> bool {
         if self.is_only_prefix {
-            return s == self.prefix;
+            return s == self.prefix.as_bytes();
         }
 
         let mut s = s;
         if !self.prefix.is_empty() {
-            if !s.starts_with(self.prefix.as_str()) {
+            if !s.starts_with(self.prefix.as_bytes()) {
                 // Fast path - s has another prefix than pr.
                 return false;
             }
@@ -547,11 +571,11 @@ impl PromRegex {
         }
         if !self.substr_dot_star.is_empty() {
             // Fast path - pr contains ".*someText.*"
-            return s.contains(&self.substr_dot_star);
+            return find_bytes(s, 0, self.substr_dot_star.as_bytes()).is_some();
         }
         if !self.substr_dot_plus.is_empty() {
             // Fast path - pr contains ".+someText.+"
-            return match s.find(&self.substr_dot_plus) {
+            return match find_bytes(s, 0, self.substr_dot_plus.as_bytes()) {
                 Some(n) => n > 0 && n + self.substr_dot_plus.len() < s.len(),
                 None => false,
             };
@@ -559,7 +583,7 @@ impl PromRegex {
 
         if !self.or_values.is_empty() {
             // Fast path - pr contains only alternate strings such as 'foo|bar|baz'
-            return self.or_values.iter().any(|v| v == s);
+            return self.or_values.iter().any(|v| v.as_bytes() == s);
         }
 
         // Fall back to slow path by matching the original regexp.
@@ -609,7 +633,10 @@ pub struct Regex {
     or_values: Vec<String>,
 
     /// The regexp for suffix.
-    suffix_re: regex::Regex,
+    ///
+    /// PORT NOTE: byte-matching (`regex::bytes`) like Go's regexp; see the
+    /// module-level PORT NOTE on invalid-UTF-8 haystacks.
+    suffix_re: regex::bytes::Regex,
 }
 
 impl Regex {
@@ -643,7 +670,7 @@ impl Regex {
         // the regex crate — so the failure is reported as an error to the
         // caller instead of a panic (the query still fails at the same
         // user-visible point, with a different message).
-        let suffix_re = regex::Regex::new(&ascii_word_boundaries(&suffix_anchored))
+        let suffix_re = regex::bytes::Regex::new(&ascii_word_boundaries(&suffix_anchored))
             .map_err(|e| e.to_string())?;
 
         Ok(Regex {
@@ -661,17 +688,23 @@ impl Regex {
 
     /// Returns true if `s` matches the regex.
     pub fn match_string(&self, s: &str) -> bool {
+        self.match_bytes(s.as_bytes())
+    }
+
+    /// Returns true if the raw bytes `s` match the regex (Go matches
+    /// `string`/`[]byte` payloads byte-wise; this is the primary matcher).
+    pub fn match_bytes(&self, s: &[u8]) -> bool {
         if self.is_only_prefix {
             if self.prefix.is_empty() {
                 return true;
             }
-            return s.contains(&self.prefix);
+            return find_bytes(s, 0, self.prefix.as_bytes()).is_some();
         }
 
         if self.prefix.is_empty() {
-            return self.match_string_no_prefix(s);
+            return self.match_bytes_no_prefix(s);
         }
-        self.match_string_with_prefix(s)
+        self.match_bytes_with_prefix(s)
     }
 
     /// Returns literals for the regex (Go `GetLiterals`).
@@ -698,7 +731,7 @@ impl Regex {
         a
     }
 
-    fn match_string_no_prefix(&self, s: &str) -> bool {
+    fn match_bytes_no_prefix(&self, s: &[u8]) -> bool {
         if self.is_suffix_dot_star {
             return true;
         }
@@ -707,11 +740,11 @@ impl Regex {
         }
         if !self.substr_dot_star.is_empty() {
             // Fast path - r contains ".*someText.*"
-            return s.contains(&self.substr_dot_star);
+            return find_bytes(s, 0, self.substr_dot_star.as_bytes()).is_some();
         }
         if !self.substr_dot_plus.is_empty() {
             // Fast path - r contains ".+someText.+"
-            return match s.find(&self.substr_dot_plus) {
+            return match find_bytes(s, 0, self.substr_dot_plus.as_bytes()) {
                 Some(n) => n > 0 && n + self.substr_dot_plus.len() < s.len(),
                 None => false,
             };
@@ -723,19 +756,16 @@ impl Regex {
         }
 
         // Fast path - compare s to r.orValues
-        self.or_values.iter().any(|v| s.contains(v.as_str()))
+        self.or_values
+            .iter()
+            .any(|v| find_bytes(s, 0, v.as_bytes()).is_some())
     }
 
-    fn match_string_with_prefix(&self, s: &str) -> bool {
-        // PORT NOTE: Go retries the prefix search from the next byte
-        // (`s[n+1:]`), which can point into the middle of a UTF-8 sequence;
-        // this port keeps byte-level search on the raw bytes. Any prefix
-        // match found this way necessarily starts at a char boundary of `s`
-        // (a valid UTF-8 needle cannot match at a continuation byte), so the
-        // `&s[..]` reslices below are always valid.
-        let sb = s.as_bytes();
+    fn match_bytes_with_prefix(&self, s: &[u8]) -> bool {
+        // Go retries the prefix search from the next byte (`s[n+1:]`); the
+        // byte-level search below is the same loop.
         let pb = self.prefix.as_bytes();
-        let Some(n) = find_bytes(sb, 0, pb) else {
+        let Some(n) = find_bytes(s, 0, pb) else {
             // Fast path - s doesn't contain the needed prefix
             return false;
         };
@@ -752,11 +782,11 @@ impl Regex {
             }
             if !self.substr_dot_star.is_empty() {
                 // Fast path - r contains ".*someText.*"
-                return s.contains(&self.substr_dot_star);
+                return find_bytes(s, 0, self.substr_dot_star.as_bytes()).is_some();
             }
             if !self.substr_dot_plus.is_empty() {
                 // Fast path - r contains ".+someText.+"
-                return match s.find(&self.substr_dot_plus) {
+                return match find_bytes(s, 0, self.substr_dot_plus.as_bytes()) {
                     Some(n) => n > 0 && n + self.substr_dot_plus.len() < s.len(),
                     None => false,
                 };
@@ -773,14 +803,14 @@ impl Regex {
             } else {
                 // Fast path - compare s to r.orValues
                 for v in &self.or_values {
-                    if stail.starts_with(v.as_str()) {
+                    if stail.starts_with(v.as_bytes()) {
                         return true;
                     }
                 }
             }
 
             // Mismatch. Try again starting from the next char.
-            let Some(n) = find_bytes(sb, next_pos, pb) else {
+            let Some(n) = find_bytes(s, next_pos, pb) else {
                 // Fast path - s doesn't contain the needed prefix
                 return false;
             };

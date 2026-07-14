@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use esl_common::atomicutil::Slice;
-use regex::Regex;
+use regex::bytes::Regex;
 
 use crate::bitmap::Bitmap;
 use crate::block_result::{BlockResult, ColRef, ResultColumn, append_result_column_with_name};
@@ -206,14 +206,17 @@ struct PipeExtractRegexpProcessorShard {
 
 impl PipeExtractRegexpProcessor {
     /// Port of Go's `pipeExtractRegexpProcessorShard.apply`.
-    fn apply(&self, v: &str, fields: &mut Vec<Vec<u8>>) {
+    ///
+    /// Matches raw value bytes; captured groups carry the matched bytes
+    /// verbatim (regex::bytes).
+    fn apply(&self, v: &[u8], fields: &mut Vec<Vec<u8>>) {
         let nfields = self.re_fields.len();
         fields.clear();
         fields.resize(nfields, Vec::new());
         if let Some(caps) = self.re.captures(v) {
             for (i, slot) in fields.iter_mut().enumerate() {
                 if let Some(m) = caps.get(i) {
-                    *slot = m.as_str().as_bytes().to_vec();
+                    *slot = m.as_bytes().to_vec();
                 }
             }
         }
@@ -256,14 +259,10 @@ impl PipeProcessor for PipeExtractRegexpProcessor {
         }
 
         let c = br.get_column_by_name(&self.from_field);
-        // PORT NOTE: regex-on-invalid-utf8 is a documented residual — the regex
-        // crate needs &str, so invalid UTF-8 source values are matched (and
-        // rewritten) via their lossy view.
-        let values: Vec<String> = br
-            .column_get_values(c)
-            .iter()
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .collect();
+        // Owned copy of the source values: `br` is mutably borrowed again
+        // below (Go's getValues aliases the block buffers instead). Raw value
+        // bytes are matched directly (regex::bytes) — never lossily decoded.
+        let values: Vec<Vec<u8>> = br.column_get_values(c).to_vec();
 
         result_columns.clear();
         for f in re_fields {
@@ -278,7 +277,7 @@ impl PipeProcessor for PipeExtractRegexpProcessor {
         result_values.resize(nfields, Vec::new());
 
         let mut need_updates = true;
-        let mut v_prev = String::new();
+        let mut v_prev: Vec<u8> = Vec::new();
         for (row_idx, v) in values.iter().enumerate() {
             if !self.has_iff || bm.is_set_bit(row_idx) {
                 if need_updates || &v_prev != v {
@@ -476,6 +475,29 @@ mod tests {
             build("foo=(?P<bar>.*) baz=(?P<xx>.*)", "x", false, false),
             &[&[("x", "a foo=cc baz=aa b"), ("bar", "abc")]],
             &[&[("x", "a foo=cc baz=aa b"), ("bar", "cc"), ("xx", "aa b")]],
+        );
+    }
+
+    // Raw (invalid-UTF-8) bytes in the source value: matching runs on the
+    // raw bytes (regex::bytes) — the capture next to the raw bytes is
+    // byte-exact and nothing is lossily transcoded (previously the source
+    // value was matched via a lossy &str view).
+    #[test]
+    fn test_pipe_extract_regexp_raw_bytes_source() {
+        use crate::rows::Field;
+
+        fn bf(name: &str, value: &[u8]) -> Field {
+            Field {
+                name: name.as_bytes().to_vec(),
+                value: value.to_vec(),
+            }
+        }
+
+        let pipe = build("k=(?P<v>[a-z]+);", "_msg", false, false);
+        run_pipe(
+            Arc::new(pipe),
+            &[vec![bf("_msg", b"\xffk=foo;\xfe")]],
+            &[vec![bf("_msg", b"\xffk=foo;\xfe"), bf("v", b"foo")]],
         );
     }
 

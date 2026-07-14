@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::pattern::{quoted_prefix, unquote_char};
+use crate::pattern::{quoted_prefix_len, unquote_char_bytes};
 use crate::tokenizer::{is_token_char, is_token_rune};
 
 pub(crate) struct PatternMatcher {
@@ -122,8 +122,14 @@ impl PatternMatcher {
     /// Returns true if s matches the given pm.
     ///
     /// PORT NOTE: named `matches` because `match` is a Rust keyword (Go:
-    /// `Match`).
+    /// `Match`). Thin convenience over [`Self::matches_bytes`].
     pub(crate) fn matches(&self, s: &str) -> bool {
+        self.matches_bytes(s.as_bytes())
+    }
+
+    /// Returns true if the raw bytes `s` match the given pm (Go's `Match`
+    /// takes a byte-wise `string`; this is the primary matcher).
+    pub(crate) fn matches_bytes(&self, s: &[u8]) -> bool {
         match self.pmo {
             PatternMatcherOption::Any => self.index_start_end(s, 0).is_some(),
             PatternMatcherOption::Full => self.index_end(s, 0) == Some(s.len()),
@@ -135,7 +141,7 @@ impl PatternMatcher {
                 }
                 // Optimization: verify that the string ends with the last separator.
                 let last_separator = &self.separators[self.separators.len() - 1];
-                if !s.ends_with(last_separator.as_str()) {
+                if !s.ends_with(last_separator.as_bytes()) {
                     return false;
                 }
 
@@ -158,8 +164,9 @@ impl PatternMatcher {
     }
 
     /// PORT NOTE: Go returns `(-1, -1)` on mismatch; the port returns `None`.
-    /// The same applies to the other index helpers below.
-    fn index_start_end(&self, s: &str, mut offset: usize) -> Option<(usize, usize)> {
+    /// The same applies to the other index helpers below. All operate on raw
+    /// value bytes (Go strings are arbitrary bytes).
+    fn index_start_end(&self, s: &[u8], mut offset: usize) -> Option<(usize, usize)> {
         loop {
             let start = self.index_start(s, offset)?;
             if let Some(end) = self.index_end(s, start) {
@@ -169,10 +176,10 @@ impl PatternMatcher {
         }
     }
 
-    fn index_start(&self, s: &str, offset: usize) -> Option<usize> {
+    fn index_start(&self, s: &[u8], offset: usize) -> Option<usize> {
         let first_sep = &self.separators[0];
         if !first_sep.is_empty() {
-            let n = index_of(&s.as_bytes()[offset..], first_sep.as_bytes())?;
+            let n = index_of(&s[offset..], first_sep.as_bytes())?;
             return Some(offset + n);
         }
 
@@ -182,17 +189,17 @@ impl PatternMatcher {
         }
 
         if placeholders[0] == PatternMatcherPlaceholder::Word {
-            return index_word_start(s.as_bytes(), offset);
+            return index_word_start(s, offset);
         }
-        index_num_start(s.as_bytes(), offset)
+        index_num_start(s, offset)
     }
 
-    fn index_end(&self, s: &str, mut offset: usize) -> Option<usize> {
+    fn index_end(&self, s: &[u8], mut offset: usize) -> Option<usize> {
         let placeholders = &self.placeholders;
 
         for (i, sep) in self.separators.iter().enumerate() {
             if !sep.is_empty() {
-                if !s.as_bytes()[offset..].starts_with(sep.as_bytes()) {
+                if !s[offset..].starts_with(sep.as_bytes()) {
                     return None;
                 }
                 offset += sep.len();
@@ -209,13 +216,13 @@ impl PatternMatcher {
 }
 
 impl PatternMatcherPlaceholder {
-    fn index_end(&self, s: &str, offset: usize) -> Option<usize> {
+    fn index_end(&self, s: &[u8], offset: usize) -> Option<usize> {
         match self {
-            PatternMatcherPlaceholder::Num => index_placeholder_num_end(s.as_bytes(), offset),
-            PatternMatcherPlaceholder::Uuid => index_placeholder_uuid_end(s.as_bytes(), offset),
-            PatternMatcherPlaceholder::Ip4 => index_placeholder_ip4_end(s.as_bytes(), offset),
-            PatternMatcherPlaceholder::Time => index_placeholder_time_end(s.as_bytes(), offset),
-            PatternMatcherPlaceholder::Date => index_placeholder_date_end(s.as_bytes(), offset),
+            PatternMatcherPlaceholder::Num => index_placeholder_num_end(s, offset),
+            PatternMatcherPlaceholder::Uuid => index_placeholder_uuid_end(s, offset),
+            PatternMatcherPlaceholder::Ip4 => index_placeholder_ip4_end(s, offset),
+            PatternMatcherPlaceholder::Time => index_placeholder_time_end(s, offset),
+            PatternMatcherPlaceholder::Date => index_placeholder_date_end(s, offset),
             PatternMatcherPlaceholder::DateTime => index_placeholder_date_time_end(s, offset),
             PatternMatcherPlaceholder::Word => index_placeholder_word_end(s, offset),
             PatternMatcherPlaceholder::Unknown => {
@@ -267,9 +274,8 @@ fn index_placeholder_date_end(b: &[u8], start: usize) -> Option<usize> {
     index_generic_placeholder_end(b, start, 3, b'/')
 }
 
-fn index_placeholder_date_time_end(s: &str, start: usize) -> Option<usize> {
+fn index_placeholder_date_time_end(b: &[u8], start: usize) -> Option<usize> {
     // <DATETIME> is '<DATE>T<TIME>' or '<DATE> <TIME>' with optional timezone
-    let b = s.as_bytes();
     let end = index_placeholder_date_end(b, start)?;
     if end >= b.len() || (b[end] != b'T' && b[end] != b' ') {
         return None;
@@ -294,14 +300,13 @@ fn index_placeholder_date_time_end(s: &str, start: usize) -> Option<usize> {
     Some(end)
 }
 
-fn index_placeholder_word_end(s: &str, start: usize) -> Option<usize> {
+fn index_placeholder_word_end(b: &[u8], start: usize) -> Option<usize> {
     // <W> is a word or a quoted string
-    let b = s.as_bytes();
     if start >= b.len() {
         return None;
     }
     if b[start] == b'"' || b[start] == b'\'' || b[start] == b'`' {
-        return index_quoted_string_end(s, start);
+        return index_quoted_string_end(b, start);
     }
     index_word_end(b, start)
 }
@@ -330,19 +335,17 @@ fn index_word_start(b: &[u8], offset: usize) -> Option<usize> {
     None
 }
 
-fn index_quoted_string_end(s: &str, start: usize) -> Option<usize> {
-    let b = s.as_bytes();
+fn index_quoted_string_end(b: &[u8], start: usize) -> Option<usize> {
     match b[start] {
         b'"' | b'`' => {
-            // start is at an ASCII quote byte, so it is a char boundary.
-            let qp = quoted_prefix(&s[start..]).ok()?;
-            Some(start + qp.len())
+            let qp_len = quoted_prefix_len(&b[start..]).ok()?;
+            Some(start + qp_len)
         }
         b'\'' => {
             let mut end = start + 1;
-            while !s.as_bytes()[end..].starts_with(b"'") {
-                let (_, _, tail) = unquote_char(&s[end..], b'\'').ok()?;
-                end = s.len() - tail.len();
+            while !b[end..].starts_with(b"'") {
+                let (_, _, tail) = unquote_char_bytes(&b[end..], b'\'').ok()?;
+                end = b.len() - tail.len();
             }
             Some(end + 1)
         }
@@ -574,6 +577,21 @@ mod tests {
             &["<foo><BAR> baz<X>y", ":<M>"],
             &[Num],
         );
+    }
+
+    #[test]
+    fn test_pattern_matcher_match_bytes_invalid_utf8() {
+        // The matcher is byte-native: literal separators are found by raw byte
+        // search, so they match around invalid-UTF-8 bytes verbatim (Go
+        // patternMatcher.Match operates on arbitrary bytes).
+        let pm = new_pattern_matcher("abc", PatternMatcherOption::Any);
+        assert!(pm.matches_bytes(b"\xffabc\xfe"));
+        assert!(pm.matches_bytes(b"\xff\xffabc"));
+        assert!(!pm.matches_bytes(b"\xffab\xffc")); // invalid byte splits "abc"
+        // Full mode requires the whole raw-byte value to equal the literal.
+        let pm_full = new_pattern_matcher("a-c", PatternMatcherOption::Full);
+        assert!(pm_full.matches_bytes(b"a-c"));
+        assert!(!pm_full.matches_bytes(b"a-c\xff"));
     }
 
     #[test]

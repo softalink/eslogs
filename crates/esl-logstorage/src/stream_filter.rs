@@ -342,8 +342,8 @@ impl StreamName {
         match tf.op.as_str() {
             "=" => v == tf.value.as_slice(),
             "!=" => v != tf.value.as_slice(),
-            "=~" => tf.regexp.as_ref().unwrap().match_string(tag_value_str(v)),
-            "!~" => !tf.regexp.as_ref().unwrap().match_string(tag_value_str(v)),
+            "=~" => tf.regexp.as_ref().unwrap().match_bytes(v),
+            "!~" => !tf.regexp.as_ref().unwrap().match_bytes(v),
             _ => {
                 esl_common::panicf!("BUG: unexpected tagFilter operation: {}", go_quote(&tf.op));
                 false
@@ -359,17 +359,6 @@ impl StreamName {
         }
         b""
     }
-}
-
-/// Checked `&str` view of a parsed stream tag value for regexp matching.
-///
-/// PORT NOTE (documented residual, same family as `re()`): the regex engine
-/// is `&str`-bound, so a tag value containing raw (invalid-UTF-8) bytes falls
-/// back to an empty match input; Go matches such values byte-wise, decoding
-/// each invalid byte as `RuneError`. Exact `=`/`!=` matching is byte-native
-/// and unaffected.
-fn tag_value_str(v: &[u8]) -> &str {
-    std::str::from_utf8(v).unwrap_or("")
 }
 
 // ---------------------------------------------------------------------------

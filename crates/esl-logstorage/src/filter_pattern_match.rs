@@ -53,18 +53,11 @@ pub(crate) fn new_filter_pattern_match(
     )
 }
 
-/// Matches the raw value bytes `v` against `pm`.
-///
-/// PORT NOTE: Go's `patternMatcher.Match` operates on arbitrary bytes, while
-/// the port's `PatternMatcher::matches` takes `&str`. Valid UTF-8 values match
-/// identically (the matcher is byte-oriented internally); invalid UTF-8 values
-/// fall back to matching the lossy-decoded string — a documented residual
-/// difference from Go (same class as regex-on-invalid-utf8).
+/// Matches the raw value bytes `v` against `pm` (Go's `patternMatcher.Match`
+/// operates on arbitrary bytes; `PatternMatcher::matches_bytes` is byte-native,
+/// so invalid UTF-8 values are matched verbatim like Go).
 fn match_pattern_bytes(pm: &PatternMatcher, v: &[u8]) -> bool {
-    match std::str::from_utf8(v) {
-        Ok(s) => pm.matches(s),
-        Err(_) => pm.matches(&String::from_utf8_lossy(v)),
-    }
+    pm.matches_bytes(v)
 }
 
 impl FilterPatternMatch {

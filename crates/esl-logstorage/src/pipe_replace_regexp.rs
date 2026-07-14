@@ -15,12 +15,14 @@
 //! `$name` / `${name}` syntax (both stop a bare `$1` at the first non-word
 //! char), so replacement templates carry over unchanged. Go's `regexpCompile`
 //! wraps the pattern in `(?s)(?:...)` so `.` matches newlines; [`regexp_compile`]
-//! reproduces that.
+//! reproduces that. Matching and expansion run on raw value bytes
+//! (`regex::bytes`), like Go; see the `regexutil` module PORT NOTE for the
+//! narrow invalid-UTF-8 rune-decode residual.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use regex::Regex;
+use regex::bytes::Regex;
 
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::pipe_update::{
@@ -153,16 +155,7 @@ impl Pipe for PipeReplaceRegexp {
         let limit = self.limit;
         let update_func: UpdateFunc = Arc::new(move |v: &[u8]| {
             let mut buf: Vec<u8> = Vec::new();
-            match std::str::from_utf8(v) {
-                Ok(s) => append_replace_regexp(&mut buf, s, &re, &replacement, limit),
-                Err(_) => {
-                    // PORT NOTE: regex-on-invalid-utf8 is a documented residual —
-                    // the regex crate needs &str, so an invalid-UTF-8 value is
-                    // rewritten via its lossy view.
-                    let s = String::from_utf8_lossy(v);
-                    append_replace_regexp(&mut buf, &s, &re, &replacement, limit);
-                }
-            }
+            append_replace_regexp(&mut buf, v, &re, &replacement, limit);
             buf
         });
 
@@ -197,10 +190,10 @@ pub(crate) fn regexp_compile(s: &str) -> Result<Regex, String> {
 /// Appends `s` to `dst` with up to `limit` regexp matches replaced by the
 /// expanded `replacement` template (all matches when `limit == 0`).
 ///
-/// Port of Go's `appendReplaceRegexp`.
+/// Port of Go's `appendReplaceRegexp`. Operates on raw value bytes.
 pub(crate) fn append_replace_regexp(
     dst: &mut Vec<u8>,
-    s: &str,
+    s: &[u8],
     re: &Regex,
     replacement: &str,
     limit: u64,
@@ -209,10 +202,9 @@ pub(crate) fn append_replace_regexp(
         return;
     }
 
-    let bytes = s.as_bytes();
     let mut prev_end = 0usize;
     let mut count: u64 = 0;
-    let mut tmp = String::new();
+    let mut tmp: Vec<u8> = Vec::new();
     // Loop shape mirrors the Go source.
     #[allow(clippy::explicit_counter_loop)]
     for caps in re.captures_iter(s) {
@@ -220,14 +212,16 @@ pub(crate) fn append_replace_regexp(
             break;
         }
         let m = caps.get(0).unwrap();
-        dst.extend_from_slice(&bytes[prev_end..m.start()]);
+        dst.extend_from_slice(&s[prev_end..m.start()]);
         tmp.clear();
-        caps.expand(replacement, &mut tmp);
-        dst.extend_from_slice(tmp.as_bytes());
+        // The replacement template is query text (valid UTF-8); expansion
+        // splices raw capture-group bytes into it (regex::bytes::Captures).
+        caps.expand(replacement.as_bytes(), &mut tmp);
+        dst.extend_from_slice(&tmp);
         prev_end = m.end();
         count += 1;
     }
-    dst.extend_from_slice(&bytes[prev_end..]);
+    dst.extend_from_slice(&s[prev_end..]);
 }
 
 #[cfg(test)]
@@ -243,7 +237,7 @@ mod tests {
     fn arr(s: &str, re: &str, replacement: &str, limit: u64) -> String {
         let re = regexp_compile(re).unwrap();
         let mut dst = Vec::new();
-        append_replace_regexp(&mut dst, s, &re, replacement, limit);
+        append_replace_regexp(&mut dst, s.as_bytes(), &re, replacement, limit);
         String::from_utf8(dst).unwrap()
     }
 
@@ -274,6 +268,30 @@ mod tests {
         );
         // no match returns input unchanged
         assert_eq!(arr("1234", "[_/]", "-", 0), "1234");
+    }
+
+    // Raw (invalid-UTF-8) value bytes are replaced byte-exactly: the
+    // untouched bytes pass through verbatim and captures carry raw bytes
+    // (regex::bytes migration; Go matches bytes the same way).
+    #[test]
+    fn test_append_replace_regexp_raw_bytes() {
+        fn arrb(s: &[u8], re: &str, replacement: &str, limit: u64) -> Vec<u8> {
+            let re = regexp_compile(re).unwrap();
+            let mut dst = Vec::new();
+            append_replace_regexp(&mut dst, s, &re, replacement, limit);
+            dst
+        }
+
+        // literal replacement between raw bytes
+        assert_eq!(arrb(b"\xffa_b\xfe", "[_/]", "-", 0), b"\xffa-b\xfe");
+        // capture-group expansion next to raw bytes: the surrounding raw
+        // bytes pass through verbatim, the capture is byte-exact
+        assert_eq!(
+            arrb(b"\xffk=foo;\xfe", "k=([a-z]+);", "<$1>", 0),
+            b"\xff<foo>\xfe"
+        );
+        // no match leaves the raw value byte-identical (never lossy)
+        assert_eq!(arrb(b"\xff\xfe", "[_/]", "-", 0), b"\xff\xfe");
     }
 
     /// Builds the `if (field:phrase)` filter used by the conditional Go tests.

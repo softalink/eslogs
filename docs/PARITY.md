@@ -387,9 +387,11 @@ what remains in section (a) is confirmed-present divergence.
   (each PORT-NOTEd in place, none on a stored/returned name or value): the
   RFC5424 **SD block** is parsed through a lossy view (fires only on invalid
   UTF-8 inside `[...]`); `_stream`/`_stream_id` rendering (validated printable
-  text); regex matching on invalid-UTF-8 values falls back to a lossy view;
-  `any_case` filters lossy-lowercase — which IS Go (`strings.ToLower` maps
-  invalid bytes to `U+FFFD`); display/error text.
+  text); `any_case` filters lossy-lowercase — which IS Go (`strings.ToLower`
+  maps invalid bytes to `U+FFFD`); display/error text. Regex (`re()`, stream-tag
+  `=~`/`!~`) and `pattern_match*` matching are now byte-native
+  (`regex::bytes::Regex` / `PatternMatcher::matches_bytes` on raw value bytes,
+  no lossy view) — see the regex invalid-haystack note below.
 - `pattern.rs` — the `extract` pattern path is byte-native: double-quoted
   `\x`/octal escapes ≥0x80 emit the raw byte (Go `strconv.Unquote` exactly;
   single-quoted keeps `AppendRune` UTF-8 encoding, also Go-exact) and values
@@ -473,6 +475,14 @@ what remains in section (a) is confirmed-present divergence.
   both re-parse to the same matcher. `regexutil.rs:461/:597` — `MustCompile`
   returns an error instead of panicking (deliberate: no `expect`-panic API).
   (`\p{...}` classes are now accepted and `\b` is ASCII like Go.)
+- `regexutil` (invalid-UTF-8 haystacks) — regex matching runs on raw value
+  bytes via `regex::bytes::Regex` (Go `regexp` matches byte payloads too), so
+  valid-UTF-8 haystacks and literal/positive-class matching over invalid bytes
+  are byte-exact. One narrow residual: Go decodes each invalid byte as `U+FFFD`
+  (`utf8.DecodeRune`), so rune-oriented constructs (`.`, negated classes,
+  `\p{...}`) match such bytes; `regex::bytes` in its default Unicode mode only
+  matches well-formed UTF-8 there, so they don't. Irreducible without a custom
+  rune-stepping engine; pinned by `test_bytes_regex_invalid_utf8_probe`.
 - `fs/mod.rs:11` + `filestream.rs:215/:389` — file-close errors are swallowed
   (file closed on `Drop`) where Go's `MustClose` panics. (The `must_mkdir`
   0777-vs-0755 divergence is closed: `must_mkdir` now sets mode `0o755`

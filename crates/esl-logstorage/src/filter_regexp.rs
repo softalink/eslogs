@@ -70,17 +70,11 @@ impl FilterRegexp {
     }
 }
 
-/// Matches the raw value bytes `v` against `re`.
-///
-/// PORT NOTE: Go's regexp engine matches arbitrary bytes, while the port's
-/// `Regex::match_string` takes `&str`. Valid UTF-8 values match identically;
-/// invalid UTF-8 values fall back to matching the lossy-decoded string, which
-/// is a documented residual difference (regex-on-invalid-utf8) from Go.
+/// Matches the raw value bytes `v` against `re` (byte matching, like Go's
+/// regexp engine; see the `regexutil` module PORT NOTE for the narrow
+/// invalid-UTF-8 rune-decode residual).
 pub(crate) fn match_regexp_bytes(re: &Regex, v: &[u8]) -> bool {
-    match std::str::from_utf8(v) {
-        Ok(s) => re.match_string(s),
-        Err(_) => re.match_string(&String::from_utf8_lossy(v)),
-    }
+    re.match_bytes(v)
 }
 
 impl FieldFilter for FilterRegexp {
