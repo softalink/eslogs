@@ -383,12 +383,13 @@ what remains in section (a) is confirmed-present divergence.
   (`Field.name: Vec<u8>` plus the column-name chain — `ColumnHeader`,
   `BlockResultColumn`, the interned part column-names table — so an
   invalid-UTF-8 name round-trips ingest→disk→query byte-identically; syslog
-  SD-IDs and Loki protobuf label names came along for free). Remaining lossy
-  (each PORT-NOTEd in place, none on a stored/returned name or value): the
-  RFC5424 **SD block** is parsed through a lossy view (fires only on invalid
-  UTF-8 inside `[...]`); `_stream`/`_stream_id` rendering (validated printable
-  text); `any_case` filters lossy-lowercase — which IS Go (`strings.ToLower`
-  maps invalid bytes to `U+FFFD`); display/error text. Regex (`re()`, stream-tag
+  SD-IDs and Loki protobuf label names came along for free). The `logfmt`
+  parser is byte-native too (`LogfmtParser::parse(&[u8])`), so RFC5424 SD field
+  values and `unpack_logfmt` values with invalid UTF-8 are preserved verbatim.
+  Remaining lossy (each PORT-NOTEd in place, none on a stored/returned name or
+  value): `_stream`/`_stream_id` rendering (validated printable text);
+  `any_case` filters lossy-lowercase — which IS Go (`strings.ToLower` maps
+  invalid bytes to `U+FFFD`); display/error text. Regex (`re()`, stream-tag
   `=~`/`!~`) and `pattern_match*` matching are now byte-native
   (`regex::bytes::Regex` / `PatternMatcher::matches_bytes` on raw value bytes,
   no lossy view) — see the regex invalid-haystack note below.

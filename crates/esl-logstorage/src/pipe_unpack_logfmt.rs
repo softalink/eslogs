@@ -149,11 +149,9 @@ impl Pipe for PipeUnpackLogfmt {
         let field_filters = self.field_filters.clone();
         let unpack_logfmt: UnpackFunc = Box::new(move |uctx, s| {
             let mut p = get_logfmt_parser();
-            // PORT NOTE: the logfmt parser operates on &str; invalid UTF-8 input
-            // extracts no fields (Go parses raw bytes — documented residual).
-            if let Ok(s) = std::str::from_utf8(s) {
-                p.parse(s);
-            }
+            // The logfmt parser is byte-native, so invalid UTF-8 input is
+            // parsed like Go (field values preserved verbatim).
+            p.parse(s);
             for f in &p.fields {
                 if !prefix_filter::match_filters(&field_filters, &f.name) {
                     continue;

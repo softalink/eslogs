@@ -7,7 +7,7 @@ use esl_common::fasttime;
 use esl_common::tzdata::Location;
 
 use crate::json_parser::{JSONParser, get_json_parser, put_json_parser};
-use crate::logfmt_parser::LogfmtParser;
+use crate::logfmt_parser::{LogfmtParser, trim_space_bytes};
 use crate::rows::Field;
 use crate::values_encoder::{
     marshal_timestamp_rfc3339_nano_string, marshal_uint64_string, try_parse_uint64_bytes,
@@ -388,15 +388,10 @@ impl SyslogParser {
         }
 
         // PORT NOTE: Go unescapes `\]` (allowed in rfc5424, but breaks strings
-        // unquoting) with a cached strings.Replacer; str::replace is used here.
-        //
-        // PORT NOTE: the SD block is handed to LogfmtParser, whose unquoting
-        // helpers (shared with pattern/stream_tags/storage_search) operate on
-        // &str; the SD block gets a checked &str view with a lossy fallback
-        // for the SD block ONLY (SD is rarely non-ASCII). This is the single
-        // residual non-byte-exact path in the syslog parse chain.
-        let sd_block = String::from_utf8_lossy(&s[..i]);
-        let sd_value = sd_block.trim().replace("\\]", "]");
+        // unquoting) with a cached strings.Replacer; the byte equivalent is used
+        // here. The SD block is handed to the byte-native LogfmtParser, so SD
+        // field values with invalid UTF-8 are preserved verbatim like Go.
+        let sd_value = replace_escaped_bracket(trim_space_bytes(&s[..i]));
         self.sd_parser.parse(&sd_value);
         if self.sd_parser.fields.is_empty() {
             // Special case when structured data doesn't contain any fields
@@ -798,6 +793,24 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// Go's `strings.IndexByte`.
 fn index_byte(s: &[u8], c: u8) -> Option<usize> {
     s.iter().position(|&b| b == c)
+}
+
+/// Byte equivalent of Go's cached `strings.NewReplacer(`\]`, `]`)` for the SD
+/// block (RFC5424 allows `\]` inside structured data, which would otherwise
+/// break unquoting). Returns the input unchanged when there is nothing to do.
+fn replace_escaped_bracket(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() && b[i + 1] == b']' {
+            out.push(b']');
+            i += 2;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn next_unescaped_char(b: &[u8], c: u8) -> Option<usize> {

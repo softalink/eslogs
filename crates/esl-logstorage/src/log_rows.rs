@@ -1284,7 +1284,7 @@ mod tests {
             put_stream_tags(st);
 
             let mut p = get_logfmt_parser();
-            p.parse(fields_str);
+            p.parse(fields_str.as_bytes());
 
             if let Err(err) = verify_stream_tags_canonical(&stream_tags_canonical, &p.fields) {
                 panic!("cannot verify stream tags: {err}");
@@ -1322,7 +1322,7 @@ mod tests {
             let stream_tags_canonical = marshal_canonical_no_sort(stream_tags);
 
             let mut p = get_logfmt_parser();
-            p.parse(fields_str);
+            p.parse(fields_str.as_bytes());
 
             assert!(
                 verify_stream_tags_canonical(&stream_tags_canonical, &p.fields).is_err(),
