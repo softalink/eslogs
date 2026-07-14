@@ -18,8 +18,8 @@ use crate::filter_phrase::{
 };
 use crate::json_parser::fastjson;
 use crate::rows::{Field, get_field_value_by_name};
-use crate::stream_filter::quote_token_if_needed;
-use crate::tokenizer::tokenize_strings;
+use crate::stream_filter::quote_value_bytes_if_needed;
+use crate::tokenizer::tokenize_bytes;
 use crate::values_encoder::ValueType;
 
 thread_local! {
@@ -42,10 +42,12 @@ fn put_parser(p: fastjson::Parser) {
 ///
 /// Example LogsQL: `tags:json_array_contains_any("prod","dev")`.
 /// Cached per-value `(tokenss, tokens_hashess)` (Go `tokenss` / `tokensHashess`).
-type CachedTokens = (Vec<Vec<String>>, Vec<Vec<u64>>);
+type CachedTokens = (Vec<Vec<Vec<u8>>>, Vec<Vec<u64>>);
 
 pub(crate) struct FilterJSONArrayContainsAny {
-    values: Vec<String>,
+    /// Raw value bytes (Go strings are arbitrary bytes; raw `\xNN` escapes
+    /// in the query text carry through byte-exact).
+    values: Vec<Vec<u8>>,
 
     /// Cached `(tokenss, tokens_hashess)` (Go `tokensOnce`).
     tokens: OnceLock<CachedTokens>,
@@ -53,7 +55,7 @@ pub(crate) struct FilterJSONArrayContainsAny {
 
 pub(crate) fn new_filter_json_array_contains_any(
     field_name: &str,
-    values: Vec<String>,
+    values: Vec<Vec<u8>>,
 ) -> FilterGeneric {
     new_filter_generic(
         field_name,
@@ -67,11 +69,13 @@ pub(crate) fn new_filter_json_array_contains_any(
 impl FilterJSONArrayContainsAny {
     fn get_tokens(&self) -> &CachedTokens {
         self.tokens.get_or_init(|| {
-            let mut tokenss: Vec<Vec<String>> = Vec::with_capacity(self.values.len());
+            // Byte tokenizer: matches the ingest-side hash_tokenizer, so
+            // bloom lookups agree for raw-byte values too.
+            let mut tokenss: Vec<Vec<Vec<u8>>> = Vec::with_capacity(self.values.len());
             for v in &self.values {
-                let mut toks: Vec<&str> = Vec::new();
-                tokenize_strings(&mut toks, std::slice::from_ref(v));
-                tokenss.push(toks.into_iter().map(|s| s.to_string()).collect());
+                let mut toks: Vec<&[u8]> = Vec::new();
+                tokenize_bytes(&mut toks, std::slice::from_ref(v));
+                tokenss.push(toks.into_iter().map(|s| s.to_vec()).collect());
             }
 
             let mut tokens_hashess: Vec<Vec<u64>> = Vec::with_capacity(tokenss.len());
@@ -88,10 +92,12 @@ impl FilterJSONArrayContainsAny {
 
 impl FieldFilter for FilterJSONArrayContainsAny {
     fn to_string(&self) -> String {
+        // Lossless render (Go quoteTokenIfNeeded, byte form): invalid UTF-8
+        // re-quotes via Go strconv.Quote byte semantics (`\xNN`).
         let args = self
             .values
             .iter()
-            .map(|v| quote_token_if_needed(v))
+            .map(|v| quote_value_bytes_if_needed(v))
             .collect::<Vec<_>>()
             .join(",");
         format!("json_array_contains_any({args})")
@@ -209,7 +215,7 @@ fn match_any_tokens_hashess(
 /// Port of Go `matchJSONArrayContainsAny`.
 ///
 /// The haystack `s` is raw value bytes (Go strings are arbitrary bytes).
-fn match_json_array_contains_any(s: &[u8], values: &[String], tokenss: &[Vec<String>]) -> bool {
+fn match_json_array_contains_any(s: &[u8], values: &[Vec<u8>], tokenss: &[Vec<Vec<u8>>]) -> bool {
     if s.is_empty() {
         // Fast path for empty strings.
         return false;
@@ -234,7 +240,7 @@ fn match_json_array_contains_any(s: &[u8], values: &[String], tokenss: &[Vec<Str
     ok
 }
 
-fn json_array_contains_any_slow(p: &mut fastjson::Parser, s: &[u8], values: &[String]) -> bool {
+fn json_array_contains_any_slow(p: &mut fastjson::Parser, s: &[u8], values: &[Vec<u8>]) -> bool {
     let v = match p.parse(s) {
         Ok(v) => v,
         Err(_) => return false,
@@ -252,7 +258,7 @@ fn json_array_contains_any_slow(p: &mut fastjson::Parser, s: &[u8], values: &[St
             fastjson::JsonType::String => {
                 let span = p.doc.string_span(e);
                 let sv = p.doc.str_bytes(span);
-                if values.iter().any(|x| x.as_bytes() == sv) {
+                if values.iter().any(|x| x.as_slice() == sv) {
                     return true;
                 }
             }
@@ -262,7 +268,7 @@ fn json_array_contains_any_slow(p: &mut fastjson::Parser, s: &[u8], values: &[St
             | fastjson::JsonType::Null => {
                 let mut bb = Vec::new();
                 p.doc.marshal_value_to(e, &mut bb);
-                if values.iter().any(|x| x.as_bytes() == bb) {
+                if values.contains(&bb) {
                     return true;
                 }
             }
@@ -274,15 +280,15 @@ fn json_array_contains_any_slow(p: &mut fastjson::Parser, s: &[u8], values: &[St
 }
 
 /// Port of Go `matchAnyTokenss`.
-fn match_any_tokenss(s: &[u8], tokenss: &[Vec<String>]) -> bool {
+fn match_any_tokenss(s: &[u8], tokenss: &[Vec<Vec<u8>>]) -> bool {
     tokenss.iter().any(|tokens| match_all_substrings(s, tokens))
 }
 
 /// Port of Go `matchAllSubstrings`.
-fn match_all_substrings(s: &[u8], tokens: &[String]) -> bool {
+fn match_all_substrings(s: &[u8], tokens: &[Vec<u8>]) -> bool {
     tokens
         .iter()
-        .all(|token| crate::filter_generic::index_bytes(s, token.as_bytes()).is_some())
+        .all(|token| crate::filter_generic::index_bytes(s, token).is_some())
 }
 
 /// Port of Go `trimJSONWhitespace`.
@@ -300,12 +306,12 @@ mod tests {
     #[test]
     fn test_match_json_array_contains_any() {
         fn f(s: &str, values: &[&str], result_expected: bool) {
-            let values: Vec<String> = values.iter().map(|v| v.to_string()).collect();
-            let mut tokenss: Vec<Vec<String>> = Vec::with_capacity(values.len());
+            let values: Vec<Vec<u8>> = values.iter().map(|v| v.as_bytes().to_vec()).collect();
+            let mut tokenss: Vec<Vec<Vec<u8>>> = Vec::with_capacity(values.len());
             for v in &values {
-                let mut toks: Vec<&str> = Vec::new();
-                tokenize_strings(&mut toks, std::slice::from_ref(v));
-                tokenss.push(toks.into_iter().map(|s| s.to_string()).collect());
+                let mut toks: Vec<&[u8]> = Vec::new();
+                tokenize_bytes(&mut toks, std::slice::from_ref(v));
+                tokenss.push(toks.into_iter().map(|s| s.to_vec()).collect());
             }
 
             let result = match_json_array_contains_any(s.as_bytes(), &values, &tokenss);

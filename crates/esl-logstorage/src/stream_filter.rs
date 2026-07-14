@@ -72,7 +72,7 @@ impl StreamFilter {
             for f in &af.tag_filters {
                 encoding::marshal_bytes(dst, f.tag_name.as_bytes());
                 encoding::marshal_bytes(dst, f.op.as_bytes());
-                encoding::marshal_bytes(dst, f.value.as_bytes());
+                encoding::marshal_bytes(dst, &f.value);
             }
         }
     }
@@ -104,8 +104,10 @@ pub(crate) struct StreamTagFilter {
     /// op is operation such as `=`, `!=`, `=~`, `!~` or `:`
     pub(crate) op: String,
 
-    /// value is the value
-    pub(crate) value: String,
+    /// value is the value. Raw bytes (Go strings are arbitrary bytes): a
+    /// quoted `\xNN` escape >= 0x80 in the query text denotes the raw byte,
+    /// which matches ingested stream tag values byte-exact for `=`/`!=`.
+    pub(crate) value: Vec<u8>,
 
     /// regexp is initialized for `=~` and `!~` op.
     pub(crate) regexp: Option<PromRegex>,
@@ -118,7 +120,8 @@ impl fmt::Display for StreamTagFilter {
             "{}{}{}",
             quote_token_if_needed(&self.tag_name),
             self.op,
-            go_quote(&self.value)
+            // Go strconv.Quote over the raw value bytes (lossless render).
+            go_quote_bytes(&self.value)
         )
     }
 }
@@ -201,10 +204,12 @@ fn parse_stream_tag_filter(lex: &mut Lexer) -> Result<StreamTagFilter, String> {
     let mut op = lex.token.clone();
     lex.next_token();
 
-    // parse tag value
-    let mut value = String::new();
+    // parse tag value.
+    // Raw-byte payload (Go parser.go:329 strconv.Unquote semantics): a quoted
+    // `\xNN` escape >= 0x80 denotes the raw byte.
+    let mut value: Vec<u8> = Vec::new();
     if op == "in" || op == "not_in" {
-        let (args, is_wildcard) = parse_args_in_parens_possible_wildcard(lex)
+        let (args, is_wildcard) = parse_args_in_parens_possible_wildcard_bytes(lex)
             .map_err(|err| format!("cannot read {op}() args inside {{...}}: {err}"))?;
         if op == "in" {
             op = "=~".to_string();
@@ -212,19 +217,22 @@ fn parse_stream_tag_filter(lex: &mut Lexer) -> Result<StreamTagFilter, String> {
             op = "!~".to_string();
         }
         if is_wildcard {
-            value = ".*".to_string();
+            value = b".*".to_vec();
         } else {
-            let args_escaped: Vec<String> = args.iter().map(|arg| regexp_quote_meta(arg)).collect();
-            value = args_escaped.join("|");
+            let args_escaped: Vec<Vec<u8>> = args
+                .iter()
+                .map(|arg| regexp_quote_meta_bytes(arg))
+                .collect();
+            value = args_escaped.join(&b'|');
         }
     } else {
-        let v = lex.next_compound_token().map_err(|err| {
+        let v = lex.next_compound_token_bytes().map_err(|err| {
             format!(
                 "cannot parse value for tag {} inside {{...}}: {err}",
                 go_quote(&tag_name)
             )
         })?;
-        value.push_str(&v);
+        value.extend_from_slice(&v);
     }
 
     let mut stf = StreamTagFilter {
@@ -234,10 +242,21 @@ fn parse_stream_tag_filter(lex: &mut Lexer) -> Result<StreamTagFilter, String> {
         regexp: None,
     };
     if stf.op == "=~" || stf.op == "!~" {
-        let re = PromRegex::new(&stf.value).map_err(|err| {
+        // Go compiles the raw value bytes with regexp, which rejects invalid
+        // UTF-8 patterns (regexp/syntax ErrInvalidUTF8); the checked &str view
+        // mirrors that rejection. PORT NOTE: the inner message approximates
+        // Go's `error parsing regexp: invalid UTF-8` (display-only).
+        let value_str = std::str::from_utf8(&stf.value).map_err(|_| {
+            format!(
+                "invalid regexp {} for {} inside {{...}}: error parsing regexp: invalid UTF-8",
+                go_quote_bytes(&stf.value),
+                go_quote(&stf.tag_name)
+            )
+        })?;
+        let re = PromRegex::new(value_str).map_err(|err| {
             format!(
                 "invalid regexp {} for {} inside {{...}}: {err}",
-                go_quote(&stf.value),
+                go_quote_bytes(&stf.value),
                 go_quote(&stf.tag_name)
             )
         })?;
@@ -294,14 +313,17 @@ impl StreamName {
             let Ok(q_prefix) = crate::pattern::quoted_prefix(s) else {
                 return false;
             };
-            let Ok(value) = crate::pattern::unquote(q_prefix) else {
+            // Go strconv.Unquote semantics: `\xNN`/octal escapes >= 0x80 in
+            // the canonical stream string denote RAW bytes (the ingested tag
+            // value bytes round-trip through the %q-style stream marshaling).
+            let Ok(value) = crate::pattern::unquote_bytes(q_prefix.as_bytes()) else {
                 return false;
             };
             s = &s[q_prefix.len()..];
 
             self.tags.push(Field {
                 name: name.as_bytes().to_vec(),
-                value: value.into_bytes(),
+                value,
             });
 
             if s.is_empty() {
@@ -318,8 +340,8 @@ impl StreamName {
     fn matches(&self, tf: &StreamTagFilter) -> bool {
         let v = self.get_tag_value_by_tag_name(&tf.tag_name);
         match tf.op.as_str() {
-            "=" => v == tf.value.as_bytes(),
-            "!=" => v != tf.value.as_bytes(),
+            "=" => v == tf.value.as_slice(),
+            "!=" => v != tf.value.as_slice(),
             "=~" => tf.regexp.as_ref().unwrap().match_string(tag_value_str(v)),
             "!~" => !tf.regexp.as_ref().unwrap().match_string(tag_value_str(v)),
             _ => {
@@ -341,9 +363,11 @@ impl StreamName {
 
 /// Checked `&str` view of a parsed stream tag value for regexp matching.
 ///
-/// The tags are produced by `go_unquote` (a `String`), so the value is always
-/// valid UTF-8 and the fallback is unreachable; it is kept for safety and
-/// returns an empty match input rather than panicking.
+/// PORT NOTE (documented residual, same family as `re()`): the regex engine
+/// is `&str`-bound, so a tag value containing raw (invalid-UTF-8) bytes falls
+/// back to an empty match input; Go matches such values byte-wise, decoding
+/// each invalid byte as `RuneError`. Exact `=`/`!=` matching is byte-native
+/// and unaffected.
 fn tag_value_str(v: &[u8]) -> &str {
     std::str::from_utf8(v).unwrap_or("")
 }
@@ -750,6 +774,60 @@ pub(crate) fn parse_args_in_parens_possible_wildcard(
     Ok((args, false))
 }
 
+/// Byte form of [`parse_args_in_parens_possible_wildcard`] for raw-byte value
+/// payloads (Go parser.go:329 strconv.Unquote semantics): quoted args carry
+/// Go-parity raw bytes (`Lexer::token_bytes`); unquoted compound args are
+/// slices of the query text (valid UTF-8) in both forms.
+pub(crate) fn parse_args_in_parens_possible_wildcard_bytes(
+    lex: &mut Lexer,
+) -> Result<(Vec<Vec<u8>>, bool), String> {
+    if !lex.is_keyword(&["("]) {
+        return Err("missing '('".to_string());
+    }
+    lex.next_token();
+
+    let mut args: Vec<Vec<u8>> = Vec::new();
+    let mut is_wildcard = false;
+    while !lex.is_keyword(&[")"]) {
+        if lex.is_keyword(&[","]) {
+            return Err("unexpected ','".to_string());
+        }
+        if lex.is_keyword(&["("]) {
+            return Err("unexpected '('".to_string());
+        }
+        let arg;
+        if lex.is_keyword(&["*"]) {
+            lex.next_token();
+            is_wildcard = true;
+            arg = b"*".to_vec();
+        } else {
+            let token = lex
+                .next_compound_token_bytes()
+                .map_err(|err| format!("cannot parse arg: {err}"))?;
+            arg = token;
+        }
+        args.push(arg);
+        if lex.is_keyword(&[")"]) {
+            break;
+        }
+        if !lex.is_keyword(&[","]) {
+            return Err(format!(
+                "missing ',' after {}; got {} instead",
+                // Go %q over the raw-byte arg.
+                go_quote_bytes(args.last().unwrap()),
+                go_quote(&lex.token)
+            ));
+        }
+        lex.next_token();
+    }
+    lex.next_token();
+
+    if is_wildcard {
+        return Ok((Vec::new(), is_wildcard));
+    }
+    Ok((args, false))
+}
+
 pub(crate) fn quote_token_if_needed(s: &str) -> String {
     if !need_quote_token(s) {
         return s.to_string();
@@ -866,14 +944,29 @@ fn is_go_print(c: char) -> bool {
 
 /// Port of Go `regexp.QuoteMeta` (escapes Go's regexp special bytes
 /// ``\.+*?()|[]{}^$``).
-fn regexp_quote_meta(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+fn regexp_quote_meta_bytes(s: &[u8]) -> Vec<u8> {
+    // Go regexp.QuoteMeta copies the string byte-wise, escaping the special
+    // ASCII bytes, so raw (invalid-UTF-8) bytes pass through unchanged.
+    let mut out = Vec::with_capacity(s.len());
+    for &c in s {
         if matches!(
             c,
-            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+            b'\\'
+                | b'.'
+                | b'+'
+                | b'*'
+                | b'?'
+                | b'('
+                | b')'
+                | b'|'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'^'
+                | b'$'
         ) {
-            out.push('\\');
+            out.push(b'\\');
         }
         out.push(c);
     }
@@ -905,6 +998,31 @@ pub(crate) fn must_new_test_stream_filter(s: &str) -> StreamFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PORT-ONLY TEST: a double-quoted `\xff`-style escape in a stream tag
+    /// value denotes the raw byte 0xFF (Go strconv.Unquote), both in the
+    /// query-side `{label="value"}` filter and in the canonical stream name
+    /// it is matched against.
+    #[test]
+    fn test_stream_filter_match_stream_name_raw_bytes() {
+        let f = |filter: &str, stream_name: &str, result_expected: bool| {
+            let sf = must_new_test_stream_filter(filter);
+            let result = sf.match_stream_name(stream_name.as_bytes());
+            assert_eq!(
+                result, result_expected,
+                "unexpected result for matching {stream_name} against {sf}"
+            );
+        };
+
+        f(r#"{foo="a\xffb"}"#, r#"{foo="a\xffb"}"#, true);
+        f(r#"{foo="a\xffb"}"#, r#"{foo="ab"}"#, false);
+        // The scalar U+00FF (two UTF-8 bytes) is a different value than the
+        // raw byte 0xFF.
+        f(r#"{foo="a\xffb"}"#, "{foo=\"a\u{ff}b\"}", false);
+        f(r#"{foo="aÿb"}"#, r#"{foo="a\xffb"}"#, false);
+        f(r#"{foo!="a\xffb"}"#, r#"{foo="a\xffb"}"#, false);
+        f(r#"{foo!="a\xffb"}"#, r#"{foo="ab"}"#, true);
+    }
 
     #[test]
     fn test_stream_filter_match_stream_name() {

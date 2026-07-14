@@ -2196,3 +2196,106 @@ fn test_raw_byte_phrase_filters_match_row() {
     // NOT the raw byte - it must not match the raw-byte row.
     check(r#"foo:'err\xffor'"#, false, false);
 }
+
+/// PORT-ONLY TEST: raw-byte VALUE payloads in `in()` / `contains_any()` /
+/// `contains_all()` literals, `string_range()` bounds (incl. the `>`/`<`
+/// string forms), `*substr*`, `contains_common_case()` /
+/// `equals_common_case()` and `json_array_contains_any()` — the
+/// query-text escape tail closed after the phrase-filter step. Rendering
+/// re-quotes the raw bytes with Go `strconv.Quote` byte semantics, so
+/// parse -> render -> re-parse is stable.
+#[test]
+fn test_parse_query_raw_byte_values_roundtrip() {
+    // in() / contains_any() / contains_all() literal values
+    ok(r#"foo:in("a\xffb", other)"#, r#"foo:in("a\xffb",other)"#);
+    ok(
+        r#"foo:contains_any("a\xffb")"#,
+        r#"foo:contains_any("a\xffb")"#,
+    );
+    ok(
+        r#"foo:contains_all("a\xffb")"#,
+        r#"foo:contains_all("a\xffb")"#,
+    );
+    // string_range() bounds
+    ok(
+        r#"foo:string_range("a\xff", "b\xff")"#,
+        r#"foo:string_range("a\xff", "b\xff")"#,
+    );
+    // >/">="/</"<=" string bounds (rendered via quoteStringTokenIfNeeded)
+    ok(r#"foo:>"a\xff""#, r#"foo:>"a\xff""#);
+    ok(r#"foo:>="a\xff""#, r#"foo:>="a\xff""#);
+    ok(r#"foo:<"a\xff""#, r#"foo:<"a\xff""#);
+    ok(r#"foo:<="a\xff""#, r#"foo:<="a\xff""#);
+    // *substr*
+    ok(r#"foo:*"a\xffb"*"#, r#"foo:*"a\xffb"*"#);
+    // common-case filters
+    ok(
+        r#"foo:contains_common_case("Err\xff")"#,
+        r#"foo:contains_common_case("Err\xff")"#,
+    );
+    ok(
+        r#"foo:equals_common_case("Err\xff")"#,
+        r#"foo:equals_common_case("Err\xff")"#,
+    );
+    // json_array_contains_any()
+    ok(
+        r#"foo:json_array_contains_any("a\xffb", c)"#,
+        r#"foo:json_array_contains_any("a\xffb",c)"#,
+    );
+    // stream-filter tag values
+    ok(r#"{foo="a\xffb"}"#, r#"{foo="a\xffb"}"#);
+    ok(r#"{foo!="a\xffb"}"#, r#"{foo!="a\xffb"}"#);
+    // `replace` pipe from/to args
+    ok(
+        r#"* | replace ("a\xff", "b\xff")"#,
+        r#"* | replace ("a\xff", "b\xff")"#,
+    );
+}
+
+/// PORT-ONLY TEST: raw-byte value payloads parsed from `"\xff"`-style query
+/// escapes must match ingested values containing the same raw bytes,
+/// byte-for-byte like Go (the in()/string_range/substr/common_case tail).
+#[test]
+fn test_raw_byte_value_filters_match_row() {
+    use crate::rows::Field;
+
+    let row = [Field {
+        name: b"foo".to_vec(),
+        value: b"err\xffor code".to_vec(),
+    }];
+    let row_plain = [Field {
+        name: b"foo".to_vec(),
+        value: b"error code".to_vec(),
+    }];
+
+    let check = |query: &str, matches_raw: bool, matches_plain: bool| {
+        let q = ParseQuery(query).unwrap_or_else(|e| panic!("cannot parse {query:?}: {e}"));
+        let f = q.get_final_filter();
+        assert_eq!(
+            f.match_row(&row),
+            matches_raw,
+            "{query} vs raw-byte row (want {matches_raw})"
+        );
+        assert_eq!(
+            f.match_row(&row_plain),
+            matches_plain,
+            "{query} vs plain row (want {matches_plain})"
+        );
+    };
+
+    // in(): exact value match on the raw bytes
+    check(r#"foo:in("err\xffor code", x)"#, true, false);
+    // contains_any()/contains_all(): phrase match on the raw bytes
+    check(r#"foo:contains_any("err\xffor", x)"#, true, false);
+    check(r#"foo:contains_all("err\xffor", code)"#, true, false);
+    // string_range(): byte-wise [min..max) comparison
+    check(r#"foo:string_range("err\xff", "err\xff\xff")"#, true, false);
+    check(r#"foo:>"err\xff""#, true, false);
+    check(r#"foo:<"err\xff""#, false, true);
+    // *substr*: raw-byte substring
+    check(r#"foo:*"rr\xffo"*"#, true, false);
+    // common-case filters: the all-lowercase variant is the raw-byte value
+    // itself (the invalid byte is never uppercase, so it carries through).
+    check(r#"foo:contains_common_case("ERR\xffOR")"#, true, false);
+    check(r#"foo:equals_common_case("ERR\xffOR CODE")"#, true, false);
+}

@@ -794,27 +794,29 @@ fn parse_pipe_replace(lex: &mut Lexer) -> Result<BoxPipe, String> {
         return Err("missing '(' after 'replace'".to_string());
     }
     lex.next_token();
+    // Raw-byte payloads (Go parser.go:329 strconv.Unquote semantics); the
+    // error messages quote them with Go %q byte semantics (`go_quote_bytes`).
     let old_substr = lex
-        .next_compound_token()
+        .next_compound_token_bytes()
         .map_err(|e| format!("cannot parse oldSubstr in 'replace': {e}"))?;
     if !lex.is_keyword(&[","]) {
         return Err(format!(
             "missing ',' after 'replace({}'",
-            go_quote(&old_substr)
+            crate::stream_filter::go_quote_bytes(&old_substr)
         ));
     }
     lex.next_token();
-    let new_substr = lex.next_compound_token().map_err(|e| {
+    let new_substr = lex.next_compound_token_bytes().map_err(|e| {
         format!(
             "cannot parse newSubstr in 'replace({}': {e}",
-            go_quote(&old_substr)
+            crate::stream_filter::go_quote_bytes(&old_substr)
         )
     })?;
     if !lex.is_keyword(&[")"]) {
         return Err(format!(
             "missing ')' after 'replace({}, {}'",
-            go_quote(&old_substr),
-            go_quote(&new_substr)
+            crate::stream_filter::go_quote_bytes(&old_substr),
+            crate::stream_filter::go_quote_bytes(&new_substr)
         ));
     }
     lex.next_token();

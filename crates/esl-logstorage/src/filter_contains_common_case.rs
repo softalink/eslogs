@@ -12,10 +12,10 @@ use crate::block_result::BlockResult;
 use crate::block_search::BlockSearch;
 use crate::filter::FieldFilter;
 use crate::filter_contains_any::FilterContainsAny;
-use crate::filter_generic::{FilterGeneric, new_filter_generic};
+use crate::filter_generic::{FilterGeneric, RUNE_ERROR, new_filter_generic};
 use crate::in_values::InValues;
+use crate::pattern_matcher::decode_rune;
 use crate::rows::Field;
-use crate::stream_filter::quote_token_if_needed;
 
 /// `FilterContainsCommonCase` matches words and phrases where every capital
 /// letter can be replaced with a small letter, plus all capital words.
@@ -23,19 +23,18 @@ use crate::stream_filter::quote_token_if_needed;
 /// Example LogsQL: `contains_common_case("Error")` is equivalent to
 /// `contains_any("Error", "error", "ERROR")`.
 pub(crate) struct FilterContainsCommonCase {
-    phrases: Vec<String>,
+    /// Raw phrase bytes (Go strings are arbitrary bytes; raw `\xNN` escapes
+    /// in the query text carry through byte-exact).
+    phrases: Vec<Vec<u8>>,
 
     contains_any: FilterContainsAny,
 }
 
 pub(crate) fn new_filter_contains_common_case(
     field_name: &str,
-    phrases: Vec<String>,
+    phrases: Vec<Vec<u8>>,
 ) -> Result<FilterGeneric, String> {
-    let common_case_phrases = get_common_case_phrases(&phrases)?
-        .into_iter()
-        .map(String::into_bytes)
-        .collect();
+    let common_case_phrases = get_common_case_phrases(&phrases)?;
 
     let fi = FilterContainsCommonCase {
         phrases,
@@ -49,10 +48,12 @@ pub(crate) fn new_filter_contains_common_case(
 
 impl FieldFilter for FilterContainsCommonCase {
     fn to_string(&self) -> String {
+        // Lossless render (Go quoteTokenIfNeeded, byte form): invalid UTF-8
+        // re-quotes via Go strconv.Quote byte semantics (`\xNN`).
         let phrases = self
             .phrases
             .iter()
-            .map(|p| quote_token_if_needed(p))
+            .map(|p| crate::stream_filter::quote_value_bytes_if_needed(p))
             .collect::<Vec<_>>()
             .join(",");
         format!("contains_common_case({phrases})")
@@ -84,50 +85,112 @@ impl FieldFilter for FilterContainsCommonCase {
 }
 
 /// Port of Go `getCommonCasePhrases`.
-pub(crate) fn get_common_case_phrases(phrases: &[String]) -> Result<Vec<String>, String> {
-    let mut dst: Vec<String> = Vec::new();
+///
+/// Operates on raw phrase bytes: Go iterates runes over the raw string, where
+/// each invalid UTF-8 byte decodes to `RuneError` (never uppercase, so it is
+/// carried through the case variants byte-exact, except in the
+/// `strings.ToUpper` variant which rewrites it to the replacement char —
+/// mirrored by [`to_upper_bytes`]).
+pub(crate) fn get_common_case_phrases(phrases: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, String> {
+    let mut dst: Vec<Vec<u8>> = Vec::new();
     for phrase in phrases {
         let upper = count_upper_runes(phrase);
         if upper > 10 {
             return Err(format!(
-                "too many common_case combinations for the {phrase:?}; reduce the number of uppercase letters here"
+                "too many common_case combinations for the {}; reduce the number of uppercase letters here",
+                // Go %q over the raw phrase bytes.
+                crate::stream_filter::go_quote_bytes(phrase)
             ));
         }
-        append_common_case_phrases(&mut dst, "", phrase);
+        append_common_case_phrases(&mut dst, b"", phrase);
     }
 
     // Deduplicate dst.
-    let m: HashSet<String> = dst.into_iter().collect();
-    let mut dst: Vec<String> = m.into_iter().collect();
+    let m: HashSet<Vec<u8>> = dst.into_iter().collect();
+    let mut dst: Vec<Vec<u8>> = m.into_iter().collect();
     dst.sort();
 
     Ok(dst)
 }
 
-/// Port of Go `countUpperRunes`.
-fn count_upper_runes(s: &str) -> usize {
-    s.chars().filter(|c| c.is_uppercase()).count()
+/// Port of Go `countUpperRunes` (Go-style rune decoding: an invalid byte
+/// yields `RuneError`, which is not uppercase).
+fn count_upper_runes(s: &[u8]) -> usize {
+    let mut upper = 0;
+    let mut b = s;
+    while !b.is_empty() {
+        let (c, size) = decode_rune(b);
+        if c.is_uppercase() {
+            upper += 1;
+        }
+        b = &b[size..];
+    }
+    upper
+}
+
+/// Byte form of Go `strings.ToUpper`: maps each decoded rune through the
+/// scalar uppercase mapping (bit-identical to the previous `&str` path for
+/// valid UTF-8); each invalid UTF-8 byte is rewritten to the replacement char
+/// (Go `strings.Map` decodes it as `utf8.RuneError` and re-encodes it) —
+/// display-lossy exactly like Go.
+fn to_upper_bytes(s: &[u8]) -> Vec<u8> {
+    if let Ok(v) = std::str::from_utf8(s) {
+        return v.to_uppercase().into_bytes();
+    }
+    let mut out = Vec::with_capacity(s.len());
+    let mut b = s;
+    let mut buf = [0u8; 4];
+    while !b.is_empty() {
+        let (r, size) = decode_rune(b);
+        if r == RUNE_ERROR && size == 1 {
+            // Invalid UTF-8 byte: Go writes utf8.RuneError.
+            out.extend_from_slice(RUNE_ERROR.encode_utf8(&mut buf).as_bytes());
+        } else {
+            for c in r.to_uppercase() {
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        b = &b[size..];
+    }
+    out
 }
 
 /// Port of Go `appendCommonCasePhrases`.
-fn append_common_case_phrases(dst: &mut Vec<String>, prefix: &str, phrase: &str) {
-    let base = format!("{prefix}{phrase}");
+fn append_common_case_phrases(dst: &mut Vec<Vec<u8>>, prefix: &[u8], phrase: &[u8]) {
+    let mut base = Vec::with_capacity(prefix.len() + phrase.len());
+    base.extend_from_slice(prefix);
+    base.extend_from_slice(phrase);
     dst.push(base.clone());
-    dst.push(base.to_uppercase());
+    dst.push(to_upper_bytes(&base));
 
-    for (off, c) in phrase.char_indices() {
+    let mut off = 0;
+    while off < phrase.len() {
+        let (c, size) = decode_rune(&phrase[off..]);
+        // An invalid byte decodes to RuneError, which is not uppercase, so it
+        // is skipped exactly like in Go (`unicode.IsUpper` is false for it).
         if !c.is_uppercase() {
+            off += size;
             continue;
         }
-        let char_len = c.len_utf8();
-
+        // `c` is uppercase, hence a validly decoded rune: `size` is its exact
+        // UTF-8 width (Go `utf8.RuneLen(c)`; the -1 case is unreachable).
         let c_lower: String = c.to_lowercase().collect();
 
-        let prefix_local = format!("{prefix}{}", &phrase[..off]);
-        let phrase_tail = &phrase[off + char_len..];
+        let mut prefix_local = Vec::with_capacity(prefix.len() + off + size);
+        prefix_local.extend_from_slice(prefix);
+        prefix_local.extend_from_slice(&phrase[..off]);
+        let phrase_tail = &phrase[off + size..];
 
-        append_common_case_phrases(dst, &format!("{prefix_local}{c_lower}"), phrase_tail);
-        append_common_case_phrases(dst, &format!("{prefix_local}{c}"), phrase_tail);
+        let mut with_lower = prefix_local.clone();
+        with_lower.extend_from_slice(c_lower.as_bytes());
+        append_common_case_phrases(dst, &with_lower, phrase_tail);
+
+        let mut with_upper = prefix_local;
+        let mut buf = [0u8; 4];
+        with_upper.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        append_common_case_phrases(dst, &with_upper, phrase_tail);
+
+        off += size;
     }
 }
 
@@ -138,9 +201,12 @@ mod tests {
     #[test]
     fn test_get_common_case_phrases_success() {
         fn f(phrases: &[&str], result_expected: &[&str]) {
-            let phrases: Vec<String> = phrases.iter().map(|s| s.to_string()).collect();
+            let phrases: Vec<Vec<u8>> = phrases.iter().map(|s| s.as_bytes().to_vec()).collect();
             let result = get_common_case_phrases(&phrases).expect("unexpected error");
-            let expected: Vec<String> = result_expected.iter().map(|s| s.to_string()).collect();
+            let expected: Vec<Vec<u8>> = result_expected
+                .iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect();
             assert_eq!(result, expected, "phrases={phrases:?}");
         }
 
@@ -162,9 +228,24 @@ mod tests {
     }
 
     #[test]
+    fn test_get_common_case_phrases_raw_bytes() {
+        // A raw invalid-UTF-8 byte decodes to RuneError (not uppercase), so
+        // it is carried byte-exact through the case variants, except in the
+        // strings.ToUpper variant, which rewrites it to U+FFFD (Go-exact).
+        let phrases = vec![b"F\xffo".to_vec()];
+        let result = get_common_case_phrases(&phrases).expect("unexpected error");
+        let expected: Vec<Vec<u8>> = vec![
+            b"F\xef\xbf\xbdO".to_vec(), // ToUpper variant: \xff -> U+FFFD
+            b"F\xffo".to_vec(),
+            b"f\xffo".to_vec(),
+        ];
+        assert_eq!(result, expected);
+    }
+
+    #[test]
     fn test_get_common_case_phrases_failure() {
         fn f(phrases: &[&str]) {
-            let phrases: Vec<String> = phrases.iter().map(|s| s.to_string()).collect();
+            let phrases: Vec<Vec<u8>> = phrases.iter().map(|s| s.as_bytes().to_vec()).collect();
             let result = get_common_case_phrases(&phrases);
             assert!(result.is_err(), "expecting non-nil error");
         }

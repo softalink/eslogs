@@ -14,7 +14,7 @@ use crate::block_search::BlockSearch;
 use crate::bloomfilter::append_tokens_hashes;
 use crate::filter::FieldFilter;
 use crate::filter_generic::{
-    FilterGeneric, clone_column_header, new_filter_generic, skip_first_last_token,
+    FilterGeneric, clone_column_header, new_filter_generic, skip_first_last_token_bytes,
 };
 use crate::filter_phrase::{
     apply_to_block_result_generic, match_bloom_filter_all_tokens, match_encoded_values_dict,
@@ -24,9 +24,9 @@ use crate::filter_prefix::{
     to_int64_string, to_uint8_string, to_uint16_string, to_uint32_string, to_uint64_string,
 };
 use crate::rows::{Field, get_field_value_by_name};
-use crate::tokenizer::tokenize_strings;
+use crate::tokenizer::tokenize_bytes;
 use crate::values_encoder::{
-    ValueType, try_parse_float64_exact, try_parse_int64, try_parse_uint64,
+    ValueType, try_parse_float64_exact_bytes, try_parse_int64_bytes, try_parse_uint64_bytes,
 };
 
 // ---------------------------------------------------------------------------
@@ -35,16 +35,18 @@ use crate::values_encoder::{
 
 /// `FilterSubstring` filters field entries by substring match.
 pub(crate) struct FilterSubstring {
-    pub(crate) substring: String,
+    /// Raw substring bytes (Go strings are arbitrary bytes; raw `\xNN`
+    /// escapes in the query text carry through byte-exact).
+    pub(crate) substring: Vec<u8>,
     tokens_hashes: OnceLock<Vec<u64>>,
 }
 
 /// Builds a substring filter for `field_name`.
-pub(crate) fn new_filter_substring(field_name: &str, substring: &str) -> FilterGeneric {
+pub(crate) fn new_filter_substring(field_name: &str, substring: impl AsRef<[u8]>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterSubstring {
-            substring: substring.to_string(),
+            substring: substring.as_ref().to_vec(),
             tokens_hashes: OnceLock::new(),
         }),
     )
@@ -53,12 +55,13 @@ pub(crate) fn new_filter_substring(field_name: &str, substring: &str) -> FilterG
 impl FilterSubstring {
     pub(crate) fn get_tokens_hashes(&self) -> &[u64] {
         self.tokens_hashes.get_or_init(|| {
-            let s = skip_first_last_token(&self.substring);
-            let mut toks: Vec<&str> = Vec::new();
-            tokenize_strings(&mut toks, std::slice::from_ref(&s));
-            let tokens: Vec<String> = toks.into_iter().map(|t| t.to_string()).collect();
+            // Byte tokenizer: matches the ingest-side hash_tokenizer, so
+            // bloom lookups agree for raw-byte substrings too.
+            let s = skip_first_last_token_bytes(&self.substring);
+            let mut toks: Vec<&[u8]> = Vec::new();
+            tokenize_bytes(&mut toks, std::slice::from_ref(&s));
             let mut hashes = Vec::new();
-            append_tokens_hashes(&mut hashes, &tokens);
+            append_tokens_hashes(&mut hashes, &toks);
             hashes
         })
     }
@@ -66,9 +69,11 @@ impl FilterSubstring {
 
 impl FieldFilter for FilterSubstring {
     fn to_string(&self) -> String {
+        // Lossless render: invalid UTF-8 re-quotes via Go strconv.Quote byte
+        // semantics (`\xNN`), so parse -> render -> re-parse is stable.
         format!(
             "*{}*",
-            crate::stream_filter::quote_token_if_needed(&self.substring)
+            crate::stream_filter::quote_value_bytes_if_needed(&self.substring)
         )
     }
 
@@ -144,7 +149,7 @@ pub(crate) fn match_string_by_substring(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    substring: &str,
+    substring: &[u8],
     tokens: &[u64],
 ) {
     if !match_bloom_filter_all_tokens(bs, ch, tokens) {
@@ -158,7 +163,7 @@ pub(crate) fn match_values_dict_by_substring(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    substring: &str,
+    substring: &[u8],
 ) {
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
@@ -171,13 +176,13 @@ pub(crate) fn match_uint8_by_substring(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    substring: &str,
+    substring: &[u8],
     tokens: &[u64],
 ) {
     if substring.is_empty() {
         return;
     }
-    match try_parse_uint64(substring) {
+    match try_parse_uint64_bytes(substring) {
         Some(n) if n <= ch.max_value => {}
         _ => {
             bm.reset_bits();
@@ -200,13 +205,13 @@ pub(crate) fn match_uint16_by_substring(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    substring: &str,
+    substring: &[u8],
     tokens: &[u64],
 ) {
     if substring.is_empty() {
         return;
     }
-    match try_parse_uint64(substring) {
+    match try_parse_uint64_bytes(substring) {
         Some(n) if n <= ch.max_value => {}
         _ => {
             bm.reset_bits();
@@ -229,13 +234,13 @@ pub(crate) fn match_uint32_by_substring(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    substring: &str,
+    substring: &[u8],
     tokens: &[u64],
 ) {
     if substring.is_empty() {
         return;
     }
-    match try_parse_uint64(substring) {
+    match try_parse_uint64_bytes(substring) {
         Some(n) if n <= ch.max_value => {}
         _ => {
             bm.reset_bits();
@@ -258,13 +263,13 @@ pub(crate) fn match_uint64_by_substring(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    substring: &str,
+    substring: &[u8],
     tokens: &[u64],
 ) {
     if substring.is_empty() {
         return;
     }
-    match try_parse_uint64(substring) {
+    match try_parse_uint64_bytes(substring) {
         Some(n) if n <= ch.max_value => {}
         _ => {
             bm.reset_bits();
@@ -287,14 +292,14 @@ pub(crate) fn match_int64_by_substring(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    substring: &str,
+    substring: &[u8],
     tokens: &[u64],
 ) {
     if substring.is_empty() {
         return;
     }
-    if substring != "-" {
-        match try_parse_int64(substring) {
+    if substring != b"-" {
+        match try_parse_int64_bytes(substring) {
             Some(n) if n >= ch.min_value as i64 && n <= ch.max_value as i64 => {}
             _ => {
                 bm.reset_bits();
@@ -318,19 +323,19 @@ pub(crate) fn match_float64_by_substring(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    substring: &str,
+    substring: &[u8],
     tokens: &[u64],
 ) {
     if substring.is_empty() {
         return;
     }
-    let ok = try_parse_float64_exact(substring).is_some();
+    let ok = try_parse_float64_exact_bytes(substring).is_some();
     if !ok
-        && !substring.contains('.')
-        && !substring.contains('+')
-        && !substring.contains('-')
-        && !substring.contains('e')
-        && !substring.contains('E')
+        && !substring.contains(&b'.')
+        && !substring.contains(&b'+')
+        && !substring.contains(&b'-')
+        && !substring.contains(&b'e')
+        && !substring.contains(&b'E')
     {
         bm.reset_bits();
         return;
@@ -351,7 +356,7 @@ pub(crate) fn match_ipv4_by_substring(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    substring: &str,
+    substring: &[u8],
     tokens: &[u64],
 ) {
     if substring.is_empty() {
@@ -373,7 +378,7 @@ pub(crate) fn match_timestamp_iso8601_by_substring(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    substring: &str,
+    substring: &[u8],
     tokens: &[u64],
 ) {
     if substring.is_empty() {

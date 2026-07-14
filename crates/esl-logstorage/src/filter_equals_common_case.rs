@@ -12,7 +12,6 @@ use crate::filter_generic::{FilterGeneric, new_filter_generic};
 use crate::filter_in::FilterIn;
 use crate::in_values::InValues;
 use crate::rows::Field;
-use crate::stream_filter::quote_token_if_needed;
 
 /// `FilterEqualsCommonCase` matches words and phrases where every capital letter
 /// can be replaced with a small letter, plus all capital words.
@@ -20,19 +19,18 @@ use crate::stream_filter::quote_token_if_needed;
 /// Example LogsQL: `equals_common_case("Error")` is equivalent to
 /// `in("Error", "error", "ERROR")`.
 pub(crate) struct FilterEqualsCommonCase {
-    phrases: Vec<String>,
+    /// Raw phrase bytes (Go strings are arbitrary bytes; raw `\xNN` escapes
+    /// in the query text carry through byte-exact).
+    phrases: Vec<Vec<u8>>,
 
     equals_any: FilterIn,
 }
 
 pub(crate) fn new_filter_equals_common_case(
     field_name: &str,
-    phrases: Vec<String>,
+    phrases: Vec<Vec<u8>>,
 ) -> Result<FilterGeneric, String> {
-    let common_case_phrases = get_common_case_phrases(&phrases)?
-        .into_iter()
-        .map(String::into_bytes)
-        .collect();
+    let common_case_phrases = get_common_case_phrases(&phrases)?;
 
     let fi = FilterEqualsCommonCase {
         phrases,
@@ -46,10 +44,12 @@ pub(crate) fn new_filter_equals_common_case(
 
 impl FieldFilter for FilterEqualsCommonCase {
     fn to_string(&self) -> String {
+        // Lossless render (Go quoteTokenIfNeeded, byte form): invalid UTF-8
+        // re-quotes via Go strconv.Quote byte semantics (`\xNN`).
         let phrases = self
             .phrases
             .iter()
-            .map(|p| quote_token_if_needed(p))
+            .map(|p| crate::stream_filter::quote_value_bytes_if_needed(p))
             .collect::<Vec<_>>()
             .join(",");
         format!("equals_common_case({phrases})")

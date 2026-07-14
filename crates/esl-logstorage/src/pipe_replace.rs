@@ -26,10 +26,11 @@ use crate::stream_filter::quote_token_if_needed;
 pub(crate) struct PipeReplace {
     /// The field whose value is rewritten (defaults to `_msg`).
     pub(crate) field: String,
-    /// The literal substring to replace.
-    pub(crate) old_substr: String,
-    /// The replacement string.
-    pub(crate) new_substr: String,
+    /// The literal substring to replace. Raw bytes (Go strings are arbitrary
+    /// bytes; raw `\xNN` escapes in the query text carry through byte-exact).
+    pub(crate) old_substr: Vec<u8>,
+    /// The replacement bytes.
+    pub(crate) new_substr: Vec<u8>,
     /// Maximum number of replacements per value (0 = unlimited).
     pub(crate) limit: u64,
     /// Optional `if (...)` filter for skipping the replace operation (Go `iff`).
@@ -40,8 +41,8 @@ impl PipeReplace {
     /// Builds a `replace` pipe from parsed arguments.
     pub(crate) fn new(
         field: impl Into<String>,
-        old_substr: impl Into<String>,
-        new_substr: impl Into<String>,
+        old_substr: impl Into<Vec<u8>>,
+        new_substr: impl Into<Vec<u8>>,
         limit: u64,
         iff: Option<Arc<IfFilter>>,
     ) -> Self {
@@ -68,10 +69,12 @@ impl Pipe for PipeReplace {
             s.push(' ');
             s.push_str(&iff.to_string());
         }
+        // Lossless render (Go quoteTokenIfNeeded, byte form): invalid UTF-8
+        // re-quotes via Go strconv.Quote byte semantics (`\xNN`).
         s.push_str(&format!(
             " ({}, {})",
-            quote_token_if_needed(&self.old_substr),
-            quote_token_if_needed(&self.new_substr)
+            crate::stream_filter::quote_value_bytes_if_needed(&self.old_substr),
+            crate::stream_filter::quote_value_bytes_if_needed(&self.new_substr)
         ));
         if self.field != "_msg" {
             s.push_str(&format!(" at {}", quote_token_if_needed(&self.field)));
@@ -130,8 +133,8 @@ impl Pipe for PipeReplace {
         // `appendReplace(a.b, v, ...)` to a pooled arena and returns the new
         // suffix. The Rust port drops the arena and returns an owned String
         // (see pipe_update.rs module docs).
-        let old_substr = self.old_substr.clone().into_bytes();
-        let new_substr = self.new_substr.clone().into_bytes();
+        let old_substr = self.old_substr.clone();
+        let new_substr = self.new_substr.clone();
         let limit = self.limit;
         let update_func: UpdateFunc = Arc::new(move |v: &[u8]| {
             let mut buf: Vec<u8> = Vec::new();

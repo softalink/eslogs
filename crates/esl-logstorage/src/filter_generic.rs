@@ -388,6 +388,31 @@ pub(crate) fn skip_last_token(s: &str) -> &str {
     }
 }
 
+/// Byte form of [`skip_first_last_token`] for raw-byte payloads (see
+/// [`skip_first_token_bytes`] / [`skip_last_token_bytes`] for the Go
+/// `RuneError` trimming semantics).
+pub(crate) fn skip_first_last_token_bytes(s: &[u8]) -> &[u8] {
+    skip_last_token_bytes(skip_first_token_bytes(s))
+}
+
+/// Byte form of [`skip_first_token`] for raw-byte payloads: Go's
+/// `utf8.DecodeRuneInString` yields `RuneError` on an invalid leading
+/// sequence, which is not a token rune, so trimming stops there — mirrored by
+/// [`crate::pattern_matcher::decode_rune`].
+pub(crate) fn skip_first_token_bytes(s: &[u8]) -> &[u8] {
+    let mut s = s;
+    while !s.is_empty() {
+        let (r, size) = crate::pattern_matcher::decode_rune(s);
+        if !is_token_rune(r) {
+            break;
+        }
+        // `r` is a validly decoded rune here (RUNE_ERROR is not a token
+        // rune), so `size` is its exact UTF-8 width.
+        s = &s[size..];
+    }
+    s
+}
+
 /// Byte form of [`skip_last_token`] for raw-byte prefixes: Go's
 /// `utf8.DecodeLastRuneInString` yields `RuneError` on an invalid trailing
 /// sequence, which is not a token rune, so trimming stops there — mirrored by

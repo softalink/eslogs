@@ -70,6 +70,19 @@ pub(crate) fn quote_string_token_if_needed(s: &str) -> String {
     go_quote(s)
 }
 
+/// Byte form of [`quote_string_token_if_needed`] for raw-byte value payloads.
+///
+/// Valid UTF-8 renders bit-identically to the `&str` form; invalid UTF-8
+/// always needs quoting in Go too (`needQuoteToken` sees the non-token
+/// `RuneError` rune), and quotes with Go `strconv.Quote` byte semantics
+/// (`\xNN` per invalid byte) — exactly what Go produces.
+pub(crate) fn quote_string_value_bytes_if_needed(v: &[u8]) -> String {
+    match std::str::from_utf8(v) {
+        Ok(s) => quote_string_token_if_needed(s),
+        Err(_) => crate::stream_filter::go_quote_bytes(v),
+    }
+}
+
 /// Port of Go `quoteFieldFilterIfNeeded`.
 /// Port of Go `quoteFieldFilterIfNeeded` (used by field-filter Display in the
 /// upstream code; kept for parity though pipe/filter Display currently routes

@@ -349,11 +349,17 @@ what remains in section (a) is confirmed-present divergence.
   (`Lexer.token_bytes`, `strconv.Unquote` semantics: double-quoted `\xNN`≥0x80
   IS the raw byte), consumed by the phrase-filter family
   (`phrase`/`exact`/`prefix`/`exact_prefix`/`seq`/`i()`) end-to-end with
-  lossless render→re-parse. Still on the scalar `String` token path (behavior
-  unchanged, no lossy): quoted field NAMES, `in()`/`contains_*` literal
-  values, `*substr*`, `string_range`, `re()`/`pattern_match` args,
-  `*_common_case`, `json_array_contains_any`, stream-filter tag values, and
-  pipe args.
+  lossless render→re-parse — as are `in()`/`contains_*` literal values,
+  `string_range` bounds (incl. the `>`/`>=`/`<`/`<=` string forms), `*substr*`,
+  `*_common_case` (Go `strings.ToUpper`-exact case expansion),
+  `json_array_contains_any`, stream-filter tag values (`{label="value"}` —
+  byte-exact `=`/`!=`, Go byte-wise `QuoteMeta` for `in`), and the `replace`
+  pipe's from/to. Still on the scalar `String` token path (behavior unchanged,
+  no lossy): quoted field NAMES (the `FieldFilter`/grammar `&str` cascade:
+  ~160 sites / 37 files — a raw-byte quoted field name scalar-decodes),
+  `re()` args (regex engine is `&str`-bound), `pattern_match*` pattern text
+  (str-native `PatternMatcher` module), and the remaining pipe args (`format`
+  patterns, `split` separator, `unpack_*` prefixes, ...).
 
 **Input handling edge cases (esl-logstorage)**
 

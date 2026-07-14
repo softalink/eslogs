@@ -26,9 +26,7 @@ use crate::parser::helpers::*;
 use crate::parser::lexer_ext::LexerExt;
 use crate::parser::parse_pipe::is_pipe_name;
 use crate::parser::parse_stats::is_stats_func_name;
-use crate::parser::{
-    MAX_STRING_RANGE_VALUE, go_quote, quote_string_token_if_needed, quote_token_if_needed,
-};
+use crate::parser::{MAX_STRING_RANGE_VALUE, go_quote};
 use crate::pattern_matcher::{PatternMatcherOption, new_pattern_matcher};
 use crate::stream_filter::{Lexer, parse_args_in_parens_possible_wildcard, parse_stream_filter};
 use crate::stream_id::StreamID;
@@ -371,7 +369,9 @@ fn parse_filter_len_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter
 }
 
 fn parse_filter_string_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
-    parse_func_args(lex, field_name, |func_name, args| {
+    // Raw-byte bounds (Go parser.go:329 strconv.Unquote semantics); the
+    // string_repr re-quotes them losslessly (Go quoteTokenIfNeeded, byte form).
+    parse_func_args_bytes(lex, field_name, |func_name, args| {
         if args.len() != 2 {
             return Err(format!(
                 "unexpected number of args for {func_name}(); got {}; want 2",
@@ -380,8 +380,8 @@ fn parse_filter_string_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFil
         }
         let string_repr = format!(
             "{func_name}({}, {})",
-            quote_token_if_needed(&args[0]),
-            quote_token_if_needed(&args[1])
+            crate::stream_filter::quote_value_bytes_if_needed(&args[0]),
+            crate::stream_filter::quote_value_bytes_if_needed(&args[1])
         );
         Ok(Box::new(
             crate::filter_string_range::new_filter_string_range(
@@ -406,7 +406,8 @@ fn parse_filter_json_array_contains_any(
     lex: &mut Lexer,
     field_name: &str,
 ) -> Result<BoxFilter, String> {
-    parse_func_args(lex, field_name, |_, args| {
+    // Raw-byte values (Go parser.go:329 strconv.Unquote semantics).
+    parse_func_args_bytes(lex, field_name, |_, args| {
         Ok(Box::new(new_filter_json_array_contains_any(
             field_name, args,
         )))
@@ -490,10 +491,9 @@ enum InKind {
 fn parse_in_values(lex: &mut Lexer, field_name: &str, kind: InKind) -> Result<BoxFilter, String> {
     // Try parsing in(arg1, ..., argN) at first
     let lex_state = lex.clone();
-    let err_first = match parse_func_args_possible_wildcard(lex) {
+    let err_first = match parse_func_args_possible_wildcard_bytes(lex) {
         Ok(None) => return Ok(Box::new(new_filter_noop())),
         Ok(Some(args)) => {
-            let args: Vec<Vec<u8>> = args.into_iter().map(String::into_bytes).collect();
             return Ok(match kind {
                 InKind::In => Box::new(new_filter_in_values(field_name, args)),
                 InKind::ContainsAll => Box::new(new_filter_contains_all_values(field_name, args)),
@@ -589,12 +589,36 @@ fn parse_func_args_possible_wildcard(lex: &mut Lexer) -> Result<Option<Vec<Strin
     Ok(Some(args))
 }
 
+/// Byte form of [`parse_func_args_possible_wildcard`] for filters whose args
+/// are raw-byte value payloads (Go parser.go:329 strconv.Unquote semantics):
+/// `in()` / `contains_any()` / `contains_all()` literal values.
+fn parse_func_args_possible_wildcard_bytes(
+    lex: &mut Lexer,
+) -> Result<Option<Vec<Vec<u8>>>, String> {
+    let func_name = lex.token.clone();
+    lex.next_token();
+    if !lex.is_keyword(&["("]) {
+        return Err(format!(
+            "the {} must be put in quotes",
+            go_quote(&func_name)
+        ));
+    }
+    let (args, is_wildcard) =
+        crate::stream_filter::parse_args_in_parens_possible_wildcard_bytes(lex)
+            .map_err(|e| format!("cannot parse {func_name}(): {e}"))?;
+    if is_wildcard {
+        return Ok(None);
+    }
+    Ok(Some(args))
+}
+
 fn parse_filter_contains_common_case(
     lex: &mut Lexer,
     field_name: &str,
 ) -> Result<BoxFilter, String> {
     lex.next_token();
-    let phrases = parse_args_in_parens(lex)
+    // Raw-byte phrases (Go parser.go:329 strconv.Unquote semantics).
+    let phrases = parse_args_in_parens_bytes(lex)
         .map_err(|e| format!("cannot parse 'contains_common_case(...)' args: {e}"))?;
     new_filter_contains_common_case(field_name, phrases)
         .map(|f| Box::new(f) as BoxFilter)
@@ -603,7 +627,8 @@ fn parse_filter_contains_common_case(
 
 fn parse_filter_equals_common_case(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
     lex.next_token();
-    let phrases = parse_args_in_parens(lex)
+    // Raw-byte phrases (Go parser.go:329 strconv.Unquote semantics).
+    let phrases = parse_args_in_parens_bytes(lex)
         .map_err(|e| format!("cannot parse 'equals_common_case(...)' args: {e}"))?;
     new_filter_equals_common_case(field_name, phrases)
         .map(|f| Box::new(f) as BoxFilter)
@@ -695,20 +720,22 @@ fn parse_filter_star(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, Str
         return Ok(Box::new(new_filter_prefix(field_name, "")));
     }
 
+    // Raw-byte payload (Go parser.go:329 strconv.Unquote semantics); the
+    // error messages quote it with Go %q byte semantics (`go_quote_bytes`).
     let phrase = lex
-        .next_compound_token()
+        .next_compound_token_bytes()
         .map_err(|e| format!("cannot read *substr* filter: {e}"))?;
     if lex.is_skipped_space() || !lex.is_keyword(&["*"]) {
         return Err(format!(
             "missing ending '*' in the *{}* filter",
-            go_quote(&phrase)
+            crate::stream_filter::go_quote_bytes(&phrase)
         ));
     }
     lex.next_token();
     if !lex.is_skipped_space() && !lex.is_query_part_trailer() {
         return Err(format!(
             "missing whitespace between *{}* and {}",
-            go_quote(&phrase),
+            crate::stream_filter::go_quote_bytes(&phrase),
             go_quote(&lex.token)
         ));
     }
@@ -856,12 +883,16 @@ fn try_parse_filter_gt_string(
     op: &str,
     include_min_value: bool,
 ) -> Option<BoxFilter> {
-    let min_value_orig = lex.next_compound_token().ok()?;
+    // Raw-byte bound (Go parser.go:329 strconv.Unquote semantics).
+    let min_value_orig = lex.next_compound_token_bytes().ok()?;
     let mut min_value = min_value_orig.clone();
     if !include_min_value {
-        min_value.push('\0');
+        min_value.push(0);
     }
-    let string_repr = format!("{op}{}", quote_string_token_if_needed(&min_value_orig));
+    let string_repr = format!(
+        "{op}{}",
+        crate::parser::quote_string_value_bytes_if_needed(&min_value_orig)
+    );
     Some(Box::new(
         crate::filter_string_range::new_filter_string_range(
             field_name,
@@ -878,12 +909,16 @@ fn try_parse_filter_lt_string(
     op: &str,
     include_max_value: bool,
 ) -> Option<BoxFilter> {
-    let max_value_orig = lex.next_compound_token().ok()?;
+    // Raw-byte bound (Go parser.go:329 strconv.Unquote semantics).
+    let max_value_orig = lex.next_compound_token_bytes().ok()?;
     let mut max_value = max_value_orig.clone();
     if include_max_value {
-        max_value.push('\0');
+        max_value.push(0);
     }
-    let string_repr = format!("{op}{}", quote_string_token_if_needed(&max_value_orig));
+    let string_repr = format!(
+        "{op}{}",
+        crate::parser::quote_string_value_bytes_if_needed(&max_value_orig)
+    );
     Some(Box::new(
         crate::filter_string_range::new_filter_string_range(
             field_name,

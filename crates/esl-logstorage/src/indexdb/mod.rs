@@ -606,7 +606,7 @@ impl IndexSearch {
         &mut self,
         tenant_id: TenantID,
         tag_name: &str,
-        tag_value: &str,
+        tag_value: &[u8],
     ) -> HashSet<U128> {
         let mut ids = HashSet::new();
         let mut sp = TagToStreamIDsRowParser::default();
@@ -614,7 +614,7 @@ impl IndexSearch {
         self.kb.clear();
         marshal_common_prefix(&mut self.kb, NS_PREFIX_TAG_TO_STREAM_IDS, tenant_id);
         stream_tags::marshal_tag_value(&mut self.kb, tag_name.as_bytes());
-        stream_tags::marshal_tag_value(&mut self.kb, tag_value.as_bytes());
+        stream_tags::marshal_tag_value(&mut self.kb, tag_value);
         let prefix_len = self.kb.len();
         self.ts.seek(&self.kb);
         while self.ts.next_item() {
