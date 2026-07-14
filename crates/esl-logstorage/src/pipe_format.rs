@@ -284,7 +284,7 @@ impl PipeProcessor for PipeFormatProcessor {
 fn format_row(steps: &[PatternStep], br: &mut BlockResult, row_idx: usize) -> Vec<u8> {
     let mut b: Vec<u8> = Vec::new();
     for step in steps {
-        b.extend_from_slice(step.prefix.as_bytes());
+        b.extend_from_slice(&step.prefix);
         if step.field.is_empty() {
             continue;
         }

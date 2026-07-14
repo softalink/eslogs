@@ -10,16 +10,21 @@
 #![allow(dead_code)]
 
 use crate::html_entities::{LONGEST_ENTITY_WITHOUT_SEMICOLON, lookup_entity, lookup_entity2};
+use crate::pattern_matcher::decode_rune;
 use crate::prefix_filter;
 
 /// Pattern represents text pattern in the form `some_text<some_field>other_text...`
+///
+/// PORT NOTE: Go `pattern` matches and stores raw byte strings; `matches` and
+/// `PatternStep.prefix` are `Vec<u8>` so values containing invalid UTF-8 match
+/// byte-for-byte like Go. Field/option NAMES remain `String`.
 #[derive(Debug)]
 pub(crate) struct Pattern {
     /// steps contains steps for extracting fields from string
     pub(crate) steps: Vec<PatternStep>,
 
     /// matches contains matches for every step in steps
-    pub(crate) matches: Vec<String>,
+    pub(crate) matches: Vec<Vec<u8>>,
 
     /// fields contains matches for non-empty fields
     pub(crate) fields: Vec<PatternField>,
@@ -37,7 +42,7 @@ pub(crate) struct PatternField {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PatternStep {
-    pub(crate) prefix: String,
+    pub(crate) prefix: Vec<u8>,
 
     pub(crate) field: String,
     pub(crate) field_opt: String,
@@ -49,7 +54,7 @@ impl Clone for Pattern {
     /// deep-clones `steps`. `matches` contents are not copied — they are
     /// transient per-`apply()` state, exactly as in Go.
     fn clone(&self) -> Pattern {
-        let matches = vec![String::new(); self.steps.len()];
+        let matches = vec![Vec::new(); self.steps.len()];
         let mut fields = Vec::new();
         for (i, step) in self.steps.iter().enumerate() {
             if !step.field.is_empty() {
@@ -91,7 +96,7 @@ pub(crate) fn parse_pattern(s: &str) -> Result<Pattern, String> {
 
     // Build pattern struct
 
-    let matches = vec![String::new(); steps.len()];
+    let matches = vec![Vec::new(); steps.len()];
 
     let mut fields = Vec::new();
     for (i, step) in steps.iter().enumerate() {
@@ -117,11 +122,11 @@ pub(crate) fn parse_pattern(s: &str) -> Result<Pattern, String> {
 
 impl Pattern {
     /// Returns the value matched for the given field.
-    pub(crate) fn field_value(&self, f: &PatternField) -> &str {
+    pub(crate) fn field_value(&self, f: &PatternField) -> &[u8] {
         &self.matches[f.match_idx]
     }
 
-    pub(crate) fn apply(&mut self, s: &str) {
+    pub(crate) fn apply(&mut self, s: &[u8]) {
         let Pattern { steps, matches, .. } = self;
         for m in matches.iter_mut() {
             m.clear();
@@ -134,15 +139,15 @@ impl Pattern {
         let mut s = &s[n + prefix_len..];
 
         for i in 0..steps.len() {
-            let next_prefix = if i + 1 < steps.len() {
-                steps[i + 1].prefix.as_str()
+            let next_prefix: &[u8] = if i + 1 < steps.len() {
+                &steps[i + 1].prefix
             } else {
-                ""
+                b""
             };
 
-            if let Some((us, n_offset)) = try_unquote_string(s, &steps[i].field_opt) {
+            if let Some((us, n_offset)) = try_unquote_bytes(s, &steps[i].field_opt) {
                 // Matched quoted string
-                matches[i].push_str(&us);
+                matches[i].extend_from_slice(&us);
                 s = &s[n_offset..];
                 if !s.starts_with(next_prefix) {
                     // Mismatch
@@ -152,14 +157,14 @@ impl Pattern {
             } else {
                 // Match unquoted string until the nextPrefix
                 if next_prefix.is_empty() {
-                    matches[i].push_str(s);
+                    matches[i].extend_from_slice(s);
                     return;
                 }
                 let Some((n, prefix_len)) = prefix_index(s, next_prefix) else {
                     // Mismatch
                     return;
                 };
-                matches[i].push_str(&s[..n]);
+                matches[i].extend_from_slice(&s[..n]);
                 s = &s[n + prefix_len..];
             }
         }
@@ -167,17 +172,61 @@ impl Pattern {
 }
 
 /// PORT NOTE: Go returns `(-1, 0)` on mismatch; the port returns `None`.
-fn prefix_index(s: &str, prefix: &str) -> Option<(usize, usize)> {
+/// Byte-level search, like Go's `strings.Index`.
+fn prefix_index(s: &[u8], prefix: &[u8]) -> Option<(usize, usize)> {
     if prefix.is_empty() {
         return Some((0, 0));
     }
-    let n = s.find(prefix)?;
+    if prefix.len() > s.len() {
+        return None;
+    }
+    let n = s.windows(prefix.len()).position(|w| w == prefix)?;
     Some((n, prefix.len()))
 }
 
+/// Byte-native port of Go `tryUnquoteString` (pattern.go), used by
+/// [`Pattern::apply`]. Matches Go's `strconv.Unquote` exactly: `\xNN`/octal
+/// escapes >= 0x80 inside double-quoted strings produce the RAW byte in the
+/// output (the result may be invalid UTF-8). The single-quoted path uses
+/// `utf8.AppendRune` semantics like Go's own loop.
+///
 /// PORT NOTE: Go returns `("", -1)` on mismatch; the port returns `None`.
-/// The unquoted string is copied into an owned `String` (Go's
-/// `strconv.Unquote` allocates as well).
+pub(crate) fn try_unquote_bytes(s: &[u8], opt: &str) -> Option<(Vec<u8>, usize)> {
+    if opt == "plain" {
+        return None;
+    }
+    if s.is_empty() {
+        return None;
+    }
+
+    match s[0] {
+        b'"' | b'`' => {
+            let qp_len = quoted_prefix_len(s).ok()?;
+            let us = unquote_bytes(&s[..qp_len]).ok()?;
+            Some((us, qp_len))
+        }
+        b'\'' => {
+            let mut b = Vec::new();
+            let mut tail = &s[1..];
+            while !tail.starts_with(b"'") {
+                let (ch, _, rest) = unquote_char_bytes(tail, b'\'').ok()?;
+                let mut tmp = [0u8; 4];
+                b.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+                tail = rest;
+            }
+            Some((b, s.len() - tail.len() + 1))
+        }
+        _ => None,
+    }
+}
+
+/// String form of [`try_unquote_bytes`] kept for the callers whose values are
+/// still `String`-typed (`storage_search`, `stream_tags`, `logfmt_parser`).
+///
+/// PORT NOTE: unlike the byte form, `\xNN`/octal escapes >= 0x80 inside
+/// double-quoted strings are UTF-8-encoded as scalars here (Go emits the raw
+/// byte) because the result must stay valid UTF-8 — documented residual for
+/// those callers. Go returns `("", -1)` on mismatch; the port returns `None`.
 pub(crate) fn try_unquote_string(s: &str, opt: &str) -> Option<(String, usize)> {
     if opt == "plain" {
         return None;
@@ -211,7 +260,11 @@ pub(crate) fn parse_pattern_steps(s: &str) -> Result<Vec<PatternStep>, String> {
 
     // unescape prefixes
     for step in &mut steps {
-        step.prefix = html_unescape_string(&step.prefix);
+        // Prefixes are slices of the pattern text (`&str`), so they are valid
+        // UTF-8 at this point; the byte type matches Go's byte-level matching.
+        let prefix = std::str::from_utf8(&step.prefix)
+            .expect("BUG: pattern prefixes come from the pattern text, which is valid UTF-8");
+        step.prefix = html_unescape_string(prefix).into_bytes();
     }
 
     // extract options part from fields
@@ -237,7 +290,7 @@ fn parse_pattern_steps_internal(s: &str) -> Result<Vec<PatternStep>, String> {
 
     let Some(n) = s.find('<') else {
         steps.push(PatternStep {
-            prefix: s.to_string(),
+            prefix: s.as_bytes().to_vec(),
             ..Default::default()
         });
         return Ok(steps);
@@ -255,7 +308,7 @@ fn parse_pattern_steps_internal(s: &str) -> Result<Vec<PatternStep>, String> {
             field = "";
         }
         steps.push(PatternStep {
-            prefix: prefix.to_string(),
+            prefix: prefix.as_bytes().to_vec(),
             field: field.to_string(),
             field_opt: String::new(),
         });
@@ -266,7 +319,7 @@ fn parse_pattern_steps_internal(s: &str) -> Result<Vec<PatternStep>, String> {
         match s.find('<') {
             None => {
                 steps.push(PatternStep {
-                    prefix: s.to_string(),
+                    prefix: s.as_bytes().to_vec(),
                     ..Default::default()
                 });
                 break;
@@ -289,30 +342,68 @@ fn parse_pattern_steps_internal(s: &str) -> Result<Vec<PatternStep>, String> {
 /// Port of Go `strconv.QuotedPrefix`: returns the quoted string (including
 /// quotes) at the start of `s`.
 pub(crate) fn quoted_prefix(s: &str) -> Result<&str, ()> {
-    let (_, n) = go_unquote_inner(s, false)?;
+    // The consumed prefix always ends right after an ASCII quote byte, so the
+    // slice below is on a char boundary.
+    let n = quoted_prefix_len(s.as_bytes())?;
     Ok(&s[..n])
 }
 
-/// Port of Go `strconv.Unquote`: interprets `s` as a Go quoted string
-/// literal, returning the value that `s` quotes.
-fn unquote(s: &str) -> Result<String, ()> {
-    let (out, n) = go_unquote_inner(s, true)?;
+/// Byte form of [`quoted_prefix`]: returns the length of the quoted string
+/// (including quotes) at the start of `s`.
+fn quoted_prefix_len(s: &[u8]) -> Result<usize, ()> {
+    let (_, n) = go_unquote_inner(s, false, false)?;
+    Ok(n)
+}
+
+/// Port of Go `strconv.Unquote` over raw bytes: interprets `s` as a Go quoted
+/// string literal, returning the value that `s` quotes. Matches Go exactly:
+/// `\xNN`/octal escapes >= 0x80 inside double-quoted strings emit the raw
+/// byte, so the result may be invalid UTF-8.
+fn unquote_bytes(s: &[u8]) -> Result<Vec<u8>, ()> {
+    let (out, n) = go_unquote_inner(s, true, false)?;
     if n != s.len() {
         return Err(());
     }
     Ok(out)
 }
 
-/// Port of Go `strconv/quote.go`'s `unquote(in, unescape)`. Returns the
-/// unescaped contents (empty when `unescape` is false) and the number of
-/// bytes consumed (the quoted prefix length).
-fn go_unquote_inner(input: &str, unescape: bool) -> Result<(String, usize), ()> {
+/// String form of `strconv.Unquote` kept for [`try_unquote_string`].
+///
+/// PORT NOTE: `\xNN`/octal escapes >= 0x80 are UTF-8-encoded as scalars here
+/// (Go emits the raw byte); see [`try_unquote_string`].
+fn unquote(s: &str) -> Result<String, ()> {
+    let (out, n) = go_unquote_inner(s.as_bytes(), true, true)?;
+    if n != s.len() {
+        return Err(());
+    }
+    Ok(String::from_utf8(out).expect("BUG: scalar-mode unquote of a str produced invalid UTF-8"))
+}
+
+/// Port of Go `strconv/quote.go`'s `unquote(in, unescape)` over raw bytes.
+/// Returns the unescaped contents (empty when `unescape` is false) and the
+/// number of bytes consumed (the quoted prefix length).
+///
+/// PORT NOTE: with `scalar_high_escapes == false` this matches Go exactly —
+/// Go appends `byte(r)` when `r < utf8.RuneSelf || !multibyte`, so the
+/// escapes `\x80`..`\xFF` and octal `\200`..`\377` inside double-quoted
+/// values produce a raw (possibly invalid-UTF-8) byte, and raw invalid UTF-8
+/// sequences inside double quotes decode as U+FFFD (via `utf8.DecodeRune`).
+/// `scalar_high_escapes == true` keeps the legacy `String`-typed behavior
+/// (UTF-8-encode the scalar, e.g. `\x80` → 0xC2 0x80 vs Go's lone 0x80) for
+/// the callers whose values are still `String` (logfmt_parser, stream_tags,
+/// storage_search); the two modes are identical for inputs whose unquoted
+/// value stays valid UTF-8.
+fn go_unquote_inner(
+    input: &[u8],
+    unescape: bool,
+    scalar_high_escapes: bool,
+) -> Result<(Vec<u8>, usize), ()> {
     // Determine the quote form and optimistically find the terminating quote.
     if input.len() < 2 {
         return Err(());
     }
-    let quote = input.as_bytes()[0];
-    let Some(end0) = input[1..].find(quote as char) else {
+    let quote = input[0];
+    let Some(end0) = input[1..].iter().position(|&b| b == quote) else {
         return Err(());
     };
     let end = end0 + 2; // position after terminating quote; may be wrong if escape sequences are present
@@ -320,73 +411,61 @@ fn go_unquote_inner(input: &str, unescape: bool) -> Result<(String, usize), ()> 
     match quote {
         b'`' => {
             if !unescape {
-                Ok((String::new(), end))
+                Ok((Vec::new(), end))
             } else {
                 let inner = &input[1..end - 1];
-                if !inner.contains('\r') {
-                    Ok((inner.to_string(), end))
+                if !inner.contains(&b'\r') {
+                    Ok((inner.to_vec(), end))
                 } else {
                     // Carriage return characters ('\r') inside raw string
                     // literals are discarded from the raw string value.
-                    let buf: String = inner.chars().filter(|&c| c != '\r').collect();
+                    let buf: Vec<u8> = inner.iter().copied().filter(|&c| c != b'\r').collect();
                     Ok((buf, end))
                 }
             }
         }
         b'"' | b'\'' => {
             // Handle quoted strings without any escape sequences.
-            if !input[..end].contains('\\') && !input[..end].contains('\n') {
+            if !input[..end].contains(&b'\\') && !input[..end].contains(&b'\n') {
+                let inner = &input[1..end - 1];
                 let valid = match quote {
-                    // PORT NOTE: Go verifies utf8.ValidString here; Rust
-                    // `&str` is valid UTF-8 by construction.
-                    b'"' => true,
+                    b'"' => std::str::from_utf8(inner).is_ok(),
                     _ => {
-                        let inner = &input[1..end - 1];
-                        match inner.chars().next() {
-                            Some(r) => 1 + r.len_utf8() + 1 == end,
-                            None => false,
-                        }
+                        let (r, n) = decode_rune(inner);
+                        inner.len() == n && (r != '\u{FFFD}' || n != 1)
                     }
                 };
                 if valid {
                     if unescape {
-                        return Ok((input[1..end - 1].to_string(), end));
+                        return Ok((inner.to_vec(), end));
                     }
-                    return Ok((String::new(), end));
+                    return Ok((Vec::new(), end));
                 }
             }
 
             // Handle quoted strings with escape sequences.
-            let mut buf = String::new();
+            let mut buf = Vec::new();
             let in0_len = input.len();
             let mut rest = &input[1..]; // skip starting quote
-            while !rest.is_empty() && rest.as_bytes()[0] != quote {
+            while !rest.is_empty() && rest[0] != quote {
                 // Process the next character,
                 // rejecting any unescaped newline characters which are invalid.
-                if rest.as_bytes()[0] == b'\n' {
+                if rest[0] == b'\n' {
                     return Err(());
                 }
-                let (r, _multibyte, rem) = unquote_char(rest, quote)?;
+                let (r, multibyte, rem) = unquote_char_bytes(rest, quote)?;
                 rest = rem;
 
                 // Append the character if unescaping the input.
                 if unescape {
-                    // PORT NOTE: Go appends `byte(r)` when !multibyte, so the
-                    // escapes `\x80`..`\xFF` and octal `\200`..`\377` inside
-                    // double-quoted values produce a raw (invalid-UTF-8) byte
-                    // in the unquoted Go string; Rust `String` must stay
-                    // valid UTF-8, so the port encodes the scalar instead
-                    // (e.g. `\x80` → 0xC2 0x80 vs Go's lone 0x80). This is
-                    // observable in extracted field values and cannot match
-                    // Go without a String→bytes refactor of field values
-                    // (crate-wide decision: Field values are `String`; this
-                    // helper is also shared by logfmt_parser, stream_tags,
-                    // storage_search and pattern_matcher). Values < 0x80 and
-                    // \u/\U escapes are byte-identical to Go. Go's own
-                    // single-quote path in `tryUnquoteString` uses
-                    // `utf8.AppendRune`, so the port matches Go exactly for
-                    // single-quoted values.
-                    buf.push(r);
+                    if !scalar_high_escapes && ((r as u32) < 0x80 || !multibyte) {
+                        // Go: buf = append(buf, byte(r)). When !multibyte the
+                        // value is at most 0xFF (\xNN or octal escape).
+                        buf.push(r as u32 as u8);
+                    } else {
+                        let mut tmp = [0u8; 4];
+                        buf.extend_from_slice(r.encode_utf8(&mut tmp).as_bytes());
+                    }
                 }
 
                 // Single quoted strings must be a single character.
@@ -396,7 +475,7 @@ fn go_unquote_inner(input: &str, unescape: bool) -> Result<(String, usize), ()> 
             }
 
             // Verify that the string ends with a terminating quote.
-            if rest.is_empty() || rest.as_bytes()[0] != quote {
+            if rest.is_empty() || rest[0] != quote {
                 return Err(());
             }
             rest = &rest[1..]; // skip terminating quote
@@ -407,20 +486,31 @@ fn go_unquote_inner(input: &str, unescape: bool) -> Result<(String, usize), ()> 
     }
 }
 
-/// Port of Go `strconv.UnquoteChar`: decodes the first character or escape
-/// sequence in `s`, returning `(value, multibyte, tail)`.
+/// String form of [`unquote_char_bytes`] kept for `pattern_matcher` and the
+/// `String`-typed single-quote loop in [`try_unquote_string`].
 pub(crate) fn unquote_char(s: &str, quote: u8) -> Result<(char, bool, &str), ()> {
+    let (value, multibyte, tail) = unquote_char_bytes(s.as_bytes(), quote)?;
+    // The consumed prefix is either a whole rune or an ASCII escape sequence,
+    // so the tail starts on a char boundary for valid `&str` input.
+    Ok((value, multibyte, &s[s.len() - tail.len()..]))
+}
+
+/// Port of Go `strconv.UnquoteChar` over raw bytes: decodes the first
+/// character or escape sequence in `s`, returning `(value, multibyte, tail)`.
+/// Raw bytes >= 0x80 decode with `utf8.DecodeRune` semantics (invalid
+/// sequences yield U+FFFD, size 1), exactly like Go.
+pub(crate) fn unquote_char_bytes(s: &[u8], quote: u8) -> Result<(char, bool, &[u8]), ()> {
     // easy cases
     if s.is_empty() {
         return Err(());
     }
-    let c = s.as_bytes()[0];
+    let c = s[0];
     if c == quote && (quote == b'\'' || quote == b'"') {
         return Err(());
     }
     if c >= 0x80 {
-        let ch = s.chars().next().ok_or(())?;
-        return Ok((ch, true, &s[ch.len_utf8()..]));
+        let (ch, size) = decode_rune(s);
+        return Ok((ch, true, &s[size..]));
     }
     if c != b'\\' {
         return Ok((c as char, false, &s[1..]));
@@ -430,7 +520,7 @@ pub(crate) fn unquote_char(s: &str, quote: u8) -> Result<(char, bool, &str), ()>
     if s.len() <= 1 {
         return Err(());
     }
-    let c = s.as_bytes()[1];
+    let c = s[1];
     let mut s = &s[2..];
 
     let (value, multibyte) = match c {
@@ -451,15 +541,14 @@ pub(crate) fn unquote_char(s: &str, quote: u8) -> Result<(char, bool, &str), ()>
                 return Err(());
             }
             let mut v: u32 = 0;
-            let bs = s.as_bytes();
-            for &b in &bs[..n] {
+            for &b in &s[..n] {
                 let x = unhex(b).ok_or(())?;
                 v = v << 4 | x;
             }
             s = &s[n..];
             if c == b'x' {
-                // single-byte value; see the PORT NOTE in go_unquote_inner
-                // about the difference with Go for values >= 0x80
+                // single-byte value, possibly not UTF-8 (Go emits `byte(r)`;
+                // see go_unquote_inner). v <= 0xFF, so from_u32 cannot fail.
                 (char::from_u32(v).ok_or(())?, false)
             } else {
                 // char::from_u32 rejects surrogates and values above the max
@@ -472,8 +561,7 @@ pub(crate) fn unquote_char(s: &str, quote: u8) -> Result<(char, bool, &str), ()>
             if s.len() < 2 {
                 return Err(());
             }
-            let bs = s.as_bytes();
-            for &b in &bs[..2] {
+            for &b in &s[..2] {
                 // one digit already; two more
                 if !(b'0'..=b'7').contains(&b) {
                     return Err(());
@@ -690,21 +778,24 @@ mod tests {
                 for (i, fld) in ptn.fields.iter().enumerate() {
                     let v = ptn.field_value(fld);
                     assert_eq!(
-                        v, results_expected[i],
+                        v,
+                        results_expected[i].as_bytes(),
                         "unexpected value for field {:?}; got {:?}; want {:?}",
-                        fld.name, v, results_expected[i]
+                        fld.name,
+                        String::from_utf8_lossy(v),
+                        results_expected[i]
                     );
                 }
             };
 
             let mut ptn = parse_pattern(pattern_str)
                 .unwrap_or_else(|e| panic!("cannot parse {pattern_str:?}: {e}"));
-            ptn.apply(s);
+            ptn.apply(s.as_bytes());
             check_fields(&ptn);
 
             // clone pattern and check fields again
             let mut ptn_copy = ptn.clone();
-            ptn_copy.apply(s);
+            ptn_copy.apply(s.as_bytes());
             check_fields(&ptn);
         }
 
@@ -755,6 +846,72 @@ mod tests {
         f(r#"[<plain:foo>]"#, r#"["foo","bar"]"#, &[r#""foo","bar""#]);
     }
 
+    /// Byte-native `apply` helper for inputs/outputs that are not valid UTF-8.
+    fn apply_bytes(pattern_str: &str, s: &[u8], results_expected: &[&[u8]]) {
+        let mut ptn = parse_pattern(pattern_str)
+            .unwrap_or_else(|e| panic!("cannot parse {pattern_str:?}: {e}"));
+        ptn.apply(s);
+        assert_eq!(ptn.fields.len(), results_expected.len());
+        for (i, fld) in ptn.fields.iter().enumerate() {
+            let v = ptn.field_value(fld);
+            assert_eq!(
+                v, results_expected[i],
+                "unexpected value for field {:?}; got {v:?}; want {:?}",
+                fld.name, results_expected[i]
+            );
+        }
+    }
+
+    /// Go's `strconv.Unquote` emits the RAW byte for `\xNN`/octal
+    /// escapes >= 0x80 inside double-quoted values (parser.go relies on the
+    /// same semantics); the extracted field value may therefore be invalid
+    /// UTF-8.
+    #[test]
+    fn test_pattern_apply_hex_escape_emits_raw_byte() {
+        // `\xff` and `\x80` inside a double-quoted value -> raw bytes.
+        apply_bytes(
+            "foo=<bar> baz=<qux>",
+            b"foo=\"\\xff\\x80\" baz=abc",
+            &[b"\xff\x80", b"abc"],
+        );
+        // Octal escapes >= 0o200 behave the same.
+        apply_bytes(
+            "foo=<bar> baz=<qux>",
+            b"foo=\"\\377\" baz=abc",
+            &[b"\xff", b"abc"],
+        );
+        // Single-quoted values keep Go's utf8.AppendRune semantics:
+        // '\xff' -> UTF-8 encoding of U+00FF (0xC3 0xBF), exactly like Go.
+        apply_bytes(
+            "foo=<bar> baz=<qux>",
+            b"foo='\\xff' baz=abc",
+            &[b"\xc3\xbf", b"abc"],
+        );
+        // Raw invalid UTF-8 inside a double-quoted value decodes as U+FFFD
+        // (Go's utf8.DecodeRune semantics in strconv.UnquoteChar).
+        apply_bytes(
+            "foo=<bar> baz=<qux>",
+            b"foo=\"\\t\xff\" baz=abc",
+            &[b"\t\xef\xbf\xbd", b"abc"],
+        );
+    }
+
+    /// Unquoted (plain) pieces of a value containing invalid UTF-8 are
+    /// extracted verbatim, byte-for-byte like Go.
+    #[test]
+    fn test_pattern_apply_invalid_utf8_value() {
+        apply_bytes(
+            "ip=<ip> code=<code>;",
+            b"ip=\xff\xfe\x80 code=200;",
+            &[b"\xff\xfe\x80", b"200"],
+        );
+        // Prefix search is a byte search: invalid UTF-8 before the first
+        // prefix must not prevent a match.
+        apply_bytes("foo=<bar>", b"\x80\xffzz foo=abc", &[b"abc"]);
+        // Trailing field captures the raw tail bytes.
+        apply_bytes("foo=<bar>", b"foo=\xf0\x28\x8c\x28", &[b"\xf0\x28\x8c\x28"]);
+    }
+
     #[test]
     fn test_parse_pattern_failure() {
         fn f(pattern_str: &str) {
@@ -792,7 +949,7 @@ mod tests {
 
         fn step(prefix: &str, field: &str, field_opt: &str) -> PatternStep {
             PatternStep {
-                prefix: prefix.to_string(),
+                prefix: prefix.as_bytes().to_vec(),
                 field: field.to_string(),
                 field_opt: field_opt.to_string(),
             }

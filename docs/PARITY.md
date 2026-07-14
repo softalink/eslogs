@@ -371,8 +371,14 @@ what remains in section (a) is confirmed-present divergence.
   on invalid-UTF-8 values falls back to a lossy view; `any_case` filters
   lossy-lowercase — which IS Go (`strings.ToLower` maps invalid bytes to
   `U+FFFD`).
-- `pattern.rs:373` — `extract` pattern `\x`/octal escapes ≥0x80 are
-  UTF-8-encoded instead of emitting the raw byte.
+- `pattern.rs` — the `extract` pattern path is byte-native: double-quoted
+  `\x`/octal escapes ≥0x80 emit the raw byte (Go `strconv.Unquote` exactly;
+  single-quoted keeps `AppendRune` UTF-8 encoding, also Go-exact) and values
+  with invalid UTF-8 are matched/extracted verbatim. The retained `String`
+  unquote forms (used by stream-tag/logfmt/storage_search token paths) keep the
+  scalar-encoding for `\x`≥0x80 — that residual moves to the lexer/token-layer
+  follow-up (`Lexer.token` is a `String`, so a raw-byte query token is not yet
+  representable there).
 - `syslog_parser.rs`, `esl-insert/src/syslog_listeners.rs` — a named IANA
   `-syslog.timezone` (e.g. `America/New_York`) is now supported on Unix: it is
   loaded DST-aware from the system zoneinfo database (`crate::tzdata`) and the

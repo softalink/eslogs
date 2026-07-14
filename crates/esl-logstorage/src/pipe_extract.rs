@@ -227,14 +227,7 @@ impl PipeProcessor for PipeExtractProcessor {
         }
 
         let c = br.get_column_by_name(&self.from_field);
-        // PORT NOTE: the pattern matcher operates on &str; invalid UTF-8 source
-        // values are applied via their lossy view (documented residual — Go
-        // matches raw bytes).
-        let values: Vec<String> = br
-            .column_get_values(c)
-            .iter()
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .collect();
+        let values: Vec<Vec<u8>> = br.column_get_values(c).to_vec();
 
         result_columns.clear();
         for f in &ptn.fields {
@@ -245,7 +238,7 @@ impl PipeProcessor for PipeExtractProcessor {
         result_values.resize(nfields, Vec::new());
 
         let mut need_updates = true;
-        let mut v_prev = String::new();
+        let mut v_prev: Vec<u8> = Vec::new();
         for (row_idx, v) in values.iter().enumerate() {
             if !self.has_iff || bm.is_set_bit(row_idx) {
                 if need_updates || &v_prev != v {
@@ -256,7 +249,7 @@ impl PipeProcessor for PipeExtractProcessor {
                     let field_vals: Vec<Vec<u8>> = ptn
                         .fields
                         .iter()
-                        .map(|f| ptn.field_value(f).as_bytes().to_vec())
+                        .map(|f| ptn.field_value(f).to_vec())
                         .collect();
                     for (i, mut val) in field_vals.into_iter().enumerate() {
                         if (val.is_empty() && self.skip_empty_results) || self.keep_original_fields
@@ -457,6 +450,46 @@ mod tests {
             build("foo=<bar> baz=<xx>", "x", false, false),
             &[&[("x", "a foo=cc baz=aa b"), ("bar", "abc")]],
             &[&[("x", "a foo=cc baz=aa b"), ("bar", "cc"), ("xx", "aa b")]],
+        );
+    }
+
+    fn byte_row(fields: &[(&str, &[u8])]) -> Vec<crate::rows::Field> {
+        fields
+            .iter()
+            .map(|(n, v)| crate::rows::Field {
+                name: n.to_string(),
+                value: v.to_vec(),
+            })
+            .collect()
+    }
+
+    /// A `\xff` escape inside a double-quoted section of the source value
+    /// unquotes to the raw byte 0xFF, exactly like Go's strconv.Unquote.
+    #[test]
+    fn test_pipe_extract_hex_escape_raw_byte() {
+        run_pipe(
+            Arc::new(build("foo=<bar> baz=<xx>", "_msg", false, false)),
+            &[byte_row(&[("_msg", b"foo=\"\\xff\" baz=abc")])],
+            &[byte_row(&[
+                ("_msg", b"foo=\"\\xff\" baz=abc"),
+                ("bar", b"\xff"),
+                ("xx", b"abc"),
+            ])],
+        );
+    }
+
+    /// Source values containing invalid UTF-8 are matched byte-for-byte and
+    /// extracted verbatim (no lossy conversion), exactly like Go.
+    #[test]
+    fn test_pipe_extract_invalid_utf8_value() {
+        run_pipe(
+            Arc::new(build("foo=<bar> baz=<xx>", "_msg", false, false)),
+            &[byte_row(&[("_msg", b"foo=\xff\xfe baz=\x80abc")])],
+            &[byte_row(&[
+                ("_msg", b"foo=\xff\xfe baz=\x80abc"),
+                ("bar", b"\xff\xfe"),
+                ("xx", b"\x80abc"),
+            ])],
         );
     }
 }
