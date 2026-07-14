@@ -17,8 +17,13 @@
 //!   * the `-remoteWrite.oauth2.*` flags are supported: a
 //!     `client_credentials` token source (see [`crate::oauth2`]) fetches and
 //!     caches a bearer token used for the outgoing requests;
-//!   * `-remoteWrite.proxyURL` is not supported — init fails with a clear
-//!     error when it is set;
+//!   * `-remoteWrite.proxyURL` is supported for `http://` and `socks5://`
+//!     proxies (RFC 1928 SOCKS5 + RFC 1929 auth, and HTTP `CONNECT`
+//!     tunnelling), including to `https` remote-write targets; the proxy
+//!     handshake runs over the same std-TCP stream via
+//!     [`esl_storage::proxy`]. Residual: `https://` proxies (TLS to the proxy)
+//!     are not supported — that needs TLS-over-TLS, which the concrete-stream
+//!     connect path cannot represent (init fails with a clear error);
 //!   * Go's one-shot retry on `io.EOF` (stale keep-alive connection) is
 //!     unnecessary and dropped, since every request uses a fresh connection.
 //!
@@ -53,6 +58,7 @@ use esl_storage::http_client::{
     AuthConfig, BasicAuthConfig, HttpResponse, Options, do_request_with_timeout,
 };
 use esl_storage::netinsert::PROTOCOL_VERSION;
+use esl_storage::proxy::ProxyConfig;
 
 use crate::oauth2::Oauth2TokenSource;
 use crate::persistentqueue::{DEFAULT_CHUNK_FILE_SIZE, FastQueue};
@@ -752,6 +758,9 @@ struct Client {
     oauth2: Option<Arc<Oauth2TokenSource>>,
     /// Extra headers from -remoteWrite.headers.
     headers: Vec<(String, String)>,
+    /// Parsed `-remoteWrite.proxyURL`; when set, requests tunnel through it
+    /// (Go: `tr.Proxy = http.ProxyURL(pu)`).
+    proxy: Option<ProxyConfig>,
 
     /// Set by [`Client::init`] when -remoteWrite.rateLimit is configured.
     rl: Mutex<Option<Arc<RateLimiter>>>,
@@ -781,10 +790,19 @@ fn new_http_client(
     };
 
     let p_url = PROXY_URL.get().get_optional_arg(arg_idx);
-    if !p_url.is_empty() {
-        // PORT NOTE: proxies are unsupported by the std-TCP house client.
-        fatalf!("-remoteWrite.proxyURL is not supported by this port; got {p_url:?}");
-    }
+    let proxy = if p_url.is_empty() {
+        None
+    } else {
+        match ProxyConfig::parse(p_url) {
+            Ok(cfg) => Some(cfg),
+            Err(err) => {
+                fatalf!(
+                    "cannot parse -remoteWrite.proxyURL for -remoteWrite.url={sanitized_url}: {err}"
+                );
+                unreachable!()
+            }
+        }
+    };
 
     let mut send_timeout = SEND_TIMEOUT.get().get_optional_arg(arg_idx);
     if send_timeout.is_zero() {
@@ -819,6 +837,7 @@ fn new_http_client(
         auth_cfg,
         oauth2,
         headers,
+        proxy,
         rl: Mutex::new(None),
         stop_senders: Mutex::new(Vec::new()),
         workers: Mutex::new(Vec::new()),
@@ -932,6 +951,7 @@ impl Client {
             &headers,
             Some(body),
             self.send_timeout,
+            self.proxy.as_ref(),
         )
     }
 
@@ -1812,6 +1832,7 @@ mod tests {
             auth_cfg,
             oauth2: None,
             headers: vec![("My-Auth".to_string(), "foobar".to_string())],
+            proxy: None,
             rl: Mutex::new(None),
             stop_senders: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),

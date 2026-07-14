@@ -51,6 +51,7 @@ pub mod http_client;
 pub mod lastn_optimization;
 pub mod netinsert;
 pub mod netselect;
+pub mod proxy;
 pub mod query_stats;
 
 // ---------------------------------------------------------------------------

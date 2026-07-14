@@ -23,6 +23,8 @@ use std::time::Duration;
 
 use esl_common::tlsutil::{self, TLSConfig, TlsClientConfig};
 
+use crate::proxy::ProxyConfig;
+
 /// Connect/read/write timeout applied to every request.
 ///
 /// PORT NOTE: Go's transport has no total request timeout; a fixed cap keeps
@@ -228,11 +230,18 @@ pub fn do_request(
         headers,
         body,
         REQUEST_TIMEOUT,
+        None,
     )
 }
 
 /// [`do_request`] with a caller-supplied connect/read/write timeout
 /// (esl-agent's remotewrite client maps `-remoteWrite.sendTimeout` here).
+///
+/// When `proxy` is `Some`, the TCP connection to `addr` is tunnelled through
+/// the proxy (esl-agent's `-remoteWrite.proxyURL`); the target's own TLS
+/// upgrade and the HTTP request/response are unchanged. When `proxy` is `None`
+/// the behaviour is identical to a direct connect.
+#[allow(clippy::too_many_arguments)]
 pub fn do_request_with_timeout(
     addr: &str,
     tls: Option<&TlsClientConfig>,
@@ -241,16 +250,25 @@ pub fn do_request_with_timeout(
     headers: &[(String, String)],
     body: Option<&[u8]>,
     timeout: Duration,
+    proxy: Option<&ProxyConfig>,
 ) -> Result<HttpResponse, String> {
     use std::net::ToSocketAddrs;
 
-    let sock_addr = addr
-        .to_socket_addrs()
-        .map_err(|err| format!("cannot resolve {addr:?}: {err}"))?
-        .next()
-        .ok_or_else(|| format!("cannot resolve {addr:?}: no addresses"))?;
-    let mut stream = TcpStream::connect_timeout(&sock_addr, timeout)
-        .map_err(|err| format!("cannot connect to {addr:?}: {err}"))?;
+    let mut stream = match proxy {
+        None => {
+            let sock_addr = addr
+                .to_socket_addrs()
+                .map_err(|err| format!("cannot resolve {addr:?}: {err}"))?
+                .next()
+                .ok_or_else(|| format!("cannot resolve {addr:?}: no addresses"))?;
+            TcpStream::connect_timeout(&sock_addr, timeout)
+                .map_err(|err| format!("cannot connect to {addr:?}: {err}"))?
+        }
+        Some(proxy) => {
+            let (host, port) = split_host_port(addr)?;
+            crate::proxy::connect_via_proxy(proxy, host, port, timeout)?
+        }
+    };
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
     let _ = stream.set_nodelay(true);
@@ -311,6 +329,31 @@ fn host_without_port(addr: &str) -> &str {
         Some((host, _)) if !host.contains(':') => host,
         _ => addr,
     }
+}
+
+/// Splits a `host:port` address into its host (bracket-stripped for IPv6) and
+/// numeric port, for handing the target to the proxy tunnel. The port is
+/// required here — every caller builds `addr` with an explicit port
+/// (`RemoteUrl::addr` / storage-node addresses always include one).
+fn split_host_port(addr: &str) -> Result<(&str, u16), String> {
+    let host = host_without_port(addr);
+    let port_str = if let Some(rest) = addr.strip_prefix('[') {
+        // Bracketed IPv6: the port (if any) follows `]`.
+        rest.rsplit_once("]:").map(|(_, p)| p)
+    } else {
+        match addr.rsplit_once(':') {
+            // Unbracketed IPv6 literal without port — no port present.
+            Some((h, _)) if h.contains(':') => None,
+            Some((_, p)) => Some(p),
+            None => None,
+        }
+    };
+    let port_str =
+        port_str.ok_or_else(|| format!("cannot determine target port from {addr:?} for proxy"))?;
+    let port = port_str
+        .parse::<u16>()
+        .map_err(|_| format!("invalid target port in {addr:?}"))?;
+    Ok((host, port))
 }
 
 /// Maps rustls' "peer closed connection without sending TLS close_notify"

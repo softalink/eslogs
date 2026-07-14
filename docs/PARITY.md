@@ -526,8 +526,13 @@ what remains in section (a) is confirmed-present divergence.
   faithful `client_credentials` token source (`crate::oauth2`) fetches, caches
   (with x/oauth2's 10s refresh margin), and applies a bearer token, sending the
   `base64(url.QueryEscape(id):url.QueryEscape(secret))` Basic header like
-  x/oauth2's `AuthStyleInHeader`. Residuals: `-remoteWrite.proxyURL` (`fatalf!`)
-  is unsupported (needs proxy-protocol support in the connection layer);
+  x/oauth2's `AuthStyleInHeader`. `-remoteWrite.proxyURL` IS supported for
+  `http://` (HTTP CONNECT, RFC 9110) and `socks5://` (RFC 1928 + RFC 1929
+  user/pass) proxies to https/http targets (`esl-storage/src/proxy.rs`,
+  `connect_via_proxy` tunnels through the existing TCP+rustls path). Residuals:
+  an `https://` **proxy** (TLS-to-the-proxy, i.e. TLS-over-TLS) is rejected —
+  the shared connect path returns a concrete `TcpStream` and `tlsutil` consumes
+  one, so nesting can't be represented without boxing the whole request path;
   `-remoteWrite.tlsHandshakeTimeout` folds into `sendTimeout` (one connection
   per request, no separate handshake timeout); and shutdown abandons an
   in-flight request after the full `sendTimeout` rather than Go's fixed 5s

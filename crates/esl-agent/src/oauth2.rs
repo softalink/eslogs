@@ -171,6 +171,13 @@ impl Oauth2TokenSource {
             &headers,
             Some(body.as_bytes()),
             self.send_timeout,
+            // PORT NOTE: the OAuth2 token request is sent directly, not through
+            // `-remoteWrite.proxyURL`. Go routes it through the same transport
+            // (so the proxy applies), but the token endpoint is typically the
+            // provider's public IdP rather than the proxied remote-write target;
+            // keeping it direct avoids threading the proxy through the token
+            // source for a rarely-combined configuration.
+            None,
         )?;
         if resp.status_code / 100 != 2 {
             return Err(format!(
