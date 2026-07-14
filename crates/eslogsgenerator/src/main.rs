@@ -342,15 +342,36 @@ fn generate_and_push_logs(cfg: &WorkerConfig, worker_id: i64, mut rng: Rng) {
         return;
     };
 
-    let mut stream = match TcpStream::connect((url.host.as_str(), url.port)) {
+    let tcp = match TcpStream::connect((url.host.as_str(), url.port)) {
         Ok(s) => s,
         Err(err) => {
             fatalf!("cannot perform request to \"{url}\": {err}");
             unreachable!()
         }
     };
+    let _ = tcp.set_nodelay(true);
+    let mut stream = if url.tls {
+        // Upgrade to TLS via the house rustls client (default trust roots).
+        let cfg = match esl_common::tlsutil::new_tls_client_config(
+            &esl_common::tlsutil::TLSConfig::default(),
+        ) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                fatalf!("cannot init TLS for \"{url}\": {err}");
+                unreachable!()
+            }
+        };
+        match esl_common::tlsutil::client_connect(&cfg, &url.host, tcp) {
+            Ok(tls) => ConnStream::Tls(Box::new(tls)),
+            Err(err) => {
+                fatalf!("cannot complete TLS handshake with \"{url}\": {err}");
+                unreachable!()
+            }
+        }
+    } else {
+        ConnStream::Plain(tcp)
+    };
     let res = (|| -> std::io::Result<()> {
-        stream.set_nodelay(true)?;
         write!(
             stream,
             "POST {} HTTP/1.1\r\nHost: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
@@ -358,7 +379,9 @@ fn generate_and_push_logs(cfg: &WorkerConfig, worker_id: i64, mut rng: Rng) {
         )?;
         {
             let sw = StatWriter {
-                w: ChunkedWriter { stream: &stream },
+                w: ChunkedWriter {
+                    stream: &mut stream,
+                },
             };
             let mut bw = BufWriter::with_capacity(1024 * 1024, sw);
             generate_logs(&mut bw, cfg, worker_id, &mut rng)?;
@@ -386,7 +409,7 @@ fn generate_and_push_logs(cfg: &WorkerConfig, worker_id: i64, mut rng: Rng) {
 
 /// Writes each buffer as one HTTP/1.1 chunk (`Transfer-Encoding: chunked`).
 struct ChunkedWriter<'a> {
-    stream: &'a TcpStream,
+    stream: &'a mut ConnStream,
 }
 
 impl Write for ChunkedWriter<'_> {
@@ -394,7 +417,7 @@ impl Write for ChunkedWriter<'_> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut s = self.stream;
+        let s = &mut self.stream;
         write!(s, "{:x}\r\n", buf.len())?;
         s.write_all(buf)?;
         s.write_all(b"\r\n")?;
@@ -402,14 +425,13 @@ impl Write for ChunkedWriter<'_> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let mut s = self.stream;
-        s.flush()
+        self.stream.flush()
     }
 }
 
 /// Reads the whole HTTP response (the request was sent with
 /// `Connection: close`) and returns its status code.
-fn read_response_status(stream: &mut TcpStream) -> Result<u16, String> {
+fn read_response_status(stream: &mut ConnStream) -> Result<u16, String> {
     let mut buf = Vec::new();
     stream
         .read_to_end(&mut buf)
@@ -601,21 +623,27 @@ impl fmt::Display for DurationFlag {
 /// sorted, keys and values percent-escaped), so the `_stream_fields` comma is
 /// sent as `%2C`.
 ///
-/// PORT NOTE: Go parses `-addr` with `net/url` and pushes via `http.Client`, so
-/// any scheme supported by the client (including https) works. This std-only
-/// port speaks plain HTTP/1.1 over TCP, so only `http://` URLs are accepted.
+/// PORT NOTE: Go parses `-addr` with `net/url` and pushes via `http.Client`.
+/// The port speaks HTTP/1.1 over a std `TcpStream`, upgrading to TLS via
+/// `esl_common::tlsutil` (rustls) for `https://` URLs.
 #[derive(Debug, PartialEq)]
 struct RemoteWriteUrl {
     host: String,
     port: u16,
     request_uri: String,
+    /// True for `https://`; the connection is TLS-upgraded before the request.
+    tls: bool,
 }
 
 impl RemoteWriteUrl {
     fn parse(addr: &str) -> Result<RemoteWriteUrl, String> {
-        let rest = addr
-            .strip_prefix("http://")
-            .ok_or("unsupported scheme; only http:// is supported")?;
+        let (rest, tls, default_port) = if let Some(r) = addr.strip_prefix("https://") {
+            (r, true, 443u16)
+        } else if let Some(r) = addr.strip_prefix("http://") {
+            (r, false, 80u16)
+        } else {
+            return Err("unsupported scheme; only http:// and https:// are supported".to_string());
+        };
         let (hostport, path_query) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
@@ -630,7 +658,7 @@ impl RemoteWriteUrl {
                     .map_err(|_| format!("cannot parse port in {hostport:?}"))?;
                 (h.to_string(), port)
             }
-            None => (hostport.to_string(), 80),
+            None => (hostport.to_string(), default_port),
         };
         let (path, query) = match path_query.split_once('?') {
             Some((p, q)) => (p, q),
@@ -660,6 +688,7 @@ impl RemoteWriteUrl {
             host,
             port,
             request_uri: format!("{path}?{encoded}"),
+            tls,
         })
     }
 }
@@ -729,7 +758,44 @@ fn hex_digit(b: u8) -> Option<u8> {
 
 impl fmt::Display for RemoteWriteUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "http://{}:{}{}", self.host, self.port, self.request_uri)
+        let scheme = if self.tls { "https" } else { "http" };
+        write!(
+            f,
+            "{scheme}://{}:{}{}",
+            self.host, self.port, self.request_uri
+        )
+    }
+}
+
+/// The push connection: a plain `TcpStream` or a rustls TLS stream over one.
+/// Both are written through `&mut` (rustls requires it), so all request writes
+/// go through a single `&mut ConnStream`.
+enum ConnStream {
+    Plain(TcpStream),
+    Tls(Box<esl_common::tlsutil::TlsClientStream>),
+}
+
+impl Write for ConnStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            ConnStream::Plain(s) => s.write(buf),
+            ConnStream::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            ConnStream::Plain(s) => s.flush(),
+            ConnStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+impl Read for ConnStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ConnStream::Plain(s) => s.read(buf),
+            ConnStream::Tls(s) => s.read(buf),
+        }
     }
 }
 
@@ -942,9 +1008,24 @@ mod tests {
         // Missing path defaults to "/".
         let u = RemoteWriteUrl::parse("http://host:1234").unwrap();
         assert_eq!(u.request_uri, "/?_stream_fields=host%2Cworker_id");
+        assert!(!u.tls);
+
+        // https:// is accepted (TLS-upgraded at push time) and defaults to :443.
+        let u = RemoteWriteUrl::parse("https://host/insert").unwrap();
+        assert!(u.tls);
+        assert_eq!(u.port, 443);
+        assert_eq!(u.host, "host");
+        assert_eq!(
+            u.to_string(),
+            "https://host:443/insert?_stream_fields=host%2Cworker_id"
+        );
+        // Explicit https port is honored.
+        let u = RemoteWriteUrl::parse("https://host:8443/insert").unwrap();
+        assert_eq!(u.port, 8443);
+        assert!(u.tls);
 
         assert!(RemoteWriteUrl::parse("stdout").is_err());
-        assert!(RemoteWriteUrl::parse("https://host/insert").is_err());
+        assert!(RemoteWriteUrl::parse("ftp://host/insert").is_err());
         assert!(RemoteWriteUrl::parse("http://host:bad/insert").is_err());
     }
 
