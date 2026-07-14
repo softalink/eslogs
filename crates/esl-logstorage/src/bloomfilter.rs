@@ -17,7 +17,7 @@ pub const BLOOM_FILTER_BITS_PER_ITEM: usize = 16;
 ///
 /// PORT NOTE: Go appends to `dst []byte` and returns it; the port mutates
 /// `dst` in place (same for the other `dst` parameters in this module).
-pub fn bloom_filter_marshal_tokens<S: AsRef<str>>(dst: &mut Vec<u8>, tokens: &[S]) {
+pub fn bloom_filter_marshal_tokens<S: AsRef<[u8]>>(dst: &mut Vec<u8>, tokens: &[S]) {
     let mut bf = get_bloom_filter();
     bf.must_init_tokens(tokens);
     bf.marshal(dst);
@@ -74,7 +74,7 @@ impl BloomFilter {
     }
 
     /// Initializes bf with the given tokens.
-    pub fn must_init_tokens<S: AsRef<str>>(&mut self, tokens: &[S]) {
+    pub fn must_init_tokens<S: AsRef<[u8]>>(&mut self, tokens: &[S]) {
         let bits_count = tokens.len() * BLOOM_FILTER_BITS_PER_ITEM;
         let words_count = bits_count.div_ceil(64);
         slicesutil::set_length(&mut self.bits, words_count);
@@ -136,7 +136,7 @@ impl BloomFilter {
 }
 
 /// Adds the given tokens to the bloom filter bits.
-pub fn bloom_filter_add_tokens<S: AsRef<str>>(bits: &mut [u64], tokens: &[S]) {
+pub fn bloom_filter_add_tokens<S: AsRef<[u8]>>(bits: &mut [u64], tokens: &[S]) {
     let hashes_count = tokens.len() * BLOOM_FILTER_HASHES_COUNT;
     let mut a = encoding::get_uint64s(hashes_count);
     a.a.clear();
@@ -176,12 +176,12 @@ fn init_bloom_filter(bits: &mut [u64], hashes: &[u64]) {
 /// PORT NOTE: Go stores the intermediate `uint64` into a byte buffer through
 /// an unsafe pointer, i.e. in native endianness; `to_ne_bytes` replicates
 /// that bit-for-bit on the same platform.
-pub fn append_tokens_hashes<S: AsRef<str>>(dst: &mut Vec<u64>, tokens: &[S]) {
+pub fn append_tokens_hashes<S: AsRef<[u8]>>(dst: &mut Vec<u64>, tokens: &[S]) {
     let hashes_count = tokens.len() * BLOOM_FILTER_HASHES_COUNT;
     dst.reserve(hashes_count);
 
     for token in tokens {
-        let mut hp = xxh64(token.as_ref().as_bytes(), 0);
+        let mut hp = xxh64(token.as_ref(), 0);
         for _ in 0..BLOOM_FILTER_HASHES_COUNT {
             let h = xxh64(&hp.to_ne_bytes(), 0);
             hp = hp.wrapping_add(1);

@@ -29,7 +29,7 @@ pub(crate) struct FilterContainsAny {
 
 pub(crate) fn new_filter_contains_any_values(
     field_name: &str,
-    values: Vec<String>,
+    values: Vec<Vec<u8>>,
 ) -> FilterGeneric {
     new_filter_generic(
         field_name,
@@ -55,7 +55,7 @@ pub(crate) fn new_filter_contains_any_query(
 }
 
 /// Port of Go `matchAnyPhrase`.
-pub(crate) fn match_any_phrase<S: AsRef<str>>(v: &[u8], phrases: &[S]) -> bool {
+pub(crate) fn match_any_phrase<S: AsRef<[u8]>>(v: &[u8], phrases: &[S]) -> bool {
     phrases.iter().any(|p| match_phrase(v, p.as_ref()))
 }
 
@@ -80,7 +80,7 @@ impl FieldFilter for FilterContainsAny {
         Some(&mut self.values)
     }
 
-    fn new_with_values(&self, field_name: &str, values: Vec<String>) -> Option<Box<dyn Filter>> {
+    fn new_with_values(&self, field_name: &str, values: Vec<Vec<u8>>) -> Option<Box<dyn Filter>> {
         Some(Box::new(new_filter_contains_any_values(field_name, values)))
     }
 
@@ -281,7 +281,7 @@ fn match_any_phrase_string(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     common_tokens: &[u64],
     token_sets: &[Vec<u64>],
 ) {
@@ -301,22 +301,22 @@ fn match_any_phrase_string(
 /// Port of Go `matchValuesAnyPhrase`.
 ///
 /// PORT NOTE: Go pools the filtered phrase subset via `getStringBucket`; the
-/// port collects it into a local `Vec<&str>` (the pooled reuse is dropped, the
-/// matching semantics are identical).
+/// port collects it into a local `Vec<&[u8]>` (the pooled reuse is dropped,
+/// the matching semantics are identical).
 fn match_values_any_phrase(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     token_sets: &[Vec<u64>],
-    match_fn: impl Fn(&[u8], &[&str]) -> bool,
+    match_fn: impl Fn(&[u8], &[&[u8]]) -> bool,
 ) {
-    let filtered: Vec<&str> = {
+    let filtered: Vec<&[u8]> = {
         phrases
             .iter()
             .enumerate()
             .filter(|(i, _)| bs.bloom_contains_all(ch, &token_sets[*i]))
-            .map(|(_, p)| p.as_str())
+            .map(|(_, p)| p.as_slice())
             .collect()
     };
     if filtered.is_empty() {
@@ -330,7 +330,7 @@ fn match_any_phrase_int64(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     common_tokens: &[u64],
     token_sets: &[Vec<u64>],
 ) {
@@ -354,7 +354,7 @@ fn match_any_phrase_float64(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     common_tokens: &[u64],
     token_sets: &[Vec<u64>],
 ) {
@@ -378,7 +378,7 @@ fn match_any_phrase_ipv4(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     common_tokens: &[u64],
     token_sets: &[Vec<u64>],
 ) {
@@ -402,7 +402,7 @@ fn match_any_phrase_timestamp_iso8601(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     common_tokens: &[u64],
     token_sets: &[Vec<u64>],
 ) {
@@ -426,7 +426,7 @@ fn match_any_phrase_dict(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
 ) {
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {

@@ -299,7 +299,7 @@ pub trait FieldFilter: Send + Sync {
     /// `newFilterInValues` / `newFilterContainsAnyValues` /
     /// `newFilterContainsAllValues`). Only implemented by the field filters
     /// whose [`FieldFilter::in_values`] returns `Some`.
-    fn new_with_values(&self, _field_name: &str, _values: Vec<String>) -> Option<Box<dyn Filter>> {
+    fn new_with_values(&self, _field_name: &str, _values: Vec<Vec<u8>>) -> Option<Box<dyn Filter>> {
         None
     }
 }

@@ -35,7 +35,7 @@ pub(crate) struct FilterIn {
     pub(crate) values: InValues,
 }
 
-pub(crate) fn new_filter_in_values(field_name: &str, values: Vec<String>) -> FilterGeneric {
+pub(crate) fn new_filter_in_values(field_name: &str, values: Vec<Vec<u8>>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterIn {
@@ -58,11 +58,12 @@ pub(crate) fn new_filter_in_query(
     )
 }
 
-/// Membership of raw value bytes in the set of needle strings. The needles are
-/// always valid UTF-8 (they come from query text or subquery `Vec<String>`
-/// results), so a value with invalid UTF-8 can never be a member.
-fn string_values_contain(string_values: &HashSet<String>, v: &[u8]) -> bool {
-    std::str::from_utf8(v).is_ok_and(|s| string_values.contains(s))
+/// Membership of raw value bytes in the set of needle byte values. The
+/// needles are raw bytes too (query text and subquery results alike), so the
+/// test is byte-exact — matching Go, where both sides are arbitrary-byte
+/// strings.
+fn string_values_contain(string_values: &HashSet<Vec<u8>>, v: &[u8]) -> bool {
+    string_values.contains(v)
 }
 
 impl FilterIn {
@@ -70,7 +71,7 @@ impl FilterIn {
         br: &mut BlockResult,
         bm: &mut Bitmap,
         r: ColRef,
-        string_values: &HashSet<String>,
+        string_values: &HashSet<Vec<u8>>,
     ) {
         let values = br.column_get_values(r);
         bm.for_each_set_bit(|idx| string_values_contain(string_values, &values[idx]));
@@ -90,7 +91,7 @@ impl FieldFilter for FilterIn {
         Some(&mut self.values)
     }
 
-    fn new_with_values(&self, field_name: &str, values: Vec<String>) -> Option<Box<dyn Filter>> {
+    fn new_with_values(&self, field_name: &str, values: Vec<Vec<u8>>) -> Option<Box<dyn Filter>> {
         Some(Box::new(new_filter_in_values(field_name, values)))
     }
 
@@ -215,7 +216,7 @@ impl FieldFilter for FilterIn {
                 // Fast path - there are no matching columns. It matches anything
                 // only for the empty value.
                 let string_values = self.values.get_string_values();
-                if !string_values.contains("") {
+                if !string_values.contains(b"".as_slice()) {
                     bm.reset_bits();
                 }
                 return;
@@ -345,8 +346,8 @@ impl FieldFilter for FilterIn {
 /// Port of Go `matchColumnByBinValues`.
 ///
 /// PORT NOTE: Go takes a `map[string]struct{}` of binary values; the port takes
-/// a membership closure so the caller can back it with either a `HashSet<String>`
-/// (string columns) or a `HashSet<Vec<u8>>` (numeric columns).
+/// a membership closure backed by a `HashSet<Vec<u8>>` (raw string values and
+/// numeric binary encodings alike).
 pub(crate) fn match_column_by_bin_values(
     br: &mut BlockResult,
     bm: &mut Bitmap,
@@ -410,7 +411,7 @@ fn match_values_dict_by_any_value(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    values: &HashSet<String>,
+    values: &HashSet<Vec<u8>>,
 ) {
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {

@@ -30,7 +30,7 @@ pub(crate) struct FilterContainsAll {
 
 pub(crate) fn new_filter_contains_all_values(
     field_name: &str,
-    values: Vec<String>,
+    values: Vec<Vec<u8>>,
 ) -> FilterGeneric {
     new_filter_generic(
         field_name,
@@ -56,7 +56,7 @@ pub(crate) fn new_filter_contains_all_query(
 }
 
 /// Port of Go `matchAllPhrases`.
-fn match_all_phrases<S: AsRef<str>>(v: &[u8], phrases: &[S]) -> bool {
+fn match_all_phrases<S: AsRef<[u8]>>(v: &[u8], phrases: &[S]) -> bool {
     for phrase in phrases {
         let phrase = phrase.as_ref();
         if phrase.is_empty() {
@@ -91,7 +91,7 @@ impl FieldFilter for FilterContainsAll {
         Some(&mut self.values)
     }
 
-    fn new_with_values(&self, field_name: &str, values: Vec<String>) -> Option<Box<dyn Filter>> {
+    fn new_with_values(&self, field_name: &str, values: Vec<Vec<u8>>) -> Option<Box<dyn Filter>> {
         Some(Box::new(new_filter_contains_all_values(field_name, values)))
     }
 
@@ -280,7 +280,7 @@ fn match_all_phrases_string(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.is_empty() {
@@ -298,7 +298,7 @@ fn match_all_phrases_int64(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.is_empty() {
@@ -320,7 +320,7 @@ fn match_all_phrases_float64(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.is_empty() {
@@ -342,7 +342,7 @@ fn match_all_phrases_ipv4(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.is_empty() {
@@ -364,7 +364,7 @@ fn match_all_phrases_timestamp_iso8601(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.is_empty() {
@@ -386,7 +386,7 @@ fn match_all_phrases_dict(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
 ) {
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {

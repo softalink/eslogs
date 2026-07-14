@@ -160,8 +160,15 @@ impl Filter for FilterStreamID {
         })?;
 
         // convert values to streamID list
+        //
+        // PORT NOTE: `_stream_id` values are engine-generated hex, so they are
+        // always valid UTF-8; a value with invalid UTF-8 simply fails the
+        // parse and is skipped, exactly like a malformed hex string in Go.
         let mut stream_ids = Vec::with_capacity(values.len());
         for v in &values {
+            let Ok(v) = std::str::from_utf8(v) else {
+                continue;
+            };
             let mut sid = StreamID::default();
             if sid.try_unmarshal_from_string(v) {
                 stream_ids.push(sid);

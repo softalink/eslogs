@@ -366,8 +366,7 @@ what remains in section (a) is confirmed-present divergence.
   place): field **names** stay `String` (invalid UTF-8 in a name becomes
   `U+FFFD` where Go keeps raw bytes — incl. RFC5424 SD param names and CEF
   extension keys); the RFC5424 **SD block** is parsed through a lossy view
-  (fires only on invalid UTF-8 inside `[...]`); `in(<subquery>)` values
-  (`GetFieldValuesFn` returns `Vec<String>`, `storage_search.rs:1537`);
+  (fires only on invalid UTF-8 inside `[...]`);
   `_stream`/`_stream_id` rendering (validated printable text); regex matching
   on invalid-UTF-8 values falls back to a lossy view; `any_case` filters
   lossy-lowercase — which IS Go (`strings.ToLower` maps invalid bytes to

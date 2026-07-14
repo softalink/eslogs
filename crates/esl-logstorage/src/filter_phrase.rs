@@ -264,8 +264,10 @@ pub(crate) fn match_string_by_phrase(
 
 /// Port of Go `matchPhrase`.
 ///
-/// The haystack `s` is raw value bytes (Go strings are arbitrary bytes).
-pub(crate) fn match_phrase(s: &[u8], phrase: &str) -> bool {
+/// Both the haystack `s` and the phrase are raw value bytes (Go strings are
+/// arbitrary bytes); `&str` phrases coerce via `AsRef<[u8]>`.
+pub(crate) fn match_phrase(s: &[u8], phrase: impl AsRef<[u8]>) -> bool {
+    let phrase = phrase.as_ref();
     if phrase.is_empty() {
         // Special case - empty phrase matches only empty string.
         return s.is_empty();
@@ -275,12 +277,12 @@ pub(crate) fn match_phrase(s: &[u8], phrase: &str) -> bool {
 
 /// Port of Go `getPhrasePos`: returns the byte offset of the phrase within `s`
 /// with token boundaries respected, or `None` if the phrase is not found.
-pub(crate) fn get_phrase_pos(s: &[u8], phrase: &str) -> Option<usize> {
-    if phrase.is_empty() {
+pub(crate) fn get_phrase_pos(s: &[u8], phrase: impl AsRef<[u8]>) -> Option<usize> {
+    let pb = phrase.as_ref();
+    if pb.is_empty() {
         return Some(0);
     }
     let sb = s;
-    let pb = phrase.as_bytes();
     if pb.len() > sb.len() {
         return None;
     }

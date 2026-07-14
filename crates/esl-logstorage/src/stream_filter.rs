@@ -740,6 +740,39 @@ pub(crate) fn go_quote(s: &str) -> String {
     out
 }
 
+/// Quotes a raw byte value for rendering into query text.
+///
+/// Valid UTF-8 renders via [`quote_token_if_needed`] (bit-identical to the
+/// `&str` behavior); invalid UTF-8 is quoted with Go `strconv.Quote` byte
+/// semantics ([`go_quote_bytes`]), where each invalid byte renders as a
+/// `\xNN` escape — exactly what Go produces when rendering such values.
+pub(crate) fn quote_value_bytes_if_needed(v: &[u8]) -> String {
+    match std::str::from_utf8(v) {
+        Ok(s) => quote_token_if_needed(s),
+        Err(_) => go_quote_bytes(v),
+    }
+}
+
+/// Port of Go `strconv.Quote` over raw bytes: decodes runes like Go
+/// (`utf8.DecodeRuneInString`), escaping each invalid byte as `\xNN`.
+fn go_quote_bytes(v: &[u8]) -> String {
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    let mut b = v;
+    while !b.is_empty() {
+        let (r, size) = crate::pattern_matcher::decode_rune(b);
+        if r == '\u{FFFD}' && size == 1 {
+            // Invalid UTF-8 byte (Go: `r == utf8.RuneError && width == 1`).
+            out.push_str(&format!("\\x{:02x}", b[0]));
+        } else {
+            append_escaped_rune(&mut out, r, '"');
+        }
+        b = &b[size..];
+    }
+    out.push('"');
+    out
+}
+
 fn append_escaped_rune(out: &mut String, c: char, quote: char) {
     if c == quote || c == '\\' {
         out.push('\\');

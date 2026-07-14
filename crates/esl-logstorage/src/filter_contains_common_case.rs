@@ -32,7 +32,10 @@ pub(crate) fn new_filter_contains_common_case(
     field_name: &str,
     phrases: Vec<String>,
 ) -> Result<FilterGeneric, String> {
-    let common_case_phrases = get_common_case_phrases(&phrases)?;
+    let common_case_phrases = get_common_case_phrases(&phrases)?
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
 
     let fi = FilterContainsCommonCase {
         phrases,

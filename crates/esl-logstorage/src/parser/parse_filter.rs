@@ -488,6 +488,7 @@ fn parse_in_values(lex: &mut Lexer, field_name: &str, kind: InKind) -> Result<Bo
     let err_first = match parse_func_args_possible_wildcard(lex) {
         Ok(None) => return Ok(Box::new(new_filter_noop())),
         Ok(Some(args)) => {
+            let args: Vec<Vec<u8>> = args.into_iter().map(String::into_bytes).collect();
             return Ok(match kind {
                 InKind::In => Box::new(new_filter_in_values(field_name, args)),
                 InKind::ContainsAll => Box::new(new_filter_contains_all_values(field_name, args)),

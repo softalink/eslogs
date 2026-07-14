@@ -143,6 +143,66 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
+/// Byte-native [`tokenize_strings`]: extracts word tokens from raw value
+/// bytes and appends them to dst, deduplicating across the whole call.
+///
+/// Mirrors Go tokenization over arbitrary byte strings: an invalid UTF-8 byte
+/// decodes as (U+FFFD, 1), which is not a token rune, so invalid bytes act as
+/// token separators — exactly like in Go (see
+/// `hash_tokenizer::HashTokenizer::tokenize_string`). For valid UTF-8 input
+/// the produced tokens are identical to [`tokenize_strings`].
+pub fn tokenize_bytes<'a, S: AsRef<[u8]>>(dst: &mut Vec<&'a [u8]>, a: &'a [S]) {
+    let mut m: HashSet<&[u8]> = HashSet::new();
+    for (i, s) in a.iter().enumerate() {
+        let s = s.as_ref();
+        if i > 0 && s == a[i - 1].as_ref() {
+            // This string has been already tokenized
+            continue;
+        }
+        tokenize_bytes_one(dst, &mut m, s);
+    }
+}
+
+fn tokenize_bytes_one<'a>(dst: &mut Vec<&'a [u8]>, m: &mut HashSet<&'a [u8]>, s: &'a [u8]) {
+    let mut s = s;
+    while !s.is_empty() {
+        // Search for the next token.
+        let mut n = s.len();
+        let mut offset = 0usize;
+        while offset < s.len() {
+            let (r, size) = crate::pattern_matcher::decode_rune(&s[offset..]);
+            if is_token_rune(r) {
+                n = offset;
+                break;
+            }
+            offset += size;
+        }
+        s = &s[n..];
+        // Search for the end of the token.
+        let mut n = s.len();
+        let mut offset = 0usize;
+        while offset < s.len() {
+            let (r, size) = crate::pattern_matcher::decode_rune(&s[offset..]);
+            if !is_token_rune(r) {
+                n = offset;
+                break;
+            }
+            offset += size;
+        }
+        if n == 0 {
+            break;
+        }
+
+        // Register the token.
+        let token = &s[..n];
+        s = &s[n..];
+        if !m.contains(token) {
+            m.insert(token);
+            dst.push(token);
+        }
+    }
+}
+
 pub(crate) fn is_ascii(s: &str) -> bool {
     s.is_ascii()
 }

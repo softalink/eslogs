@@ -7,7 +7,7 @@ use esl_common::encoding;
 
 use crate::bloomfilter::{append_hashes_hashes, append_tokens_hashes};
 use crate::hash_tokenizer::tokenize_hashes;
-use crate::tokenizer::tokenize_strings;
+use crate::tokenizer::tokenize_bytes;
 use crate::values_encoder::{
     marshal_float64, try_parse_float64_exact, try_parse_int64, try_parse_ipv4,
     try_parse_timestamp_iso8601, try_parse_uint64,
@@ -20,7 +20,9 @@ use crate::values_encoder::{
 /// OnceLock field.
 #[derive(Debug, Default)]
 pub struct InValues {
-    pub values: Vec<String>,
+    /// The literal values to match. Raw value bytes (Go strings are arbitrary
+    /// bytes): values resolved from a subquery keep invalid UTF-8 byte-exact.
+    pub values: Vec<Vec<u8>>,
 
     /// If set, then `values` must be populated from this subquery before
     /// filter execution (Go `q *Query`).
@@ -39,7 +41,9 @@ pub struct InValues {
 
     tokens_hashes_all: OnceLock<Vec<u64>>,
 
-    string_values: OnceLock<HashSet<String>>,
+    // PORT NOTE: raw value bytes (Go string keys are arbitrary bytes), so
+    // membership tests are byte-exact.
+    string_values: OnceLock<HashSet<Vec<u8>>>,
 
     // PORT NOTE: Go's map[string]struct{} keys hold the binary value encoding
     // sliced out of a shared buf; the Rust port uses HashSet<Vec<u8>> keys.
@@ -61,7 +65,7 @@ pub struct InValues {
 }
 
 impl InValues {
-    pub fn new(values: Vec<String>) -> InValues {
+    pub fn new(values: Vec<Vec<u8>>) -> InValues {
         InValues {
             values,
             ..Default::default()
@@ -85,7 +89,7 @@ impl InValues {
         }
         self.values
             .iter()
-            .map(|v| crate::stream_filter::quote_token_if_needed(v))
+            .map(|v| crate::stream_filter::quote_value_bytes_if_needed(v))
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -96,13 +100,13 @@ impl InValues {
 
     pub fn has_empty_value(&self) -> bool {
         let m = self.get_string_values();
-        m.contains("")
+        m.contains(b"".as_slice())
     }
 
     pub fn get_non_empty_values_len(&self) -> usize {
         let m = self.get_string_values();
         let mut n = m.len();
-        if m.contains("") {
+        if m.contains(b"".as_slice()) {
             n -= 1;
         }
         n
@@ -146,7 +150,7 @@ impl InValues {
         (common_tokens_hashes, token_sets_hashes)
     }
 
-    pub fn get_string_values(&self) -> &HashSet<String> {
+    pub fn get_string_values(&self) -> &HashSet<Vec<u8>> {
         self.string_values.get_or_init(|| {
             let values = &self.values;
             let mut m = HashSet::with_capacity(values.len());
@@ -162,7 +166,7 @@ impl InValues {
             let values = &self.values;
             let mut m = HashSet::with_capacity(values.len());
             for v in values {
-                let n = match try_parse_uint64(v) {
+                let n = match as_utf8(v).and_then(try_parse_uint64) {
                     Some(n) if n < (1 << 8) => n,
                     _ => continue,
                 };
@@ -177,7 +181,7 @@ impl InValues {
             let values = &self.values;
             let mut m = HashSet::with_capacity(values.len());
             for v in values {
-                let n = match try_parse_uint64(v) {
+                let n = match as_utf8(v).and_then(try_parse_uint64) {
                     Some(n) if n < (1 << 16) => n,
                     _ => continue,
                 };
@@ -194,7 +198,7 @@ impl InValues {
             let values = &self.values;
             let mut m = HashSet::with_capacity(values.len());
             for v in values {
-                let n = match try_parse_uint64(v) {
+                let n = match as_utf8(v).and_then(try_parse_uint64) {
                     Some(n) if n < (1 << 32) => n,
                     _ => continue,
                 };
@@ -211,7 +215,7 @@ impl InValues {
             let values = &self.values;
             let mut m = HashSet::with_capacity(values.len());
             for v in values {
-                let n = match try_parse_uint64(v) {
+                let n = match as_utf8(v).and_then(try_parse_uint64) {
                     Some(n) => n,
                     None => continue,
                 };
@@ -228,7 +232,7 @@ impl InValues {
             let values = &self.values;
             let mut m = HashSet::with_capacity(values.len());
             for v in values {
-                let n = match try_parse_int64(v) {
+                let n = match as_utf8(v).and_then(try_parse_int64) {
                     Some(n) => n,
                     None => continue,
                 };
@@ -245,7 +249,7 @@ impl InValues {
             let values = &self.values;
             let mut m = HashSet::with_capacity(values.len());
             for v in values {
-                let f = match try_parse_float64_exact(v) {
+                let f = match as_utf8(v).and_then(try_parse_float64_exact) {
                     Some(f) => f,
                     None => continue,
                 };
@@ -262,7 +266,7 @@ impl InValues {
             let values = &self.values;
             let mut m = HashSet::with_capacity(values.len());
             for v in values {
-                let n = match try_parse_ipv4(v) {
+                let n = match as_utf8(v).and_then(try_parse_ipv4) {
                     Some(n) => n,
                     None => continue,
                 };
@@ -279,7 +283,7 @@ impl InValues {
             let values = &self.values;
             let mut m = HashSet::with_capacity(values.len());
             for v in values {
-                let n = match try_parse_timestamp_iso8601(v) {
+                let n = match as_utf8(v).and_then(try_parse_timestamp_iso8601) {
                     Some(n) => n,
                     None => continue,
                 };
@@ -292,14 +296,20 @@ impl InValues {
     }
 }
 
+/// Checked UTF-8 view of raw value bytes: invalid bytes yield `None`, so a
+/// numeric/timestamp parse fails exactly like it does in Go.
+fn as_utf8(v: &[u8]) -> Option<&str> {
+    std::str::from_utf8(v).ok()
+}
+
 /// PORT NOTE: Go slices all the token sets out of a shared tokensBuf
 /// (recycled at 60KiB) to reduce allocations; the Rust port collects borrowed
 /// tokens per value instead.
-pub fn get_common_tokens_and_token_sets(values: &[String]) -> (Vec<&str>, Vec<Vec<&str>>) {
-    let mut token_sets: Vec<Vec<&str>> = Vec::with_capacity(values.len());
+pub fn get_common_tokens_and_token_sets(values: &[Vec<u8>]) -> (Vec<&[u8]>, Vec<Vec<&[u8]>>) {
+    let mut token_sets: Vec<Vec<&[u8]>> = Vec::with_capacity(values.len());
     for v in values {
         let mut tokens = Vec::new();
-        tokenize_strings(&mut tokens, std::slice::from_ref(v));
+        tokenize_bytes(&mut tokens, std::slice::from_ref(v));
         token_sets.push(tokens);
     }
 
@@ -319,7 +329,7 @@ pub fn get_common_tokens_and_token_sets(values: &[String]) -> (Vec<&str>, Vec<Ve
 /// Returns common tokens seen at every set of tokens inside token_sets.
 ///
 /// The returned common tokens preserve the original order seen in token_sets.
-fn get_common_tokens<'a>(token_sets: &[Vec<&'a str>]) -> Vec<&'a str> {
+fn get_common_tokens<'a>(token_sets: &[Vec<&'a [u8]>]) -> Vec<&'a [u8]> {
     if token_sets.is_empty() {
         return Vec::new();
     }
@@ -342,8 +352,12 @@ mod tests {
     #[test]
     fn test_get_common_tokens_and_token_sets() {
         fn f(values: &[&str], common_tokens_expected: &[&str], token_sets_expected: &[&[&str]]) {
-            let values: Vec<String> = values.iter().map(|s| s.to_string()).collect();
-            let (mut common_tokens, token_sets) = get_common_tokens_and_token_sets(&values);
+            let values: Vec<Vec<u8>> = values.iter().map(|s| s.as_bytes().to_vec()).collect();
+            let (common_tokens, token_sets) = get_common_tokens_and_token_sets(&values);
+            let mut common_tokens: Vec<&str> = common_tokens
+                .into_iter()
+                .map(|t| std::str::from_utf8(t).unwrap())
+                .collect();
             common_tokens.sort_unstable();
 
             assert_eq!(
@@ -351,7 +365,11 @@ mod tests {
                 "unexpected commonTokens for values={values:?}"
             );
 
-            for (i, mut tokens) in token_sets.into_iter().enumerate() {
+            for (i, tokens) in token_sets.into_iter().enumerate() {
+                let mut tokens: Vec<&str> = tokens
+                    .into_iter()
+                    .map(|t| std::str::from_utf8(t).unwrap())
+                    .collect();
                 tokens.sort_unstable();
                 let tokens_expected = token_sets_expected[i];
                 assert_eq!(

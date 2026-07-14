@@ -269,9 +269,9 @@ fn init_subqueries_net(q: &mut Query, run_net_query: &RunNetQueryFn<'_>) -> Resu
     if q.has_filter_in_with_query() {
         // Go caches subquery results in an `inValuesCache` keyed by the
         // subquery string; the cache is folded into the closure.
-        let mut cache: HashMap<String, Vec<String>> = HashMap::new();
+        let mut cache: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut get_field_values =
-            |q_text: &str, field_name: &str| -> Result<Vec<String>, String> {
+            |q_text: &str, field_name: &str| -> Result<Vec<Vec<u8>>, String> {
                 if let Some(values) = cache.get(q_text) {
                     return Ok(values.clone());
                 }
@@ -321,7 +321,7 @@ fn get_field_values_net(
     q: &Query,
     run_net_query: &RunNetQueryFn<'_>,
     field_name: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<Vec<u8>>, String> {
     let q_holder;
     let q = if is_last_pipe_uniq(&q.pipes) {
         q
@@ -333,7 +333,7 @@ fn get_field_values_net(
         &q_holder
     };
 
-    let values: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let values: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let values_w = Arc::clone(&values);
     let write_block: WriteDataBlockFn = Arc::new(move |_worker_id, db: &mut DataBlock| {
         if db.rows_count() == 0 {
@@ -346,9 +346,9 @@ fn get_field_values_net(
         }
 
         let mut dst = values_w.lock().unwrap();
-        for v in &cs[0].values {
-            dst.push(String::from_utf8_lossy(v).into_owned());
-        }
+        // Raw byte clone: subquery values keep invalid UTF-8 byte-exact
+        // (Go strings are arbitrary bytes).
+        dst.extend(cs[0].values.iter().cloned());
     });
 
     run_net_query(q, write_block)?;

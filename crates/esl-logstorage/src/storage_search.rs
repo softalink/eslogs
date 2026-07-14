@@ -1349,7 +1349,7 @@ impl Storage {
 /// Port of Go `getFieldValuesFunc`: executes the subquery given as rendered
 /// text and returns the unique values of the given field
 /// (`fn(q_text, q_field_name)`).
-pub(crate) type GetFieldValuesFn<'a> = dyn FnMut(&str, &str) -> Result<Vec<String>, String> + 'a;
+pub(crate) type GetFieldValuesFn<'a> = dyn FnMut(&str, &str) -> Result<Vec<Vec<u8>>, String> + 'a;
 
 /// Port of Go `getJoinRowsFunc`: executes the join subquery given as rendered
 /// text and returns its result rows.
@@ -1508,7 +1508,7 @@ fn get_field_values_generic(
     hidden_fields_filters: &[String],
     cancel: Option<&Arc<AtomicBool>>,
     qs: &Arc<QueryStats>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<Vec<u8>>, String> {
     let q_holder;
     let q = if is_last_pipe_uniq(q.pipes()) {
         q
@@ -1520,7 +1520,7 @@ fn get_field_values_generic(
         &q_holder
     };
 
-    let values: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let values: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let values_w = Arc::clone(&values);
     let write_block: WriteDataBlockFn = Arc::new(move |_worker_id, db: &mut DataBlock| {
         if db.rows_count() == 0 {
@@ -1533,9 +1533,9 @@ fn get_field_values_generic(
         }
 
         let mut dst = values_w.lock().unwrap();
-        for v in &cs[0].values {
-            dst.push(String::from_utf8_lossy(v).into_owned());
-        }
+        // Raw byte clone: subquery values keep invalid UTF-8 byte-exact
+        // (Go strings are arbitrary bytes).
+        dst.extend(cs[0].values.iter().cloned());
     });
 
     run_query(
@@ -1665,9 +1665,9 @@ pub(crate) fn init_subqueries(
     if has_in {
         // Go `getValuesForQuery` caches subquery results in an `inValuesCache`
         // keyed by the subquery string; the cache is folded into the closure.
-        let mut cache: HashMap<String, Vec<String>> = HashMap::new();
+        let mut cache: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut get_field_values =
-            |q_text: &str, field_name: &str| -> Result<Vec<String>, String> {
+            |q_text: &str, field_name: &str| -> Result<Vec<Vec<u8>>, String> {
                 if let Some(values) = cache.get(q_text) {
                     return Ok(values.clone());
                 }
@@ -3082,6 +3082,98 @@ mod tests {
                 ],
                 &[("instance", "host-1:234"), ("x", "55")],
             ],
+        );
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
+    }
+
+    /// `in(<subquery>)` must match raw-byte values byte-exactly: a subquery
+    /// yielding a value with invalid UTF-8 must select rows carrying that
+    /// exact byte value (Go strings are arbitrary bytes; the resolved in-set
+    /// must not mangle them into U+FFFD).
+    #[test]
+    fn test_storage_run_query_in_subquery_raw_bytes() {
+        let path = run_query_temp_path("in-subquery-raw-bytes");
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+
+        let tenant = TenantID {
+            account_id: 0,
+            project_id: 0,
+        };
+
+        // `foo` value with invalid UTF-8 (0xff cannot appear in UTF-8).
+        let raw: &[u8] = b"val-\xff\xfe-x";
+        let rows: &[(&[u8], &str)] = &[
+            (raw, "pick"),           // selected by the subquery
+            (raw, "other"),          // same raw bytes, matched via the in-set
+            (b"val-clean", "other"), // must not match
+        ];
+        let mut lr = get_log_rows(&["host"], &[], &[], &[], "");
+        let base = now_nanos();
+        for (i, (foo, bar)) in rows.iter().enumerate() {
+            let mut fields = vec![
+                Field {
+                    name: "_msg".to_string(),
+                    value: b"message".to_vec(),
+                },
+                Field {
+                    name: "host".to_string(),
+                    value: b"node-1".to_vec(),
+                },
+                Field {
+                    name: "foo".to_string(),
+                    value: foo.to_vec(),
+                },
+                Field {
+                    name: "bar".to_string(),
+                    value: bar.as_bytes().to_vec(),
+                },
+            ];
+            lr.must_add(tenant, base + i as i64, &mut fields, -1);
+        }
+        s.must_add_rows(&lr);
+        s.debug_flush();
+
+        // The subquery yields the raw-byte `foo` value of the "pick" row; the
+        // outer in() filter must match both rows carrying those exact bytes.
+        assert_eq!(
+            count_rows(&s, tenant, "foo:in(bar:pick | fields foo) | fields foo"),
+            2,
+            "in(<subquery>) must match the raw-byte value byte-exactly"
+        );
+
+        // The matched rows must carry the original bytes, unmangled.
+        {
+            let q = ParseQuery("foo:in(bar:pick | fields foo) | fields foo").expect("parse query");
+            let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+            let cap = Arc::clone(&captured);
+            let write: WriteDataBlockFn = Arc::new(move |_wid, db: &mut DataBlock| {
+                let n = db.rows_count();
+                let cs = db.get_columns(false);
+                let mut dst = cap.lock().unwrap();
+                for c in cs {
+                    if c.name == "foo" {
+                        for i in 0..n {
+                            dst.push(c.values[i].clone());
+                        }
+                    }
+                }
+            });
+            s.run_query(&[tenant], &q, write).expect("run_query");
+            let values = captured.lock().unwrap();
+            assert_eq!(values.len(), 2);
+            for v in values.iter() {
+                assert_eq!(v.as_slice(), raw, "matched value must keep raw bytes");
+            }
+        }
+
+        // A subquery matching nothing must select nothing.
+        assert_eq!(
+            count_rows(&s, tenant, "foo:in(bar:nomatch | fields foo)"),
+            0,
+            "empty in-set must match no rows"
         );
 
         s.must_close();
