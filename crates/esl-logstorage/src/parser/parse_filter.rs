@@ -248,7 +248,11 @@ fn parse_filter_generic(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, 
 
 fn parse_filter_phrase(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
     let stop_tokens: &[&str] = if field_name.is_empty() { &[":"] } else { &[] };
-    let phrase = lex.next_compound_token_ext(stop_tokens)?;
+    // `phrase_bytes` is the Go-parity raw payload (parser.go:329
+    // strconv.Unquote: `"\xff"` in query text denotes the raw byte 0xFF);
+    // `phrase` is the legacy scalar String form used where the token acts as
+    // a field NAME (still String-typed — see the lexer PORT NOTE).
+    let (phrase, phrase_bytes) = lex.next_compound_token_ext_pair(stop_tokens)?;
 
     if !lex.is_skipped_space() && lex.is_keyword(&["*"]) {
         lex.next_token();
@@ -256,7 +260,7 @@ fn parse_filter_phrase(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, S
             lex.next_token();
             return parse_filter_generic(lex, &format!("{phrase}*"));
         }
-        return Ok(Box::new(new_filter_prefix(field_name, &phrase)));
+        return Ok(Box::new(new_filter_prefix(field_name, &phrase_bytes)));
     }
 
     if field_name.is_empty() && lex.is_keyword(&[":"]) {
@@ -269,7 +273,7 @@ fn parse_filter_phrase(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, S
         };
     }
 
-    Ok(Box::new(new_filter_phrase(field_name, &phrase)))
+    Ok(Box::new(new_filter_phrase(field_name, &phrase_bytes)))
 }
 
 fn parse_filter_parens(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
@@ -307,7 +311,7 @@ fn parse_any_case_filter(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter,
 fn parse_func_arg_maybe_prefix(
     lex: &mut Lexer,
     field_name: &str,
-    callback: impl Fn(&str, bool) -> Result<BoxFilter, String>,
+    callback: impl Fn(&[u8], bool) -> Result<BoxFilter, String>,
 ) -> Result<BoxFilter, String> {
     let lex_state = lex.clone();
     let func_name = lex.token.clone();
@@ -319,13 +323,14 @@ fn parse_func_arg_maybe_prefix(
     }
     lex.next_token();
 
-    let mut arg = String::new();
+    // Raw-byte payload (Go parser.go:329 strconv.Unquote semantics).
+    let mut arg = Vec::new();
     let mut is_wildcard = lex.is_keyword(&["*"]);
     if is_wildcard {
         lex.next_token();
     } else {
         let token = lex
-            .next_compound_token()
+            .next_compound_token_bytes()
             .map_err(|e| format!("cannot read {func_name}() arg: {e}"))?;
         arg = token;
         if !lex.is_skipped_space() && lex.is_keyword(&["*"]) {
@@ -606,7 +611,7 @@ fn parse_filter_equals_common_case(lex: &mut Lexer, field_name: &str) -> Result<
 }
 
 fn parse_filter_sequence(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
-    parse_func_args(lex, field_name, |_, args| {
+    parse_func_args_bytes(lex, field_name, |_, args| {
         Ok(Box::new(new_filter_sequence(field_name, args)))
     })
 }
@@ -750,8 +755,9 @@ fn parse_filter_eq(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, Strin
             go_quote(&op)
         ));
     }
+    // Raw-byte payload (Go parser.go:329 strconv.Unquote semantics).
     let phrase = lex
-        .next_compound_token()
+        .next_compound_token_bytes()
         .map_err(|e| format!("cannot parse token after {}: {e}", go_quote(&op)))?;
     if !lex.is_skipped_space() && lex.is_keyword(&["*"]) {
         lex.next_token();
@@ -981,6 +987,25 @@ fn parse_func_args(
         return parse_filter_phrase(lex, field_name);
     }
     let args = parse_args_in_parens(lex).map_err(|e| format!("cannot parse {func_name}(): {e}"))?;
+    callback(&func_name, args)
+}
+
+/// Byte form of [`parse_func_args`] for filters whose args are raw-byte
+/// phrase payloads (Go parser.go:329 strconv.Unquote semantics).
+fn parse_func_args_bytes(
+    lex: &mut Lexer,
+    field_name: &str,
+    callback: impl Fn(&str, Vec<Vec<u8>>) -> Result<BoxFilter, String>,
+) -> Result<BoxFilter, String> {
+    let lex_state = lex.clone();
+    let func_name = lex.token.clone();
+    lex.next_token();
+    if !lex.is_keyword(&["("]) {
+        *lex = lex_state;
+        return parse_filter_phrase(lex, field_name);
+    }
+    let args =
+        parse_args_in_parens_bytes(lex).map_err(|e| format!("cannot parse {func_name}(): {e}"))?;
     callback(&func_name, args)
 }
 

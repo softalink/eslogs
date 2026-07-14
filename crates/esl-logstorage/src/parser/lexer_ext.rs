@@ -42,6 +42,10 @@ pub(crate) trait LexerExt {
     fn is_prev_raw_token(&self, tokens: &[&str]) -> bool;
     fn check_prev_adjacent_token(&self, tokens: &[&str]) -> Result<(), String>;
     fn next_compound_token_ext(&mut self, stop_tokens: &[&str]) -> Result<String, String>;
+    fn next_compound_token_ext_pair(
+        &mut self,
+        stop_tokens: &[&str],
+    ) -> Result<(String, Vec<u8>), String>;
     fn next_compound_math_token(&mut self) -> Result<String, String>;
     fn is_allowed_compound_token(&self, stop_tokens: &[&str]) -> bool;
 }
@@ -145,6 +149,28 @@ impl LexerExt for Lexer<'_> {
         }
 
         Ok(s)
+    }
+
+    /// [`LexerExt::next_compound_token_ext`] returning both the legacy
+    /// `String` form (scalar decoding of `\xNN >= 0x80` escapes; used for
+    /// field names and keyword-shaped checks) and the Go-parity raw-byte
+    /// payload (`Lexer::token_bytes`; used for phrase/value payloads). The
+    /// two differ only for double/backtick-quoted tokens whose unquoted value
+    /// is invalid UTF-8; unquoted compound tokens are slices of the query
+    /// text and thus identical in both forms.
+    fn next_compound_token_ext_pair(
+        &mut self,
+        stop_tokens: &[&str],
+    ) -> Result<(String, Vec<u8>), String> {
+        if self.is_quoted_token() {
+            let s = self.token.clone();
+            let b = self.token_bytes.clone();
+            self.next_token();
+            return Ok((s, b));
+        }
+        let s = self.next_compound_token_ext(stop_tokens)?;
+        let b = s.clone().into_bytes();
+        Ok((s, b))
     }
 
     fn next_compound_math_token(&mut self) -> Result<String, String> {

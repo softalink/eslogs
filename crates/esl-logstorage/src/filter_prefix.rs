@@ -15,7 +15,7 @@ use crate::block_search::BlockSearch;
 use crate::bloomfilter::append_tokens_hashes;
 use crate::filter::FieldFilter;
 use crate::filter_generic::{
-    FilterGeneric, RUNE_ERROR, clone_column_header, get_tokens_skip_last, index_bytes,
+    FilterGeneric, RUNE_ERROR, clone_column_header, get_tokens_skip_last_bytes, index_bytes,
     new_filter_generic, rune_at, rune_before,
 };
 use crate::filter_phrase::{
@@ -38,16 +38,18 @@ use crate::values_encoder::{
 /// `FilterPrefix` matches the given prefix. Example LogsQL: `prefix*` or
 /// `"some prefix"*`. The special case `*` matches a non-empty value.
 pub(crate) struct FilterPrefix {
-    pub(crate) prefix: String,
+    /// The prefix to match. Raw bytes like Go's `string` (a double-quoted
+    /// `"\xff"` escape in query text denotes the raw byte 0xFF).
+    pub(crate) prefix: Vec<u8>,
     tokens_hashes: OnceLock<Vec<u64>>,
 }
 
 /// Builds a prefix filter for `field_name`.
-pub(crate) fn new_filter_prefix(field_name: &str, prefix: &str) -> FilterGeneric {
+pub(crate) fn new_filter_prefix(field_name: &str, prefix: impl AsRef<[u8]>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterPrefix {
-            prefix: prefix.to_string(),
+            prefix: prefix.as_ref().to_vec(),
             tokens_hashes: OnceLock::new(),
         }),
     )
@@ -56,7 +58,7 @@ pub(crate) fn new_filter_prefix(field_name: &str, prefix: &str) -> FilterGeneric
 impl FilterPrefix {
     pub(crate) fn get_tokens_hashes(&self) -> &[u64] {
         self.tokens_hashes.get_or_init(|| {
-            let tokens = get_tokens_skip_last(&self.prefix);
+            let tokens = get_tokens_skip_last_bytes(&self.prefix);
             let mut hashes = Vec::new();
             append_tokens_hashes(&mut hashes, &tokens);
             hashes
@@ -73,9 +75,11 @@ impl FieldFilter for FilterPrefix {
         if self.prefix.is_empty() {
             return "*".to_string();
         }
+        // Lossless render: invalid UTF-8 re-quotes via Go strconv.Quote byte
+        // semantics (`\xNN`), so parse -> render -> re-parse is stable.
         format!(
             "{}*",
-            crate::stream_filter::quote_token_if_needed(&self.prefix)
+            crate::stream_filter::quote_value_bytes_if_needed(&self.prefix)
         )
     }
 
@@ -148,9 +152,10 @@ pub(crate) fn match_timestamp_iso8601_by_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         return;
     }
@@ -170,9 +175,10 @@ pub(crate) fn match_ipv4_by_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         return;
     }
@@ -192,19 +198,22 @@ pub(crate) fn match_float64_by_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         return;
     }
-    let ok = try_parse_float64_exact(prefix).is_some();
+    let ok = crate::filter_phrase::phrase_utf8(prefix)
+        .and_then(try_parse_float64_exact)
+        .is_some();
     if !ok
-        && prefix != "."
-        && prefix != "+"
-        && prefix != "-"
-        && !prefix.starts_with('e')
-        && !prefix.starts_with('E')
+        && prefix != b"."
+        && prefix != b"+"
+        && prefix != b"-"
+        && !prefix.starts_with(b"e")
+        && !prefix.starts_with(b"E")
     {
         bm.reset_bits();
         return;
@@ -225,8 +234,9 @@ pub(crate) fn match_values_dict_by_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
 ) {
+    let prefix = prefix.as_ref();
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
         bb.push(u8::from(match_prefix(v, prefix)));
@@ -238,27 +248,28 @@ pub(crate) fn match_string_by_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
     if !match_bloom_filter_all_tokens(bs, ch, tokens) {
         bm.reset_bits();
         return;
     }
-    visit_values(bs, ch, bm, |v| match_prefix(v, prefix));
+    visit_values(bs, ch, bm, |v| match_prefix(v, &prefix));
 }
 
 pub(crate) fn match_uint8_by_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         return;
     }
-    match try_parse_uint64(prefix) {
+    match crate::filter_phrase::phrase_utf8(prefix).and_then(try_parse_uint64) {
         Some(n) if n <= ch.max_value => {}
         _ => {
             bm.reset_bits();
@@ -281,13 +292,14 @@ pub(crate) fn match_uint16_by_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         return;
     }
-    match try_parse_uint64(prefix) {
+    match crate::filter_phrase::phrase_utf8(prefix).and_then(try_parse_uint64) {
         Some(n) if n <= ch.max_value => {}
         _ => {
             bm.reset_bits();
@@ -310,13 +322,14 @@ pub(crate) fn match_uint32_by_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         return;
     }
-    match try_parse_uint64(prefix) {
+    match crate::filter_phrase::phrase_utf8(prefix).and_then(try_parse_uint64) {
         Some(n) if n <= ch.max_value => {}
         _ => {
             bm.reset_bits();
@@ -339,13 +352,14 @@ pub(crate) fn match_uint64_by_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         return;
     }
-    match try_parse_uint64(prefix) {
+    match crate::filter_phrase::phrase_utf8(prefix).and_then(try_parse_uint64) {
         Some(n) if n <= ch.max_value => {}
         _ => {
             bm.reset_bits();
@@ -368,14 +382,15 @@ pub(crate) fn match_int64_by_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         return;
     }
-    if prefix != "-" {
-        match try_parse_int64(prefix) {
+    if prefix != b"-" {
+        match crate::filter_phrase::phrase_utf8(prefix).and_then(try_parse_int64) {
             Some(n) if n >= ch.min_value as i64 && n <= ch.max_value as i64 => {}
             _ => {
                 bm.reset_bits();
@@ -398,13 +413,14 @@ pub(crate) fn match_int64_by_prefix(
 /// Port of Go `matchPrefix`.
 ///
 /// The haystack `s` is raw value bytes (Go strings are arbitrary bytes).
-pub(crate) fn match_prefix(s: &[u8], prefix: &str) -> bool {
+pub(crate) fn match_prefix(s: &[u8], prefix: impl AsRef<[u8]>) -> bool {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         // Special case - empty prefix matches any non-empty string.
         return !s.is_empty();
     }
     let sb = s;
-    let pb = prefix.as_bytes();
+    let pb = prefix;
     if pb.len() > sb.len() {
         return false;
     }

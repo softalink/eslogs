@@ -2123,3 +2123,76 @@ fn test_parse_query_optimize_stream_filters() {
     );
     f(r#"{foo="bar"} or {baz="x"}"#, r#"{foo="bar"} or {baz="x"}"#);
 }
+
+/// PORT-ONLY TEST: a double-quoted `\xff`-style escape in QUERY TEXT denotes
+/// the raw byte 0xFF in phrase/value payloads (Go parser.go:329 uses
+/// `strconv.Unquote` for double-quoted/backtick tokens), and rendering such a
+/// filter re-quotes the raw bytes with Go `strconv.Quote` byte semantics, so
+/// parse -> render -> re-parse is stable.
+#[test]
+fn test_parse_query_raw_byte_phrase_roundtrip() {
+    // phrase filter
+    ok(r#"foo:"a\xffb""#, r#"foo:"a\xffb""#);
+    ok(r#""\xff\xfe""#, r#""\xff\xfe""#);
+    // prefix filter
+    ok(r#"foo:"a\xff"*"#, r#"foo:"a\xff"*"#);
+    // exact / exact-prefix filters
+    ok(r#"foo:="a\xff""#, r#"foo:="a\xff""#);
+    ok(r#"foo:="a\xff"*"#, r#"foo:="a\xff"*"#);
+    ok(r#"foo:exact("a\xff")"#, r#"foo:="a\xff""#);
+    // any-case phrase / prefix filters
+    ok(r#"foo:i("a\xff")"#, r#"foo:i("a\xff")"#);
+    ok(r#"foo:i("a\xff"*)"#, r#"foo:i("a\xff"*)"#);
+    // sequence filter
+    ok(r#"foo:seq("a\xff", bar)"#, r#"foo:seq("a\xff",bar)"#);
+    // octal escapes >= 0o200 behave the same (raw byte)
+    ok(r#"foo:"a\377b""#, r#"foo:"a\xffb""#);
+}
+
+/// PORT-ONLY TEST: raw-byte phrase payloads parsed from `"\xff"`-style query
+/// escapes must match ingested values containing the same raw bytes,
+/// byte-for-byte like Go.
+#[test]
+fn test_raw_byte_phrase_filters_match_row() {
+    use crate::rows::Field;
+
+    let row = [Field {
+        name: b"foo".to_vec(),
+        value: b"err\xffor code".to_vec(),
+    }];
+    let row_plain = [Field {
+        name: b"foo".to_vec(),
+        value: b"error code".to_vec(),
+    }];
+
+    let check = |query: &str, matches_raw: bool, matches_plain: bool| {
+        let q = ParseQuery(query).unwrap_or_else(|e| panic!("cannot parse {query:?}: {e}"));
+        let f = q.get_final_filter();
+        assert_eq!(
+            f.match_row(&row),
+            matches_raw,
+            "{query} vs raw-byte row (want {matches_raw})"
+        );
+        assert_eq!(
+            f.match_row(&row_plain),
+            matches_plain,
+            "{query} vs plain row (want {matches_plain})"
+        );
+    };
+
+    // phrase
+    check(r#"foo:"err\xffor""#, true, false);
+    // prefix
+    check(r#"foo:"err\xffor"*"#, true, false);
+    // exact + exact-prefix
+    check(r#"foo:="err\xffor code""#, true, false);
+    check(r#"foo:="err\xffor"*"#, true, false);
+    // seq
+    check(r#"foo:seq("err\xffor", code)"#, true, false);
+    // any-case phrase: Go lowercases via strings.ToLower (invalid bytes map
+    // to U+FFFD on both the phrase and the value side, so they still match).
+    check(r#"foo:i("ERR\xffOR")"#, true, false);
+    // single-quoted '\xff' is a UTF-8-encoded scalar (Go utf8.AppendRune),
+    // NOT the raw byte - it must not match the raw-byte row.
+    check(r#"foo:'err\xffor'"#, false, false);
+}

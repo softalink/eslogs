@@ -13,7 +13,7 @@ use crate::block_search::BlockSearch;
 use crate::bloomfilter::{BLOOM_FILTER_HASHES_COUNT, append_tokens_hashes};
 use crate::filter::FieldFilter;
 use crate::filter_generic::{
-    FilterGeneric, clone_column_header, get_tokens_skip_last, new_filter_generic,
+    FilterGeneric, clone_column_header, get_tokens_skip_last_bytes, new_filter_generic,
 };
 use crate::filter_phrase::{
     apply_to_block_result_generic, match_bloom_filter_all_tokens, match_encoded_values_dict,
@@ -31,16 +31,18 @@ use crate::values_encoder::{ValueType, try_parse_int64, try_parse_uint64};
 
 /// `FilterExactPrefix` matches the exact prefix. Example LogsQL: `="foo bar"*`.
 pub(crate) struct FilterExactPrefix {
-    pub(crate) prefix: String,
+    /// The exact prefix to match. Raw bytes like Go's `string` (a
+    /// double-quoted `"\xff"` escape in query text denotes the raw byte 0xFF).
+    pub(crate) prefix: Vec<u8>,
     tokens_hashes: OnceLock<Vec<u64>>,
 }
 
 /// Builds an exact-prefix filter for `field_name`.
-pub(crate) fn new_filter_exact_prefix(field_name: &str, prefix: &str) -> FilterGeneric {
+pub(crate) fn new_filter_exact_prefix(field_name: &str, prefix: impl AsRef<[u8]>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterExactPrefix {
-            prefix: prefix.to_string(),
+            prefix: prefix.as_ref().to_vec(),
             tokens_hashes: OnceLock::new(),
         }),
     )
@@ -49,7 +51,7 @@ pub(crate) fn new_filter_exact_prefix(field_name: &str, prefix: &str) -> FilterG
 impl FilterExactPrefix {
     pub(crate) fn get_tokens_hashes(&self) -> &[u64] {
         self.tokens_hashes.get_or_init(|| {
-            let tokens = get_tokens_skip_last(&self.prefix);
+            let tokens = get_tokens_skip_last_bytes(&self.prefix);
             let mut hashes = Vec::new();
             append_tokens_hashes(&mut hashes, &tokens);
             hashes
@@ -59,9 +61,11 @@ impl FilterExactPrefix {
 
 impl FieldFilter for FilterExactPrefix {
     fn to_string(&self) -> String {
+        // Lossless render: invalid UTF-8 re-quotes via Go strconv.Quote byte
+        // semantics (`\xNN`), so parse -> render -> re-parse is stable.
         format!(
             "={}*",
-            crate::stream_filter::quote_token_if_needed(&self.prefix)
+            crate::stream_filter::quote_value_bytes_if_needed(&self.prefix)
         )
     }
 
@@ -136,13 +140,15 @@ pub(crate) fn match_timestamp_iso8601_by_exact_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         return;
     }
-    if !("0"..="9").contains(&prefix) || !match_bloom_filter_all_tokens(bs, ch, tokens) {
+    if !(&b"0"[..]..=&b"9"[..]).contains(&prefix) || !match_bloom_filter_all_tokens(bs, ch, tokens)
+    {
         bm.reset_bits();
         return;
     }
@@ -158,13 +164,14 @@ pub(crate) fn match_ipv4_by_exact_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         return;
     }
-    if !("0"..="9").contains(&prefix)
+    if !(&b"0"[..]..=&b"9"[..]).contains(&prefix)
         || tokens.len() > 3 * BLOOM_FILTER_HASHES_COUNT
         || !match_bloom_filter_all_tokens(bs, ch, tokens)
     {
@@ -183,9 +190,10 @@ pub(crate) fn match_float64_by_exact_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         // An empty prefix matches all the values.
         return;
@@ -208,8 +216,9 @@ pub(crate) fn match_values_dict_by_exact_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
 ) {
+    let prefix = prefix.as_ref();
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
         bb.push(u8::from(match_exact_prefix(v, prefix)));
@@ -221,9 +230,10 @@ pub(crate) fn match_string_by_exact_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if !match_bloom_filter_all_tokens(bs, ch, tokens) {
         bm.reset_bits();
         return;
@@ -235,9 +245,10 @@ pub(crate) fn match_uint8_by_exact_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if !match_min_max_exact_prefix(ch, bm, prefix, tokens) {
         return;
     }
@@ -253,9 +264,10 @@ pub(crate) fn match_uint16_by_exact_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if !match_min_max_exact_prefix(ch, bm, prefix, tokens) {
         return;
     }
@@ -271,9 +283,10 @@ pub(crate) fn match_uint32_by_exact_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if !match_min_max_exact_prefix(ch, bm, prefix, tokens) {
         return;
     }
@@ -289,9 +302,10 @@ pub(crate) fn match_uint64_by_exact_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if !match_min_max_exact_prefix(ch, bm, prefix, tokens) {
         return;
     }
@@ -307,9 +321,10 @@ pub(crate) fn match_int64_by_exact_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         // An empty prefix matches all the values.
         return;
@@ -320,8 +335,8 @@ pub(crate) fn match_int64_by_exact_prefix(
         bm.reset_bits();
         return;
     }
-    if prefix != "-" {
-        match try_parse_int64(prefix) {
+    if prefix != b"-" {
+        match crate::filter_phrase::phrase_utf8(prefix).and_then(try_parse_int64) {
             Some(n) if n <= ch.max_value as i64 && n >= ch.min_value as i64 => {}
             _ => {
                 bm.reset_bits();
@@ -341,9 +356,10 @@ pub(crate) fn match_int64_by_exact_prefix(
 pub(crate) fn match_min_max_exact_prefix(
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix: &str,
+    prefix: impl AsRef<[u8]>,
     tokens: &[u64],
 ) -> bool {
+    let prefix = prefix.as_ref();
     if prefix.is_empty() {
         // An empty prefix matches all the values.
         return false;
@@ -354,7 +370,7 @@ pub(crate) fn match_min_max_exact_prefix(
         bm.reset_bits();
         return false;
     }
-    match try_parse_uint64(prefix) {
+    match crate::filter_phrase::phrase_utf8(prefix).and_then(try_parse_uint64) {
         Some(n) if n <= ch.max_value => true,
         _ => {
             bm.reset_bits();
@@ -364,6 +380,6 @@ pub(crate) fn match_min_max_exact_prefix(
 }
 
 /// Port of Go `matchExactPrefix`.
-pub(crate) fn match_exact_prefix(s: &[u8], prefix: &str) -> bool {
-    s.starts_with(prefix.as_bytes())
+pub(crate) fn match_exact_prefix(s: &[u8], prefix: impl AsRef<[u8]>) -> bool {
+    s.starts_with(prefix.as_ref())
 }

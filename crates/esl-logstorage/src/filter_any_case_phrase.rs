@@ -23,28 +23,33 @@ use crate::filter_phrase::{
     match_ipv4_by_phrase, match_phrase, match_timestamp_iso8601_by_phrase, visit_values,
 };
 use crate::rows::{Field, get_field_value_by_name};
-use crate::stream_filter::quote_token_if_needed;
-use crate::tokenizer::tokenize_strings;
+use crate::tokenizer::tokenize_bytes;
 use crate::values_encoder::ValueType;
 
 /// `FilterAnyCasePhrase` filters field entries by case-insensitive phrase match.
 ///
 /// An example LogsQL query: `i(word)` or `i("word1 ... wordN")`.
 pub(crate) struct FilterAnyCasePhrase {
-    phrase: String,
+    /// The phrase to match, case-insensitively. Raw bytes like Go's `string`
+    /// (a double-quoted `"\xff"` escape in query text denotes the raw byte
+    /// 0xFF).
+    phrase: Vec<u8>,
 
-    phrase_lowercase: OnceLock<String>,
-    phrase_uppercase: OnceLock<String>,
+    phrase_lowercase: OnceLock<Vec<u8>>,
+    phrase_uppercase: OnceLock<Vec<u8>>,
 
     /// Cached `(tokens_hashes, tokens_hashes_uppercase)` (Go `tokensOnce`).
     tokens: OnceLock<(Vec<u64>, Vec<u64>)>,
 }
 
-pub(crate) fn new_filter_any_case_phrase(field_name: &str, phrase: &str) -> FilterGeneric {
+pub(crate) fn new_filter_any_case_phrase(
+    field_name: &str,
+    phrase: impl AsRef<[u8]>,
+) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterAnyCasePhrase {
-            phrase: phrase.to_string(),
+            phrase: phrase.as_ref().to_vec(),
             phrase_lowercase: OnceLock::new(),
             phrase_uppercase: OnceLock::new(),
             tokens: OnceLock::new(),
@@ -52,25 +57,68 @@ pub(crate) fn new_filter_any_case_phrase(field_name: &str, phrase: &str) -> Filt
     )
 }
 
+/// Go-style lossy decode of a raw-byte string: runes decode with
+/// `utf8.DecodeRune` semantics (each invalid byte yields one U+FFFD), which is
+/// exactly how Go's `strings.ToLower`/`ToUpper` (`strings.Map`) see a
+/// raw-byte string before applying the case mapping.
+pub(crate) fn go_lossy_decode(v: &[u8]) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut b = v;
+    while !b.is_empty() {
+        let (r, size) = crate::pattern_matcher::decode_rune(b);
+        out.push(r);
+        b = &b[size..];
+    }
+    out
+}
+
 impl FilterAnyCasePhrase {
-    fn get_phrase_lowercase(&self) -> &str {
+    fn get_phrase_lowercase(&self) -> &[u8] {
         self.phrase_lowercase
-            .get_or_init(|| self.phrase.to_lowercase())
+            .get_or_init(|| match std::str::from_utf8(&self.phrase) {
+                // Valid UTF-8 keeps the pre-existing `str::to_lowercase` path
+                // (bit-identical behavior for valid-UTF-8 queries).
+                Ok(s) => s.to_lowercase().into_bytes(),
+                // Go strings.ToLower maps invalid bytes to U+FFFD rune-wise
+                // and applies the simple case mapping — match that exactly.
+                Err(_) => {
+                    let mut bb = Vec::new();
+                    append_lowercase(&mut bb, &go_lossy_decode(&self.phrase));
+                    bb
+                }
+            })
     }
 
-    fn get_phrase_uppercase(&self) -> &str {
+    fn get_phrase_uppercase(&self) -> &[u8] {
         self.phrase_uppercase
-            .get_or_init(|| self.phrase.to_uppercase())
+            .get_or_init(|| match std::str::from_utf8(&self.phrase) {
+                Ok(s) => s.to_uppercase().into_bytes(),
+                // Invalid bytes decode to U+FFFD first (Go strings.ToUpper),
+                // then uppercase; only ever compared against ASCII timestamp
+                // strings, so the full-vs-simple mapping difference is moot.
+                Err(_) => go_lossy_decode(&self.phrase).to_uppercase().into_bytes(),
+            })
     }
 
     fn get_tokens(&self) -> &(Vec<u64>, Vec<u64>) {
         self.tokens.get_or_init(|| {
-            let mut toks: Vec<&str> = Vec::new();
-            tokenize_strings(&mut toks, std::slice::from_ref(&self.phrase));
+            // Byte tokenizer: matches the ingest-side hash_tokenizer, so
+            // bloom lookups agree for raw-byte phrases too.
+            let mut toks: Vec<&[u8]> = Vec::new();
+            tokenize_bytes(&mut toks, std::slice::from_ref(&self.phrase));
             let mut tokens_hashes = Vec::new();
             append_tokens_hashes(&mut tokens_hashes, &toks);
 
-            let tokens_uppercase: Vec<String> = toks.iter().map(|t| t.to_uppercase()).collect();
+            // Tokens consist of token runes only, so they are valid UTF-8
+            // even when the phrase is not.
+            let tokens_uppercase: Vec<String> = toks
+                .iter()
+                .map(|t| {
+                    std::str::from_utf8(t)
+                        .expect("BUG: tokenizer emitted a non-UTF-8 token")
+                        .to_uppercase()
+                })
+                .collect();
             let mut tokens_hashes_uppercase = Vec::new();
             append_tokens_hashes(&mut tokens_hashes_uppercase, &tokens_uppercase);
 
@@ -81,7 +129,12 @@ impl FilterAnyCasePhrase {
 
 impl FieldFilter for FilterAnyCasePhrase {
     fn to_string(&self) -> String {
-        format!("i({})", quote_token_if_needed(&self.phrase))
+        // Lossless render: invalid UTF-8 re-quotes via Go strconv.Quote byte
+        // semantics (`\xNN`), so parse -> render -> re-parse is stable.
+        format!(
+            "i({})",
+            crate::stream_filter::quote_value_bytes_if_needed(&self.phrase)
+        )
     }
 
     fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
@@ -95,7 +148,7 @@ impl FieldFilter for FilterAnyCasePhrase {
         bm: &mut Bitmap,
         field_name: &str,
     ) {
-        let phrase_lowercase = self.get_phrase_lowercase().to_string();
+        let phrase_lowercase = self.get_phrase_lowercase().to_vec();
         apply_to_block_result_generic(br, bm, field_name, &phrase_lowercase, match_any_case_phrase);
     }
 
@@ -105,7 +158,7 @@ impl FieldFilter for FilterAnyCasePhrase {
         bm: &mut Bitmap,
         field_name: &str,
     ) {
-        let phrase_lowercase = self.get_phrase_lowercase().to_string();
+        let phrase_lowercase = self.get_phrase_lowercase().to_vec();
 
         // Verify whether fp matches const column.
         let v = bs.get_const_column_value(field_name);
@@ -148,7 +201,7 @@ impl FieldFilter for FilterAnyCasePhrase {
             ValueType::FLOAT64 => match_float64_by_phrase(bs, &ch, bm, &phrase_lowercase, &tokens),
             ValueType::IPV4 => match_ipv4_by_phrase(bs, &ch, bm, &phrase_lowercase, &tokens),
             ValueType::TIMESTAMP_ISO8601 => {
-                let phrase_uppercase = self.get_phrase_uppercase().to_string();
+                let phrase_uppercase = self.get_phrase_uppercase().to_vec();
                 let tokens_uppercase = self.get_tokens().1.clone();
                 match_timestamp_iso8601_by_phrase(bs, &ch, bm, &phrase_uppercase, &tokens_uppercase)
             }
@@ -161,7 +214,7 @@ fn match_values_dict_by_any_case_phrase(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrase_lowercase: &str,
+    phrase_lowercase: &[u8],
 ) {
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
@@ -174,13 +227,13 @@ fn match_string_by_any_case_phrase(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrase_lowercase: &str,
+    phrase_lowercase: &[u8],
 ) {
     visit_values(bs, ch, bm, |v| match_any_case_phrase(v, phrase_lowercase));
 }
 
 /// Port of Go `matchAnyCasePhrase`.
-fn match_any_case_phrase(s: &[u8], phrase_lowercase: &str) -> bool {
+fn match_any_case_phrase(s: &[u8], phrase_lowercase: &[u8]) -> bool {
     if phrase_lowercase.is_empty() {
         // Special case - empty phrase matches only empty string.
         return s.is_empty();
@@ -219,7 +272,7 @@ mod tests {
     #[test]
     fn test_match_any_case_phrase() {
         fn f(s: &str, phrase_lowercase: &str, result_expected: bool) {
-            let result = match_any_case_phrase(s.as_bytes(), phrase_lowercase);
+            let result = match_any_case_phrase(s.as_bytes(), phrase_lowercase.as_bytes());
             assert_eq!(
                 result, result_expected,
                 "s={s:?} phrase={phrase_lowercase:?}"

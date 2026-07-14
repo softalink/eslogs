@@ -13,8 +13,8 @@ use crate::block_result::BlockResult;
 use crate::block_search::BlockSearch;
 use crate::bloomfilter::append_tokens_hashes;
 use crate::filter::FieldFilter;
-use crate::filter_any_case_phrase::is_ascii_lowercase;
-use crate::filter_generic::{FilterGeneric, get_tokens_skip_last, new_filter_generic};
+use crate::filter_any_case_phrase::{go_lossy_decode, is_ascii_lowercase};
+use crate::filter_generic::{FilterGeneric, get_tokens_skip_last_bytes, new_filter_generic};
 use crate::filter_phrase::{
     apply_to_block_result_generic, match_encoded_values_dict, visit_values,
 };
@@ -24,7 +24,6 @@ use crate::filter_prefix::{
     match_uint32_by_prefix, match_uint64_by_prefix,
 };
 use crate::rows::{Field, get_field_value_by_name};
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::ValueType;
 
 /// `FilterAnyCasePrefix` matches the given prefix in lower, upper and mixed case.
@@ -32,20 +31,26 @@ use crate::values_encoder::ValueType;
 /// Example LogsQL: `i(prefix*)` or `i("some prefix"*)`. A special case `i(*)`
 /// equals `*` and matches a non-empty value.
 pub(crate) struct FilterAnyCasePrefix {
-    prefix: String,
+    /// The prefix to match, case-insensitively. Raw bytes like Go's `string`
+    /// (a double-quoted `"\xff"` escape in query text denotes the raw byte
+    /// 0xFF).
+    prefix: Vec<u8>,
 
-    prefix_lowercase: OnceLock<String>,
-    prefix_uppercase: OnceLock<String>,
+    prefix_lowercase: OnceLock<Vec<u8>>,
+    prefix_uppercase: OnceLock<Vec<u8>>,
 
     /// Cached `(tokens_hashes, tokens_uppercase_hashes)` (Go `tokensOnce`).
     tokens: OnceLock<(Vec<u64>, Vec<u64>)>,
 }
 
-pub(crate) fn new_filter_any_case_prefix(field_name: &str, prefix: &str) -> FilterGeneric {
+pub(crate) fn new_filter_any_case_prefix(
+    field_name: &str,
+    prefix: impl AsRef<[u8]>,
+) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterAnyCasePrefix {
-            prefix: prefix.to_string(),
+            prefix: prefix.as_ref().to_vec(),
             prefix_lowercase: OnceLock::new(),
             prefix_uppercase: OnceLock::new(),
             tokens: OnceLock::new(),
@@ -54,23 +59,48 @@ pub(crate) fn new_filter_any_case_prefix(field_name: &str, prefix: &str) -> Filt
 }
 
 impl FilterAnyCasePrefix {
-    fn get_prefix_lowercase(&self) -> &str {
+    fn get_prefix_lowercase(&self) -> &[u8] {
         self.prefix_lowercase
-            .get_or_init(|| self.prefix.to_lowercase())
+            .get_or_init(|| match std::str::from_utf8(&self.prefix) {
+                // Valid UTF-8 keeps the pre-existing `str::to_lowercase` path
+                // (bit-identical behavior for valid-UTF-8 queries).
+                Ok(s) => s.to_lowercase().into_bytes(),
+                // Go strings.ToLower maps invalid bytes to U+FFFD rune-wise
+                // and applies the simple case mapping — match that exactly.
+                Err(_) => {
+                    let mut bb = Vec::new();
+                    append_lowercase(&mut bb, &go_lossy_decode(&self.prefix));
+                    bb
+                }
+            })
     }
 
-    fn get_prefix_uppercase(&self) -> &str {
+    fn get_prefix_uppercase(&self) -> &[u8] {
         self.prefix_uppercase
-            .get_or_init(|| self.prefix.to_uppercase())
+            .get_or_init(|| match std::str::from_utf8(&self.prefix) {
+                Ok(s) => s.to_uppercase().into_bytes(),
+                // Invalid bytes decode to U+FFFD first (Go strings.ToUpper);
+                // only ever compared against ASCII timestamp strings.
+                Err(_) => go_lossy_decode(&self.prefix).to_uppercase().into_bytes(),
+            })
     }
 
     fn get_tokens(&self) -> &(Vec<u64>, Vec<u64>) {
         self.tokens.get_or_init(|| {
-            let tokens = get_tokens_skip_last(&self.prefix);
+            let tokens = get_tokens_skip_last_bytes(&self.prefix);
             let mut tokens_hashes = Vec::new();
             append_tokens_hashes(&mut tokens_hashes, &tokens);
 
-            let tokens_uppercase: Vec<String> = tokens.iter().map(|t| t.to_uppercase()).collect();
+            // Tokens consist of token runes only, so they are valid UTF-8
+            // even when the prefix is not.
+            let tokens_uppercase: Vec<String> = tokens
+                .iter()
+                .map(|t| {
+                    std::str::from_utf8(t)
+                        .expect("BUG: tokenizer emitted a non-UTF-8 token")
+                        .to_uppercase()
+                })
+                .collect();
             let mut tokens_uppercase_hashes = Vec::new();
             append_tokens_hashes(&mut tokens_uppercase_hashes, &tokens_uppercase);
 
@@ -84,7 +114,12 @@ impl FieldFilter for FilterAnyCasePrefix {
         if self.prefix.is_empty() {
             return "i(*)".to_string();
         }
-        format!("i({}*)", quote_token_if_needed(&self.prefix))
+        // Lossless render: invalid UTF-8 re-quotes via Go strconv.Quote byte
+        // semantics (`\xNN`), so parse -> render -> re-parse is stable.
+        format!(
+            "i({}*)",
+            crate::stream_filter::quote_value_bytes_if_needed(&self.prefix)
+        )
     }
 
     fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
@@ -98,7 +133,7 @@ impl FieldFilter for FilterAnyCasePrefix {
         bm: &mut Bitmap,
         field_name: &str,
     ) {
-        let prefix_lowercase = self.get_prefix_lowercase().to_string();
+        let prefix_lowercase = self.get_prefix_lowercase().to_vec();
         apply_to_block_result_generic(br, bm, field_name, &prefix_lowercase, match_any_case_prefix);
     }
 
@@ -108,7 +143,7 @@ impl FieldFilter for FilterAnyCasePrefix {
         bm: &mut Bitmap,
         field_name: &str,
     ) {
-        let prefix_lowercase = self.get_prefix_lowercase().to_string();
+        let prefix_lowercase = self.get_prefix_lowercase().to_vec();
 
         // Verify whether fp matches const column.
         let v = bs.get_const_column_value(field_name);
@@ -142,7 +177,7 @@ impl FieldFilter for FilterAnyCasePrefix {
             ValueType::FLOAT64 => match_float64_by_prefix(bs, &ch, bm, &prefix_lowercase, &tokens),
             ValueType::IPV4 => match_ipv4_by_prefix(bs, &ch, bm, &prefix_lowercase, &tokens),
             ValueType::TIMESTAMP_ISO8601 => {
-                let prefix_uppercase = self.get_prefix_uppercase().to_string();
+                let prefix_uppercase = self.get_prefix_uppercase().to_vec();
                 let tokens_uppercase = self.get_tokens().1.clone();
                 match_timestamp_iso8601_by_prefix(bs, &ch, bm, &prefix_uppercase, &tokens_uppercase)
             }
@@ -155,7 +190,7 @@ fn match_values_dict_by_any_case_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix_lowercase: &str,
+    prefix_lowercase: &[u8],
 ) {
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
@@ -168,13 +203,13 @@ fn match_string_by_any_case_prefix(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    prefix_lowercase: &str,
+    prefix_lowercase: &[u8],
 ) {
     visit_values(bs, ch, bm, |v| match_any_case_prefix(v, prefix_lowercase));
 }
 
 /// Port of Go `matchAnyCasePrefix`.
-fn match_any_case_prefix(s: &[u8], prefix_lowercase: &str) -> bool {
+fn match_any_case_prefix(s: &[u8], prefix_lowercase: &[u8]) -> bool {
     if prefix_lowercase.is_empty() {
         // Special case - empty prefix matches any non-empty string.
         return !s.is_empty();
@@ -203,7 +238,7 @@ mod tests {
     #[test]
     fn test_match_any_case_prefix() {
         fn f(s: &str, prefix_lowercase: &str, result_expected: bool) {
-            let result = match_any_case_prefix(s.as_bytes(), prefix_lowercase);
+            let result = match_any_case_prefix(s.as_bytes(), prefix_lowercase.as_bytes());
             assert_eq!(
                 result, result_expected,
                 "s={s:?} prefix={prefix_lowercase:?}"

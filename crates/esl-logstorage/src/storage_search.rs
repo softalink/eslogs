@@ -2253,6 +2253,67 @@ mod tests {
         esl_common::fs::must_remove_dir(&path);
     }
 
+    /// PORT-ONLY TEST: a `"\xff"`-style escape in QUERY TEXT denotes the raw
+    /// byte 0xFF in phrase/value payloads (Go parser.go:329 strconv.Unquote),
+    /// so a query phrase written with such escapes must match an ingested
+    /// value containing the same raw bytes - end to end through ingestion,
+    /// on-disk blocks, bloom filters and block search.
+    #[test]
+    fn test_run_query_raw_byte_phrase_end_to_end() {
+        let path = run_query_temp_path("raw-byte-phrase");
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+
+        let tenant = TenantID {
+            account_id: 0,
+            project_id: 0,
+        };
+
+        // One row carries a raw invalid-UTF-8 byte inside the `foo` value;
+        // the other is plain ASCII.
+        let values: [&[u8]; 2] = [b"err\xffor code", b"error code"];
+        let mut lr = get_log_rows(&[], &[], &[], &[], "");
+        let base = now_nanos();
+        for (i, value) in values.iter().enumerate() {
+            let mut fields = vec![
+                Field {
+                    name: b"_msg".to_vec(),
+                    value: b"hello".to_vec(),
+                },
+                Field {
+                    name: b"foo".to_vec(),
+                    value: value.to_vec(),
+                },
+            ];
+            lr.must_add(tenant, base + i as i64, &mut fields, -1);
+        }
+        s.must_add_rows(&lr);
+        s.debug_flush();
+
+        assert_eq!(count_rows(&s, tenant, "*"), 2, "`*` must match both rows");
+        // Phrase with a raw-byte escape matches only the raw-byte row.
+        assert_eq!(
+            count_rows(&s, tenant, r#"foo:"err\xffor""#),
+            1,
+            "raw-byte phrase must match the raw-byte row only"
+        );
+        // Exact value with a raw-byte escape.
+        assert_eq!(
+            count_rows(&s, tenant, r#"foo:="err\xffor code""#),
+            1,
+            "raw-byte exact value must match the raw-byte row only"
+        );
+        // Plain phrase does not match the raw-byte row.
+        assert_eq!(
+            count_rows(&s, tenant, r#"foo:"error""#),
+            1,
+            "plain phrase must match the plain row only"
+        );
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
+    }
+
     /// `stream_context` end-to-end: the surrounding-logs seam wired by
     /// `init_subqueries` (Go `initStreamContextPipes`) must return the
     /// before/after context rows around each matching row, and a misplaced

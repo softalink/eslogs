@@ -511,6 +511,44 @@ pub(crate) fn parse_args_in_parens(lex: &mut Lexer) -> Result<Vec<String>, Strin
     Ok(args)
 }
 
+/// Byte form of [`parse_args_in_parens`] for raw-byte phrase payloads:
+/// quoted args carry Go-parity raw bytes (`Lexer::token_bytes`); unquoted
+/// compound args are slices of the query text (valid UTF-8) in both forms.
+pub(crate) fn parse_args_in_parens_bytes(lex: &mut Lexer) -> Result<Vec<Vec<u8>>, String> {
+    if !lex.is_keyword(&["("]) {
+        return Err("missing '('".to_string());
+    }
+    lex.next_token();
+    let mut args: Vec<Vec<u8>> = Vec::new();
+    while !lex.is_keyword(&[")"]) {
+        if lex.is_keyword(&[","]) {
+            return Err("unexpected ','".to_string());
+        }
+        if lex.is_keyword(&["("]) {
+            return Err("unexpected '('".to_string());
+        }
+        let arg = lex
+            .next_compound_token_bytes()
+            .map_err(|e| format!("cannot parse arg: {e}"))?;
+        args.push(arg);
+        if lex.is_keyword(&[")"]) {
+            break;
+        }
+        if !lex.is_keyword(&[","]) {
+            return Err(format!(
+                "missing ',' after {}; got {} instead",
+                // go_quote_bytes: display-only quoting of a raw-byte arg in
+                // the error message (Go %q over raw bytes).
+                crate::stream_filter::go_quote_bytes(args.last().unwrap()),
+                go_quote(&lex.token)
+            ));
+        }
+        lex.next_token();
+    }
+    lex.next_token();
+    Ok(args)
+}
+
 /// Port of Go `parseLimit` (pipe_sort.go).
 pub(crate) fn parse_limit(lex: &mut Lexer) -> Result<u64, String> {
     if !lex.is_keyword(&["limit"]) {

@@ -24,7 +24,7 @@ use crate::filter_phrase::{
     to_float64_string, to_ipv4_string, to_timestamp_iso8601_string, visit_values,
 };
 use crate::rows::{Field, get_field_value_by_name};
-use crate::tokenizer::tokenize_strings;
+use crate::tokenizer::tokenize_bytes;
 use crate::values_encoder::ValueType;
 
 // ---------------------------------------------------------------------------
@@ -33,13 +33,15 @@ use crate::values_encoder::ValueType;
 
 /// `FilterSequence` matches an ordered sequence of phrases.
 pub(crate) struct FilterSequence {
-    pub(crate) phrases: Vec<String>,
-    non_empty_phrases: OnceLock<Vec<String>>,
+    /// The ordered phrases to match. Raw bytes like Go's `string` (a
+    /// double-quoted `"\xff"` escape in query text denotes the raw byte 0xFF).
+    pub(crate) phrases: Vec<Vec<u8>>,
+    non_empty_phrases: OnceLock<Vec<Vec<u8>>>,
     tokens_hashes: OnceLock<Vec<u64>>,
 }
 
 /// Builds a sequence filter for `field_name`.
-pub(crate) fn new_filter_sequence(field_name: &str, phrases: Vec<String>) -> FilterGeneric {
+pub(crate) fn new_filter_sequence(field_name: &str, phrases: Vec<Vec<u8>>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterSequence {
@@ -51,7 +53,7 @@ pub(crate) fn new_filter_sequence(field_name: &str, phrases: Vec<String>) -> Fil
 }
 
 impl FilterSequence {
-    fn get_non_empty_phrases(&self) -> &[String] {
+    fn get_non_empty_phrases(&self) -> &[Vec<u8>] {
         self.non_empty_phrases.get_or_init(|| {
             self.phrases
                 .iter()
@@ -64,11 +66,12 @@ impl FilterSequence {
     fn get_tokens_hashes(&self) -> &[u64] {
         self.tokens_hashes.get_or_init(|| {
             let phrases = self.get_non_empty_phrases();
-            let mut toks: Vec<&str> = Vec::new();
-            tokenize_strings(&mut toks, phrases);
-            let tokens: Vec<String> = toks.into_iter().map(|s| s.to_string()).collect();
+            // Byte tokenizer: matches the ingest-side hash_tokenizer, so
+            // bloom lookups agree for raw-byte phrases too.
+            let mut toks: Vec<&[u8]> = Vec::new();
+            tokenize_bytes(&mut toks, phrases);
             let mut hashes = Vec::new();
-            append_tokens_hashes(&mut hashes, &tokens);
+            append_tokens_hashes(&mut hashes, &toks);
             hashes
         })
     }
@@ -76,10 +79,12 @@ impl FilterSequence {
 
 impl FieldFilter for FilterSequence {
     fn to_string(&self) -> String {
+        // Lossless render: invalid UTF-8 re-quotes via Go strconv.Quote byte
+        // semantics (`\xNN`), so parse -> render -> re-parse is stable.
         let a: Vec<String> = self
             .phrases
             .iter()
-            .map(|p| crate::stream_filter::quote_token_if_needed(p))
+            .map(|p| crate::stream_filter::quote_value_bytes_if_needed(p))
             .collect();
         format!("seq({})", a.join(","))
     }
@@ -163,7 +168,7 @@ pub(crate) fn match_timestamp_iso8601_by_sequence(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.len() == 1 {
@@ -186,7 +191,7 @@ pub(crate) fn match_ipv4_by_sequence(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.len() == 1 {
@@ -209,7 +214,7 @@ pub(crate) fn match_float64_by_sequence(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if !match_bloom_filter_all_tokens(bs, ch, tokens) {
@@ -228,7 +233,7 @@ pub(crate) fn match_values_dict_by_sequence(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
 ) {
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
@@ -241,7 +246,7 @@ pub(crate) fn match_string_by_sequence(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if !match_bloom_filter_all_tokens(bs, ch, tokens) {
@@ -255,7 +260,7 @@ pub(crate) fn match_uint8_by_sequence(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.len() > 1 {
@@ -269,7 +274,7 @@ pub(crate) fn match_uint16_by_sequence(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.len() > 1 {
@@ -283,7 +288,7 @@ pub(crate) fn match_uint32_by_sequence(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.len() > 1 {
@@ -297,7 +302,7 @@ pub(crate) fn match_uint64_by_sequence(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.len() > 1 {
@@ -311,7 +316,7 @@ pub(crate) fn match_int64_by_sequence(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrases: &[String],
+    phrases: &[Vec<u8>],
     tokens: &[u64],
 ) {
     if phrases.len() > 1 {
@@ -324,7 +329,7 @@ pub(crate) fn match_int64_by_sequence(
 /// Port of Go `matchSequence`.
 ///
 /// The haystack `s` is raw value bytes (Go strings are arbitrary bytes).
-pub(crate) fn match_sequence<S: AsRef<str>>(s: &[u8], phrases: &[S]) -> bool {
+pub(crate) fn match_sequence<S: AsRef<[u8]>>(s: &[u8], phrases: &[S]) -> bool {
     let mut s = s;
     for phrase in phrases {
         let phrase = phrase.as_ref();

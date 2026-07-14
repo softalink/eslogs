@@ -394,7 +394,8 @@ pub(crate) fn match_timestamp_iso8601_by_substring(
 /// Port of Go `matchSubstring`.
 ///
 /// The haystack `s` is raw value bytes (Go strings are arbitrary bytes).
-pub(crate) fn match_substring(s: &[u8], substring: &str) -> bool {
+pub(crate) fn match_substring(s: &[u8], substring: impl AsRef<[u8]>) -> bool {
+    let substring = substring.as_ref();
     if substring.is_empty() {
         // Special case - empty substring matches anything.
         return true;
@@ -403,7 +404,7 @@ pub(crate) fn match_substring(s: &[u8], substring: &str) -> bool {
         // Fast path - the substring is too long.
         return false;
     }
-    crate::filter_generic::index_bytes(s, substring.as_bytes()).is_some()
+    crate::filter_generic::index_bytes(s, substring).is_some()
 }
 
 #[cfg(test)]

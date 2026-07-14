@@ -291,10 +291,10 @@ impl StreamName {
             if !s.starts_with('"') {
                 return false;
             }
-            let Ok(q_prefix) = go_quoted_prefix(s) else {
+            let Ok(q_prefix) = crate::pattern::quoted_prefix(s) else {
                 return false;
             };
-            let Ok(value) = go_unquote(q_prefix) else {
+            let Ok(value) = crate::pattern::unquote(q_prefix) else {
                 return false;
             };
             s = &s[q_prefix.len()..];
@@ -391,7 +391,20 @@ pub(crate) struct Lexer<'a> {
     /// token contains the current token
     ///
     /// an empty token means the end of s
+    ///
+    /// PORT NOTE: Go's token is a `string` = raw bytes; this `String` form
+    /// keeps the legacy scalar decoding (`\xNN` escapes >= 0x80 in
+    /// double-quoted tokens decode to the code point U+00NN) for keyword
+    /// checks, error messages and the consumers whose payloads are still
+    /// `String`-typed (field names, pipe args, ...). Byte-exact payloads
+    /// (phrases/values) must read [`Lexer::token_bytes`] instead.
     pub(crate) token: String,
+
+    /// The Go-parity raw-byte payload of `token` (Go parser.go `lex.token`,
+    /// unquoted via `strconv.Unquote`): `\xNN`/octal escapes >= 0x80 inside
+    /// double-quoted/backquoted tokens denote RAW bytes, so this may be
+    /// invalid UTF-8. Equals `token.as_bytes()` for every other token kind.
+    pub(crate) token_bytes: Vec<u8>,
 
     /// raw_token contains raw token before unquoting
     raw_token: String,
@@ -421,6 +434,7 @@ impl<'a> Lexer<'a> {
             s,
             s_orig: s,
             token: String::new(),
+            token_bytes: Vec::new(),
             raw_token: String::new(),
             prev_raw_token: String::new(),
             is_skipped_space: false,
@@ -468,6 +482,21 @@ impl<'a> Lexer<'a> {
     #[inline]
     pub(crate) fn is_quoted_token(&self) -> bool {
         self.token != self.raw_token
+    }
+
+    /// Byte form of [`Lexer::next_compound_token`] for phrase/value payloads:
+    /// a quoted token returns its Go-parity raw-byte payload
+    /// ([`Lexer::token_bytes`], possibly invalid UTF-8); unquoted compound
+    /// tokens are slices of the query text (always valid UTF-8), so the
+    /// `String` path is byte-exact for them.
+    pub(crate) fn next_compound_token_bytes(&mut self) -> Result<Vec<u8>, String> {
+        if self.is_quoted_token() {
+            // Quoted tokens cannot be a part of compound token, so return them as is.
+            let b = self.token_bytes.clone();
+            self.next_token();
+            return Ok(b);
+        }
+        self.next_compound_token().map(String::into_bytes)
     }
 
     pub(crate) fn next_compound_token(&mut self) -> Result<String, String> {
@@ -549,6 +578,7 @@ impl<'a> Lexer<'a> {
 
     fn next_char_token(&mut self, s: &'a str, size: usize) {
         self.token = s[..size].to_string();
+        self.token_bytes = self.token.clone().into_bytes();
         self.raw_token = self.token.clone();
         self.s = &s[size..];
     }
@@ -558,6 +588,7 @@ impl<'a> Lexer<'a> {
         let mut s = self.s;
         self.prev_raw_token = std::mem::take(&mut self.raw_token);
         self.token.clear();
+        self.token_bytes.clear();
         self.is_skipped_space = false;
 
         if s.is_empty() {
@@ -601,23 +632,35 @@ impl<'a> Lexer<'a> {
         let r = s.chars().next().unwrap();
         match r {
             '"' | '`' => {
-                let Ok(prefix) = go_quoted_prefix(s) else {
+                let Ok(prefix) = crate::pattern::quoted_prefix(s) else {
                     self.next_char_token(s, 1);
                     return;
                 };
-                let Ok(token) = go_unquote(prefix) else {
+                // Go parser.go:329 `strconv.Unquote`: `\xNN`/octal escapes
+                // >= 0x80 inside double-quoted tokens denote RAW bytes in the
+                // token payload (`token_bytes`); the `token` String form keeps
+                // the scalar decoding for the still-String-typed consumers
+                // (see the field docs). Both decode the same syntax, so the
+                // scalar form cannot fail once the byte form succeeded.
+                let Ok(token_bytes) = crate::pattern::unquote_bytes(prefix.as_bytes()) else {
                     self.next_char_token(s, 1);
                     return;
                 };
-                self.token = token;
+                self.token = crate::pattern::unquote(prefix)
+                    .expect("BUG: scalar unquote failed on input accepted by unquote_bytes");
+                self.token_bytes = token_bytes;
                 self.raw_token = prefix.to_string();
                 self.s = &s[prefix.len()..];
             }
             '\'' => {
+                // Go parser.go:341-346: single-quoted tokens decode via
+                // strconv.UnquoteChar + utf8.AppendRune, so `\xNN` escapes
+                // >= 0x80 are UTF-8-encoded scalars — the String form is
+                // byte-exact here.
                 let mut b = String::new();
                 let mut tail = &s[1..];
                 while !tail.starts_with('\'') {
-                    let Ok((ch, new_tail)) = go_unquote_char(tail, '\'') else {
+                    let Ok((ch, _, new_tail)) = crate::pattern::unquote_char(tail, b'\'') else {
                         self.next_char_token(s, 1);
                         return;
                     };
@@ -626,6 +669,7 @@ impl<'a> Lexer<'a> {
                 }
                 let size = s.len() - tail.len() + 1;
                 self.token = b;
+                self.token_bytes = self.token.clone().into_bytes();
                 self.raw_token = s[..size].to_string();
                 self.s = &s[size..];
             }
@@ -755,7 +799,7 @@ pub(crate) fn quote_value_bytes_if_needed(v: &[u8]) -> String {
 
 /// Port of Go `strconv.Quote` over raw bytes: decodes runes like Go
 /// (`utf8.DecodeRuneInString`), escaping each invalid byte as `\xNN`.
-fn go_quote_bytes(v: &[u8]) -> String {
+pub(crate) fn go_quote_bytes(v: &[u8]) -> String {
     let mut out = String::with_capacity(v.len() + 2);
     out.push('"');
     let mut b = v;
@@ -814,142 +858,11 @@ fn is_go_print(c: char) -> bool {
     !c.is_control() && !c.is_whitespace()
 }
 
-/// Port of Go `strconv.QuotedPrefix`: returns the quoted string
-/// (double-quoted or backquoted) at the start of s.
-fn go_quoted_prefix(s: &str) -> Result<&str, ()> {
-    let quote = s.chars().next().ok_or(())?;
-    match quote {
-        '`' => {
-            let rest = &s[1..];
-            let n = rest.find('`').ok_or(())?;
-            Ok(&s[..n + 2])
-        }
-        '"' | '\'' => {
-            let mut tail = &s[1..];
-            loop {
-                if tail.starts_with(quote) {
-                    let end = s.len() - tail.len() + 1;
-                    return Ok(&s[..end]);
-                }
-                if tail.is_empty() || tail.starts_with('\n') {
-                    return Err(());
-                }
-                let (_, new_tail) = go_unquote_char(tail, quote)?;
-                tail = new_tail;
-            }
-        }
-        _ => Err(()),
-    }
-}
-
-/// Port of Go `strconv.Unquote` for double-quoted and backquoted strings.
-fn go_unquote(s: &str) -> Result<String, ()> {
-    if s.len() < 2 {
-        return Err(());
-    }
-    let quote = s.chars().next().unwrap();
-    match quote {
-        '`' => {
-            if !s.ends_with('`') {
-                return Err(());
-            }
-            let inner = &s[1..s.len() - 1];
-            if inner.contains('`') {
-                return Err(());
-            }
-            // Go removes carriage returns from raw strings.
-            Ok(inner.replace('\r', ""))
-        }
-        '"' | '\'' => {
-            let mut out = String::new();
-            let mut tail = &s[1..];
-            loop {
-                if let Some(t) = tail.strip_prefix(quote) {
-                    if !t.is_empty() {
-                        return Err(());
-                    }
-                    if quote == '\'' && out.chars().count() != 1 {
-                        return Err(());
-                    }
-                    return Ok(out);
-                }
-                if tail.is_empty() || tail.starts_with('\n') {
-                    return Err(());
-                }
-                let (c, new_tail) = go_unquote_char(tail, quote)?;
-                out.push(c);
-                tail = new_tail;
-            }
-        }
-        _ => Err(()),
-    }
-}
-
-/// Port of Go `strconv.UnquoteChar`: decodes the first character or escape
-/// sequence in s. quote specifies the surrounding quote character.
-///
-/// PORT NOTE: Go returns `\xNN >= 0x80` escapes as raw bytes
-/// (multibyte=false); Rust strings must stay valid UTF-8, so such escapes
-/// decode to the code point U+00NN instead.
-fn go_unquote_char(s: &str, quote: char) -> Result<(char, &str), ()> {
-    let c0 = s.chars().next().ok_or(())?;
-    if c0 == quote && (quote == '\'' || quote == '"') {
-        return Err(());
-    }
-    if c0 != '\\' {
-        return Ok((c0, &s[c0.len_utf8()..]));
-    }
-
-    let mut rest = &s[1..];
-    let c = rest.chars().next().ok_or(())?;
-    rest = &rest[c.len_utf8()..];
-    let value = match c {
-        'a' => '\x07',
-        'b' => '\x08',
-        'f' => '\x0c',
-        'n' => '\n',
-        'r' => '\r',
-        't' => '\t',
-        'v' => '\x0b',
-        'x' | 'u' | 'U' => {
-            let n = match c {
-                'x' => 2,
-                'u' => 4,
-                _ => 8,
-            };
-            if rest.len() < n || !rest.is_char_boundary(n) {
-                return Err(());
-            }
-            let v = u32::from_str_radix(&rest[..n], 16).map_err(|_| ())?;
-            rest = &rest[n..];
-            char::from_u32(v).ok_or(())?
-        }
-        '0'..='7' => {
-            let mut v = c as u32 - '0' as u32;
-            for _ in 0..2 {
-                let d = rest.chars().next().ok_or(())?;
-                if !('0'..='7').contains(&d) {
-                    return Err(());
-                }
-                v = v * 8 + (d as u32 - '0' as u32);
-                rest = &rest[1..];
-            }
-            if v > 255 {
-                return Err(());
-            }
-            char::from_u32(v).ok_or(())?
-        }
-        '\\' => '\\',
-        '\'' | '"' => {
-            if c != quote {
-                return Err(());
-            }
-            c
-        }
-        _ => return Err(()),
-    };
-    Ok((value, rest))
-}
+// PORT NOTE: the private `go_quoted_prefix` / `go_unquote` / `go_unquote_char`
+// copies that used to live here were duplicates of the byte-native Go
+// `strconv` engine in `pattern.rs`; the lexer and `StreamName::parse` now call
+// `crate::pattern::{quoted_prefix, quoted_prefix_len, unquote, unquote_bytes,
+// unquote_char}` directly.
 
 /// Port of Go `regexp.QuoteMeta` (escapes Go's regexp special bytes
 /// ``\.+*?()|[]{}^$``).

@@ -343,10 +343,17 @@ what remains in section (a) is confirmed-present divergence.
   keep non-printable non-ASCII runes raw where Go's `strconv.AppendQuote`
   `\uXXXX`-escapes them (reachable when a key both needs escaping and holds a
   non-printable non-ASCII rune).
-- `stream_filter.rs:762/:843` — `is_go_print` approximates `unicode.IsPrint`
+- `stream_filter.rs` — `is_go_print` approximates `unicode.IsPrint`
   (format/surrogate/private-use/unassigned code points render raw where Go
-  escapes them), and `\xNN` (≥0x80) decodes to a Unicode scalar instead of
-  Go's raw byte.
+  escapes them). The LogsQL lexer carries a Go-exact raw-byte token payload
+  (`Lexer.token_bytes`, `strconv.Unquote` semantics: double-quoted `\xNN`≥0x80
+  IS the raw byte), consumed by the phrase-filter family
+  (`phrase`/`exact`/`prefix`/`exact_prefix`/`seq`/`i()`) end-to-end with
+  lossless render→re-parse. Still on the scalar `String` token path (behavior
+  unchanged, no lossy): quoted field NAMES, `in()`/`contains_*` literal
+  values, `*substr*`, `string_range`, `re()`/`pattern_match` args,
+  `*_common_case`, `json_array_contains_any`, stream-filter tag values, and
+  pipe args.
 
 **Input handling edge cases (esl-logstorage)**
 

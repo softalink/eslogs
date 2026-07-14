@@ -388,12 +388,33 @@ pub(crate) fn skip_last_token(s: &str) -> &str {
     }
 }
 
-/// Port of Go `getTokensSkipLast`: tokenizes `s` after trimming its last token.
-pub(crate) fn get_tokens_skip_last(s: &str) -> Vec<String> {
-    let trimmed = skip_last_token(s);
-    let mut dst: Vec<&str> = Vec::new();
-    crate::tokenizer::tokenize_strings(&mut dst, std::slice::from_ref(&trimmed));
-    dst.into_iter().map(|t| t.to_string()).collect()
+/// Byte form of [`skip_last_token`] for raw-byte prefixes: Go's
+/// `utf8.DecodeLastRuneInString` yields `RuneError` on an invalid trailing
+/// sequence, which is not a token rune, so trimming stops there — mirrored by
+/// [`decode_rune_at_end`].
+pub(crate) fn skip_last_token_bytes(s: &[u8]) -> &[u8] {
+    let mut s = s;
+    while !s.is_empty() {
+        let r = decode_rune_at_end(s);
+        if !is_token_rune(r) {
+            break;
+        }
+        // `r` is a validly decoded rune here (RUNE_ERROR is not a token
+        // rune), so it occupies exactly `len_utf8()` bytes.
+        s = &s[..s.len() - r.len_utf8()];
+    }
+    s
+}
+
+/// Port of Go `getTokensSkipLast`: tokenizes `s` after trimming its last
+/// token. Operates on raw bytes; the tokens are emitted by the byte tokenizer
+/// (the ingest-side one), keeping bloom-filter hashes consistent for prefixes
+/// containing invalid UTF-8.
+pub(crate) fn get_tokens_skip_last_bytes(s: &[u8]) -> Vec<Vec<u8>> {
+    let trimmed = skip_last_token_bytes(s);
+    let mut dst: Vec<&[u8]> = Vec::new();
+    crate::tokenizer::tokenize_bytes(&mut dst, std::slice::from_ref(&trimmed));
+    dst.into_iter().map(|t| t.to_vec()).collect()
 }
 
 // ---------------------------------------------------------------------------

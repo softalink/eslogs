@@ -350,7 +350,7 @@ pub(crate) fn quoted_prefix(s: &str) -> Result<&str, ()> {
 
 /// Byte form of [`quoted_prefix`]: returns the length of the quoted string
 /// (including quotes) at the start of `s`.
-fn quoted_prefix_len(s: &[u8]) -> Result<usize, ()> {
+pub(crate) fn quoted_prefix_len(s: &[u8]) -> Result<usize, ()> {
     let (_, n) = go_unquote_inner(s, false, false)?;
     Ok(n)
 }
@@ -359,7 +359,7 @@ fn quoted_prefix_len(s: &[u8]) -> Result<usize, ()> {
 /// string literal, returning the value that `s` quotes. Matches Go exactly:
 /// `\xNN`/octal escapes >= 0x80 inside double-quoted strings emit the raw
 /// byte, so the result may be invalid UTF-8.
-fn unquote_bytes(s: &[u8]) -> Result<Vec<u8>, ()> {
+pub(crate) fn unquote_bytes(s: &[u8]) -> Result<Vec<u8>, ()> {
     let (out, n) = go_unquote_inner(s, true, false)?;
     if n != s.len() {
         return Err(());
@@ -371,7 +371,7 @@ fn unquote_bytes(s: &[u8]) -> Result<Vec<u8>, ()> {
 ///
 /// PORT NOTE: `\xNN`/octal escapes >= 0x80 are UTF-8-encoded as scalars here
 /// (Go emits the raw byte); see [`try_unquote_string`].
-fn unquote(s: &str) -> Result<String, ()> {
+pub(crate) fn unquote(s: &str) -> Result<String, ()> {
     let (out, n) = go_unquote_inner(s.as_bytes(), true, true)?;
     if n != s.len() {
         return Err(());

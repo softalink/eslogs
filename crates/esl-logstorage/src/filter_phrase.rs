@@ -25,7 +25,7 @@ use crate::filter_generic::{
     FilterGeneric, RUNE_ERROR, index_bytes, new_filter_generic, rune_at, rune_before,
 };
 use crate::rows::{Field, get_field_value_by_name};
-use crate::tokenizer::{is_token_rune, tokenize_strings};
+use crate::tokenizer::{is_token_rune, tokenize_bytes};
 use crate::values_encoder::{
     ValueType, marshal_float64_string, marshal_ipv4_string, marshal_timestamp_iso8601_string,
     try_parse_float64_exact, try_parse_int64, try_parse_ipv4, try_parse_timestamp_iso8601,
@@ -42,7 +42,9 @@ use crate::values_encoder::{
 /// simplest LogsQL query: `word`. The special case `""` matches any log entry
 /// without the given field.
 pub(crate) struct FilterPhrase {
-    pub(crate) phrase: String,
+    /// The phrase to match. Raw bytes like Go's `string` (a double-quoted
+    /// `"\xff"` escape in query text denotes the raw byte 0xFF).
+    pub(crate) phrase: Vec<u8>,
 
     /// Cached token hashes (Go `filterPhrase.tokensHashes` behind `tokensOnce`).
     ///
@@ -54,11 +56,11 @@ pub(crate) struct FilterPhrase {
 }
 
 /// Builds a phrase filter for `field_name`.
-pub(crate) fn new_filter_phrase(field_name: &str, phrase: &str) -> FilterGeneric {
+pub(crate) fn new_filter_phrase(field_name: &str, phrase: impl AsRef<[u8]>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterPhrase {
-            phrase: phrase.to_string(),
+            phrase: phrase.as_ref().to_vec(),
             tokens_hashes: OnceLock::new(),
         }),
     )
@@ -67,11 +69,12 @@ pub(crate) fn new_filter_phrase(field_name: &str, phrase: &str) -> FilterGeneric
 impl FilterPhrase {
     pub(crate) fn get_tokens_hashes(&self) -> &[u64] {
         self.tokens_hashes.get_or_init(|| {
-            let mut toks: Vec<&str> = Vec::new();
-            tokenize_strings(&mut toks, std::slice::from_ref(&self.phrase));
-            let tokens: Vec<String> = toks.into_iter().map(|s| s.to_string()).collect();
+            // Byte tokenizer: matches the ingest-side hash_tokenizer, so
+            // bloom lookups agree for raw-byte phrases too.
+            let mut toks: Vec<&[u8]> = Vec::new();
+            tokenize_bytes(&mut toks, std::slice::from_ref(&self.phrase));
             let mut hashes = Vec::new();
-            append_tokens_hashes(&mut hashes, &tokens);
+            append_tokens_hashes(&mut hashes, &toks);
             hashes
         })
     }
@@ -79,7 +82,9 @@ impl FilterPhrase {
 
 impl FieldFilter for FilterPhrase {
     fn to_string(&self) -> String {
-        crate::stream_filter::quote_token_if_needed(&self.phrase)
+        // Lossless render: invalid UTF-8 re-quotes via Go strconv.Quote byte
+        // semantics (`\xNN`), so parse -> render -> re-parse is stable.
+        crate::stream_filter::quote_value_bytes_if_needed(&self.phrase)
     }
 
     fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
@@ -152,14 +157,26 @@ impl FieldFilter for FilterPhrase {
 // Phrase-specific block-search matchers
 // ---------------------------------------------------------------------------
 
+/// Checked `&str` view of a (possibly raw-byte) query phrase for the numeric
+/// `try_parse_*` helpers: Go parses the raw-byte string and fails on
+/// non-numeric bytes, so invalid UTF-8 (never numeric) maps to `None` — the
+/// same "cannot parse" outcome as Go.
+pub(crate) fn phrase_utf8(v: &[u8]) -> Option<&str> {
+    std::str::from_utf8(v).ok()
+}
+
 pub(crate) fn match_timestamp_iso8601_by_phrase(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrase: &str,
+    phrase: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
-    if try_parse_timestamp_iso8601(phrase).is_some() {
+    let phrase = phrase.as_ref();
+    if phrase_utf8(phrase)
+        .and_then(try_parse_timestamp_iso8601)
+        .is_some()
+    {
         // Fast path - the phrase contains complete timestamp, so exact search.
         match_timestamp_iso8601_by_exact_value(bs, ch, bm, phrase, tokens);
         return;
@@ -180,10 +197,11 @@ pub(crate) fn match_ipv4_by_phrase(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrase: &str,
+    phrase: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
-    if try_parse_ipv4(phrase).is_some() {
+    let phrase = phrase.as_ref();
+    if phrase_utf8(phrase).and_then(try_parse_ipv4).is_some() {
         // Fast path - phrase contains the full IP address, so exact matching.
         match_ipv4_by_exact_value(bs, ch, bm, phrase, tokens);
         return;
@@ -204,17 +222,20 @@ pub(crate) fn match_float64_by_phrase(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrase: &str,
+    phrase: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let phrase = phrase.as_ref();
     // The phrase may contain a part of the floating-point number, so search in
     // the string representation.
-    let ok = try_parse_float64_exact(phrase).is_some();
-    if !ok && phrase != "." && phrase != "+" && phrase != "-" {
+    let ok = phrase_utf8(phrase)
+        .and_then(try_parse_float64_exact)
+        .is_some();
+    if !ok && phrase != b"." && phrase != b"+" && phrase != b"-" {
         bm.reset_bits();
         return;
     }
-    if matches!(phrase.find('.'), Some(n) if n > 0 && n < phrase.len() - 1) {
+    if matches!(phrase.iter().position(|&c| c == b'.'), Some(n) if n > 0 && n < phrase.len() - 1) {
         // Fast path - the phrase contains the exact floating-point number.
         match_float64_by_exact_value(bs, ch, bm, phrase, tokens);
         return;
@@ -235,8 +256,9 @@ pub(crate) fn match_values_dict_by_phrase(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrase: &str,
+    phrase: impl AsRef<[u8]>,
 ) {
+    let phrase = phrase.as_ref();
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
         bb.push(u8::from(match_phrase(v, phrase)));
@@ -248,14 +270,14 @@ pub(crate) fn match_string_by_phrase(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    phrase: &str,
+    phrase: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
     if !match_bloom_filter_all_tokens(bs, ch, tokens) {
         bm.reset_bits();
         return;
     }
-    visit_values(bs, ch, bm, |v| match_phrase(v, phrase));
+    visit_values(bs, ch, bm, |v| match_phrase(v, &phrase));
 }
 
 // ---------------------------------------------------------------------------
@@ -442,11 +464,12 @@ pub(crate) fn apply_to_block_result_generic<F>(
     br: &mut BlockResult,
     bm: &mut Bitmap,
     field_name: &str,
-    phrase: &str,
+    phrase: impl AsRef<[u8]>,
     match_func: F,
 ) where
-    F: Fn(&[u8], &str) -> bool,
+    F: Fn(&[u8], &[u8]) -> bool,
 {
+    let phrase = phrase.as_ref();
     let r = br.get_column_by_name(field_name);
     if br.column_is_const(r) {
         let v = br.column_get_value_at_row(r, 0);
@@ -465,27 +488,27 @@ pub(crate) fn apply_to_block_result_generic<F>(
         ValueType::STRING | ValueType::DICT => {
             match_column_by_generic(br, bm, r, phrase, &match_func)
         }
-        ValueType::UINT8 => match try_parse_uint64(phrase) {
+        ValueType::UINT8 => match phrase_utf8(phrase).and_then(try_parse_uint64) {
             Some(n) if n < (1 << 8) => match_column_by_generic(br, bm, r, phrase, &match_func),
             _ => bm.reset_bits(),
         },
-        ValueType::UINT16 => match try_parse_uint64(phrase) {
+        ValueType::UINT16 => match phrase_utf8(phrase).and_then(try_parse_uint64) {
             Some(n) if n < (1 << 16) => match_column_by_generic(br, bm, r, phrase, &match_func),
             _ => bm.reset_bits(),
         },
-        ValueType::UINT32 => match try_parse_uint64(phrase) {
+        ValueType::UINT32 => match phrase_utf8(phrase).and_then(try_parse_uint64) {
             Some(n) if n < (1 << 32) => match_column_by_generic(br, bm, r, phrase, &match_func),
             _ => bm.reset_bits(),
         },
         ValueType::UINT64 => {
-            if try_parse_uint64(phrase).is_some() {
+            if phrase_utf8(phrase).and_then(try_parse_uint64).is_some() {
                 match_column_by_generic(br, bm, r, phrase, &match_func);
             } else {
                 bm.reset_bits();
             }
         }
         ValueType::INT64 => {
-            if try_parse_int64(phrase).is_some() {
+            if phrase_utf8(phrase).and_then(try_parse_int64).is_some() {
                 match_column_by_generic(br, bm, r, phrase, &match_func);
             } else {
                 bm.reset_bits();
@@ -503,11 +526,12 @@ pub(crate) fn match_column_by_generic<F>(
     br: &mut BlockResult,
     bm: &mut Bitmap,
     r: ColRef,
-    phrase: &str,
+    phrase: impl AsRef<[u8]>,
     match_func: &F,
 ) where
-    F: Fn(&[u8], &str) -> bool,
+    F: Fn(&[u8], &[u8]) -> bool,
 {
+    let phrase = phrase.as_ref();
     let values = br.column_get_values(r);
     bm.for_each_set_bit(|idx| match_func(&values[idx], phrase));
 }

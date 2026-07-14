@@ -20,7 +20,7 @@ use crate::filter_phrase::{
     match_bloom_filter_all_tokens, match_encoded_values_dict, visit_values,
 };
 use crate::rows::{Field, get_field_value_by_name};
-use crate::tokenizer::tokenize_strings;
+use crate::tokenizer::tokenize_bytes;
 use crate::values_encoder::{
     ValueType, marshal_float64, try_parse_float64_exact, try_parse_int64, try_parse_ipv4,
     try_parse_timestamp_iso8601, try_parse_uint64, unmarshal_float64, unmarshal_int64,
@@ -35,16 +35,18 @@ use crate::values_encoder::{
 /// `FilterExact` matches the exact value. Example LogsQL: `exact("foo bar")` or
 /// `="foo bar"`.
 pub(crate) struct FilterExact {
-    pub(crate) value: String,
+    /// The exact value to match. Raw bytes like Go's `string` (a double-quoted
+    /// `"\xff"` escape in query text denotes the raw byte 0xFF).
+    pub(crate) value: Vec<u8>,
     tokens_hashes: OnceLock<Vec<u64>>,
 }
 
 /// Builds an exact filter for `field_name`.
-pub(crate) fn new_filter_exact(field_name: &str, value: &str) -> FilterGeneric {
+pub(crate) fn new_filter_exact(field_name: &str, value: impl AsRef<[u8]>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterExact {
-            value: value.to_string(),
+            value: value.as_ref().to_vec(),
             tokens_hashes: OnceLock::new(),
         }),
     )
@@ -53,11 +55,12 @@ pub(crate) fn new_filter_exact(field_name: &str, value: &str) -> FilterGeneric {
 impl FilterExact {
     pub(crate) fn get_tokens_hashes(&self) -> &[u64] {
         self.tokens_hashes.get_or_init(|| {
-            let mut toks: Vec<&str> = Vec::new();
-            tokenize_strings(&mut toks, std::slice::from_ref(&self.value));
-            let tokens: Vec<String> = toks.into_iter().map(|s| s.to_string()).collect();
+            // Byte tokenizer: matches the ingest-side hash_tokenizer, so
+            // bloom lookups agree for raw-byte values too.
+            let mut toks: Vec<&[u8]> = Vec::new();
+            tokenize_bytes(&mut toks, std::slice::from_ref(&self.value));
             let mut hashes = Vec::new();
-            append_tokens_hashes(&mut hashes, &tokens);
+            append_tokens_hashes(&mut hashes, &toks);
             hashes
         })
     }
@@ -65,15 +68,17 @@ impl FilterExact {
 
 impl FieldFilter for FilterExact {
     fn to_string(&self) -> String {
+        // Lossless render: invalid UTF-8 re-quotes via Go strconv.Quote byte
+        // semantics (`\xNN`), so parse -> render -> re-parse is stable.
         format!(
             "={}",
-            crate::stream_filter::quote_token_if_needed(&self.value)
+            crate::stream_filter::quote_value_bytes_if_needed(&self.value)
         )
     }
 
     fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
         let v = get_field_value_by_name(fields, field_name);
-        v == self.value.as_bytes()
+        v == self.value.as_slice()
     }
 
     fn apply_to_block_result_by_field(
@@ -83,11 +88,12 @@ impl FieldFilter for FilterExact {
         field_name: &str,
     ) {
         let value = self.value.clone();
+        let value_str = crate::filter_phrase::phrase_utf8(&value);
 
         let r = br.get_column_by_name(field_name);
         if br.column_is_const(r) {
             let v = br.column_get_value_at_row(r, 0);
-            if v != value.as_bytes() {
+            if v != value.as_slice() {
                 bm.reset_bits();
             }
             return;
@@ -103,7 +109,7 @@ impl FieldFilter for FilterExact {
             // per-row values (identical result).
             ValueType::STRING | ValueType::DICT => match_column_by_exact_value(br, bm, r, &value),
             ValueType::UINT8 => {
-                let n_needed = match try_parse_uint64(&value) {
+                let n_needed = match value_str.and_then(try_parse_uint64) {
                     Some(n) if n < (1 << 8) => n as u8,
                     _ => {
                         bm.reset_bits();
@@ -114,7 +120,7 @@ impl FieldFilter for FilterExact {
                 bm.for_each_set_bit(|idx| unmarshal_uint8(&ve[idx]) == n_needed);
             }
             ValueType::UINT16 => {
-                let n_needed = match try_parse_uint64(&value) {
+                let n_needed = match value_str.and_then(try_parse_uint64) {
                     Some(n) if n < (1 << 16) => n as u16,
                     _ => {
                         bm.reset_bits();
@@ -125,7 +131,7 @@ impl FieldFilter for FilterExact {
                 bm.for_each_set_bit(|idx| unmarshal_uint16(&ve[idx]) == n_needed);
             }
             ValueType::UINT32 => {
-                let n_needed = match try_parse_uint64(&value) {
+                let n_needed = match value_str.and_then(try_parse_uint64) {
                     Some(n) if n < (1 << 32) => n as u32,
                     _ => {
                         bm.reset_bits();
@@ -136,7 +142,7 @@ impl FieldFilter for FilterExact {
                 bm.for_each_set_bit(|idx| unmarshal_uint32(&ve[idx]) == n_needed);
             }
             ValueType::UINT64 => {
-                let n_needed = match try_parse_uint64(&value) {
+                let n_needed = match value_str.and_then(try_parse_uint64) {
                     Some(n) => n,
                     None => {
                         bm.reset_bits();
@@ -147,7 +153,7 @@ impl FieldFilter for FilterExact {
                 bm.for_each_set_bit(|idx| unmarshal_uint64(&ve[idx]) == n_needed);
             }
             ValueType::INT64 => {
-                let n_needed = match try_parse_int64(&value) {
+                let n_needed = match value_str.and_then(try_parse_int64) {
                     Some(n) => n,
                     None => {
                         bm.reset_bits();
@@ -158,7 +164,7 @@ impl FieldFilter for FilterExact {
                 bm.for_each_set_bit(|idx| unmarshal_int64(&ve[idx]) == n_needed);
             }
             ValueType::FLOAT64 => {
-                let f_needed = match try_parse_float64_exact(&value) {
+                let f_needed = match value_str.and_then(try_parse_float64_exact) {
                     Some(f) => f,
                     None => {
                         bm.reset_bits();
@@ -169,7 +175,7 @@ impl FieldFilter for FilterExact {
                 bm.for_each_set_bit(|idx| unmarshal_float64(&ve[idx]) == f_needed);
             }
             ValueType::IPV4 => {
-                let ip_needed = match try_parse_ipv4(&value) {
+                let ip_needed = match value_str.and_then(try_parse_ipv4) {
                     Some(ip) => ip,
                     None => {
                         bm.reset_bits();
@@ -180,7 +186,7 @@ impl FieldFilter for FilterExact {
                 bm.for_each_set_bit(|idx| unmarshal_ipv4(&ve[idx]) == ip_needed);
             }
             ValueType::TIMESTAMP_ISO8601 => {
-                let ts_needed = match try_parse_timestamp_iso8601(&value) {
+                let ts_needed = match value_str.and_then(try_parse_timestamp_iso8601) {
                     Some(t) => t,
                     None => {
                         bm.reset_bits();
@@ -204,7 +210,7 @@ impl FieldFilter for FilterExact {
 
         let v = bs.get_const_column_value(field_name);
         if !v.is_empty() {
-            if value.as_bytes() != v.as_slice() {
+            if value != v {
                 bm.reset_bits();
             }
             return;
@@ -251,10 +257,11 @@ pub(crate) fn match_column_by_exact_value(
     br: &mut BlockResult,
     bm: &mut Bitmap,
     r: ColRef,
-    value: &str,
+    value: impl AsRef<[u8]>,
 ) {
+    let value = value.as_ref();
     let values = br.column_get_values(r);
-    bm.for_each_set_bit(|idx| values[idx].as_slice() == value.as_bytes());
+    bm.for_each_set_bit(|idx| values[idx].as_slice() == value);
 }
 
 // ---------------------------------------------------------------------------
@@ -265,10 +272,11 @@ pub(crate) fn match_timestamp_iso8601_by_exact_value(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    value: &str,
+    value: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
-    let n = match try_parse_timestamp_iso8601(value) {
+    let value = value.as_ref();
+    let n = match crate::filter_phrase::phrase_utf8(value).and_then(try_parse_timestamp_iso8601) {
         Some(n) if n >= ch.min_value as i64 && n <= ch.max_value as i64 => n,
         _ => {
             bm.reset_bits();
@@ -284,10 +292,11 @@ pub(crate) fn match_ipv4_by_exact_value(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    value: &str,
+    value: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
-    let n = match try_parse_ipv4(value) {
+    let value = value.as_ref();
+    let n = match crate::filter_phrase::phrase_utf8(value).and_then(try_parse_ipv4) {
         Some(n) if (n as u64) >= ch.min_value && (n as u64) <= ch.max_value => n,
         _ => {
             bm.reset_bits();
@@ -303,10 +312,11 @@ pub(crate) fn match_float64_by_exact_value(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    value: &str,
+    value: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
-    let f = match try_parse_float64_exact(value) {
+    let value = value.as_ref();
+    let f = match crate::filter_phrase::phrase_utf8(value).and_then(try_parse_float64_exact) {
         Some(f) if f >= f64::from_bits(ch.min_value) && f <= f64::from_bits(ch.max_value) => f,
         _ => {
             bm.reset_bits();
@@ -322,11 +332,12 @@ pub(crate) fn match_values_dict_by_exact_value(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    value: &str,
+    value: impl AsRef<[u8]>,
 ) {
+    let value = value.as_ref();
     let mut bb = Vec::with_capacity(ch.values_dict.values.len());
     for v in &ch.values_dict.values {
-        bb.push(u8::from(v.as_slice() == value.as_bytes()));
+        bb.push(u8::from(v.as_slice() == value));
     }
     match_encoded_values_dict(bs, ch, bm, &bb);
 }
@@ -335,24 +346,26 @@ pub(crate) fn match_string_by_exact_value(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    value: &str,
+    value: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
+    let value = value.as_ref();
     if !match_bloom_filter_all_tokens(bs, ch, tokens) {
         bm.reset_bits();
         return;
     }
-    visit_values(bs, ch, bm, |v| v == value.as_bytes());
+    visit_values(bs, ch, bm, |v| v == value);
 }
 
 pub(crate) fn match_uint8_by_exact_value(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    value: &str,
+    value: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
-    let n = match try_parse_uint64(value) {
+    let value = value.as_ref();
+    let n = match crate::filter_phrase::phrase_utf8(value).and_then(try_parse_uint64) {
         Some(n) if n >= ch.min_value && n <= ch.max_value => n,
         _ => {
             bm.reset_bits();
@@ -367,10 +380,11 @@ pub(crate) fn match_uint16_by_exact_value(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    value: &str,
+    value: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
-    let n = match try_parse_uint64(value) {
+    let value = value.as_ref();
+    let n = match crate::filter_phrase::phrase_utf8(value).and_then(try_parse_uint64) {
         Some(n) if n >= ch.min_value && n <= ch.max_value => n,
         _ => {
             bm.reset_bits();
@@ -386,10 +400,11 @@ pub(crate) fn match_uint32_by_exact_value(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    value: &str,
+    value: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
-    let n = match try_parse_uint64(value) {
+    let value = value.as_ref();
+    let n = match crate::filter_phrase::phrase_utf8(value).and_then(try_parse_uint64) {
         Some(n) if n >= ch.min_value && n <= ch.max_value => n,
         _ => {
             bm.reset_bits();
@@ -405,10 +420,11 @@ pub(crate) fn match_uint64_by_exact_value(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    value: &str,
+    value: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
-    let n = match try_parse_uint64(value) {
+    let value = value.as_ref();
+    let n = match crate::filter_phrase::phrase_utf8(value).and_then(try_parse_uint64) {
         Some(n) if n >= ch.min_value && n <= ch.max_value => n,
         _ => {
             bm.reset_bits();
@@ -424,10 +440,11 @@ pub(crate) fn match_int64_by_exact_value(
     bs: &mut BlockSearch<'_>,
     ch: &ColumnHeader,
     bm: &mut Bitmap,
-    value: &str,
+    value: impl AsRef<[u8]>,
     tokens: &[u64],
 ) {
-    let n = match try_parse_int64(value) {
+    let value = value.as_ref();
+    let n = match crate::filter_phrase::phrase_utf8(value).and_then(try_parse_int64) {
         Some(n) if n >= ch.min_value as i64 && n <= ch.max_value as i64 => n,
         _ => {
             bm.reset_bits();
