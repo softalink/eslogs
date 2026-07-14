@@ -1099,6 +1099,21 @@ impl ResponseWriter {
         Some(crate::disconnect_watcher::watch(sock))
     }
 
+    /// One-shot synchronous check of whether the client has already closed the
+    /// connection (Go's `r.Context().Err()` at a single point). A non-blocking
+    /// `peek` that leaves any queued pipelined bytes intact. Returns `false`
+    /// when no live connection is attached (direct handler calls in tests).
+    ///
+    /// Safe to call from a buffered handler before it writes its response: the
+    /// probe does not consume bytes and the connection worker resumes socket
+    /// I/O only after the handler returns.
+    pub fn is_client_disconnected(&self) -> bool {
+        match self.stream.as_ref() {
+            Some(s) => crate::disconnect_watcher::probe_disconnected_once(s.raw_sock()),
+            None => false,
+        }
+    }
+
     /// Streams the currently buffered body to the client mid-handler as an
     /// HTTP/1.1 chunk (Go `http.Flusher.Flush`).
     ///

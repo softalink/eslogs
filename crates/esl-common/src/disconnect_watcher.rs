@@ -71,6 +71,14 @@ fn watch_loop() {
     }
 }
 
+/// One-shot synchronous client-disconnect probe (Go `r.Context().Err()` at a
+/// single point): a non-blocking `peek` that returns `true` when the client has
+/// gone (EOF or hard error) and `false` while it is still connected (idle or a
+/// pipelined follow-up request queued). Does not consume any buffered bytes.
+pub fn probe_disconnected_once(stream: &TcpStream) -> bool {
+    probe_disconnected(stream)
+}
+
 /// Probes `stream` for a client disconnect without consuming any buffered
 /// bytes (`peek`, not `read`: a pipelined keep-alive request must stay queued
 /// for the connection worker).
@@ -158,6 +166,27 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         f()
+    }
+
+    #[test]
+    fn test_probe_disconnected_once() {
+        // Still connected (idle) -> false.
+        let (server, client) = tcp_pair();
+        assert!(!probe_disconnected_once(&server));
+        // Client closes -> the one-shot probe reports the disconnect, and the
+        // socket is left in blocking mode for the connection worker.
+        drop(client);
+        assert!(wait_until(Duration::from_secs(5), || {
+            probe_disconnected_once(&server)
+        }));
+        // A pipelined follow-up byte is NOT consumed and reads as "connected".
+        let (server, mut client) = tcp_pair();
+        client.write_all(b"x").unwrap();
+        assert!(!probe_disconnected_once(&server));
+        let mut buf = [0u8; 1];
+        server.set_nonblocking(false).unwrap();
+        assert_eq!((&server).read(&mut buf).unwrap(), 1);
+        assert_eq!(buf[0], b'x'); // peek left the byte queued
     }
 
     #[test]

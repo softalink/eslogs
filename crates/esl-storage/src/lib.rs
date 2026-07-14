@@ -39,7 +39,7 @@ use esl_common::flagutil::{
 };
 use esl_common::httpserver::{Request, ResponseWriter};
 use esl_common::stringsutil::json_string;
-use esl_common::{cgroup, fatalf, httputil, infof, panicf};
+use esl_common::{cgroup, fatalf, httputil, infof, panicf, warnf};
 
 use esl_logstorage::log_rows::LogRows;
 use esl_logstorage::parser::Query;
@@ -765,10 +765,6 @@ fn process_partition_list(
 }
 
 /// Port of Go `processPartitionSnapshotCreate`.
-///
-/// PORT NOTE: Go drops the created snapshot when the client has already closed
-/// the connection (`r.Context().Err()`); the ported httpserver exposes no
-/// client-disconnect signal, so the snapshot is always kept.
 fn process_partition_snapshot_create(
     storage: &Arc<Storage>,
     req: &mut Request,
@@ -784,8 +780,25 @@ fn process_partition_snapshot_create(
         partition_prefix = req.form_value("name").to_string();
     }
 
-    let snapshot_paths: Vec<String> = storage
-        .partition_snapshot_must_create(&partition_prefix)
+    let snapshot_paths = storage.partition_snapshot_must_create(&partition_prefix);
+
+    // Go: if the client already closed the connection, drop the created
+    // snapshot rather than leak it (`r.Context().Err()`). A one-shot
+    // disconnect probe stands in for Go's request context.
+    if w.is_client_disconnected() {
+        for path in &snapshot_paths {
+            infof!(
+                "deleting already created snapshot at {} because the client canceled the request",
+                path.display()
+            );
+            if let Err(err) = storage.partition_snapshot_delete(path) {
+                warnf!("cannot delete already created snapshot: {err}");
+            }
+        }
+        return true;
+    }
+
+    let snapshot_paths: Vec<String> = snapshot_paths
         .iter()
         .map(|p: &PathBuf| p.to_string_lossy().into_owned())
         .collect();

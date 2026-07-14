@@ -522,9 +522,6 @@ what remains in section (a) is confirmed-present divergence.
   the small esmui JS/CSS/HTML/image assets, which browsers do not range-request).
   The `/select/esmui` redirect now re-encodes the query like Go's `Form.Encode()`
   (`Request::form_encoded`: keys sorted, keys/values percent-escaped).
-- `esl-storage/src/lib.rs:783` — snapshots created for a client that has
-  already disconnected are kept; Go checks `r.Context().Err()` and deletes
-  them (the port has no client-disconnect signal on this path).
 - `esl-agent/src/remotewrite.rs:759/:1054` — `-remoteWrite.oauth2.*` (Err
   "not supported") and `-remoteWrite.proxyURL` (`fatalf!`) are unsupported;
   `-remoteWrite.tlsHandshakeTimeout` folds into `sendTimeout` (one connection
