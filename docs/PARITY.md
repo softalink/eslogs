@@ -516,12 +516,14 @@ what remains in section (a) is confirmed-present divergence.
 
 **Query serving, agent, tools (esl-select / esl-storage / esl-agent / CLIs)**
 
-- `esl-select/src/esmui_assets.rs:10` *(low, deliberate)* — esmui static serving
-  answers a `Range:` request with a full 200 instead of 206 (Go's `FileServer`
-  supports ranges; the port's reduced server does not — this never triggers for
-  the small esmui JS/CSS/HTML/image assets, which browsers do not range-request).
-  The `/select/esmui` redirect now re-encodes the query like Go's `Form.Encode()`
-  (`Request::form_encoded`: keys sorted, keys/values percent-escaped).
+- `esl-select/src/esmui_assets.rs` — esmui static serving honors a single-range
+  `Range:` request with `206 Partial Content` + `Content-Range`/`Accept-Ranges`
+  (Go's `http.ServeContent`), and answers an unsatisfiable range with `416`.
+  Residual: a *multi-range* request (comma-separated) falls back to the full
+  `200` body where Go emits `multipart/byteranges` — browsers never send this
+  for the small esmui JS/CSS/HTML/image assets. The `/select/esmui` redirect
+  re-encodes the query like Go's `Form.Encode()` (`Request::form_encoded`: keys
+  sorted, keys/values percent-escaped).
 - `esl-agent/src/remotewrite.rs` — `-remoteWrite.oauth2.*` IS supported: a
   faithful `client_credentials` token source (`crate::oauth2`) fetches, caches
   (with x/oauth2's 10s refresh margin), and applies a bearer token, sending the
