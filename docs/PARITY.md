@@ -522,8 +522,12 @@ what remains in section (a) is confirmed-present divergence.
   the small esmui JS/CSS/HTML/image assets, which browsers do not range-request).
   The `/select/esmui` redirect now re-encodes the query like Go's `Form.Encode()`
   (`Request::form_encoded`: keys sorted, keys/values percent-escaped).
-- `esl-agent/src/remotewrite.rs:759/:1054` — `-remoteWrite.oauth2.*` (Err
-  "not supported") and `-remoteWrite.proxyURL` (`fatalf!`) are unsupported;
+- `esl-agent/src/remotewrite.rs` — `-remoteWrite.oauth2.*` IS supported: a
+  faithful `client_credentials` token source (`crate::oauth2`) fetches, caches
+  (with x/oauth2's 10s refresh margin), and applies a bearer token, sending the
+  `base64(url.QueryEscape(id):url.QueryEscape(secret))` Basic header like
+  x/oauth2's `AuthStyleInHeader`. Residuals: `-remoteWrite.proxyURL` (`fatalf!`)
+  is unsupported (needs proxy-protocol support in the connection layer);
   `-remoteWrite.tlsHandshakeTimeout` folds into `sendTimeout` (one connection
   per request, no separate handshake timeout); and shutdown abandons an
   in-flight request after the full `sendTimeout` rather than Go's fixed 5s

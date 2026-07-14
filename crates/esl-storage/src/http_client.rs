@@ -159,7 +159,7 @@ fn read_trimmed_file(path: &str) -> Result<String, String> {
 
 /// Standard base64 encoding (RFC 4648, with padding); replaces Go's
 /// `encoding/base64.StdEncoding` for the basic-auth header.
-fn base64_std_encode(data: &[u8]) -> String {
+pub fn base64_std_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {

@@ -14,8 +14,11 @@
 //!   * `https` remote write URLs are supported through the rustls-based
 //!     client in `esl_common::tlsutil`, configured per URL from the
 //!     `-remoteWrite.tls*` flags;
-//!   * `-remoteWrite.proxyURL` and the `-remoteWrite.oauth2.*` flags are not
-//!     supported — init fails with a clear error when they are set;
+//!   * the `-remoteWrite.oauth2.*` flags are supported: a
+//!     `client_credentials` token source (see [`crate::oauth2`]) fetches and
+//!     caches a bearer token used for the outgoing requests;
+//!   * `-remoteWrite.proxyURL` is not supported — init fails with a clear
+//!     error when it is set;
 //!   * Go's one-shot retry on `io.EOF` (stale keep-alive connection) is
 //!     unnecessary and dropped, since every request uses a fresh connection.
 //!
@@ -51,6 +54,7 @@ use esl_storage::http_client::{
 };
 use esl_storage::netinsert::PROTOCOL_VERSION;
 
+use crate::oauth2::Oauth2TokenSource;
 use crate::persistentqueue::{DEFAULT_CHUNK_FILE_SIZE, FastQueue};
 
 // ---------------------------------------------------------------------------
@@ -240,6 +244,25 @@ static OAUTH2_CLIENT_SECRET: Flag<ArrayString> = Flag::new(
 static OAUTH2_CLIENT_SECRET_FILE: Flag<ArrayString> = Flag::new(
     "remoteWrite.oauth2.clientSecretFile",
     "Optional OAuth2 clientSecretFile to use for the corresponding -remoteWrite.url",
+    ArrayString::default,
+);
+
+static OAUTH2_ENDPOINT_PARAMS: Flag<ArrayString> = Flag::new(
+    "remoteWrite.oauth2.endpointParams",
+    "Optional OAuth2 endpoint parameters to use for the corresponding -remoteWrite.url . \
+     The endpoint parameters must be set in JSON format: {\"param1\":\"value1\",...,\"paramN\":\"valueN\"}",
+    ArrayString::default,
+);
+
+static OAUTH2_TOKEN_URL: Flag<ArrayString> = Flag::new(
+    "remoteWrite.oauth2.tokenUrl",
+    "Optional OAuth2 tokenURL to use for the corresponding -remoteWrite.url",
+    ArrayString::default,
+);
+
+static OAUTH2_SCOPES: Flag<ArrayString> = Flag::new(
+    "remoteWrite.oauth2.scopes",
+    "Optional OAuth2 scopes to use for the corresponding -remoteWrite.url. Scopes must be delimited by ';'",
     ArrayString::default,
 );
 
@@ -723,6 +746,10 @@ struct Client {
     retry_max_time: i64,
 
     auth_cfg: AuthConfig,
+    /// OAuth2 `client_credentials` token source; when set, its bearer token
+    /// takes precedence over `auth_cfg` for the outgoing `Authorization`
+    /// header (Go: `promauth` uses the oauth2 token source as the auth).
+    oauth2: Option<Arc<Oauth2TokenSource>>,
     /// Extra headers from -remoteWrite.headers.
     headers: Vec<(String, String)>,
 
@@ -742,7 +769,7 @@ fn new_http_client(
     fq: Arc<FastQueue>,
 ) -> Arc<Client> {
     let is_tls = remote_write_url.scheme == "https";
-    let (auth_cfg, headers) = match get_auth_config(arg_idx, is_tls) {
+    let (auth_cfg, headers, oauth2) = match get_auth_config(arg_idx, is_tls) {
         Ok(v) => v,
         Err(err) => {
             fatalf!(
@@ -790,6 +817,7 @@ fn new_http_client(
             .as_nanos() as i64,
         retry_max_time: RETRY_MAX_TIME.get().get_optional_arg(arg_idx).as_nanos() as i64,
         auth_cfg,
+        oauth2,
         headers,
         rl: Mutex::new(None),
         stop_senders: Mutex::new(Vec::new()),
@@ -888,7 +916,10 @@ impl Client {
             "Content-Type".to_string(),
             "application/octet-stream".to_string(),
         ));
-        let auth_header = self.auth_cfg.get_auth_header()?;
+        let auth_header = match &self.oauth2 {
+            Some(src) => src.get_token()?,
+            None => self.auth_cfg.get_auth_header()?,
+        };
         if !auth_header.is_empty() {
             headers.push(("Authorization".to_string(), auth_header));
         }
@@ -1011,10 +1042,13 @@ fn log_block_rejected(block: &[u8], sanitized_url: &str, resp: &HttpResponse) {
 /// `esl_storage::http_client::Options`). The rustls client config is then
 /// built eagerly by `Options::new_config`, so broken TLS files fail at init
 /// instead of on the first request (Go loads them lazily at dial time).
-fn get_auth_config(
-    arg_idx: usize,
-    is_tls: bool,
-) -> Result<(AuthConfig, Vec<(String, String)>), String> {
+type AuthConfigResult = (
+    AuthConfig,
+    Vec<(String, String)>,
+    Option<Arc<Oauth2TokenSource>>,
+);
+
+fn get_auth_config(arg_idx: usize, is_tls: bool) -> Result<AuthConfigResult, String> {
     let headers_value = HEADERS.get().get_optional_arg(arg_idx);
     let mut hdrs = Vec::new();
     if !headers_value.is_empty() {
@@ -1045,13 +1079,14 @@ fn get_auth_config(
     let token = BEARER_TOKEN.get().get_optional_arg(arg_idx);
     let token_file = BEARER_TOKEN_FILE.get().get_optional_arg(arg_idx);
 
-    // PORT NOTE: OAuth2 is not supported by this port; fail clearly like the
-    // proxy case instead of silently ignoring credentials.
-    let client_secret = OAUTH2_CLIENT_SECRET.get().get_optional_arg(arg_idx);
-    let client_secret_file = OAUTH2_CLIENT_SECRET_FILE.get().get_optional_arg(arg_idx);
-    let client_id = OAUTH2_CLIENT_ID.get().get_optional_arg(arg_idx);
-    if !client_secret.is_empty() || !client_secret_file.is_empty() || !client_id.is_empty() {
-        return Err("-remoteWrite.oauth2.* flags are not supported by this port".to_string());
+    let oauth2 = build_oauth2_token_source(arg_idx)?;
+    if oauth2.is_some() && (basic_auth.is_some() || !token.is_empty() || !token_file.is_empty()) {
+        // Go promauth rejects combining oauth2 with basic_auth/bearer_token.
+        return Err(
+            "cannot simultaneously use -remoteWrite.basicAuth.*/-remoteWrite.bearerToken* and \
+             -remoteWrite.oauth2.* for the same -remoteWrite.url"
+                .to_string(),
+        );
     }
 
     let tls_config = if is_tls {
@@ -1076,7 +1111,114 @@ fn get_auth_config(
     let auth_cfg = opts.new_config().map_err(|err| {
         format!("cannot populate auth config for remoteWrite idx: {arg_idx}, err: {err}")
     })?;
-    Ok((auth_cfg, hdrs))
+    Ok((auth_cfg, hdrs, oauth2))
+}
+
+/// Builds the OAuth2 `client_credentials` token source for the given
+/// -remoteWrite.url index, or `None` when no `-remoteWrite.oauth2.*` flag is
+/// set for it.
+///
+/// PORT NOTE: Go's getAuthConfig only triggers the oauth2 build when
+/// clientSecret/clientSecretFile is set and then relies on
+/// `promauth.OAuth2Config.validate` for the required fields; the port triggers
+/// on any oauth2 flag and validates up front so a partial config surfaces a
+/// clear error instead of being silently ignored.
+///
+/// PORT NOTE: the OAuth2 token endpoint uses default TLS (system CA), matching
+/// Go, which does not apply the `-remoteWrite.tls*` flags to it.
+fn build_oauth2_token_source(arg_idx: usize) -> Result<Option<Arc<Oauth2TokenSource>>, String> {
+    let client_id = OAUTH2_CLIENT_ID.get().get_optional_arg(arg_idx);
+    let client_secret = OAUTH2_CLIENT_SECRET.get().get_optional_arg(arg_idx);
+    let client_secret_file = OAUTH2_CLIENT_SECRET_FILE.get().get_optional_arg(arg_idx);
+    let token_url = OAUTH2_TOKEN_URL.get().get_optional_arg(arg_idx);
+    let scopes_raw = OAUTH2_SCOPES.get().get_optional_arg(arg_idx);
+    let endpoint_params_json = OAUTH2_ENDPOINT_PARAMS.get().get_optional_arg(arg_idx);
+
+    let configured = !client_id.is_empty()
+        || !client_secret.is_empty()
+        || !client_secret_file.is_empty()
+        || !token_url.is_empty()
+        || !scopes_raw.is_empty()
+        || !endpoint_params_json.is_empty();
+    if !configured {
+        return Ok(None);
+    }
+
+    // Match promauth.OAuth2Config.validate.
+    if client_id.is_empty() {
+        return Err("-remoteWrite.oauth2.clientID cannot be empty".to_string());
+    }
+    if client_secret.is_empty() && client_secret_file.is_empty() {
+        return Err(
+            "either -remoteWrite.oauth2.clientSecret or -remoteWrite.oauth2.clientSecretFile must be set"
+                .to_string(),
+        );
+    }
+    if !client_secret.is_empty() && !client_secret_file.is_empty() {
+        return Err(
+            "-remoteWrite.oauth2.clientSecret and -remoteWrite.oauth2.clientSecretFile cannot be set simultaneously"
+                .to_string(),
+        );
+    }
+    if token_url.is_empty() {
+        return Err("-remoteWrite.oauth2.tokenUrl cannot be empty".to_string());
+    }
+
+    let token_url_parsed = RemoteUrl::parse(token_url)
+        .map_err(|err| format!("cannot parse -remoteWrite.oauth2.tokenUrl={token_url:?}: {err}"))?;
+
+    let endpoint_params = esl_common::flagutil::parse_json_map(endpoint_params_json)
+        .map_err(|err| {
+            format!("cannot parse JSON for -remoteWrite.oauth2.endpointParams={endpoint_params_json:?}: {err}")
+        })?
+        .unwrap_or_default();
+
+    // Go: strings.Split(scopes, ";") — an empty flag yields [""], preserved
+    // for faithful token-request bodies (see oauth2::build_token_request_body).
+    let scopes: Vec<String> = scopes_raw.split(';').map(str::to_string).collect();
+
+    // Basic credentials for the token request plus the token endpoint TLS
+    // (default TLS for https token URLs; none for http).
+    let token_tls = if token_url_parsed.scheme == "https" {
+        Some(TLSConfig::default())
+    } else {
+        None
+    };
+    let token_opts = Options {
+        basic_auth: Some(BasicAuthConfig {
+            username: client_id.to_string(),
+            username_file: String::new(),
+            password: client_secret.to_string(),
+            password_file: client_secret_file.to_string(),
+        }),
+        bearer_token: String::new(),
+        bearer_token_file: String::new(),
+        tls_config: token_tls,
+    };
+    let token_auth_cfg = token_opts
+        .new_config()
+        .map_err(|err| format!("cannot initialize OAuth2 token endpoint auth config: {err}"))?;
+
+    let send_timeout = {
+        let t = SEND_TIMEOUT.get().get_optional_arg(arg_idx);
+        if t.is_zero() {
+            Duration::from_secs(60)
+        } else {
+            t
+        }
+    };
+
+    Ok(Some(Arc::new(Oauth2TokenSource::new(
+        token_url_parsed.addr(),
+        token_url_parsed.path_and_query(),
+        token_auth_cfg,
+        client_id.to_string(),
+        client_secret.to_string(),
+        client_secret_file.to_string(),
+        scopes,
+        endpoint_params,
+        send_timeout,
+    ))))
 }
 
 /// parseRetryAfterHeader parses `Retry-After` value retrieved from HTTP
@@ -1553,9 +1695,9 @@ mod tests {
     // flags are unset here, so the https config is the default one.
     #[test]
     fn test_get_auth_config_tls_gating() {
-        let (ac, _) = get_auth_config(0, false).unwrap();
+        let (ac, _, _) = get_auth_config(0, false).unwrap();
         assert!(ac.tls().is_none(), "http URL must not carry a TLS config");
-        let (ac, _) = get_auth_config(0, true).unwrap();
+        let (ac, _, _) = get_auth_config(0, true).unwrap();
         assert!(ac.tls().is_some(), "https URL must carry a TLS config");
     }
 
@@ -1668,6 +1810,7 @@ mod tests {
             retry_min_interval: 100_000_000,
             retry_max_time: 1_000_000_000,
             auth_cfg,
+            oauth2: None,
             headers: vec![("My-Auth".to_string(), "foobar".to_string())],
             rl: Mutex::new(None),
             stop_senders: Mutex::new(Vec::new()),
