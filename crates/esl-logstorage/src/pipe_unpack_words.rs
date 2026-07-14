@@ -15,15 +15,14 @@ use crate::pipe_unpack::PipeUnpackWriteContext;
 use crate::prefix_filter;
 use crate::rows::Field;
 use crate::stats_uniq_values::marshal_json_array;
-use crate::stream_filter::quote_token_if_needed;
 use crate::tokenizer::{get_tokenizer, put_tokenizer};
 
 /// `| unpack_words ...` pipe (Go `pipeUnpackWords`).
 pub(crate) struct PipeUnpackWords {
     /// Field to unpack words from.
-    src_field: String,
+    src_field: Vec<u8>,
     /// Field to put the unpacked words into.
-    dst_field: String,
+    dst_field: Vec<u8>,
     /// Whether to drop duplicate words.
     drop_duplicates: bool,
 }
@@ -31,8 +30,8 @@ pub(crate) struct PipeUnpackWords {
 /// Constructs a `PipeUnpackWords` (Go `parsePipeUnpackWords`; lexer parsing is
 /// deferred).
 pub(crate) fn new_pipe_unpack_words(
-    src_field: impl Into<String>,
-    dst_field: impl Into<String>,
+    src_field: impl Into<Vec<u8>>,
+    dst_field: impl Into<Vec<u8>>,
     drop_duplicates: bool,
 ) -> PipeUnpackWords {
     PipeUnpackWords {
@@ -51,11 +50,17 @@ impl Pipe for PipeUnpackWords {
 
     fn to_string(&self) -> String {
         let mut s = String::from("unpack_words");
-        if self.src_field != "_msg" {
-            s += &format!(" from {}", quote_token_if_needed(&self.src_field));
+        if self.src_field != b"_msg" {
+            s += &format!(
+                " from {}",
+                crate::parser::quote_token_bytes_if_needed(&self.src_field)
+            );
         }
         if self.dst_field != self.src_field {
-            s += &format!(" as {}", quote_token_if_needed(&self.dst_field));
+            s += &format!(
+                " as {}",
+                crate::parser::quote_token_bytes_if_needed(&self.dst_field)
+            );
         }
         if self.drop_duplicates {
             s += " drop_duplicates";
@@ -75,7 +80,7 @@ impl Pipe for PipeUnpackWords {
     }
 
     fn can_return_last_n_results(&self) -> bool {
-        self.dst_field != "_time"
+        self.dst_field != b"_time"
     }
 
     fn new_pipe_processor(
@@ -95,8 +100,8 @@ impl Pipe for PipeUnpackWords {
 }
 
 struct PipeUnpackWordsProcessor {
-    src_field: String,
-    dst_field: String,
+    src_field: Vec<u8>,
+    dst_field: Vec<u8>,
     drop_duplicates: bool,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Slice<std::sync::Mutex<PipeUnpackWordsProcessorShard>>,
@@ -136,7 +141,7 @@ impl PipeProcessor for PipeUnpackWordsProcessor {
         let mut t = get_tokenizer();
         let keep_duplicate_tokens = !self.drop_duplicates;
         let mut field = [Field {
-            name: self.dst_field.clone().into_bytes(),
+            name: self.dst_field.clone(),
             value: Vec::new(),
         }];
         for row_idx in 0..values.len() {

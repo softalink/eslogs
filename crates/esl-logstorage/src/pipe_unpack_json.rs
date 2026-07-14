@@ -18,11 +18,11 @@ use crate::stream_filter::quote_token_if_needed;
 /// `| unpack_json ...` pipe (Go `pipeUnpackJSON`).
 pub(crate) struct PipeUnpackJSON {
     /// Field to unpack JSON fields from.
-    from_field: String,
+    from_field: Vec<u8>,
     /// Field filters to extract from JSON.
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
     /// JSON keys whose values are preserved (not flattened).
-    preserve_keys: Vec<String>,
+    preserve_keys: Vec<Vec<u8>>,
     /// Prefix added to unpacked field names.
     result_prefix: String,
     keep_original_fields: bool,
@@ -35,16 +35,16 @@ pub(crate) struct PipeUnpackJSON {
 /// struct; lexer parsing is deferred).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn new_pipe_unpack_json(
-    from_field: impl Into<String>,
-    field_filters: Vec<String>,
-    preserve_keys: Vec<String>,
+    from_field: impl Into<Vec<u8>>,
+    field_filters: Vec<Vec<u8>>,
+    preserve_keys: Vec<Vec<u8>>,
     result_prefix: impl Into<String>,
     keep_original_fields: bool,
     skip_empty_results: bool,
     iff: Option<IfFilter>,
 ) -> PipeUnpackJSON {
     let field_filters = if field_filters.is_empty() {
-        vec!["*".to_string()]
+        vec![b"*".to_vec()]
     } else {
         field_filters
     };
@@ -117,7 +117,10 @@ impl Pipe for PipeUnpackJSON {
             s += &format!(" {iff}");
         }
         if !crate::filter_generic::is_msg_field_name(&self.from_field) {
-            s += &format!(" from {}", quote_token_if_needed(&self.from_field));
+            s += &format!(
+                " from {}",
+                crate::parser::quote_token_bytes_if_needed(&self.from_field)
+            );
         }
         if !prefix_filter::match_all(&self.field_filters) {
             s += &format!(" fields ({})", field_names_string(&self.field_filters));
@@ -178,7 +181,7 @@ impl Pipe for PipeUnpackJSON {
                 return;
             }
             let mut p = get_json_parser();
-            let preserve: Vec<&str> = preserve_keys.iter().map(|s| s.as_str()).collect();
+            let preserve: Vec<&[u8]> = preserve_keys.iter().map(|s| s.as_slice()).collect();
             // PORT NOTE: Go passes math.MaxInt for maxFieldNameLen; the public
             // Rust wrapper uses `consts::MAX_FIELD_NAME_SIZE` (128). This only
             // affects flattened keys longer than 128 bytes, which are otherwise
@@ -187,13 +190,13 @@ impl Pipe for PipeUnpackJSON {
                 Err(_) => {
                     for filter in &field_filters {
                         if !prefix_filter::is_wildcard_filter(filter) {
-                            uctx.add_field(filter.as_bytes(), "");
+                            uctx.add_field(filter, "");
                         }
                     }
                 }
                 Ok(()) => {
                     for f in p.fields() {
-                        if !prefix_filter::match_filters_bytes(&field_filters, &f.name) {
+                        if !prefix_filter::match_filters(&field_filters, &f.name) {
                             continue;
                         }
                         uctx.add_field(&f.name, &f.value);
@@ -202,10 +205,9 @@ impl Pipe for PipeUnpackJSON {
                         if prefix_filter::is_wildcard_filter(filter) {
                             continue;
                         }
-                        let add_empty_field =
-                            !p.fields().iter().any(|f| f.name == filter.as_bytes());
+                        let add_empty_field = !p.fields().iter().any(|f| &f.name == filter);
                         if add_empty_field {
-                            uctx.add_field(filter.as_bytes(), "");
+                            uctx.add_field(filter, "");
                         }
                     }
                 }
@@ -244,10 +246,10 @@ fn trim_json_whitespace(mut s: &[u8]) -> &[u8] {
 }
 
 /// Port of Go's `fieldNamesString`.
-fn field_names_string(fields: &[String]) -> String {
+fn field_names_string(fields: &[Vec<u8>]) -> String {
     fields
         .iter()
-        .map(|f| quote_token_if_needed(f))
+        .map(|f| crate::parser::quote_token_bytes_if_needed(f))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -343,7 +345,7 @@ mod tests {
         run(
             new_pipe_unpack_json(
                 "_msg",
-                vec!["foo".to_string(), "b".to_string()],
+                vec![b"foo".to_vec(), b"b".to_vec()],
                 vec![],
                 "",
                 false,
@@ -365,7 +367,7 @@ mod tests {
             new_pipe_unpack_json(
                 "_msg",
                 vec![],
-                vec!["foo".to_string()],
+                vec![b"foo".to_vec()],
                 "",
                 false,
                 false,
@@ -427,7 +429,7 @@ mod tests {
         run(
             new_pipe_unpack_json(
                 "x",
-                vec!["foo".to_string(), "bar".to_string()],
+                vec![b"foo".to_vec(), b"bar".to_vec()],
                 vec![],
                 "",
                 false,

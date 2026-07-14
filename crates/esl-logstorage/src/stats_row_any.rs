@@ -69,12 +69,12 @@ pub(crate) fn fields_state_size(fields: &[Field]) -> usize {
 
 /// `row_any(...)` stats function.
 pub struct StatsRowAny {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Builds a [`StatsRowAny`] from already-parsed field filters
 /// (Go `parseStatsRowAny`).
-pub(crate) fn new_stats_row_any(field_filters: Vec<String>) -> StatsRowAny {
+pub(crate) fn new_stats_row_any(field_filters: Vec<Vec<u8>>) -> StatsRowAny {
     StatsRowAny { field_filters }
 }
 
@@ -102,7 +102,7 @@ impl StatsFunc for StatsRowAny {
 #[derive(Default, PartialEq, Debug)]
 pub(crate) struct StatsRowAnyProcessor {
     fields: Vec<Field>,
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 impl StatsRowAnyProcessor {

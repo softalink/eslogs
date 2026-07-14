@@ -36,7 +36,7 @@ pub(crate) struct FilterRange {
 
 /// Builds a range filter for `field_name`.
 pub(crate) fn new_filter_range(
-    field_name: &str,
+    field_name: &[u8],
     min_value: f64,
     max_value: f64,
     string_repr: &str,
@@ -56,7 +56,7 @@ impl FieldFilter for FilterRange {
         self.string_repr.clone()
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_range(v, self.min_value, self.max_value)
     }
@@ -65,7 +65,7 @@ impl FieldFilter for FilterRange {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let min_value = self.min_value;
         let max_value = self.max_value;
@@ -97,7 +97,7 @@ impl FieldFilter for FilterRange {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let min_value = self.min_value;
         let max_value = self.max_value;

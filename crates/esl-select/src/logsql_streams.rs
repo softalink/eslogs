@@ -214,7 +214,7 @@ pub fn process_stream_field_values_request(
         &ca.tenant_ids,
         &ca.q,
         &ca.hidden_fields_filters,
-        field_name,
+        field_name.as_bytes(),
         filter,
         limit as u64,
         cancel.as_deref(),

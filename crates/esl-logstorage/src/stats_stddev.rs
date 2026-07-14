@@ -21,13 +21,13 @@ use crate::values_encoder::{marshal_float64, marshal_float64_string, unmarshal_f
 
 /// Port of `statsStddev`.
 pub(crate) struct StatsStddev {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Port of `parseStatsStddev`. Empty filters default to `["*"]`.
-pub(crate) fn new_stats_stddev(mut field_filters: Vec<String>) -> StatsStddev {
+pub(crate) fn new_stats_stddev(mut field_filters: Vec<Vec<u8>>) -> StatsStddev {
     if field_filters.is_empty() {
-        field_filters.push("*".to_string());
+        field_filters.push(b"*".to_vec());
     }
     StatsStddev { field_filters }
 }
@@ -53,7 +53,7 @@ impl StatsFunc for StatsStddev {
 
 /// Port of `statsStddevProcessor`.
 pub(crate) struct StatsStddevProcessor {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
     avg: f64,
     q: f64,
     count: f64,
@@ -162,7 +162,7 @@ mod tests {
     }
 
     fn run(filters: &[&str], block: &[Vec<Field>]) -> String {
-        let sf = new_stats_stddev(filters.iter().map(|s| s.to_string()).collect());
+        let sf = new_stats_stddev(filters.iter().map(|s| s.as_bytes().to_vec()).collect());
         let mut sp = sf.new_stats_processor();
         let mut br = BlockResult::default();
         br.must_init_from_rows(block);
@@ -195,14 +195,14 @@ mod tests {
         // shortest-round-trip form (17 significant digits + trailing zeros,
         // NOT the exact 151-digit integer expansion).
         let mut sp = StatsStddevProcessor {
-            field_filters: vec!["a".to_string()],
+            field_filters: vec![b"a".to_vec()],
             avg: 0.0,
             q: 0.0,
             count: 0.0,
         };
         sp.update_state(0.0);
         sp.update_state((2.0f64).powi(501));
-        let sf = new_stats_stddev(vec!["a".to_string()]);
+        let sf = new_stats_stddev(vec![b"a".to_vec()]);
         let mut dst = Vec::new();
         sp.finalize_stats(&sf, &mut dst, None);
         assert_eq!(
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_stddev_export_import_merge() {
-        let sf = new_stats_stddev(vec!["a".to_string()]);
+        let sf = new_stats_stddev(vec![b"a".to_vec()]);
         let mut a = sf.new_stats_processor();
         let mut br1 = BlockResult::default();
         br1.must_init_from_rows(&[vec![field("a", "1")]]);

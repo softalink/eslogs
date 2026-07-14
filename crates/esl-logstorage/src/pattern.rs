@@ -32,7 +32,7 @@ pub(crate) struct Pattern {
 
 #[derive(Debug)]
 pub(crate) struct PatternField {
-    pub(crate) name: String,
+    pub(crate) name: Vec<u8>,
 
     /// PORT NOTE: Go stores `value *string` pointing into `pattern.matches`;
     /// the port stores the index into `matches` instead. Use
@@ -44,7 +44,7 @@ pub(crate) struct PatternField {
 pub(crate) struct PatternStep {
     pub(crate) prefix: Vec<u8>,
 
-    pub(crate) field: String,
+    pub(crate) field: Vec<u8>,
     pub(crate) field_opt: String,
 }
 
@@ -81,8 +81,10 @@ pub(crate) fn parse_pattern(s: &str) -> Result<Pattern, String> {
         if steps[i].prefix.is_empty() {
             return Err(format!(
                 "missing delimiter between <{}> and <{}>",
-                steps[i - 1].field,
-                steps[i].field
+                // Display-only: pattern text is valid UTF-8 (it is a &str
+                // slice), so the lossy view is exact here.
+                String::from_utf8_lossy(&steps[i - 1].field),
+                String::from_utf8_lossy(&steps[i].field)
             ));
         }
     }
@@ -90,7 +92,11 @@ pub(crate) fn parse_pattern(s: &str) -> Result<Pattern, String> {
     // Verify that fields do not end with '*'
     for step in &steps {
         if prefix_filter::is_wildcard_filter(&step.field) {
-            return Err(format!("wildcard field {:?} isn't supported", step.field));
+            return Err(format!(
+                "wildcard field {} isn't supported",
+                // go_quote_bytes: display-only quoting (Go %q over raw bytes).
+                crate::stream_filter::go_quote_bytes(&step.field)
+            ));
         }
     }
 
@@ -270,12 +276,14 @@ pub(crate) fn parse_pattern_steps(s: &str) -> Result<Vec<PatternStep>, String> {
     // extract options part from fields
     for step in &mut steps {
         let field = std::mem::take(&mut step.field);
-        let mut fs: &str = &field;
+        // Pattern text is a &str slice, so the field bytes are valid UTF-8.
+        let mut fs: &str = std::str::from_utf8(&field)
+            .expect("BUG: pattern fields come from the pattern text, which is valid UTF-8");
         if let Some(n) = fs.find(':') {
             step.field_opt = fs[..n].trim().to_string();
             fs = &fs[n + 1..];
         }
-        step.field = fs.trim().to_string();
+        step.field = fs.trim().as_bytes().to_vec();
     }
 
     Ok(steps)
@@ -309,7 +317,7 @@ fn parse_pattern_steps_internal(s: &str) -> Result<Vec<PatternStep>, String> {
         }
         steps.push(PatternStep {
             prefix: prefix.as_bytes().to_vec(),
-            field: field.to_string(),
+            field: field.as_bytes().to_vec(),
             field_opt: String::new(),
         });
         if s.is_empty() {
@@ -950,7 +958,7 @@ mod tests {
         fn step(prefix: &str, field: &str, field_opt: &str) -> PatternStep {
             PatternStep {
                 prefix: prefix.as_bytes().to_vec(),
-                field: field.to_string(),
+                field: field.as_bytes().to_vec(),
                 field_opt: field_opt.to_string(),
             }
         }

@@ -45,7 +45,7 @@ pub(crate) struct PipeFormat {
     format_str: String,
     steps: Vec<PatternStep>,
 
-    result_field: String,
+    result_field: Vec<u8>,
 
     keep_original_fields: bool,
     skip_empty_results: bool,
@@ -61,7 +61,7 @@ impl PipeFormat {
     /// raw pattern; `result_field` is the `as ...` target (`"_msg"` by default).
     pub(crate) fn new(
         format_str: impl Into<String>,
-        result_field: impl Into<String>,
+        result_field: impl Into<Vec<u8>>,
         keep_original_fields: bool,
         skip_empty_results: bool,
         iff: Option<Arc<IfFilter>>,
@@ -142,7 +142,9 @@ impl Pipe for PipeFormat {
         s.push_str(&quote_token_if_needed(&self.format_str));
         if !is_msg_field_name(&self.result_field) {
             s.push_str(" as ");
-            s.push_str(&quote_token_if_needed(&self.result_field));
+            s.push_str(&crate::parser::quote_token_bytes_if_needed(
+                &self.result_field,
+            ));
         }
         if self.keep_original_fields {
             s.push_str(" keep_original_fields");
@@ -158,7 +160,7 @@ impl Pipe for PipeFormat {
     }
 
     fn can_return_last_n_results(&self) -> bool {
-        self.result_field != "_time"
+        self.result_field != b"_time"
     }
 
     fn stats_labels_tail_op(&self) -> Option<crate::pipe::StatsTailOp> {
@@ -216,7 +218,7 @@ impl Pipe for PipeFormat {
 
 struct PipeFormatProcessor {
     steps: Vec<PatternStep>,
-    result_field: String,
+    result_field: Vec<u8>,
     keep_original_fields: bool,
     skip_empty_results: bool,
     iff: Option<Arc<IfFilter>>,
@@ -250,7 +252,7 @@ impl PipeProcessor for PipeFormatProcessor {
             }
         }
 
-        shard.rc.name = self.result_field.clone().into_bytes();
+        shard.rc.name = self.result_field.clone();
 
         let result_column = br.get_column_by_name(&self.result_field);
         for row_idx in 0..br.rows_len() {

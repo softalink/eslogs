@@ -65,14 +65,14 @@ use crate::values_encoder::{
 pub struct PipeStatsFunc {
     f: Box<dyn StatsFunc>,
     iff: Option<Box<dyn Filter>>,
-    result_name: String,
+    result_name: Vec<u8>,
 }
 
 /// Builds a [`PipeStatsFunc`] (Go `pipeStatsFunc` literal).
 pub(crate) fn new_pipe_stats_func(
     f: Box<dyn StatsFunc>,
     iff: Option<Box<dyn Filter>>,
-    result_name: String,
+    result_name: Vec<u8>,
 ) -> PipeStatsFunc {
     PipeStatsFunc {
         f,
@@ -146,7 +146,7 @@ impl PipeStats {
     /// step and returns true (Go `pipeStats.initRateFuncsFromTimeBucket`).
     fn init_rate_funcs_from_time_bucket(&mut self) -> bool {
         let bucket = self.by_fields.iter().find_map(|bf| {
-            if bf.name == "_time" && bf.bucket_size > 0.0 {
+            if bf.name == b"_time" && bf.bucket_size > 0.0 {
                 Some(bf.bucket_size as i64)
             } else {
                 None
@@ -166,9 +166,9 @@ impl PipeStats {
 /// `by (name)` case).
 // Ported for Go parity; not yet wired into a caller (see PARITY.md).
 #[allow(dead_code)]
-pub(crate) fn new_by_stats_field(name: &str) -> ByStatsField {
+pub(crate) fn new_by_stats_field(name: &[u8]) -> ByStatsField {
     ByStatsField {
-        name: name.to_string(),
+        name: name.to_vec(),
         bucket_size_str: String::new(),
         bucket_size: 0.0,
         bucket_offset_str: String::new(),
@@ -181,7 +181,9 @@ fn has_bucket_config(bf: &ByStatsField) -> bool {
 }
 
 fn by_stats_field_to_string(bf: &ByStatsField) -> String {
-    let mut s = bf.name.clone();
+    // Go byStatsField.String(): quoteTokenIfNeeded(bf.name) (raw-byte names
+    // quote with Go strconv.Quote byte semantics).
+    let mut s = crate::parser::quote_token_bytes_if_needed(&bf.name);
     if !bf.bucket_size_str.is_empty() {
         s += ":";
         s += &bf.bucket_size_str;
@@ -202,23 +204,25 @@ pub(crate) fn new_pipe_stats(
     if funcs.is_empty() {
         return Err("'stats' pipe must contain at least a single entry".to_string());
     }
-    let mut seen_result_names: HashMap<&str, ()> = HashMap::new();
+    let mut seen_result_names: HashMap<&[u8], ()> = HashMap::new();
     for f in &funcs {
         if let Some(bf) = by_fields.iter().find(|bf| bf.name == f.result_name) {
             return Err(format!(
-                "the {:?} is used as 'by' field [{}], so it cannot be used as result name for [{}]",
-                f.result_name,
+                "the {} is used as 'by' field [{}], so it cannot be used as result name for [{}]",
+                // go_quote_bytes: display-only quoting of a raw-byte name in
+                // the error message (Go %q over raw bytes).
+                crate::stream_filter::go_quote_bytes(&f.result_name),
                 by_stats_field_to_string(bf),
                 f.f.to_string()
             ));
         }
         if seen_result_names
-            .insert(f.result_name.as_str(), ())
+            .insert(f.result_name.as_slice(), ())
             .is_some()
         {
             return Err(format!(
-                "cannot use identical result name {:?} for [{}]",
-                f.result_name,
+                "cannot use identical result name {} for [{}]",
+                crate::stream_filter::go_quote_bytes(&f.result_name),
                 f.f.to_string()
             ));
         }
@@ -255,7 +259,7 @@ impl Pipe for PipeStats {
                 .iter()
                 .map(|f| {
                     let result_name_quoted =
-                        crate::stream_filter::quote_token_if_needed(&f.result_name);
+                        crate::parser::quote_token_bytes_if_needed(&f.result_name);
                     format!("import_state({result_name_quoted}) as {result_name_quoted}")
                 })
                 .collect()
@@ -269,7 +273,7 @@ impl Pipe for PipeStats {
                         fs += &format!(" if ({})", iff.to_string());
                     }
                     fs += " as ";
-                    fs += &crate::stream_filter::quote_token_if_needed(&f.result_name);
+                    fs += &crate::parser::quote_token_bytes_if_needed(&f.result_name);
                     fs
                 })
                 .collect()
@@ -422,7 +426,7 @@ impl Pipe for PipeStats {
 
         // add step to byFields
         let mut bf = ByStatsField {
-            name: "_time".to_string(),
+            name: b"_time".to_vec(),
             bucket_size_str: format!("{step}"),
             bucket_size: step as f64,
             ..ByStatsField::default()
@@ -435,7 +439,7 @@ impl Pipe for PipeStats {
         let mut dst_fields = Vec::with_capacity(self.by_fields.len() + 1);
         dst_fields.push(bf);
         for f in self.by_fields.iter() {
-            if f.name != "_time" {
+            if f.name != b"_time" {
                 dst_fields.push(f.clone());
             }
         }
@@ -450,7 +454,7 @@ impl Pipe for PipeStats {
     }
 
     /// Port of Go `pipeStats.resultFields`.
-    fn fixed_result_fields(&self) -> Option<Vec<String>> {
+    fn fixed_result_fields(&self) -> Option<Vec<Vec<u8>>> {
         let mut field_names = Vec::with_capacity(self.by_fields.len() + self.funcs.len());
         for bf in self.by_fields.iter() {
             field_names.push(bf.name.clone());
@@ -966,13 +970,13 @@ impl PipeStatsProcessor {
         let mut rcs: Vec<ResultColumn> = Vec::with_capacity(ncols);
         for bf in self.by_fields.iter() {
             rcs.push(ResultColumn {
-                name: bf.name.clone().into_bytes(),
+                name: bf.name.clone(),
                 values: Vec::new(),
             });
         }
         for f in funcs.iter() {
             rcs.push(ResultColumn {
-                name: f.result_name.clone().into_bytes(),
+                name: f.result_name.clone(),
                 values: Vec::new(),
             });
         }
@@ -1132,9 +1136,9 @@ mod tests {
 
     fn count_func(name: &str) -> PipeStatsFunc {
         new_pipe_stats_func(
-            Box::new(new_stats_count(vec!["*".to_string()])),
+            Box::new(new_stats_count(vec![b"*".to_vec()])),
             None,
-            name.to_string(),
+            name.as_bytes().to_vec(),
         )
     }
 
@@ -1144,7 +1148,7 @@ mod tests {
     #[test]
     fn test_stats_state_size_budget_exhausted_errors_on_flush() {
         let processor = PipeStatsProcessor {
-            by_fields: Arc::new(vec![new_by_stats_field("host")]),
+            by_fields: Arc::new(vec![new_by_stats_field(b"host")]),
             funcs: Arc::new(vec![count_func("cnt")]),
             mode: PipeStatsMode::Default,
             stop: Arc::new(AtomicBool::new(false)),
@@ -1187,7 +1191,7 @@ mod tests {
             vec![new_pipe_stats_func(
                 Box::new(crate::stats_rate::new_stats_rate()),
                 None,
-                "r".to_string(),
+                b"r".to_vec(),
             )],
         )
         .unwrap();
@@ -1208,7 +1212,7 @@ mod tests {
     // yields rate = 4 / 2 = 2, ignoring the passed 4s step.
     #[test]
     fn test_stats_rate_step_from_time_bucket() {
-        let mut time_bucket = new_by_stats_field("_time");
+        let mut time_bucket = new_by_stats_field(b"_time");
         time_bucket.bucket_size_str = "2000000000".to_string();
         time_bucket.bucket_size = 2_000_000_000.0;
         let mut ps = new_pipe_stats(
@@ -1216,7 +1220,7 @@ mod tests {
             vec![new_pipe_stats_func(
                 Box::new(crate::stats_rate::new_stats_rate()),
                 None,
-                "r".to_string(),
+                b"r".to_vec(),
             )],
         )
         .unwrap();
@@ -1248,7 +1252,8 @@ mod tests {
 
     #[test]
     fn test_stats_count_by_single_field() {
-        let ps = new_pipe_stats(vec![new_by_stats_field("host")], vec![count_func("cnt")]).unwrap();
+        let ps =
+            new_pipe_stats(vec![new_by_stats_field(b"host")], vec![count_func("cnt")]).unwrap();
         let blocks = vec![vec![
             vec![field("host", "a"), field("x", "1")],
             vec![field("host", "b"), field("x", "2")],
@@ -1267,11 +1272,11 @@ mod tests {
     #[test]
     fn test_stats_sum_by_two_fields() {
         let ps = new_pipe_stats(
-            vec![new_by_stats_field("k1"), new_by_stats_field("k2")],
+            vec![new_by_stats_field(b"k1"), new_by_stats_field(b"k2")],
             vec![new_pipe_stats_func(
-                Box::new(new_stats_sum(vec!["v".to_string()])),
+                Box::new(new_stats_sum(vec![b"v".to_vec()])),
                 None,
-                "s".to_string(),
+                b"s".to_vec(),
             )],
         )
         .unwrap();
@@ -1302,7 +1307,7 @@ mod tests {
     #[test]
     fn test_stats_numeric_grouping_merges_across_workers() {
         // Two workers each see the same numeric key; flush must merge them.
-        let ps = new_pipe_stats(vec![new_by_stats_field("n")], vec![count_func("c")]).unwrap();
+        let ps = new_pipe_stats(vec![new_by_stats_field(b"n")], vec![count_func("c")]).unwrap();
         let sink = Collector::new();
         let stop = Arc::new(AtomicBool::new(false));
         let pp = pipe_new(&ps, 2, stop, sink.clone());
@@ -1330,7 +1335,8 @@ mod tests {
 
     #[test]
     fn test_stats_to_string() {
-        let ps = new_pipe_stats(vec![new_by_stats_field("host")], vec![count_func("cnt")]).unwrap();
+        let ps =
+            new_pipe_stats(vec![new_by_stats_field(b"host")], vec![count_func("cnt")]).unwrap();
         assert_eq!(ps.to_string(), "stats by (host) count(*) as cnt");
     }
 

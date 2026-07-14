@@ -39,7 +39,7 @@ use esl_common::encoding::{
 use esl_common::stringsutil::{json_string_bytes_append, less_natural};
 
 use crate::block_result::{BlockResult, ColRef};
-use crate::prefix_filter::{Filter, is_wildcard_filter, match_filters_bytes};
+use crate::prefix_filter::{Filter, is_wildcard_filter, match_filters};
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::stats_count_uniq::{SIZE_OF_STRING, field_names_string, need_stop};
 use crate::values_encoder::{
@@ -51,14 +51,14 @@ use crate::values_encoder::{
 // Shared helpers (also used by stats_values)
 // ---------------------------------------------------------------------------
 
-fn is_single_field(filters: &[String]) -> bool {
+fn is_single_field(filters: &[Vec<u8>]) -> bool {
     filters.len() == 1 && !is_wildcard_filter(&filters[0])
 }
 
 /// Returns the columns matching the given field filters (Go
 /// `getMatchingColumns`). Non-wildcard filters that match nothing get an empty
 /// column, matching Go's behavior.
-pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> Vec<ColRef> {
+pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[Vec<u8>]) -> Vec<ColRef> {
     if is_single_field(filters) {
         return vec![br.get_column_by_name(&filters[0])];
     }
@@ -66,7 +66,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
     let cols = br.get_columns();
     let mut dst: Vec<ColRef> = Vec::new();
     for &r in &cols {
-        if match_filters_bytes(filters, br.column_name(r)) {
+        if match_filters(filters, br.column_name(r)) {
             dst.push(r);
         }
     }
@@ -76,7 +76,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
         }
         let mut need_empty = true;
         for &r in &cols {
-            if br.column_name(r) == f.as_bytes() {
+            if br.column_name(r) == f.as_slice() {
                 need_empty = false;
                 break;
             }
@@ -241,14 +241,14 @@ fn is_likely_number(s: &str) -> bool {
 /// `uniq_values(fields...)` stats function (Go `statsUniqValues`).
 #[derive(Debug, Default, Clone)]
 pub struct StatsUniqValues {
-    pub(crate) field_filters: Vec<String>,
+    pub(crate) field_filters: Vec<Vec<u8>>,
     pub(crate) limit: u64,
 }
 
 impl StatsUniqValues {
     /// Constructs a `uniq_values` function (exposed for the future parser).
     #[allow(dead_code)] // consumed by the not-yet-ported stats parser.
-    pub(crate) fn new(field_filters: Vec<String>, limit: u64) -> Self {
+    pub(crate) fn new(field_filters: Vec<Vec<u8>>, limit: u64) -> Self {
         Self {
             field_filters,
             limit,
@@ -287,7 +287,7 @@ impl StatsFunc for StatsUniqValues {
 /// `statsUniqValuesProcessor`).
 #[derive(Debug, Default, PartialEq)]
 pub struct StatsUniqValuesProcessor {
-    pub(crate) field_filters: Vec<String>,
+    pub(crate) field_filters: Vec<Vec<u8>>,
     pub(crate) limit: u64,
     // PORT NOTE: retained for parity (the pipe sets it), but the sequential
     // set-union merge does not need it.

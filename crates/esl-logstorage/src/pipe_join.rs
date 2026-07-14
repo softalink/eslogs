@@ -28,7 +28,7 @@ use crate::stream_filter::quote_token_if_needed;
 /// `pipeJoin` implements `| join by (...) ...`.
 pub struct PipeJoin {
     /// Fields to join on (Go `byFields`).
-    pub(crate) by_fields: Vec<String>,
+    pub(crate) by_fields: Vec<Vec<u8>>,
 
     /// Opaque rendered text of the join subquery (Go `q.String()`), present only
     /// when the join uses a subquery rather than inline rows.
@@ -60,7 +60,7 @@ pub struct PipeJoin {
 /// `query_text` is set, the map is built by [`Pipe::init_join_map`] once
 /// `storage_search::init_subqueries` executes the subquery.
 pub(crate) fn new_pipe_join(
-    by_fields: Vec<String>,
+    by_fields: Vec<Vec<u8>>,
     rows: Option<Vec<Vec<Field>>>,
     query_text: Option<String>,
     is_inner: bool,
@@ -84,7 +84,7 @@ pub(crate) fn new_pipe_join(
 /// path, which needs no subquery execution).
 fn build_join_map(
     rows: &[Vec<Field>],
-    by_fields: &[String],
+    by_fields: &[Vec<u8>],
     prefix: &str,
 ) -> HashMap<Vec<u8>, Vec<Vec<Field>>> {
     let mut m: HashMap<Vec<u8>, Vec<Vec<Field>>> = HashMap::with_capacity(rows.len());
@@ -95,7 +95,7 @@ fn build_join_map(
         for bf in by_fields {
             let mut v: &[u8] = b"";
             for f in row {
-                if f.name == bf.as_bytes() {
+                if &f.name == bf {
                     v = &f.value;
                     break;
                 }
@@ -105,7 +105,7 @@ fn build_join_map(
 
         let mut fields: Vec<Field> = Vec::new();
         for f in row {
-            if !by_fields.iter().any(|bf| bf.as_bytes() == f.name) {
+            if !by_fields.iter().any(|bf| bf == &f.name) {
                 let name = if prefix.is_empty() {
                     f.name.clone()
                 } else {
@@ -293,7 +293,7 @@ impl Pipe for PipeJoin {
 }
 
 struct PipeJoinProcessor {
-    by_fields: Vec<String>,
+    by_fields: Vec<Vec<u8>>,
     is_inner: bool,
     m: HashMap<Vec<u8>, Vec<Vec<Field>>>,
     stop: Arc<AtomicBool>,
@@ -328,7 +328,7 @@ impl PipeProcessor for PipeJoinProcessor {
             .iter()
             .map(|&c| {
                 let name = br.column_name(c);
-                self.by_fields.iter().position(|bf| bf.as_bytes() == name)
+                self.by_fields.iter().position(|bf| bf == name)
             })
             .collect();
 
@@ -524,7 +524,7 @@ mod tests {
 
     fn subquery_join(by_fields: &[&str], is_inner: bool) -> PipeJoin {
         new_pipe_join(
-            by_fields.iter().map(|s| s.to_string()).collect(),
+            by_fields.iter().map(|s| s.as_bytes().to_vec()).collect(),
             None,
             Some("abc".to_string()),
             is_inner,
@@ -566,7 +566,7 @@ mod tests {
         prefix: &str,
     ) -> PipeJoin {
         new_pipe_join(
-            by_fields.iter().map(|s| s.to_string()).collect(),
+            by_fields.iter().map(|s| s.as_bytes().to_vec()).collect(),
             Some(join_rows.to_vec()),
             None,
             is_inner,

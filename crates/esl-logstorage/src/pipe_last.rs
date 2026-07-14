@@ -13,7 +13,6 @@ use crate::pipe_sort::PipeSort;
 use crate::pipe_sort_topk::new_pipe_topk_processor;
 use crate::prefix_filter;
 use crate::stats_count::field_names_string;
-use crate::stream_filter::quote_token_if_needed;
 
 /// Renders the shared string representation of the `first`/`last` pipes.
 ///
@@ -45,10 +44,13 @@ pub(crate) fn pipe_last_first_string(ps: &PipeSort) -> String {
 
 /// PORT NOTE: Go's `rankFieldNameString` lives in `pipe_top.go`, which is not
 /// ported yet; local copy until that module lands (matching `pipe_sort.rs`).
-fn rank_field_name_string(rank_field_name: &str) -> String {
+fn rank_field_name_string(rank_field_name: &[u8]) -> String {
     let mut s = String::from(" rank");
-    if rank_field_name != "rank" {
-        s += &format!(" as {}", quote_token_if_needed(rank_field_name));
+    if rank_field_name != b"rank" {
+        s += &format!(
+            " as {}",
+            crate::parser::quote_token_bytes_if_needed(rank_field_name)
+        );
     }
     s
 }
@@ -125,7 +127,7 @@ mod tests {
             0,
             limit,
             rank.to_string(),
-            partition.iter().map(|s| s.to_string()).collect(),
+            partition.iter().map(|s| s.as_bytes().to_vec()).collect(),
         )
     }
 

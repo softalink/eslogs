@@ -63,7 +63,6 @@ use crate::consts::{
 };
 use crate::encoding::StringsBlockUnmarshaler;
 use crate::filter::Filter;
-use crate::log_rows::get_canonical_field_name;
 use crate::part::Part;
 use crate::prefix_filter;
 use crate::query_stats::QueryStats;
@@ -287,14 +286,9 @@ impl<'a> BlockSearch<'a> {
     }
 
     /// Returns true if the given field name must be hidden during the query.
-    pub fn is_hidden_field(&self, name: &str) -> bool {
+    /// Names are raw bytes; the comparison is byte-wise like Go.
+    pub fn is_hidden_field(&self, name: &[u8]) -> bool {
         self.pso.hidden_fields_filter.match_string(name)
-    }
-
-    /// Byte-name variant of [`Self::is_hidden_field`] for raw `Field.name`
-    /// bytes (the filter patterns are query text; comparison is byte-wise).
-    pub fn is_hidden_field_bytes(&self, name: &[u8]) -> bool {
-        self.pso.hidden_fields_filter.match_string_bytes(name)
     }
 
     /// Returns the value of the const column with the given name, or an empty
@@ -303,8 +297,8 @@ impl<'a> BlockSearch<'a> {
     /// PORT NOTE: Go returns a `string` view into `ccsCache`; the port returns
     /// owned bytes so callers do not hold a borrow of `self` across other
     /// accessor calls (values are raw bytes; Go strings are arbitrary bytes).
-    pub fn get_const_column_value(&mut self, name: &str) -> Vec<u8> {
-        let name = get_canonical_field_name(name);
+    pub fn get_const_column_value(&mut self, name: &[u8]) -> Vec<u8> {
+        let name = crate::log_rows::get_canonical_field_name_bytes(name);
         if self.is_hidden_field(name) {
             return Vec::new();
         }
@@ -312,7 +306,7 @@ impl<'a> BlockSearch<'a> {
         if self.part_format_version() < 1 {
             let csh = self.get_columns_header();
             for cc in &csh.const_columns {
-                if cc.name == name.as_bytes() {
+                if cc.name == name {
                     return cc.value.clone();
                 }
             }
@@ -325,7 +319,7 @@ impl<'a> BlockSearch<'a> {
         };
 
         for cc in &self.ccs_cache {
-            if cc.name == name.as_bytes() {
+            if cc.name == name {
                 return cc.value.clone();
             }
         }
@@ -373,16 +367,11 @@ impl<'a> BlockSearch<'a> {
     }
 
     /// Returns the column header for the given name, or `None` when the column
-    /// is absent or hidden.
-    pub fn get_column_header(&mut self, name: &str) -> Option<&ColumnHeader> {
-        self.get_column_header_bytes(name.as_bytes())
-    }
-
-    /// Byte-name variant of [`Self::get_column_header`] for raw `Field.name`
-    /// bytes (Go strings are arbitrary bytes).
-    pub fn get_column_header_bytes(&mut self, name: &[u8]) -> Option<&ColumnHeader> {
+    /// is absent or hidden. Names are raw bytes (Go strings are arbitrary
+    /// bytes).
+    pub fn get_column_header(&mut self, name: &[u8]) -> Option<&ColumnHeader> {
         let name = crate::log_rows::get_canonical_field_name_bytes(name);
-        if self.is_hidden_field_bytes(name) {
+        if self.is_hidden_field(name) {
             return None;
         }
 
@@ -391,7 +380,7 @@ impl<'a> BlockSearch<'a> {
             return csh.column_headers.iter().find(|ch| ch.name == name);
         }
 
-        let column_name_id = self.get_column_name_id_bytes(name)?;
+        let column_name_id = self.get_column_name_id(name)?;
 
         if let Some(pos) = self.chs_cache.iter().position(|ch| ch.name == name) {
             return Some(&self.chs_cache[pos]);
@@ -440,13 +429,8 @@ impl<'a> BlockSearch<'a> {
         self.chs_cache.last().map(|b| b.as_ref())
     }
 
-    /// Returns the internal id for the given column name.
-    pub fn get_column_name_id(&self, name: &str) -> Option<u64> {
-        self.get_column_name_id_bytes(name.as_bytes())
-    }
-
-    /// Byte-name variant of [`Self::get_column_name_id`].
-    pub fn get_column_name_id_bytes(&self, name: &[u8]) -> Option<u64> {
+    /// Returns the internal id for the given column name (raw bytes).
+    pub fn get_column_name_id(&self, name: &[u8]) -> Option<u64> {
         self.p.column_name_ids.get(name).copied()
     }
 

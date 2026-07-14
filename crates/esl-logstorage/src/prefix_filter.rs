@@ -1,6 +1,12 @@
 //! Port of `lib/prefixfilter/filter.go` from EsLogs v1.51.0.
 //!
 //! Filtering by full strings and by prefixes ending with '*'.
+//!
+//! PORT NOTE: Go strings are raw bytes and every comparison here is byte-wise
+//! (`strings.HasPrefix`/`==`), so the port stores filters as `Vec<u8>` and the
+//! public API accepts any byte-like input (`impl AsRef<[u8]>`), letting both
+//! `&str` literals and raw `Field.name` bytes flow through one byte-native
+//! surface.
 
 use std::fmt;
 
@@ -24,7 +30,7 @@ impl Filter {
     /// Returns the list of allow strings if there are no wildcard filters in the allow list.
     ///
     /// It returns `None` if there are wildcard filters.
-    pub fn get_allow_strings(&self) -> Option<&[String]> {
+    pub fn get_allow_strings(&self) -> Option<&[Vec<u8>]> {
         if self.allow.wildcards.is_empty() {
             return Some(&self.allow.full_strings);
         }
@@ -32,12 +38,12 @@ impl Filter {
     }
 
     /// Returns allow filters from the filter.
-    pub fn get_allow_filters(&self) -> Vec<String> {
+    pub fn get_allow_filters(&self) -> Vec<Vec<u8>> {
         self.allow.get_filters()
     }
 
     /// Returns deny filters from the filter.
-    pub fn get_deny_filters(&self) -> Vec<String> {
+    pub fn get_deny_filters(&self) -> Vec<Vec<u8>> {
         self.deny.get_filters()
     }
 
@@ -59,7 +65,8 @@ impl Filter {
     /// s may be either a regular string or a wildcard ending with '*'.
     /// If s is a wildcard, then true is returned if at least a single string
     /// matching this wildcard matches the filter.
-    pub fn match_string_or_wildcard(&self, s: &str) -> bool {
+    pub fn match_string_or_wildcard(&self, s: impl AsRef<[u8]>) -> bool {
+        let s = s.as_ref();
         if !is_wildcard_filter(s) {
             return self.match_string(s);
         }
@@ -76,21 +83,12 @@ impl Filter {
     /// PORT NOTE: Go's `MatchString` returns false for a nil `*Filter`
     /// receiver; Rust callers holding an `Option<&Filter>` map `None` to
     /// false at the call site instead.
-    pub fn match_string(&self, s: &str) -> bool {
+    pub fn match_string(&self, s: impl AsRef<[u8]>) -> bool {
+        let s = s.as_ref();
         if !self.allow.match_string(s) {
             return false;
         }
         !self.deny.match_string(s)
-    }
-
-    /// Byte-name variant of [`Filter::match_string`] for raw `Field.name`
-    /// bytes: the filter patterns are query text (valid UTF-8), and the
-    /// comparison is byte-wise, matching Go's raw-byte string comparison.
-    pub fn match_string_bytes(&self, s: &[u8]) -> bool {
-        if !self.allow.match_string_bytes(s) {
-            return false;
-        }
-        !self.deny.match_string_bytes(s)
     }
 
     fn normalize(&mut self) {
@@ -103,7 +101,7 @@ impl Filter {
     ///
     /// Every filter may end with '*'. In this case it matches all the strings
     /// starting with the prefix before '*'.
-    pub fn add_allow_filters<S: AsRef<str>>(&mut self, filters: &[S]) {
+    pub fn add_allow_filters<S: AsRef<[u8]>>(&mut self, filters: &[S]) {
         for filter in filters {
             self.add_allow_filter(filter.as_ref());
         }
@@ -113,7 +111,8 @@ impl Filter {
     ///
     /// The filter may end with '*'. In this case it matches all the strings
     /// starting with the prefix before '*'.
-    pub fn add_allow_filter(&mut self, filter: &str) {
+    pub fn add_allow_filter(&mut self, filter: impl AsRef<[u8]>) {
+        let filter = filter.as_ref();
         self.allow.add_filter(filter);
         self.deny.remove_filter(filter, true);
 
@@ -124,7 +123,7 @@ impl Filter {
     ///
     /// Every filter may end with '*'. In this case it stops matching all the
     /// strings starting with the prefix before '*'.
-    pub fn add_deny_filters<S: AsRef<str>>(&mut self, filters: &[S]) {
+    pub fn add_deny_filters<S: AsRef<[u8]>>(&mut self, filters: &[S]) {
         for filter in filters {
             self.add_deny_filter(filter.as_ref());
         }
@@ -134,7 +133,8 @@ impl Filter {
     ///
     /// Every filter may end with '*'. In this case it stops matching all the
     /// strings starting with the prefix before '*'.
-    pub fn add_deny_filter(&mut self, filter: &str) {
+    pub fn add_deny_filter(&mut self, filter: impl AsRef<[u8]>) {
+        let filter = filter.as_ref();
         if !self.match_string_or_wildcard(filter) {
             // Nothing to deny.
             return;
@@ -162,20 +162,20 @@ impl fmt::Display for Filter {
     }
 }
 
-// Go `joinQuotedStrings`: quotes via strconv.Quote (`go_quote`), so
-// non-ASCII/control characters render exactly like Go.
-fn join_quoted_strings(a: &[String]) -> String {
+// Go `joinQuotedStrings`: quotes via strconv.Quote (`go_quote_bytes`), so
+// non-ASCII/control/invalid-UTF-8 bytes render exactly like Go.
+fn join_quoted_strings(a: &[Vec<u8>]) -> String {
     let tmp: Vec<String> = a
         .iter()
-        .map(|s| crate::stream_filter::go_quote(s))
+        .map(|s| crate::stream_filter::go_quote_bytes(s))
         .collect();
     tmp.join(",")
 }
 
 #[derive(Clone, Debug, Default)]
 struct InnerFilter {
-    full_strings: Vec<String>,
-    wildcards: Vec<String>,
+    full_strings: Vec<Vec<u8>>,
+    wildcards: Vec<Vec<u8>>,
 }
 
 impl InnerFilter {
@@ -184,24 +184,26 @@ impl InnerFilter {
         self.wildcards.clear();
     }
 
-    fn get_filters(&self) -> Vec<String> {
+    fn get_filters(&self) -> Vec<Vec<u8>> {
         let mut filters = self.full_strings.clone();
         for wc in &self.wildcards {
-            filters.push(format!("{wc}*"));
+            let mut f = wc.clone();
+            f.push(b'*');
+            filters.push(f);
         }
         filters.sort();
         filters
     }
 
     fn match_all(&self) -> bool {
-        self.wildcards.iter().any(String::is_empty)
+        self.wildcards.iter().any(|wc| wc.is_empty())
     }
 
     fn match_nothing(&self) -> bool {
         self.full_strings.is_empty() && self.wildcards.is_empty()
     }
 
-    fn add_filter(&mut self, filter: &str) {
+    fn add_filter(&mut self, filter: &[u8]) {
         if !is_wildcard_filter(filter) {
             self.add_full_string(filter);
             return;
@@ -211,14 +213,14 @@ impl InnerFilter {
         self.add_wildcard(wildcard);
     }
 
-    fn add_wildcard(&mut self, wildcard: &str) {
+    fn add_wildcard(&mut self, wildcard: &[u8]) {
         if !self.match_wildcard(wildcard) {
             self.drop_wildcard(wildcard);
-            self.wildcards.push(wildcard.to_string());
+            self.wildcards.push(wildcard.to_vec());
         }
     }
 
-    fn remove_filter(&mut self, filter: &str, remove_broader_wildcards: bool) {
+    fn remove_filter(&mut self, filter: &[u8], remove_broader_wildcards: bool) {
         if !is_wildcard_filter(filter) {
             self.remove_full_string(filter);
         } else {
@@ -227,12 +229,12 @@ impl InnerFilter {
         }
 
         if remove_broader_wildcards {
-            let s = filter.strip_suffix('*').unwrap_or(filter);
-            self.wildcards.retain(|wc| !s.starts_with(wc.as_str()));
+            let s = filter.strip_suffix(b"*").unwrap_or(filter);
+            self.wildcards.retain(|wc| !s.starts_with(wc.as_slice()));
         }
     }
 
-    fn drop_wildcard(&mut self, wildcard: &str) {
+    fn drop_wildcard(&mut self, wildcard: &[u8]) {
         // drop the wildcard together with weaker wildcards
         self.wildcards.retain(|wc| !wc.starts_with(wildcard));
 
@@ -240,17 +242,17 @@ impl InnerFilter {
         self.full_strings.retain(|s| !s.starts_with(wildcard));
     }
 
-    fn add_full_string(&mut self, s: &str) {
+    fn add_full_string(&mut self, s: &[u8]) {
         if !self.match_string(s) {
-            self.full_strings.push(s.to_string());
+            self.full_strings.push(s.to_vec());
         }
     }
 
-    fn remove_full_string(&mut self, s: &str) {
+    fn remove_full_string(&mut self, s: &[u8]) {
         self.full_strings.retain(|x| x != s);
     }
 
-    fn match_string(&self, s: &str) -> bool {
+    fn match_string(&self, s: &[u8]) -> bool {
         if self.match_nothing() {
             // Fast path for common case when there are no filters.
             return false;
@@ -263,9 +265,9 @@ impl InnerFilter {
         self.full_strings.iter().any(|x| x == s)
     }
 
-    fn match_wildcard_filter(&self, wildcard: &str) -> bool {
+    fn match_wildcard_filter(&self, wildcard: &[u8]) -> bool {
         for wc in &self.wildcards {
-            if wildcard.starts_with(wc.as_str()) || wc.starts_with(wildcard) {
+            if wildcard.starts_with(wc.as_slice()) || wc.starts_with(wildcard) {
                 return true;
             }
         }
@@ -277,35 +279,22 @@ impl InnerFilter {
         false
     }
 
-    fn match_wildcard(&self, wildcard: &str) -> bool {
+    fn match_wildcard(&self, wildcard: &[u8]) -> bool {
         self.wildcards
             .iter()
-            .any(|wc| wildcard.starts_with(wc.as_str()))
-    }
-
-    /// Byte variant of [`InnerFilter::match_string`] (see
-    /// [`Filter::match_string_bytes`]).
-    fn match_string_bytes(&self, s: &[u8]) -> bool {
-        if self.match_nothing() {
-            // Fast path for common case when there are no filters.
-            return false;
-        }
-
-        // Slower path for regular case.
-        if self.wildcards.iter().any(|wc| s.starts_with(wc.as_bytes())) {
-            return true;
-        }
-        self.full_strings.iter().any(|x| x.as_bytes() == s)
+            .any(|wc| wildcard.starts_with(wc.as_slice()))
     }
 }
 
 /// Returns true if the filter ends with '*', e.g. it matches any string containing the prefix in front of '*'.
-pub fn is_wildcard_filter(filter: &str) -> bool {
-    filter.ends_with('*')
+pub fn is_wildcard_filter(filter: impl AsRef<[u8]>) -> bool {
+    filter.as_ref().last() == Some(&b'*')
 }
 
 /// Returns true if s matches filter.
-pub fn match_filter(filter: &str, s: &str) -> bool {
+pub fn match_filter(filter: impl AsRef<[u8]>, s: impl AsRef<[u8]>) -> bool {
+    let filter = filter.as_ref();
+    let s = s.as_ref();
     if !is_wildcard_filter(filter) {
         return filter == s;
     }
@@ -313,49 +302,33 @@ pub fn match_filter(filter: &str, s: &str) -> bool {
     s.starts_with(wildcard)
 }
 
-/// Byte-name variant of [`match_filter`] for raw `Field.name` bytes (the
-/// filter is query text; comparison is byte-wise like Go).
-pub fn match_filter_bytes(filter: &str, s: &[u8]) -> bool {
-    if !is_wildcard_filter(filter) {
-        return filter.as_bytes() == s;
-    }
-    let wildcard = &filter[..filter.len() - 1];
-    s.starts_with(wildcard.as_bytes())
-}
-
 /// Returns true if s matches any filter from filters.
-pub fn match_filters<S: AsRef<str>>(filters: &[S], s: &str) -> bool {
-    filters
-        .iter()
-        .any(|filter| match_filter(filter.as_ref(), s))
-}
-
-/// Byte-name variant of [`match_filters`] (see [`match_filter_bytes`]).
-pub fn match_filters_bytes<S: AsRef<str>>(filters: &[S], s: &[u8]) -> bool {
-    filters
-        .iter()
-        .any(|filter| match_filter_bytes(filter.as_ref(), s))
+pub fn match_filters<S: AsRef<[u8]>>(filters: &[S], s: impl AsRef<[u8]>) -> bool {
+    let s = s.as_ref();
+    filters.iter().any(|filter| match_filter(filter, s))
 }
 
 /// Returns true if filters match any string.
-pub fn match_all<S: AsRef<str>>(filters: &[S]) -> bool {
-    filters.iter().any(|filter| filter.as_ref() == "*")
+pub fn match_all<S: AsRef<[u8]>>(filters: &[S]) -> bool {
+    filters.iter().any(|filter| filter.as_ref() == b"*")
 }
 
 /// Replaces `src_filter` prefix with `dst_filter` prefix at s and appends the result to dst.
 ///
 /// PORT NOTE: Go returns the (possibly reallocated) dst slice; Rust appends to
 /// the `Vec` in place, following the esl-common `marshal_*` convention.
-pub fn append_replace(dst: &mut Vec<u8>, src_filter: &str, dst_filter: &str, s: &str) {
-    append_replace_bytes(dst, src_filter, dst_filter, s.as_bytes());
-}
-
-/// Byte-name variant of [`append_replace`] for raw `Field.name` bytes (the
-/// filters are query text; the raw name bytes are preserved verbatim).
-pub fn append_replace_bytes(dst: &mut Vec<u8>, src_filter: &str, dst_filter: &str, s: &[u8]) {
+pub fn append_replace(
+    dst: &mut Vec<u8>,
+    src_filter: impl AsRef<[u8]>,
+    dst_filter: impl AsRef<[u8]>,
+    s: impl AsRef<[u8]>,
+) {
+    let src_filter = src_filter.as_ref();
+    let dst_filter = dst_filter.as_ref();
+    let s = s.as_ref();
     if !is_wildcard_filter(src_filter) {
-        if s == src_filter.as_bytes() {
-            dst.extend_from_slice(dst_filter.as_bytes());
+        if s == src_filter {
+            dst.extend_from_slice(dst_filter);
         } else {
             dst.extend_from_slice(s);
         }
@@ -363,18 +336,18 @@ pub fn append_replace_bytes(dst: &mut Vec<u8>, src_filter: &str, dst_filter: &st
     }
 
     let src_prefix = &src_filter[..src_filter.len() - 1];
-    if !s.starts_with(src_prefix.as_bytes()) {
+    if !s.starts_with(src_prefix) {
         dst.extend_from_slice(s);
         return;
     }
     if !is_wildcard_filter(dst_filter) {
-        dst.extend_from_slice(dst_filter.as_bytes());
+        dst.extend_from_slice(dst_filter);
         return;
     }
 
     let src_suffix = &s[src_prefix.len()..];
     let dst_prefix = &dst_filter[..dst_filter.len() - 1];
-    dst.extend_from_slice(dst_prefix.as_bytes());
+    dst.extend_from_slice(dst_prefix);
     dst.extend_from_slice(src_suffix);
 }
 
@@ -633,9 +606,11 @@ mod tests {
             f.add_allow_filters(allow);
             f.add_deny_filters(deny);
 
-            let result = f
-                .get_allow_strings()
-                .map(|ss| ss.iter().map(String::as_str).collect::<Vec<_>>());
+            let result = f.get_allow_strings().map(|ss| {
+                ss.iter()
+                    .map(|s| std::str::from_utf8(s).unwrap())
+                    .collect::<Vec<_>>()
+            });
             let expected = result_expected.map(<[&str]>::to_vec);
             assert_eq!(
                 result, expected,
@@ -660,6 +635,10 @@ mod tests {
             f.add_deny_filters(deny);
 
             let result = f.get_allow_filters();
+            let result: Vec<&str> = result
+                .iter()
+                .map(|s| std::str::from_utf8(s).unwrap())
+                .collect();
             assert_eq!(
                 result, result_expected,
                 "unexpected result; got\n{result:?}\nwant\n{result_expected:?}"
@@ -684,6 +663,10 @@ mod tests {
             f.add_deny_filters(deny);
 
             let result = f.get_deny_filters();
+            let result: Vec<&str> = result
+                .iter()
+                .map(|s| std::str::from_utf8(s).unwrap())
+                .collect();
             assert_eq!(
                 result, result_expected,
                 "unexpected result; got\n{result:?}\nwant\n{result_expected:?}"
@@ -845,7 +828,15 @@ mod tests {
             f.add_allow_filters(allow);
 
             let deny_result = f.get_deny_filters();
+            let deny_result: Vec<&str> = deny_result
+                .iter()
+                .map(|s| std::str::from_utf8(s).unwrap())
+                .collect();
             let allow_result = f.get_allow_filters();
+            let allow_result: Vec<&str> = allow_result
+                .iter()
+                .map(|s| std::str::from_utf8(s).unwrap())
+                .collect();
 
             assert_eq!(
                 deny_result, deny_expected,

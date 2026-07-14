@@ -56,7 +56,7 @@ pub(crate) struct FilterPhrase {
 }
 
 /// Builds a phrase filter for `field_name`.
-pub(crate) fn new_filter_phrase(field_name: &str, phrase: impl AsRef<[u8]>) -> FilterGeneric {
+pub(crate) fn new_filter_phrase(field_name: &[u8], phrase: impl AsRef<[u8]>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterPhrase {
@@ -87,7 +87,7 @@ impl FieldFilter for FilterPhrase {
         crate::stream_filter::quote_value_bytes_if_needed(&self.phrase)
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_phrase(v, &self.phrase)
     }
@@ -96,7 +96,7 @@ impl FieldFilter for FilterPhrase {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         apply_to_block_result_generic(br, bm, field_name, &self.phrase, |v, phrase| {
             match_phrase(v, phrase)
@@ -107,7 +107,7 @@ impl FieldFilter for FilterPhrase {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let phrase = self.phrase.clone();
 
@@ -463,7 +463,7 @@ pub(crate) fn to_timestamp_iso8601_string(part_path: &str, buf: &mut Vec<u8>, v:
 pub(crate) fn apply_to_block_result_generic<F>(
     br: &mut BlockResult,
     bm: &mut Bitmap,
-    field_name: &str,
+    field_name: &[u8],
     phrase: impl AsRef<[u8]>,
     match_func: F,
 ) where

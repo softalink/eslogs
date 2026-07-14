@@ -202,7 +202,7 @@ impl PipeTopkProcessor {
             let mut other_cols: Vec<(Vec<u8>, crate::block_result::ColRef)> = Vec::new();
             for &r in &cols {
                 let name = br.column_name(r).to_vec();
-                if by_fields.iter().any(|bf| bf.name.as_bytes() == name) {
+                if by_fields.iter().any(|bf| bf.name == name) {
                     continue;
                 }
                 other_cols.push((name, r));
@@ -554,10 +554,10 @@ impl PipeTopkProcessor {
 
             let mut names: Vec<Vec<u8>> = Vec::new();
             if has_rank {
-                names.push(ps.rank_field_name.clone().into_bytes());
+                names.push(ps.rank_field_name.clone());
             }
             for bf in &ps.by_fields {
-                names.push(bf.name.clone().into_bytes());
+                names.push(bf.name.clone());
             }
             for c in &r.other_columns {
                 names.push(c.name.clone());

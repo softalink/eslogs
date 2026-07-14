@@ -28,7 +28,7 @@ pub(crate) fn should_deny_overwritten_field(
 
 /// `| extract ...` pipe (Go `pipeExtract`).
 pub(crate) struct PipeExtract {
-    from_field: String,
+    from_field: Vec<u8>,
     ptn: Pattern,
     pattern_str: String,
     keep_original_fields: bool,
@@ -40,7 +40,7 @@ pub(crate) struct PipeExtract {
 /// `parsePipeExtract`; lexer parsing of the surrounding pipe is deferred).
 pub(crate) fn new_pipe_extract(
     pattern_str: &str,
-    from_field: impl Into<String>,
+    from_field: impl Into<Vec<u8>>,
     keep_original_fields: bool,
     skip_empty_results: bool,
     iff: Option<IfFilter>,
@@ -105,7 +105,10 @@ impl Pipe for PipeExtract {
         }
         s += &format!(" {}", quote_token_if_needed(&self.pattern_str));
         if !crate::filter_generic::is_msg_field_name(&self.from_field) {
-            s += &format!(" from {}", quote_token_if_needed(&self.from_field));
+            s += &format!(
+                " from {}",
+                crate::parser::quote_token_bytes_if_needed(&self.from_field)
+            );
         }
         if self.keep_original_fields {
             s += " keep_original_fields";
@@ -170,7 +173,7 @@ impl Pipe for PipeExtract {
 }
 
 struct PipeExtractProcessor {
-    from_field: String,
+    from_field: Vec<u8>,
     ptn: Pattern,
     keep_original_fields: bool,
     skip_empty_results: bool,

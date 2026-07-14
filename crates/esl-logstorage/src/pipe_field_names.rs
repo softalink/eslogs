@@ -18,7 +18,7 @@ use crate::values_encoder::marshal_uint64_string;
 /// See <https://docs.victoriametrics.com/victorialogs/logsql/#field_names-pipe>
 pub(crate) struct PipeFieldNames {
     /// Name of the column results are written to (defaults to `name`).
-    pub(crate) result_name: String,
+    pub(crate) result_name: Vec<u8>,
 
     /// If non-empty, only field names containing this substring are returned.
     pub(crate) filter: String,
@@ -35,7 +35,7 @@ pub(crate) struct PipeFieldNames {
 /// `is_first_pipe` is set later by the query optimizer
 /// ([`Pipe::mark_first_pipe`]), matching Go's `parsePipeFieldNames` which
 /// leaves it `false`.
-pub(crate) fn new_pipe_field_names(result_name: String, filter: String) -> PipeFieldNames {
+pub(crate) fn new_pipe_field_names(result_name: Vec<u8>, filter: String) -> PipeFieldNames {
     PipeFieldNames {
         result_name,
         filter,
@@ -51,17 +51,17 @@ impl Pipe for PipeFieldNames {
     fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
         let result_name_local = crate::pipe_field_values::get_unique_result_name(
             &self.result_name,
-            &["hits".to_string()],
+            &[b"hits".to_vec()],
         );
         let mut p_str = format!(
             "stats by ({}) sum(hits) as hits",
-            quote_token_if_needed(&result_name_local)
+            crate::parser::quote_token_bytes_if_needed(&result_name_local)
         );
         if result_name_local != self.result_name {
             p_str += &format!(
                 " | rename {} as {}",
-                quote_token_if_needed(&result_name_local),
-                quote_token_if_needed(&self.result_name)
+                crate::parser::quote_token_bytes_if_needed(&result_name_local),
+                crate::parser::quote_token_bytes_if_needed(&self.result_name)
             );
         }
         let ps_local = crate::pipe::must_parse_pipes(&p_str, timestamp);
@@ -79,8 +79,11 @@ impl Pipe for PipeFieldNames {
         if !self.filter.is_empty() {
             s += &format!(" filter {}", quote_token_if_needed(&self.filter));
         }
-        if self.result_name != "name" {
-            s += &format!(" as {}", quote_token_if_needed(&self.result_name));
+        if self.result_name != b"name" {
+            s += &format!(
+                " as {}",
+                crate::parser::quote_token_bytes_if_needed(&self.result_name)
+            );
         }
         s
     }
@@ -123,7 +126,7 @@ impl Pipe for PipeFieldNames {
 }
 
 struct PipeFieldNamesProcessor {
-    result_name: String,
+    result_name: Vec<u8>,
     filter: String,
     is_first_pipe: bool,
     stop: Arc<AtomicBool>,
@@ -229,9 +232,9 @@ struct PipeFieldNamesWriteContext<'a> {
 }
 
 impl<'a> PipeFieldNamesWriteContext<'a> {
-    fn new(result_name: &str, pp_next: &'a dyn PipeProcessor) -> Self {
+    fn new(result_name: &[u8], pp_next: &'a dyn PipeProcessor) -> Self {
         let mut rcs: [ResultColumn; 2] = Default::default();
-        rcs[0].name = result_name.as_bytes().to_vec();
+        rcs[0].name = result_name.to_vec();
         rcs[1].name = b"hits".to_vec();
         Self {
             pp_next,
@@ -283,7 +286,7 @@ mod tests {
     use super::*;
 
     fn pfn(result_name: &str, filter: &str) -> PipeFieldNames {
-        new_pipe_field_names(result_name.to_string(), filter.to_string())
+        new_pipe_field_names(result_name.as_bytes().to_vec(), filter.to_string())
     }
 
     #[test]

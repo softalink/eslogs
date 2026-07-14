@@ -38,10 +38,10 @@ pub(crate) struct PipeSplit {
     pub(crate) separator: String,
 
     /// Field to split.
-    pub(crate) src_field: String,
+    pub(crate) src_field: Vec<u8>,
 
     /// Field to store the split result.
-    pub(crate) dst_field: String,
+    pub(crate) dst_field: Vec<u8>,
 }
 
 impl PipeSplit {
@@ -51,8 +51,8 @@ impl PipeSplit {
     /// already-parsed separator/source/destination.
     pub(crate) fn new(
         separator: impl Into<String>,
-        src_field: impl Into<String>,
-        dst_field: impl Into<String>,
+        src_field: impl Into<Vec<u8>>,
+        dst_field: impl Into<Vec<u8>>,
     ) -> Self {
         Self {
             separator: separator.into(),
@@ -71,11 +71,17 @@ impl Pipe for PipeSplit {
 
     fn to_string(&self) -> String {
         let mut s = format!("split {}", quote_token_if_needed(&self.separator));
-        if self.src_field != "_msg" {
-            s += &format!(" from {}", quote_token_if_needed(&self.src_field));
+        if self.src_field != b"_msg" {
+            s += &format!(
+                " from {}",
+                crate::parser::quote_token_bytes_if_needed(&self.src_field)
+            );
         }
         if self.dst_field != self.src_field {
-            s += &format!(" as {}", quote_token_if_needed(&self.dst_field));
+            s += &format!(
+                " as {}",
+                crate::parser::quote_token_bytes_if_needed(&self.dst_field)
+            );
         }
         s
     }
@@ -85,7 +91,7 @@ impl Pipe for PipeSplit {
     }
 
     fn can_return_last_n_results(&self) -> bool {
-        self.dst_field != "_time"
+        self.dst_field != b"_time"
     }
 
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
@@ -112,8 +118,8 @@ impl Pipe for PipeSplit {
 
 struct PipeSplitProcessor {
     separator: String,
-    src_field: String,
-    dst_field: String,
+    src_field: Vec<u8>,
+    dst_field: Vec<u8>,
     pp_next: Arc<dyn PipeProcessor>,
 }
 
@@ -160,7 +166,7 @@ impl PipeProcessor for PipeSplitProcessor {
             dst_values.push(encoded.clone());
         }
         rcs.push(ResultColumn {
-            name: self.dst_field.clone().into_bytes(),
+            name: self.dst_field.clone(),
             values: dst_values,
         });
 
@@ -409,11 +415,11 @@ mod tests {
         assert_eq!(got_deny, exp_deny, "deny filters mismatch");
     }
 
-    fn csv(s: &str) -> Vec<String> {
+    fn csv(s: &str) -> Vec<Vec<u8>> {
         if s.is_empty() {
             return Vec::new();
         }
-        s.split(',').map(|x| x.to_string()).collect()
+        s.split(',').map(|x| x.as_bytes().to_vec()).collect()
     }
 
     #[derive(Default)]

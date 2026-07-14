@@ -8,22 +8,24 @@ use esl_common::encoding;
 use crate::block_result::BlockResult;
 use crate::prefix_filter::Filter;
 use crate::stats::{StatsFunc, StatsProcessor};
-use crate::stream_filter::quote_token_if_needed;
 
 /// `any(field)` stats function.
 pub struct StatsAny {
-    field_name: String,
+    field_name: Vec<u8>,
 }
 
 /// Builds a [`StatsAny`] for the given single field (Go `parseStatsAny`'s tail;
 /// the "exactly one arg" check lives in the not-yet-ported parser).
-pub(crate) fn new_stats_any(field_name: String) -> StatsAny {
+pub(crate) fn new_stats_any(field_name: Vec<u8>) -> StatsAny {
     StatsAny { field_name }
 }
 
 impl StatsFunc for StatsAny {
     fn to_string(&self) -> String {
-        format!("any({})", quote_token_if_needed(&self.field_name))
+        format!(
+            "any({})",
+            crate::parser::quote_token_bytes_if_needed(&self.field_name)
+        )
     }
 
     fn update_needed_fields(&self, pf: &mut Filter) {
@@ -41,7 +43,7 @@ impl StatsFunc for StatsAny {
 #[derive(Default, PartialEq, Debug)]
 pub(crate) struct StatsAnyProcessor {
     value: Vec<u8>,
-    field_name: String,
+    field_name: Vec<u8>,
 }
 
 impl StatsAnyProcessor {

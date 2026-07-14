@@ -10,14 +10,14 @@ use crate::bitmap::Bitmap;
 use crate::block_result::{BlockResult, ColRef, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::pipe_update::IfFilter;
-use crate::prefix_filter::{self, match_filters_bytes};
+use crate::prefix_filter::{self, match_filters};
 use crate::rows::Field;
 use crate::stats_count_uniq::field_names_string;
 use crate::stream_tags::{get_stream_tags, put_stream_tags};
 
 /// `pipeSetStreamFields` implements `| set_stream_fields ...`.
 pub struct PipeSetStreamFields {
-    pub(crate) stream_field_filters: Vec<String>,
+    pub(crate) stream_field_filters: Vec<Vec<u8>>,
 
     /// Optional filter for skipping setting stream fields.
     pub(crate) iff: Option<Arc<IfFilter>>,
@@ -29,7 +29,7 @@ pub struct PipeSetStreamFields {
 /// this constructor takes the parsed stream field filters and optional
 /// `if (...)` filter directly.
 pub(crate) fn new_pipe_set_stream_fields(
-    stream_field_filters: Vec<String>,
+    stream_field_filters: Vec<Vec<u8>>,
     iff: Option<Arc<IfFilter>>,
 ) -> PipeSetStreamFields {
     PipeSetStreamFields {
@@ -130,7 +130,7 @@ impl Pipe for PipeSetStreamFields {
 }
 
 struct PipeSetStreamFieldsProcessor {
-    stream_field_filters: Vec<String>,
+    stream_field_filters: Vec<Vec<u8>>,
     iff: Option<Arc<IfFilter>>,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<PipeSetStreamFieldsProcessorShard>>,
@@ -173,12 +173,12 @@ impl PipeProcessor for PipeSetStreamFieldsProcessor {
         let matching: Vec<(ColRef, Vec<u8>)> = cs
             .iter()
             .zip(names.iter())
-            .filter(|(_, name)| match_filters_bytes(&self.stream_field_filters, name))
+            .filter(|(_, name)| match_filters(&self.stream_field_filters, name))
             .map(|(&c, name)| (c, name.clone()))
             .collect();
 
-        let stream_column = br.get_column_by_name("_stream");
-        let stream_id_column = br.get_column_by_name("_stream_id");
+        let stream_column = br.get_column_by_name(b"_stream");
+        let stream_id_column = br.get_column_by_name(b"_stream_id");
 
         shard.rcs[0].name = b"_stream".to_vec();
         shard.rcs[1].name = b"_stream_id".to_vec();
@@ -273,18 +273,18 @@ mod tests {
     // LogsQL parser is ported.
 
     fn set_stream_fields(filters: &[&str], iff: Option<Arc<IfFilter>>) -> PipeSetStreamFields {
-        new_pipe_set_stream_fields(filters.iter().map(|s| s.to_string()).collect(), iff)
+        new_pipe_set_stream_fields(filters.iter().map(|s| s.as_bytes().to_vec()).collect(), iff)
     }
 
     fn exact_iff(field: &str, value: &str) -> Arc<IfFilter> {
-        let f: Arc<dyn Filter> = Arc::new(new_filter_exact(field, value));
+        let f: Arc<dyn Filter> = Arc::new(new_filter_exact(field.as_bytes(), value));
         Arc::new(IfFilter::new(f))
     }
 
     fn and_iff(pairs: &[(&str, &str)]) -> Arc<IfFilter> {
         let filters: Vec<Box<dyn Filter>> = pairs
             .iter()
-            .map(|(f, v)| Box::new(new_filter_exact(f, v)) as Box<dyn Filter>)
+            .map(|(f, v)| Box::new(new_filter_exact(f.as_bytes(), v)) as Box<dyn Filter>)
             .collect();
         let f: Arc<dyn Filter> = Arc::new(new_filter_and(filters));
         Arc::new(IfFilter::new(f))

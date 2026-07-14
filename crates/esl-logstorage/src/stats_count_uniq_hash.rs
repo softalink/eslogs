@@ -46,14 +46,14 @@ use crate::values_encoder::{
 /// `count_uniq_hash(fields...)` stats function (Go `statsCountUniqHash`).
 #[derive(Debug, Default, Clone)]
 pub struct StatsCountUniqHash {
-    pub(crate) fields: Vec<String>,
+    pub(crate) fields: Vec<Vec<u8>>,
     pub(crate) limit: u64,
 }
 
 impl StatsCountUniqHash {
     /// Constructs a `count_uniq_hash` function (exposed for the future parser).
     #[allow(dead_code)] // consumed by the not-yet-ported stats parser.
-    pub(crate) fn new(fields: Vec<String>, limit: u64) -> Self {
+    pub(crate) fn new(fields: Vec<Vec<u8>>, limit: u64) -> Self {
         Self { fields, limit }
     }
 }
@@ -170,7 +170,7 @@ fn shard_index_string_hash(h: u64, len: usize) -> usize {
 /// `statsCountUniqHashProcessor`).
 #[derive(Debug, Default)]
 pub struct StatsCountUniqHashProcessor {
-    pub(crate) fields: Vec<String>,
+    pub(crate) fields: Vec<Vec<u8>>,
     pub(crate) limit: u64,
     pub(crate) concurrency: usize,
     pub(crate) uniq_values: StatsCountUniqHashSet,
@@ -386,7 +386,7 @@ impl StatsCountUniqHashProcessor {
     fn update_stats_for_all_rows_single_column(
         &mut self,
         br: &mut BlockResult,
-        column_name: &str,
+        column_name: &[u8],
     ) -> i64 {
         let mut inc = 0i64;
         let r = br.get_column_by_name(column_name);
@@ -481,7 +481,7 @@ impl StatsCountUniqHashProcessor {
     fn update_stats_for_row_single_column(
         &mut self,
         br: &mut BlockResult,
-        column_name: &str,
+        column_name: &[u8],
         row_idx: usize,
     ) -> i64 {
         let r = br.get_column_by_name(column_name);

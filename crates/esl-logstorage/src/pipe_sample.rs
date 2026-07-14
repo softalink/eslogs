@@ -254,10 +254,10 @@ mod tests {
         assert_eq!(got_deny, exp_deny, "deny filters mismatch");
     }
 
-    fn csv(s: &str) -> Vec<String> {
+    fn csv(s: &str) -> Vec<Vec<u8>> {
         if s.is_empty() {
             return Vec::new();
         }
-        s.split(',').map(|x| x.to_string()).collect()
+        s.split(',').map(|x| x.as_bytes().to_vec()).collect()
     }
 }

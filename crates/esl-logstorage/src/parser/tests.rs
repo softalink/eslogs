@@ -618,7 +618,10 @@ fn test_query_get_stats_labels_add_grouping_by_time_success() {
             .unwrap_or_else(|e| {
                 panic!("unexpected error in get_stats_labels_add_grouping_by_time({q_str}): {e}")
             });
-        let fields_expected: Vec<String> = fields_expected.iter().map(|s| s.to_string()).collect();
+        let fields_expected: Vec<Vec<u8>> = fields_expected
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
         assert_eq!(
             fields, fields_expected,
             "unexpected labelFields for [{q_str}]"
@@ -1198,7 +1201,10 @@ fn test_query_get_stats_labels_success() {
         let fields = q
             .get_stats_labels()
             .unwrap_or_else(|e| panic!("unexpected error in get_stats_labels({q_str:?}): {e}"));
-        let fields_expected: Vec<String> = fields_expected.iter().map(|s| s.to_string()).collect();
+        let fields_expected: Vec<Vec<u8>> = fields_expected
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
         assert_eq!(
             fields, fields_expected,
             "unexpected labelFields for [{q_str}]"
@@ -1648,7 +1654,7 @@ fn test_query_add_count_by_time_pipe() {
     fn f(q_str: &str, step: i64, offset: i64, fields: &[&str], result_expected: &str) {
         let mut q = ParseQuery(q_str)
             .unwrap_or_else(|e| panic!("unexpected error when parsing [{q_str}]: {e}"));
-        let fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+        let fields: Vec<Vec<u8>> = fields.iter().map(|s| s.as_bytes().to_vec()).collect();
         q.add_count_by_time_pipe(step, offset, &fields);
 
         assert_eq!(
@@ -1826,7 +1832,10 @@ fn test_query_get_fixed_fields_success() {
         let result = q
             .get_fixed_fields()
             .unwrap_or_else(|| panic!("unexpected error in get_fixed_fields() for [{q_str}]"));
-        let result_expected: Vec<String> = result_expected.iter().map(|s| s.to_string()).collect();
+        let result_expected: Vec<Vec<u8>> = result_expected
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
         assert_eq!(result, result_expected, "unexpected result for [{q_str}]");
     }
 
@@ -2147,6 +2156,43 @@ fn test_parse_query_raw_byte_phrase_roundtrip() {
     ok(r#"foo:seq("a\xff", bar)"#, r#"foo:seq("a\xff",bar)"#);
     // octal escapes >= 0o200 behave the same (raw byte)
     ok(r#"foo:"a\377b""#, r#"foo:"a\xffb""#);
+}
+
+/// PORT-ONLY TEST: a double-quoted `\xff`-style escape in QUERY TEXT denotes
+/// the raw byte 0xFF in field NAMES too (Go parser.go strconv.Unquote), and
+/// rendering re-quotes the raw name bytes with Go `strconv.Quote` byte
+/// semantics (`needQuoteToken` sees the non-token `RuneError` rune, so such
+/// names are always quoted), keeping parse -> render -> re-parse lossless.
+#[test]
+fn test_parse_query_raw_byte_field_name_roundtrip() {
+    // phrase filter on a raw-byte field name
+    ok(r#""na\xffme":value"#, r#""na\xffme":value"#);
+    // exact filter
+    ok(r#""na\xffme":="v""#, r#""na\xffme":=v"#);
+    // wildcard field filter with a raw-byte prefix
+    ok(r#""na\xff"*:value"#, r#""na\xff"*:value"#);
+    // eq_field / le_field with raw-byte names on both sides
+    ok(
+        r#""na\xffme":eq_field("ot\xfeher")"#,
+        r#""na\xffme":eq_field("ot\xfeher")"#,
+    );
+    ok(
+        r#""na\xffme":le_field("ot\xfeher")"#,
+        r#""na\xffme":le_field("ot\xfeher")"#,
+    );
+    // pipes referencing raw-byte field names
+    ok(r#"* | fields "na\xffme""#, r#"* | fields "na\xffme""#);
+    ok(
+        r#"* | rename "na\xffme" as "ot\xfeher""#,
+        r#"* | rename "na\xffme" as "ot\xfeher""#,
+    );
+    ok(
+        r#"* | stats by ("na\xffme") count() rows"#,
+        r#"* | stats by ("na\xffme") count(*) as rows"#,
+    );
+    ok(r#"* | sort by ("na\xffme")"#, r#"* | sort by ("na\xffme")"#);
+    // octal escapes >= 0o200 behave the same (raw byte) in names
+    ok(r#""na\377me":value"#, r#""na\xffme":value"#);
 }
 
 /// PORT-ONLY TEST: raw-byte phrase payloads parsed from `"\xff"`-style query

@@ -17,17 +17,16 @@ use crate::rows::{Field, marshal_fields_to_json};
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::stats_min::{field_names_string, get_matching_columns, less_bytes};
 use crate::stats_row_any::{fields_state_size, marshal_fields, unmarshal_fields};
-use crate::stream_filter::quote_token_if_needed;
 
 /// Port of `statsRowMin`.
 pub(crate) struct StatsRowMin {
-    src_field: String,
-    field_filters: Vec<String>,
+    src_field: Vec<u8>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Port of `parseStatsRowMin`. The first parsed filter is the (non-wildcard)
 /// source field; the remainder default to `["*"]` when empty.
-pub(crate) fn new_stats_row_min(mut field_filters: Vec<String>) -> Result<StatsRowMin, String> {
+pub(crate) fn new_stats_row_min(mut field_filters: Vec<Vec<u8>>) -> Result<StatsRowMin, String> {
     if field_filters.is_empty() {
         return Err("missing source field for 'row_min' func".to_string());
     }
@@ -36,7 +35,7 @@ pub(crate) fn new_stats_row_min(mut field_filters: Vec<String>) -> Result<StatsR
         return Err(format!("the source field {src_field:?} cannot be wildcard"));
     }
     if field_filters.is_empty() {
-        field_filters.push("*".to_string());
+        field_filters.push(b"*".to_vec());
     }
     Ok(StatsRowMin {
         src_field,
@@ -50,7 +49,10 @@ impl StatsFunc for StatsRowMin {
     }
 
     fn to_string(&self) -> String {
-        let mut s = format!("row_min({}", quote_token_if_needed(&self.src_field));
+        let mut s = format!(
+            "row_min({}",
+            crate::parser::quote_token_bytes_if_needed(&self.src_field)
+        );
         if !prefix_filter::match_all(&self.field_filters) {
             s.push_str(", ");
             s.push_str(&field_names_string(&self.field_filters));
@@ -76,8 +78,8 @@ impl StatsFunc for StatsRowMin {
 
 /// Port of `statsRowMinProcessor`.
 pub(crate) struct StatsRowMinProcessor {
-    src_field: String,
-    field_filters: Vec<String>,
+    src_field: Vec<u8>,
+    field_filters: Vec<Vec<u8>>,
     min: Vec<u8>,
     fields: Vec<Field>,
 }
@@ -94,7 +96,7 @@ impl StatsRowMinProcessor {
         &mut self,
         v: &[u8],
         br: &mut BlockResult,
-        field_filters: &[String],
+        field_filters: &[Vec<u8>],
         row_idx: usize,
     ) -> i64 {
         if !self.need_update_state_string(v) {
@@ -206,7 +208,8 @@ mod tests {
     }
 
     fn run(filters: Vec<&str>, blocks: &[Vec<Vec<Field>>]) -> String {
-        let sf = new_stats_row_min(filters.iter().map(|s| s.to_string()).collect()).unwrap();
+        let sf =
+            new_stats_row_min(filters.iter().map(|s| s.as_bytes().to_vec()).collect()).unwrap();
         let mut sp = sf.new_stats_processor();
         for block in blocks {
             let mut br = BlockResult::default();
@@ -232,7 +235,7 @@ mod tests {
     #[test]
     fn test_row_min_rejects_missing_and_wildcard_src() {
         assert!(new_stats_row_min(vec![]).is_err());
-        assert!(new_stats_row_min(vec!["*".to_string()]).is_err());
+        assert!(new_stats_row_min(vec![b"*".to_vec()]).is_err());
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub(crate) struct FilterStreamID {
 
     /// The field name for obtaining values from if `q_text` is set
     /// (Go `qFieldName`).
-    q_field_name: String,
+    q_field_name: Vec<u8>,
 
     stream_ids_map: OnceLock<HashSet<Vec<u8>>>,
 }
@@ -41,7 +41,7 @@ pub(crate) fn new_filter_stream_id(stream_ids: Vec<StreamID>) -> FilterStreamID 
     FilterStreamID {
         stream_ids,
         q_text: None,
-        q_field_name: String::new(),
+        q_field_name: Vec::new(),
         stream_ids_map: OnceLock::new(),
     }
 }
@@ -49,7 +49,7 @@ pub(crate) fn new_filter_stream_id(stream_ids: Vec<StreamID>) -> FilterStreamID 
 /// Port of Go `newFilterStreamIDFromQuery`.
 pub(crate) fn new_filter_stream_id_from_query(
     q_text: String,
-    q_field_name: String,
+    q_field_name: Vec<u8>,
 ) -> FilterStreamID {
     FilterStreamID {
         stream_ids: Vec::new(),
@@ -180,7 +180,7 @@ impl Filter for FilterStreamID {
 
     fn match_row(&self, fields: &[Field]) -> bool {
         let m = self.get_stream_ids_map();
-        let v = get_field_value_by_name(fields, "_stream_id");
+        let v = get_field_value_by_name(fields, b"_stream_id");
         m.contains(v)
     }
 
@@ -192,7 +192,7 @@ impl Filter for FilterStreamID {
             return;
         }
 
-        let r = br.get_column_by_name("_stream_id");
+        let r = br.get_column_by_name(b"_stream_id");
         if br.column_is_const(r) {
             let v = br.column_get_value_at_row(r, 0).to_vec();
             if !m.contains(&v) {

@@ -271,7 +271,7 @@ fn init_subqueries_net(q: &mut Query, run_net_query: &RunNetQueryFn<'_>) -> Resu
         // subquery string; the cache is folded into the closure.
         let mut cache: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut get_field_values =
-            |q_text: &str, field_name: &str| -> Result<Vec<Vec<u8>>, String> {
+            |q_text: &str, field_name: &[u8]| -> Result<Vec<Vec<u8>>, String> {
                 if let Some(values) = cache.get(q_text) {
                     return Ok(values.clone());
                 }
@@ -320,14 +320,14 @@ fn init_subqueries_net(q: &mut Query, run_net_query: &RunNetQueryFn<'_>) -> Resu
 fn get_field_values_net(
     q: &Query,
     run_net_query: &RunNetQueryFn<'_>,
-    field_name: &str,
+    field_name: &[u8],
 ) -> Result<Vec<Vec<u8>>, String> {
     let q_holder;
     let q = if is_last_pipe_uniq(&q.pipes) {
         q
     } else {
         let mut q_new = q.clone(q.get_timestamp());
-        let quoted_field_name = crate::parser::quote_token_if_needed(field_name);
+        let quoted_field_name = crate::parser::quote_token_bytes_if_needed(field_name);
         q_new.must_append_pipe(&format!("uniq by ({quoted_field_name})"));
         q_holder = q_new;
         &q_holder

@@ -16,13 +16,12 @@ use crate::block_result::{BlockResult, ResultColumn};
 use crate::filter_generic::is_msg_field_name;
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{marshal_float64, marshal_float64_string};
 
 /// `pipeHash` implements `| hash(field) [as result]`.
 pub struct PipeHash {
-    pub(crate) field_name: String,
-    pub(crate) result_field: String,
+    pub(crate) field_name: Vec<u8>,
+    pub(crate) result_field: Vec<u8>,
 }
 
 /// Constructs a `hash` pipe from already-parsed components.
@@ -30,7 +29,7 @@ pub struct PipeHash {
 /// PORT NOTE: Go's `parsePipeHash` is lexer-dependent and deferred; this
 /// constructor takes the source field and result field directly (the Go parser
 /// defaults `result_field` to `_msg`).
-pub(crate) fn new_pipe_hash(field_name: String, result_field: String) -> PipeHash {
+pub(crate) fn new_pipe_hash(field_name: Vec<u8>, result_field: Vec<u8>) -> PipeHash {
     PipeHash {
         field_name,
         result_field,
@@ -52,9 +51,15 @@ impl Pipe for PipeHash {
     }
 
     fn to_string(&self) -> String {
-        let mut s = format!("hash({})", quote_token_if_needed(&self.field_name));
+        let mut s = format!(
+            "hash({})",
+            crate::parser::quote_token_bytes_if_needed(&self.field_name)
+        );
         if !is_msg_field_name(&self.result_field) {
-            s += &format!(" as {}", quote_token_if_needed(&self.result_field));
+            s += &format!(
+                " as {}",
+                crate::parser::quote_token_bytes_if_needed(&self.result_field)
+            );
         }
         s
     }
@@ -64,7 +69,7 @@ impl Pipe for PipeHash {
     }
 
     fn can_return_last_n_results(&self) -> bool {
-        self.result_field != "_time"
+        self.result_field != b"_time"
     }
 
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
@@ -93,8 +98,8 @@ impl Pipe for PipeHash {
 }
 
 struct PipeHashProcessor {
-    field_name: String,
-    result_field: String,
+    field_name: Vec<u8>,
+    result_field: Vec<u8>,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<PipeHashProcessorShard>>,
 }
@@ -111,7 +116,7 @@ impl PipeProcessor for PipeHashProcessor {
         }
 
         let mut shard = self.shards[worker_id].lock().unwrap();
-        shard.rc.name = self.result_field.clone().into_bytes();
+        shard.rc.name = self.result_field.clone();
 
         let c = br.get_column_by_name(&self.field_name);
         if br.column_is_const(c) {
@@ -166,13 +171,13 @@ mod tests {
     // the lexer-based `parsePipeHash`, which is deferred; they are omitted until
     // the LogsQL parser is ported.
 
-    fn hash(field_name: &str, result_field: &str) -> PipeHash {
-        new_pipe_hash(field_name.to_string(), result_field.to_string())
+    fn hash(field_name: &[u8], result_field: &str) -> PipeHash {
+        new_pipe_hash(field_name.to_vec(), result_field.as_bytes().to_vec())
     }
 
     #[test]
     fn test_pipe_hash() {
-        let p = hash("foo", "x");
+        let p = hash(b"foo", "x");
         assert_rows_eq(
             &run_pipe(
                 &p,
@@ -197,25 +202,25 @@ mod tests {
     #[test]
     fn test_pipe_hash_update_needed_fields() {
         // all the needed fields
-        assert_needed_fields(&hash("y", "x"), "*", "", "*", "x");
-        assert_needed_fields(&hash("x", "x"), "*", "", "*", "");
+        assert_needed_fields(&hash(b"y", "x"), "*", "", "*", "x");
+        assert_needed_fields(&hash(b"x", "x"), "*", "", "*", "");
 
         // unneeded fields do not intersect with output field
-        assert_needed_fields(&hash("y", "x"), "*", "f1,f2", "*", "f1,f2,x");
-        assert_needed_fields(&hash("x", "x"), "*", "f1,f2", "*", "f1,f2");
+        assert_needed_fields(&hash(b"y", "x"), "*", "f1,f2", "*", "f1,f2,x");
+        assert_needed_fields(&hash(b"x", "x"), "*", "f1,f2", "*", "f1,f2");
 
         // unneeded fields intersect with output field
-        assert_needed_fields(&hash("z", "x"), "*", "x,y", "*", "x,y");
-        assert_needed_fields(&hash("y", "x"), "*", "x,y", "*", "x,y");
-        assert_needed_fields(&hash("x", "x"), "*", "x,y", "*", "x,y");
+        assert_needed_fields(&hash(b"z", "x"), "*", "x,y", "*", "x,y");
+        assert_needed_fields(&hash(b"y", "x"), "*", "x,y", "*", "x,y");
+        assert_needed_fields(&hash(b"x", "x"), "*", "x,y", "*", "x,y");
 
         // needed fields do not intersect with output field
-        assert_needed_fields(&hash("y", "z"), "x,y", "", "x,y", "");
-        assert_needed_fields(&hash("z", "z"), "x,y", "", "x,y", "");
+        assert_needed_fields(&hash(b"y", "z"), "x,y", "", "x,y", "");
+        assert_needed_fields(&hash(b"z", "z"), "x,y", "", "x,y", "");
 
         // needed fields intersect with output field
-        assert_needed_fields(&hash("z", "f2"), "f2,y", "", "y,z", "");
-        assert_needed_fields(&hash("y", "f2"), "f2,y", "", "y", "");
-        assert_needed_fields(&hash("y", "y"), "f2,y", "", "f2,y", "");
+        assert_needed_fields(&hash(b"z", "f2"), "f2,y", "", "y,z", "");
+        assert_needed_fields(&hash(b"y", "f2"), "f2,y", "", "y", "");
+        assert_needed_fields(&hash(b"y", "y"), "f2,y", "", "f2,y", "");
     }
 }

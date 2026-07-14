@@ -100,11 +100,11 @@ pub(crate) fn handle_protobuf<S: LogRowsStorage>(
 
     let use_default_stream_fields = cp.cp.stream_fields.is_empty();
     let msg_fields: Vec<&str> = cp.cp.msg_fields.iter().map(String::as_str).collect();
-    let preserve_keys: Vec<&str> = cp
+    let preserve_keys: Vec<&[u8]> = cp
         .cp
         .preserve_json_keys
         .iter()
-        .map(String::as_str)
+        .map(|s| s.as_bytes())
         .collect();
 
     let mut lmp = cp.cp.new_log_message_processor(storage, "loki_protobuf");
@@ -151,7 +151,7 @@ fn parse_protobuf_request<S: LogRowsStorage>(
     data: &[u8],
     lmp: &mut LogMessageProcessor<'_, S>,
     msg_fields: &[&str],
-    preserve_keys: &[&str],
+    preserve_keys: &[&[u8]],
     msg_fields_prefix: &str,
     use_default_stream_fields: bool,
     parse_message: bool,
@@ -954,7 +954,8 @@ mod tests {
         pr.marshal_protobuf(&mut data);
 
         let no_fields: [&str; 0] = [];
-        let res = parse_protobuf_request(&data, &mut lmp, &no_fields, &no_fields, "", true, true);
+        let no_keys: [&[u8]; 0] = [];
+        let res = parse_protobuf_request(&data, &mut lmp, &no_fields, &no_keys, "", true, true);
         assert!(res.is_ok(), "unexpected error: {res:?}");
         lmp.close();
 

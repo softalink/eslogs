@@ -14,10 +14,9 @@ use crate::block_search::BlockSearch;
 use crate::filter::Filter;
 use crate::filter_generic::{clone_column_header, quote_field_name_if_needed};
 use crate::filter_range::parse_math_number;
-use crate::log_rows::get_canonical_column_name;
+use crate::log_rows::get_canonical_column_name_bytes;
 use crate::prefix_filter;
 use crate::rows::{Field, get_field_value_by_name};
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{ValueType, unmarshal_float64, unmarshal_int64};
 
 /// `FilterLeField` matches rows where `field_name` is `<=` (or `<`) the
@@ -25,21 +24,21 @@ use crate::values_encoder::{ValueType, unmarshal_float64, unmarshal_int64};
 ///
 /// Example LogsQL: `fieldName:le_field(otherField)`.
 pub(crate) struct FilterLeField {
-    pub(crate) field_name: String,
-    pub(crate) other_field_name: String,
+    pub(crate) field_name: Vec<u8>,
+    pub(crate) other_field_name: Vec<u8>,
     pub(crate) exclude_equal_values: bool,
     prefix_filter: OnceLock<prefix_filter::Filter>,
 }
 
 /// Builds a le_field / lt_field filter.
 pub(crate) fn new_filter_le_field(
-    field_name: &str,
-    other_field_name: &str,
+    field_name: &[u8],
+    other_field_name: &[u8],
     exclude_equal_values: bool,
 ) -> FilterLeField {
     FilterLeField {
-        field_name: get_canonical_column_name(field_name).to_string(),
-        other_field_name: get_canonical_column_name(other_field_name).to_string(),
+        field_name: get_canonical_column_name_bytes(field_name).to_vec(),
+        other_field_name: get_canonical_column_name_bytes(other_field_name).to_vec(),
         exclude_equal_values,
         prefix_filter: OnceLock::new(),
     }
@@ -49,7 +48,7 @@ impl FilterLeField {
     fn get_prefix_filter(&self) -> &prefix_filter::Filter {
         self.prefix_filter.get_or_init(|| {
             let mut pf = prefix_filter::Filter::default();
-            pf.add_allow_filters(&[self.field_name.as_str(), self.other_field_name.as_str()]);
+            pf.add_allow_filters(&[self.field_name.as_slice(), self.other_field_name.as_slice()]);
             pf
         })
     }
@@ -159,7 +158,7 @@ impl Filter for FilterLeField {
             "{}{}({})",
             quote_field_name_if_needed(&self.field_name),
             func_name,
-            quote_token_if_needed(&self.other_field_name)
+            crate::parser::quote_token_bytes_if_needed(&self.other_field_name)
         )
     }
 
@@ -419,11 +418,11 @@ mod tests {
     #[test]
     fn test_to_string() {
         assert_eq!(
-            new_filter_le_field("foo", "bar", false).to_string(),
+            new_filter_le_field(b"foo", b"bar", false).to_string(),
             "foo:le_field(bar)"
         );
         assert_eq!(
-            new_filter_le_field("foo", "bar", true).to_string(),
+            new_filter_le_field(b"foo", b"bar", true).to_string(),
             "foo:lt_field(bar)"
         );
     }
@@ -449,10 +448,10 @@ mod tests {
 
     #[test]
     fn test_match_row() {
-        let f = new_filter_le_field("foo", "bar", false);
+        let f = new_filter_le_field(b"foo", b"bar", false);
         assert!(f.match_row(&[field("foo", "9"), field("bar", "10")]));
         assert!(!f.match_row(&[field("foo", "11"), field("bar", "10")]));
-        let lt = new_filter_le_field("foo", "bar", true);
+        let lt = new_filter_le_field(b"foo", b"bar", true);
         assert!(!lt.match_row(&[field("foo", "10"), field("bar", "10")]));
     }
 }

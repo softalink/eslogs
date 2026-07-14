@@ -17,7 +17,7 @@ use crate::syslog_parser::{get_syslog_parser, put_syslog_parser};
 
 /// `| unpack_syslog ...` pipe (Go `pipeUnpackSyslog`).
 pub(crate) struct PipeUnpackSyslog {
-    from_field: String,
+    from_field: Vec<u8>,
 
     /// Original `offset` token (for `to_string`).
     offset_str: String,
@@ -36,7 +36,7 @@ pub(crate) struct PipeUnpackSyslog {
 /// Constructs a `PipeUnpackSyslog` (Go `parsePipeUnpackSyslog`; lexer parsing —
 /// including `offset` duration parsing — is deferred).
 pub(crate) fn new_pipe_unpack_syslog(
-    from_field: impl Into<String>,
+    from_field: impl Into<Vec<u8>>,
     offset_str: impl Into<String>,
     offset_secs: i64,
     result_prefix: impl Into<String>,
@@ -100,7 +100,10 @@ impl Pipe for PipeUnpackSyslog {
             s += &format!(" {iff}");
         }
         if !crate::filter_generic::is_msg_field_name(&self.from_field) {
-            s += &format!(" from {}", quote_token_if_needed(&self.from_field));
+            s += &format!(
+                " from {}",
+                crate::parser::quote_token_bytes_if_needed(&self.from_field)
+            );
         }
         if !self.offset_str.is_empty() {
             s += &format!(" offset {}", self.offset_str);

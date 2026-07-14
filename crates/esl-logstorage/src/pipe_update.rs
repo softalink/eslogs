@@ -33,7 +33,7 @@ pub(crate) type UpdateFunc = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
 /// an `IfFilter` from an already-parsed filter via [`IfFilter::new`].
 pub(crate) struct IfFilter {
     pub f: Arc<dyn Filter>,
-    pub allow_filters: Vec<String>,
+    pub allow_filters: Vec<Vec<u8>>,
 }
 
 impl IfFilter {
@@ -98,7 +98,7 @@ impl IfFilter {
 /// Port of Go `updateNeededFieldsForUpdatePipe`.
 pub(crate) fn update_needed_fields_for_update_pipe(
     pf: &mut prefix_filter::Filter,
-    field: &str,
+    field: &[u8],
     iff: Option<&IfFilter>,
 ) {
     if let Some(iff) = iff
@@ -125,7 +125,7 @@ pub(crate) fn should_deny_overwritten_field(
 pub(crate) fn new_pipe_update_processor(
     update_func: UpdateFunc,
     pp_next: Arc<dyn PipeProcessor>,
-    field: String,
+    field: Vec<u8>,
     iff: Option<Arc<IfFilter>>,
     concurrency: usize,
 ) -> Arc<dyn PipeProcessor> {
@@ -143,7 +143,7 @@ pub(crate) fn new_pipe_update_processor(
 
 struct PipeUpdateProcessor {
     update_func: UpdateFunc,
-    field: String,
+    field: Vec<u8>,
     iff: Option<Arc<IfFilter>>,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<PipeUpdateProcessorShard>>,
@@ -175,7 +175,7 @@ impl PipeProcessor for PipeUpdateProcessor {
             }
         }
 
-        shard.rc.name = self.field.clone().into_bytes();
+        shard.rc.name = self.field.clone();
 
         let c = br.get_column_by_name(&self.field);
         let values: Vec<Vec<u8>> = br.column_get_values(c).to_vec();
@@ -364,11 +364,11 @@ pub(crate) mod test_utils {
             .collect()
     }
 
-    fn split_csv(s: &str) -> Vec<String> {
+    fn split_csv(s: &str) -> Vec<Vec<u8>> {
         if s.is_empty() {
             return Vec::new();
         }
-        s.split(',').map(|x| x.to_string()).collect()
+        s.split(',').map(|x| x.as_bytes().to_vec()).collect()
     }
 
     /// Port of Go `expectPipeNeededFields`: seeds a prefix filter with

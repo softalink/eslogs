@@ -38,7 +38,7 @@ pub(crate) struct FilterIPv6Range {
 
 /// Builds an ipv6-range filter for `field_name`.
 pub(crate) fn new_filter_ipv6_range(
-    field_name: &str,
+    field_name: &[u8],
     min_value: [u8; 16],
     max_value: [u8; 16],
 ) -> FilterGeneric {
@@ -86,7 +86,7 @@ impl FieldFilter for FilterIPv6Range {
         format!("ipv6_range({min_value}, {max_value})")
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_ipv6_range(v, self.min_value, self.max_value)
     }
@@ -95,7 +95,7 @@ impl FieldFilter for FilterIPv6Range {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let min_value = self.min_value;
         let max_value = self.max_value;
@@ -128,7 +128,7 @@ impl FieldFilter for FilterIPv6Range {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let min_value = self.min_value;
         let max_value = self.max_value;

@@ -13,7 +13,6 @@ use crate::block_result::{BlockResult, ResultColumn};
 use crate::json_parser::fastjson;
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{marshal_float64, marshal_uint64_string};
 
 thread_local! {
@@ -32,15 +31,15 @@ fn put_parser(p: fastjson::Parser) {
 
 /// `| json_array_len ...` pipe (Go `pipeJSONArrayLen`).
 pub(crate) struct PipeJSONArrayLen {
-    field_name: String,
-    result_field: String,
+    field_name: Vec<u8>,
+    result_field: Vec<u8>,
 }
 
 /// Constructs a `PipeJSONArrayLen` (Go `parsePipeJSONArrayLen`; lexer parsing
 /// is deferred).
 pub(crate) fn new_pipe_json_array_len(
-    field_name: impl Into<String>,
-    result_field: impl Into<String>,
+    field_name: impl Into<Vec<u8>>,
+    result_field: impl Into<Vec<u8>>,
 ) -> PipeJSONArrayLen {
     PipeJSONArrayLen {
         field_name: field_name.into(),
@@ -58,10 +57,13 @@ impl Pipe for PipeJSONArrayLen {
     fn to_string(&self) -> String {
         let mut s = format!(
             "json_array_len({})",
-            quote_token_if_needed(&self.field_name)
+            crate::parser::quote_token_bytes_if_needed(&self.field_name)
         );
         if !crate::filter_generic::is_msg_field_name(&self.result_field) {
-            s += &format!(" as {}", quote_token_if_needed(&self.result_field));
+            s += &format!(
+                " as {}",
+                crate::parser::quote_token_bytes_if_needed(&self.result_field)
+            );
         }
         s
     }
@@ -78,7 +80,7 @@ impl Pipe for PipeJSONArrayLen {
     }
 
     fn can_return_last_n_results(&self) -> bool {
-        self.result_field != "_time"
+        self.result_field != b"_time"
     }
 
     fn new_pipe_processor(
@@ -97,8 +99,8 @@ impl Pipe for PipeJSONArrayLen {
 }
 
 struct PipeJSONArrayLenProcessor {
-    field_name: String,
-    result_field: String,
+    field_name: Vec<u8>,
+    result_field: Vec<u8>,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Slice<std::sync::Mutex<PipeJSONArrayLenProcessorShard>>,
 }
@@ -121,7 +123,7 @@ impl PipeProcessor for PipeJSONArrayLenProcessor {
         let shard = &mut *guard;
 
         shard.rc.reset();
-        shard.rc.name = self.result_field.clone().into_bytes();
+        shard.rc.name = self.result_field.clone();
         shard.min_value = f64::NAN;
         shard.max_value = f64::NAN;
 

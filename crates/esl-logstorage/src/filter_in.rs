@@ -35,7 +35,7 @@ pub(crate) struct FilterIn {
     pub(crate) values: InValues,
 }
 
-pub(crate) fn new_filter_in_values(field_name: &str, values: Vec<Vec<u8>>) -> FilterGeneric {
+pub(crate) fn new_filter_in_values(field_name: &[u8], values: Vec<Vec<u8>>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterIn {
@@ -46,9 +46,9 @@ pub(crate) fn new_filter_in_values(field_name: &str, values: Vec<Vec<u8>>) -> Fi
 
 /// Builds an `in(<subquery>)` filter (Go `parseFilterIn` with `iv.q` set).
 pub(crate) fn new_filter_in_query(
-    field_name: &str,
+    field_name: &[u8],
     q_text: String,
-    q_field_name: String,
+    q_field_name: Vec<u8>,
 ) -> FilterGeneric {
     new_filter_generic(
         field_name,
@@ -91,11 +91,11 @@ impl FieldFilter for FilterIn {
         Some(&mut self.values)
     }
 
-    fn new_with_values(&self, field_name: &str, values: Vec<Vec<u8>>) -> Option<Box<dyn Filter>> {
+    fn new_with_values(&self, field_name: &[u8], values: Vec<Vec<u8>>) -> Option<Box<dyn Filter>> {
         Some(Box::new(new_filter_in_values(field_name, values)))
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         let string_values = self.values.get_string_values();
         string_values_contain(string_values, v)
@@ -105,7 +105,7 @@ impl FieldFilter for FilterIn {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         if self.values.is_empty() {
             bm.reset_bits();
@@ -193,7 +193,7 @@ impl FieldFilter for FilterIn {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         if self.values.is_empty() {
             bm.reset_bits();

@@ -52,7 +52,7 @@ impl JSONParser {
     pub fn parse_log_message(
         &mut self,
         msg: &[u8],
-        preserve_keys: &[&str],
+        preserve_keys: &[&[u8]],
         field_prefix: &str,
     ) -> Result<(), String> {
         self.parse_log_message_impl(msg, preserve_keys, field_prefix, MAX_FIELD_NAME_SIZE)
@@ -68,7 +68,7 @@ impl JSONParser {
     fn parse_log_message_impl(
         &mut self,
         msg: &[u8],
-        preserve_keys: &[&str],
+        preserve_keys: &[&[u8]],
         field_prefix: &str,
         max_field_name_len: usize,
     ) -> Result<(), String> {
@@ -136,7 +136,7 @@ pub(crate) struct CommonJson {
     /// `fieldPrefix` string by reference; the port copies them, since
     /// `JSONScanner` keeps the settings alive across `next_log_message()`
     /// calls.
-    preserve_keys: Vec<String>,
+    preserve_keys: Vec<Vec<u8>>,
     field_prefix: String,
     max_field_name_len: usize,
 }
@@ -151,13 +151,13 @@ impl CommonJson {
 
     pub(crate) fn init(
         &mut self,
-        preserve_keys: &[&str],
+        preserve_keys: &[&[u8]],
         field_prefix: &str,
         max_field_name_len: usize,
     ) {
         self.preserve_keys.clear();
         self.preserve_keys
-            .extend(preserve_keys.iter().map(|s| s.to_string()));
+            .extend(preserve_keys.iter().map(|s| s.to_vec()));
         self.field_prefix.clear();
         self.field_prefix.push_str(field_prefix);
         self.max_field_name_len = max_field_name_len;
@@ -242,7 +242,7 @@ impl CommonJson {
         // Drop trailing dot
         let key = &self.prefix_buf[..self.prefix_buf.len() - 1];
 
-        self.preserve_keys.iter().any(|k| k.as_bytes() == key)
+        self.preserve_keys.iter().any(|k| k == key)
     }
 
     fn append_preserved_log_field(&mut self, doc: &fastjson::Doc, o: u32) {
@@ -1264,7 +1264,8 @@ mod tests {
     fn test_json_parser_success() {
         fn f(data: &str, preserve_keys: &[&str], field_prefix: &str, fields_expected: &[Field]) {
             let mut p = get_json_parser();
-            p.parse_log_message(data.as_bytes(), preserve_keys, field_prefix)
+            let preserve_keys: Vec<&[u8]> = preserve_keys.iter().map(|s| s.as_bytes()).collect();
+            p.parse_log_message(data.as_bytes(), &preserve_keys, field_prefix)
                 .unwrap_or_else(|e| panic!("unexpected error: {e}"));
             assert_eq!(
                 p.fields(),

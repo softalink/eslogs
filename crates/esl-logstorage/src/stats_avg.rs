@@ -18,11 +18,11 @@ use crate::values_encoder::{marshal_float64, unmarshal_float64};
 
 /// `avg(...)` stats function.
 pub struct StatsAvg {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Builds a [`StatsAvg`] from already-parsed field filters (Go `parseStatsAvg`).
-pub(crate) fn new_stats_avg(field_filters: Vec<String>) -> StatsAvg {
+pub(crate) fn new_stats_avg(field_filters: Vec<Vec<u8>>) -> StatsAvg {
     StatsAvg { field_filters }
 }
 
@@ -48,7 +48,7 @@ impl StatsFunc for StatsAvg {
 pub(crate) struct StatsAvgProcessor {
     sum: f64,
     count: u64,
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 impl StatsProcessor for StatsAvgProcessor {

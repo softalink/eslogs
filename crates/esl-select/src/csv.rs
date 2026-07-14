@@ -6,9 +6,9 @@ use esl_logstorage::storage_search::BlockColumn;
 
 /// Appends `fields` as a single RFC 4180 csv line to `dst`
 /// (Go `appendCSVLine`).
-pub fn append_csv_line(dst: &mut Vec<u8>, fields: &[String]) {
+pub fn append_csv_line(dst: &mut Vec<u8>, fields: &[Vec<u8>]) {
     for (i, field) in fields.iter().enumerate() {
-        append_csv_field(dst, field.as_bytes());
+        append_csv_field(dst, field);
         if i != fields.len() - 1 {
             dst.push(b',');
         }
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn test_append_csv_line() {
         fn f(fields: &[&str], result_expected: &str) {
-            let fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+            let fields: Vec<Vec<u8>> = fields.iter().map(|s| s.as_bytes().to_vec()).collect();
             let mut result = Vec::new();
             append_csv_line(&mut result, &fields);
             assert_eq!(

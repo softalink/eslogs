@@ -130,7 +130,7 @@ pub fn process_field_values_request(storage: &Arc<Storage>, req: &Request, w: &m
         &ca.tenant_ids,
         &ca.q,
         &ca.hidden_fields_filters,
-        field_name,
+        field_name.as_bytes(),
         filter,
         limit as u64,
         cancel.as_deref(),

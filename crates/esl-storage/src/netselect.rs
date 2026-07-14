@@ -302,7 +302,7 @@ impl StorageNode {
         tenant_ids: &[TenantID],
         q: &Query,
         allow_partial_response: bool,
-        field_name: &str,
+        field_name: &[u8],
         filter: &str,
         limit: u64,
     ) -> Result<Vec<ValueWithHits>, NetError> {
@@ -312,6 +312,16 @@ impl StorageNode {
             q,
             allow_partial_response,
         );
+        // PORT NOTE (str-bound seam): the network select protocol carries
+        // args through the String-typed multipart/form layer; a raw-byte
+        // (invalid UTF-8) field name cannot round-trip through it, so it is
+        // rejected here with a clear error instead of a lossy re-encoding.
+        let field_name = std::str::from_utf8(field_name).map_err(|_| {
+            NetError::Other(
+                "non-UTF-8 field names are not supported over the network select protocol"
+                    .to_string(),
+            )
+        })?;
         args.push(("field".to_string(), field_name.to_string()));
         args.push(("filter".to_string(), filter.to_string()));
         args.push(("limit".to_string(), format!("{limit}")));
@@ -349,7 +359,7 @@ impl StorageNode {
         tenant_ids: &[TenantID],
         q: &Query,
         allow_partial_response: bool,
-        field_name: &str,
+        field_name: &[u8],
         filter: &str,
         limit: u64,
     ) -> Result<Vec<ValueWithHits>, NetError> {
@@ -359,6 +369,13 @@ impl StorageNode {
             q,
             allow_partial_response,
         );
+        // PORT NOTE (str-bound seam): see `get_field_values` above.
+        let field_name = std::str::from_utf8(field_name).map_err(|_| {
+            NetError::Other(
+                "non-UTF-8 field names are not supported over the network select protocol"
+                    .to_string(),
+            )
+        })?;
         args.push(("field".to_string(), field_name.to_string()));
         args.push(("filter".to_string(), filter.to_string()));
         args.push(("limit".to_string(), format!("{limit}")));
@@ -706,7 +723,7 @@ impl Storage {
         tenant_ids: &[TenantID],
         q: &Query,
         allow_partial_response: bool,
-        field_name: &str,
+        field_name: &[u8],
         filter: &str,
         limit: u64,
     ) -> Result<Vec<ValueWithHits>, String> {
@@ -748,7 +765,7 @@ impl Storage {
         tenant_ids: &[TenantID],
         q: &Query,
         allow_partial_response: bool,
-        field_name: &str,
+        field_name: &[u8],
         filter: &str,
         limit: u64,
     ) -> Result<Vec<ValueWithHits>, String> {

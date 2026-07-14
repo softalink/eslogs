@@ -21,7 +21,7 @@
 use esl_common::regexutil::Regex;
 
 use crate::filter::Filter;
-use crate::log_rows::get_canonical_column_name;
+use crate::log_rows::get_canonical_column_name_bytes;
 use crate::parser::helpers::*;
 use crate::parser::lexer_ext::LexerExt;
 use crate::parser::parse_pipe::is_pipe_name;
@@ -82,10 +82,10 @@ pub(crate) fn parse_filter(
             ));
         }
     }
-    parse_filter_or(lex, "")
+    parse_filter_or(lex, b"")
 }
 
-fn parse_filter_or(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_or(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     let mut filters: Vec<BoxFilter> = Vec::new();
     loop {
         let f = parse_filter_and(lex, field_name)?;
@@ -102,7 +102,7 @@ fn parse_filter_or(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, Strin
     }
 }
 
-fn parse_filter_and(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_and(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     let mut filters: Vec<BoxFilter> = Vec::new();
     loop {
         let f = parse_filter_generic(lex, field_name)?;
@@ -119,7 +119,7 @@ fn parse_filter_and(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, Stri
     }
 }
 
-fn parse_filter_generic(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_generic(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     if lex.is_keyword(&[""]) {
         return Err(format!(
             "unexpected end of query after {}; expecting a filter",
@@ -244,37 +244,39 @@ fn parse_filter_generic(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, 
     parse_filter_phrase(lex, field_name)
 }
 
-fn parse_filter_phrase(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_phrase(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     let stop_tokens: &[&str] = if field_name.is_empty() { &[":"] } else { &[] };
     // `phrase_bytes` is the Go-parity raw payload (parser.go:329
-    // strconv.Unquote: `"\xff"` in query text denotes the raw byte 0xFF);
-    // `phrase` is the legacy scalar String form used where the token acts as
-    // a field NAME (still String-typed — see the lexer PORT NOTE).
-    let (phrase, phrase_bytes) = lex.next_compound_token_ext_pair(stop_tokens)?;
+    // strconv.Unquote: `"\xff"` in query text denotes the raw byte 0xFF).
+    // The same raw bytes act as the field NAME when a ':' follows (field
+    // names are raw bytes end-to-end).
+    let (_, phrase_bytes) = lex.next_compound_token_ext_pair(stop_tokens)?;
 
     if !lex.is_skipped_space() && lex.is_keyword(&["*"]) {
         lex.next_token();
         if field_name.is_empty() && lex.is_keyword(&[":"]) {
             lex.next_token();
-            return parse_filter_generic(lex, &format!("{phrase}*"));
+            let mut wildcard_name = phrase_bytes.clone();
+            wildcard_name.push(b'*');
+            return parse_filter_generic(lex, &wildcard_name);
         }
         return Ok(Box::new(new_filter_prefix(field_name, &phrase_bytes)));
     }
 
     if field_name.is_empty() && lex.is_keyword(&[":"]) {
         lex.next_token();
-        return match phrase.as_str() {
-            "_time" => parse_filter_time_internal(lex),
-            "_stream_id" => parse_filter_stream_id_internal(lex),
-            "_stream" => parse_filter_stream_internal(lex, "_stream"),
-            _ => parse_filter_generic(lex, &phrase),
+        return match phrase_bytes.as_slice() {
+            b"_time" => parse_filter_time_internal(lex),
+            b"_stream_id" => parse_filter_stream_id_internal(lex),
+            b"_stream" => parse_filter_stream_internal(lex, b"_stream"),
+            _ => parse_filter_generic(lex, &phrase_bytes),
         };
     }
 
     Ok(Box::new(new_filter_phrase(field_name, &phrase_bytes)))
 }
 
-fn parse_filter_parens(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_parens(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     lex.next_token();
     let f = parse_filter_or(lex, field_name)?;
     if !lex.is_keyword(&[")"]) {
@@ -284,7 +286,7 @@ fn parse_filter_parens(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, S
     Ok(f)
 }
 
-fn parse_filter_not(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_not(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     lex.next_token();
     let mut f = parse_filter_generic(lex, field_name)?;
     // Go collapses double-negation via a type switch on *filterNot.
@@ -296,7 +298,7 @@ fn parse_filter_not(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, Stri
     Ok(Box::new(new_filter_not(f)))
 }
 
-fn parse_any_case_filter(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_any_case_filter(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     parse_func_arg_maybe_prefix(lex, field_name, |phrase, is_prefix| {
         if is_prefix {
             Ok(Box::new(new_filter_any_case_prefix(field_name, phrase)))
@@ -308,7 +310,7 @@ fn parse_any_case_filter(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter,
 
 fn parse_func_arg_maybe_prefix(
     lex: &mut Lexer,
-    field_name: &str,
+    field_name: &[u8],
     callback: impl Fn(&[u8], bool) -> Result<BoxFilter, String>,
 ) -> Result<BoxFilter, String> {
     let lex_state = lex.clone();
@@ -346,7 +348,7 @@ fn parse_func_arg_maybe_prefix(
     callback(&arg, is_wildcard)
 }
 
-fn parse_filter_len_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_len_range(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     parse_func_args(lex, field_name, |func_name, args| {
         if args.len() != 2 {
             return Err(format!(
@@ -368,7 +370,7 @@ fn parse_filter_len_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter
     })
 }
 
-fn parse_filter_string_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_string_range(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     // Raw-byte bounds (Go parser.go:329 strconv.Unquote semantics); the
     // string_repr re-quotes them losslessly (Go quoteTokenIfNeeded, byte form).
     parse_func_args_bytes(lex, field_name, |func_name, args| {
@@ -394,7 +396,7 @@ fn parse_filter_string_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFil
     })
 }
 
-fn parse_filter_value_type(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_value_type(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     parse_func_arg(lex, field_name, |_, arg| {
         Ok(Box::new(crate::filter_value_type::new_filter_value_type(
             field_name, arg,
@@ -404,7 +406,7 @@ fn parse_filter_value_type(lex: &mut Lexer, field_name: &str) -> Result<BoxFilte
 
 fn parse_filter_json_array_contains_any(
     lex: &mut Lexer,
-    field_name: &str,
+    field_name: &[u8],
 ) -> Result<BoxFilter, String> {
     // Raw-byte values (Go parser.go:329 strconv.Unquote semantics).
     parse_func_args_bytes(lex, field_name, |_, args| {
@@ -414,7 +416,7 @@ fn parse_filter_json_array_contains_any(
     })
 }
 
-fn parse_filter_ipv4_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_ipv4_range(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     parse_func_args(lex, field_name, |func_name, args| {
         if args.len() == 1 {
             let (min_v, max_v) = try_parse_ipv4_cidr(&args[0]).ok_or_else(|| {
@@ -447,7 +449,7 @@ fn parse_filter_ipv4_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFilte
     })
 }
 
-fn parse_filter_ipv6_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_ipv6_range(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     parse_func_args(lex, field_name, |func_name, args| {
         if args.len() == 1 {
             let (min_v, max_v) = try_parse_ipv6_cidr(&args[0]).ok_or_else(|| {
@@ -488,7 +490,7 @@ enum InKind {
 }
 
 /// Port of Go `parseInValues`.
-fn parse_in_values(lex: &mut Lexer, field_name: &str, kind: InKind) -> Result<BoxFilter, String> {
+fn parse_in_values(lex: &mut Lexer, field_name: &[u8], kind: InKind) -> Result<BoxFilter, String> {
     // Try parsing in(arg1, ..., argN) at first
     let lex_state = lex.clone();
     let err_first = match parse_func_args_possible_wildcard_bytes(lex) {
@@ -548,7 +550,7 @@ fn parse_in_values(lex: &mut Lexer, field_name: &str, kind: InKind) -> Result<Bo
 /// text (see the module docs), so the subquery is optimized (the ported subset,
 /// as Go's top-level `optimize()` would via `visitSubqueries`) and rendered
 /// here.
-fn parse_in_query(lex: &mut Lexer) -> Result<Option<(String, String)>, String> {
+fn parse_in_query(lex: &mut Lexer) -> Result<Option<(String, Vec<u8>)>, String> {
     let mut q = crate::parser::query::parse_query_in_parens(lex)
         .map_err(|e| format!("cannot parse in(...) query: {e}"))?;
     if q.is_star_query() {
@@ -561,7 +563,7 @@ fn parse_in_query(lex: &mut Lexer) -> Result<Option<(String, String)>, String> {
 }
 
 /// Port of Go `getFieldNameFromPipes`.
-fn get_field_name_from_pipes(pipes: &[Box<dyn crate::pipe::Pipe>]) -> Result<String, String> {
+fn get_field_name_from_pipes(pipes: &[Box<dyn crate::pipe::Pipe>]) -> Result<Vec<u8>, String> {
     let Some(last) = pipes.last() else {
         return Err("missing 'fields' or 'uniq' pipes at the end of query".to_string());
     };
@@ -614,7 +616,7 @@ fn parse_func_args_possible_wildcard_bytes(
 
 fn parse_filter_contains_common_case(
     lex: &mut Lexer,
-    field_name: &str,
+    field_name: &[u8],
 ) -> Result<BoxFilter, String> {
     lex.next_token();
     // Raw-byte phrases (Go parser.go:329 strconv.Unquote semantics).
@@ -625,7 +627,10 @@ fn parse_filter_contains_common_case(
         .map_err(|e| format!("cannot parse 'contains_common_case(...)': {e}"))
 }
 
-fn parse_filter_equals_common_case(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_equals_common_case(
+    lex: &mut Lexer,
+    field_name: &[u8],
+) -> Result<BoxFilter, String> {
     lex.next_token();
     // Raw-byte phrases (Go parser.go:329 strconv.Unquote semantics).
     let phrases = parse_args_in_parens_bytes(lex)
@@ -635,24 +640,24 @@ fn parse_filter_equals_common_case(lex: &mut Lexer, field_name: &str) -> Result<
         .map_err(|e| format!("cannot parse 'equals_common_case(...)': {e}"))
 }
 
-fn parse_filter_sequence(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_sequence(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     parse_func_args_bytes(lex, field_name, |_, args| {
         Ok(Box::new(new_filter_sequence(field_name, args)))
     })
 }
 
-fn parse_filter_eq_field(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
-    parse_func_arg(lex, field_name, |_, arg| {
+fn parse_filter_eq_field(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
+    parse_func_arg_bytes(lex, field_name, |_, arg| {
         Ok(Box::new(new_filter_eq_field(field_name, arg)))
     })
 }
 
 fn parse_filter_le_field(
     lex: &mut Lexer,
-    field_name: &str,
+    field_name: &[u8],
     exclude_equal: bool,
 ) -> Result<BoxFilter, String> {
-    parse_func_arg(lex, field_name, |_, arg| {
+    parse_func_arg_bytes(lex, field_name, |_, arg| {
         Ok(Box::new(new_filter_le_field(
             field_name,
             arg,
@@ -661,7 +666,7 @@ fn parse_filter_le_field(
     })
 }
 
-fn parse_filter_exact(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_exact(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     parse_func_arg_maybe_prefix(lex, field_name, |phrase, is_prefix| {
         if is_prefix {
             Ok(Box::new(new_filter_exact_prefix(field_name, phrase)))
@@ -673,7 +678,7 @@ fn parse_filter_exact(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, St
 
 fn parse_filter_pattern_match(
     lex: &mut Lexer,
-    field_name: &str,
+    field_name: &[u8],
     pmo: PatternMatcherOption,
 ) -> Result<BoxFilter, String> {
     parse_func_arg(lex, field_name, |func_name, arg| {
@@ -684,14 +689,14 @@ fn parse_filter_pattern_match(
     })
 }
 
-fn parse_filter_regexp(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_regexp(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     parse_func_arg(lex, field_name, |_, arg| {
         new_filter_regexp_opt(field_name, arg)
     })
 }
 
 /// Port of Go `newFilterRegexpOpt`.
-fn new_filter_regexp_opt(field_name: &str, arg: &str) -> Result<BoxFilter, String> {
+fn new_filter_regexp_opt(field_name: &[u8], arg: &str) -> Result<BoxFilter, String> {
     if arg.is_empty() || arg == ".*" {
         return Ok(Box::new(new_filter_noop()));
     }
@@ -701,19 +706,21 @@ fn new_filter_regexp_opt(field_name: &str, arg: &str) -> Result<BoxFilter, Strin
     let re = Regex::new(arg).map_err(|e| {
         format!(
             "invalid regexp {}:{}: {e}",
-            go_quote(get_canonical_column_name(field_name)),
+            // go_quote_bytes: display-only quoting of a raw-byte name in the
+            // error message (Go %q over raw bytes).
+            crate::stream_filter::go_quote_bytes(get_canonical_column_name_bytes(field_name)),
             go_quote(arg)
         )
     })?;
     Ok(Box::new(new_filter_regexp(field_name, re, arg.to_string())))
 }
 
-fn parse_filter_star(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_star(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     lex.next_token();
 
     if field_name.is_empty() && lex.is_keyword(&[":"]) {
         lex.next_token();
-        return parse_filter_generic(lex, "*");
+        return parse_filter_generic(lex, b"*");
     }
 
     if lex.is_skipped_space() || lex.is_query_part_trailer() {
@@ -744,7 +751,7 @@ fn parse_filter_star(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, Str
     )))
 }
 
-fn parse_filter_tilda(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_tilda(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     let op = lex.token.clone();
     lex.next_token();
     if lex.is_keyword(&["-"]) {
@@ -762,18 +769,20 @@ fn parse_filter_tilda(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, St
     let arg = lex.next_compound_token().map_err(|e| {
         format!(
             "cannot read regexp for field {}: {e}",
-            go_quote(get_canonical_column_name(field_name))
+            // go_quote_bytes: display-only quoting of a raw-byte name in the
+            // error message (Go %q over raw bytes).
+            crate::stream_filter::go_quote_bytes(get_canonical_column_name_bytes(field_name))
         )
     })?;
     new_filter_regexp_opt(field_name, &arg)
 }
 
-fn parse_filter_not_tilda(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_not_tilda(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     let f = parse_filter_tilda(lex, field_name)?;
     Ok(Box::new(new_filter_not(f)))
 }
 
-fn parse_filter_eq(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_eq(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     let op = lex.token.clone();
     lex.next_token();
     if lex.is_skipped_space() && field_name.is_empty() {
@@ -793,12 +802,12 @@ fn parse_filter_eq(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, Strin
     Ok(Box::new(new_filter_exact(field_name, &phrase)))
 }
 
-fn parse_filter_neq(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_neq(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     let f = parse_filter_eq(lex, field_name)?;
     Ok(Box::new(new_filter_not(f)))
 }
 
-fn parse_filter_gt(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_gt(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     lex.next_token();
     let mut include_min_value = false;
     let mut op = ">".to_string();
@@ -834,7 +843,7 @@ fn parse_filter_gt(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, Strin
     }
 }
 
-fn parse_filter_lt(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_lt(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     lex.next_token();
     let mut include_max_value = false;
     let mut op = "<".to_string();
@@ -879,7 +888,7 @@ fn missing_colon_err(op: &str) -> String {
 
 fn try_parse_filter_gt_string(
     lex: &mut Lexer,
-    field_name: &str,
+    field_name: &[u8],
     op: &str,
     include_min_value: bool,
 ) -> Option<BoxFilter> {
@@ -905,7 +914,7 @@ fn try_parse_filter_gt_string(
 
 fn try_parse_filter_lt_string(
     lex: &mut Lexer,
-    field_name: &str,
+    field_name: &[u8],
     op: &str,
     include_max_value: bool,
 ) -> Option<BoxFilter> {
@@ -929,7 +938,7 @@ fn try_parse_filter_lt_string(
     ))
 }
 
-fn parse_filter_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_range(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     let lex_state = lex.clone();
     let func_name = lex.token.clone();
     lex.next_token();
@@ -995,7 +1004,7 @@ fn parse_filter_range(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, St
 
 fn parse_func_arg(
     lex: &mut Lexer,
-    field_name: &str,
+    field_name: &[u8],
     callback: impl Fn(&str, &str) -> Result<BoxFilter, String>,
 ) -> Result<BoxFilter, String> {
     parse_func_args(lex, field_name, |func_name, args| {
@@ -1011,7 +1020,7 @@ fn parse_func_arg(
 
 fn parse_func_args(
     lex: &mut Lexer,
-    field_name: &str,
+    field_name: &[u8],
     callback: impl Fn(&str, Vec<String>) -> Result<BoxFilter, String>,
 ) -> Result<BoxFilter, String> {
     let lex_state = lex.clone();
@@ -1027,9 +1036,27 @@ fn parse_func_args(
 
 /// Byte form of [`parse_func_args`] for filters whose args are raw-byte
 /// phrase payloads (Go parser.go:329 strconv.Unquote semantics).
+/// Single-raw-byte-arg form of [`parse_func_arg`] (Go strings are raw bytes;
+/// used where the arg is a field name or byte payload).
+fn parse_func_arg_bytes(
+    lex: &mut Lexer,
+    field_name: &[u8],
+    callback: impl Fn(&str, &[u8]) -> Result<BoxFilter, String>,
+) -> Result<BoxFilter, String> {
+    parse_func_args_bytes(lex, field_name, |func_name, args| {
+        if args.len() != 1 {
+            return Err(format!(
+                "unexpected number of args for {func_name}(); got {}; want 1",
+                args.len()
+            ));
+        }
+        callback(func_name, &args[0])
+    })
+}
+
 fn parse_func_args_bytes(
     lex: &mut Lexer,
-    field_name: &str,
+    field_name: &[u8],
     callback: impl Fn(&str, Vec<Vec<u8>>) -> Result<BoxFilter, String>,
 ) -> Result<BoxFilter, String> {
     let lex_state = lex.clone();
@@ -1046,7 +1073,7 @@ fn parse_func_args_bytes(
 
 // ---- _time filters ----
 
-fn parse_filter_time_generic(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_time_generic(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     if !field_name.is_empty() {
         return parse_filter_phrase(lex, field_name);
     }
@@ -1054,7 +1081,7 @@ fn parse_filter_time_generic(lex: &mut Lexer, field_name: &str) -> Result<BoxFil
     lex.next_token();
     if !lex.is_keyword(&[":"]) {
         *lex = lex_state;
-        return parse_filter_phrase(lex, "");
+        return parse_filter_phrase(lex, b"");
     }
     lex.next_token();
     parse_filter_time_internal(lex)
@@ -1393,7 +1420,7 @@ fn parse_filter_time_eq(lex: &mut Lexer) -> Result<(i64, i64, String), String> {
 
 // ---- _stream_id filters ----
 
-fn parse_filter_stream_id(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_stream_id(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     if !field_name.is_empty() {
         return parse_filter_phrase(lex, field_name);
     }
@@ -1401,7 +1428,7 @@ fn parse_filter_stream_id(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter
     lex.next_token();
     if !lex.is_keyword(&[":"]) {
         *lex = lex_state;
-        return parse_filter_phrase(lex, "");
+        return parse_filter_phrase(lex, b"");
     }
     lex.next_token();
     parse_filter_stream_id_internal(lex)
@@ -1483,7 +1510,7 @@ fn parse_stream_id(lex: &mut Lexer) -> Result<StreamID, String> {
 
 // ---- _stream filters ----
 
-fn parse_filter_stream(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
+fn parse_filter_stream(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
     if !field_name.is_empty() {
         return parse_filter_phrase(lex, field_name);
     }
@@ -1491,17 +1518,17 @@ fn parse_filter_stream(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, S
     lex.next_token();
     if !lex.is_keyword(&[":"]) {
         *lex = lex_state;
-        return parse_filter_phrase(lex, "");
+        return parse_filter_phrase(lex, b"");
     }
     lex.next_token();
-    parse_filter_stream_internal(lex, "_stream")
+    parse_filter_stream_internal(lex, b"_stream")
 }
 
-fn parse_filter_stream_internal(lex: &mut Lexer, field_name: &str) -> Result<BoxFilter, String> {
-    if !field_name.is_empty() && field_name != "_stream" {
+fn parse_filter_stream_internal(lex: &mut Lexer, field_name: &[u8]) -> Result<BoxFilter, String> {
+    if !field_name.is_empty() && field_name != b"_stream" {
         return Err(format!(
             "stream filter cannot be applied to {} field; it can be applied only to _stream field",
-            go_quote(field_name)
+            crate::stream_filter::go_quote_bytes(field_name)
         ));
     }
     let sf = parse_stream_filter(lex)?;

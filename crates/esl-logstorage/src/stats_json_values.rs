@@ -29,13 +29,12 @@ use std::sync::atomic::AtomicBool;
 use esl_common::encoding;
 
 use crate::block_result::{BlockResult, ColRef};
-use crate::filter_generic::quote_field_filter_if_needed;
+use crate::parser::quote_field_filter_if_needed;
 use crate::prefix_filter;
 use crate::rows::{Field, marshal_fields_to_json};
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::stats_json_values_sorted::StatsJSONValuesSortedProcessor;
 use crate::stats_json_values_topk::StatsJSONValuesTopkProcessor;
-use crate::stream_filter::quote_token_if_needed;
 
 /// A single sort field for `json_values(...) sort by (...)`.
 ///
@@ -43,13 +42,13 @@ use crate::stream_filter::quote_token_if_needed;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BySortField {
     /// The name of the field to sort by.
-    pub(crate) name: String,
+    pub(crate) name: Vec<u8>,
     /// Whether sorting is in descending order.
     pub(crate) is_desc: bool,
 }
 
 impl BySortField {
-    pub(crate) fn new(name: impl Into<String>, is_desc: bool) -> Self {
+    pub(crate) fn new(name: impl Into<Vec<u8>>, is_desc: bool) -> Self {
         Self {
             name: name.into(),
             is_desc,
@@ -59,7 +58,7 @@ impl BySortField {
 
 impl std::fmt::Display for BySortField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&quote_token_if_needed(&self.name))?;
+        f.write_str(&crate::parser::quote_token_bytes_if_needed(&self.name))?;
         if self.is_desc {
             f.write_str(" desc")?;
         }
@@ -73,7 +72,7 @@ impl std::fmt::Display for BySortField {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct StatsJSONValues {
     /// Field filters for fields to select from logs.
-    pub(crate) field_filters: Vec<String>,
+    pub(crate) field_filters: Vec<Vec<u8>>,
 
     /// Optional fields for sorting the selected logs; empty means unsorted.
     pub(crate) sort_fields: Vec<BySortField>,
@@ -87,7 +86,7 @@ impl StatsJSONValues {
     /// constructor (deferred until `lexer` is ported). Exposed for the future
     /// parser and for tests.
     pub(crate) fn new(
-        field_filters: Vec<String>,
+        field_filters: Vec<Vec<u8>>,
         sort_fields: Vec<BySortField>,
         limit: u64,
     ) -> Self {
@@ -158,7 +157,7 @@ pub(crate) struct StatsJSONValuesProcessor {
     fields_buf: Vec<Field>,
 
     // Captured config (see module docs).
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
     limit: u64,
 }
 
@@ -170,7 +169,7 @@ impl StatsJSONValuesProcessor {
         Self::default()
     }
 
-    fn with_config(field_filters: Vec<String>, limit: u64) -> Self {
+    fn with_config(field_filters: Vec<Vec<u8>>, limit: u64) -> Self {
         Self {
             field_filters,
             limit,
@@ -313,7 +312,7 @@ pub(crate) fn marshal_json_values(dst: &mut Vec<u8>, items: &[Vec<u8>]) {
 /// PORT NOTE: port of `getMatchingColumns` + `matchingColumns.sort`
 /// (`block_result.go`). The Go pooling (`getMatchingColumns`/`putMatchingColumns`)
 /// is dropped; the result is an owned `Vec<ColRef>`.
-pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> Vec<ColRef> {
+pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[Vec<u8>]) -> Vec<ColRef> {
     let mut cs: Vec<ColRef> = if is_single_field(filters) {
         vec![br.get_column_by_name(&filters[0])]
     } else {
@@ -326,11 +325,11 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
     cs
 }
 
-fn is_single_field(filters: &[String]) -> bool {
+fn is_single_field(filters: &[Vec<u8>]) -> bool {
     filters.len() == 1 && !prefix_filter::is_wildcard_filter(&filters[0])
 }
 
-fn get_matching_columns_slow(br: &mut BlockResult, filters: &[String]) -> Vec<ColRef> {
+fn get_matching_columns_slow(br: &mut BlockResult, filters: &[Vec<u8>]) -> Vec<ColRef> {
     let all = br.get_columns();
     let names: Vec<Vec<u8>> = all.iter().map(|&c| br.column_name(c).to_vec()).collect();
 
@@ -338,7 +337,7 @@ fn get_matching_columns_slow(br: &mut BlockResult, filters: &[String]) -> Vec<Co
 
     // Add columns matching the given filters.
     for (i, &c) in all.iter().enumerate() {
-        if prefix_filter::match_filters_bytes(filters, &names[i]) {
+        if prefix_filter::match_filters(filters, &names[i]) {
             dst.push(c);
         }
     }
@@ -348,7 +347,7 @@ fn get_matching_columns_slow(br: &mut BlockResult, filters: &[String]) -> Vec<Co
         if prefix_filter::is_wildcard_filter(f) {
             continue;
         }
-        if !names.iter().any(|n| n == f.as_bytes()) {
+        if !names.iter().any(|n| n == f) {
             dst.push(br.get_column_by_name(f));
         }
     }
@@ -356,7 +355,7 @@ fn get_matching_columns_slow(br: &mut BlockResult, filters: &[String]) -> Vec<Co
     dst
 }
 
-fn field_names_string(fields: &[String]) -> String {
+fn field_names_string(fields: &[Vec<u8>]) -> String {
     fields
         .iter()
         .map(|f| quote_field_filter_if_needed(f))
@@ -391,7 +390,10 @@ mod tests {
         spec: &[&[(&str, &str)]],
     ) -> String {
         let sv = StatsJSONValues::new(
-            field_filters.iter().map(|s| s.to_string()).collect(),
+            field_filters
+                .iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect(),
             sort_fields,
             limit,
         );

@@ -250,18 +250,26 @@ impl Histogram {
 
 /// Port of `statsQuantile`.
 pub(crate) struct StatsQuantile {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
     phi: f64,
     phi_str: String,
 }
 
 /// Port of `parseStatsQuantile`. The first parsed filter is `phi`; the
 /// remainder default to `["*"]` when empty.
-pub(crate) fn new_stats_quantile(mut field_filters: Vec<String>) -> Result<StatsQuantile, String> {
+pub(crate) fn new_stats_quantile(mut field_filters: Vec<Vec<u8>>) -> Result<StatsQuantile, String> {
     if field_filters.is_empty() {
         return Err("missing phi arg at 'quantile'".to_string());
     }
-    let phi_str = field_filters.remove(0);
+    let phi_bytes = field_filters.remove(0);
+    // Checked str view: float parsing genuinely needs text and fails in Go
+    // for non-numeric (including invalid-UTF-8) input too.
+    let phi_str = String::from_utf8(phi_bytes.clone()).map_err(|_| {
+        format!(
+            "phi arg in 'quantile' must be floating point number; got {}",
+            crate::stream_filter::go_quote_bytes(&phi_bytes)
+        )
+    })?;
     let phi = try_parse_float64(&phi_str).ok_or_else(|| {
         format!("phi arg in 'quantile' must be floating point number; got {phi_str:?}")
     })?;
@@ -271,7 +279,7 @@ pub(crate) fn new_stats_quantile(mut field_filters: Vec<String>) -> Result<Stats
         ));
     }
     if field_filters.is_empty() {
-        field_filters.push("*".to_string());
+        field_filters.push(b"*".to_vec());
     }
     Ok(StatsQuantile {
         field_filters,
@@ -305,7 +313,7 @@ impl StatsFunc for StatsQuantile {
 
 /// Builds a bare [`StatsQuantileProcessor`] (used by `stats_median` too).
 pub(crate) fn new_stats_quantile_processor(
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
     phi: f64,
 ) -> StatsQuantileProcessor {
     StatsQuantileProcessor {
@@ -317,7 +325,7 @@ pub(crate) fn new_stats_quantile_processor(
 
 /// Port of `statsQuantileProcessor`.
 pub(crate) struct StatsQuantileProcessor {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
     phi: f64,
     h: Histogram,
 }
@@ -391,8 +399,8 @@ mod tests {
     }
 
     fn run_quantile(phi: &str, filters: &[&str], block: &[Vec<Field>]) -> String {
-        let mut all: Vec<String> = vec![phi.to_string()];
-        all.extend(filters.iter().map(|s| s.to_string()));
+        let mut all: Vec<Vec<u8>> = vec![phi.as_bytes().to_vec()];
+        all.extend(filters.iter().map(|s| s.as_bytes().to_vec()));
         let sf = new_stats_quantile(all).unwrap();
         let mut sp = sf.new_stats_processor();
         let mut br = BlockResult::default();

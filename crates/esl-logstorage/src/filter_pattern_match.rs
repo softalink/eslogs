@@ -40,7 +40,7 @@ pub(crate) struct FilterPatternMatch {
 }
 
 pub(crate) fn new_filter_pattern_match(
-    field_name: &str,
+    field_name: &[u8],
     func_name: &str,
     pm: PatternMatcher,
 ) -> FilterGeneric {
@@ -84,7 +84,7 @@ impl FieldFilter for FilterPatternMatch {
         )
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_pattern_bytes(&self.pm, v)
     }
@@ -93,7 +93,7 @@ impl FieldFilter for FilterPatternMatch {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let r = br.get_column_by_name(field_name);
         if br.column_is_const(r) {
@@ -133,7 +133,7 @@ impl FieldFilter for FilterPatternMatch {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         // Verify whether fp matches const column.
         let v = bs.get_const_column_value(field_name);

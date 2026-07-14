@@ -247,7 +247,11 @@ pub trait FieldFilter: Send + Sync {
 
     /// Returns true if the filter for `field_name` matches a row with the
     /// given fields (Go `matchRowByField`).
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool;
+    ///
+    /// `field_name` is raw bytes: field names parsed from query text carry
+    /// Go-parity raw bytes (a quoted `"\xff"` name matches an ingested
+    /// raw-byte name, like Go).
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool;
 
     /// Updates `bm` according to the filter for `field_name` applied to the
     /// given `bs` block (Go `applyToBlockSearchByField`).
@@ -255,7 +259,7 @@ pub trait FieldFilter: Send + Sync {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     );
 
     /// Updates `bm` according to the filter for `field_name` applied to the
@@ -264,7 +268,7 @@ pub trait FieldFilter: Send + Sync {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     );
 
     /// `Query::optimize` support (Go `removeStarFilters`): returns true when
@@ -299,7 +303,11 @@ pub trait FieldFilter: Send + Sync {
     /// `newFilterInValues` / `newFilterContainsAnyValues` /
     /// `newFilterContainsAllValues`). Only implemented by the field filters
     /// whose [`FieldFilter::in_values`] returns `Some`.
-    fn new_with_values(&self, _field_name: &str, _values: Vec<Vec<u8>>) -> Option<Box<dyn Filter>> {
+    fn new_with_values(
+        &self,
+        _field_name: &[u8],
+        _values: Vec<Vec<u8>>,
+    ) -> Option<Box<dyn Filter>> {
         None
     }
 }

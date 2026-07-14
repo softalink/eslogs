@@ -40,14 +40,14 @@ use crate::stats_uniq_values::{get_matching_columns, marshal_json_array};
 /// `values(fields...)` stats function (Go `statsValues`).
 #[derive(Debug, Default, Clone)]
 pub struct StatsValues {
-    pub(crate) field_filters: Vec<String>,
+    pub(crate) field_filters: Vec<Vec<u8>>,
     pub(crate) limit: u64,
 }
 
 impl StatsValues {
     /// Constructs a `values` function (exposed for the future parser).
     #[allow(dead_code)] // consumed by the not-yet-ported stats parser.
-    pub(crate) fn new(field_filters: Vec<String>, limit: u64) -> Self {
+    pub(crate) fn new(field_filters: Vec<Vec<u8>>, limit: u64) -> Self {
         Self {
             field_filters,
             limit,
@@ -84,7 +84,7 @@ impl StatsFunc for StatsValues {
 /// Accumulates `values` state for one group (Go `statsValuesProcessor`).
 #[derive(Debug, Default, PartialEq)]
 pub struct StatsValuesProcessor {
-    pub(crate) field_filters: Vec<String>,
+    pub(crate) field_filters: Vec<Vec<u8>>,
     pub(crate) limit: u64,
     pub(crate) values: Vec<Vec<u8>>,
 }

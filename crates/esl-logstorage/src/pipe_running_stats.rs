@@ -63,13 +63,13 @@ pub trait RunningStatsProcessor: Send {
 /// A running-stats function to execute and the name of its output field.
 pub struct PipeRunningStatsFunc {
     f: Box<dyn RunningStatsFunc>,
-    result_name: String,
+    result_name: Vec<u8>,
 }
 
 /// Builds a [`PipeRunningStatsFunc`].
 pub(crate) fn new_pipe_running_stats_func(
     f: Box<dyn RunningStatsFunc>,
-    result_name: String,
+    result_name: Vec<u8>,
 ) -> PipeRunningStatsFunc {
     PipeRunningStatsFunc { f, result_name }
 }
@@ -79,14 +79,14 @@ pub struct PipeRunningStats {
     /// When set, compute total stats (aka `total_stats`) rather than running
     /// stats.
     is_total: bool,
-    by_fields: Arc<Vec<String>>,
+    by_fields: Arc<Vec<Vec<u8>>>,
     funcs: Arc<Vec<PipeRunningStatsFunc>>,
 }
 
 /// Builds a [`PipeRunningStats`] (Go `parsePipeRunningStatsExt` result).
 pub(crate) fn new_pipe_running_stats(
     is_total: bool,
-    by_fields: Vec<String>,
+    by_fields: Vec<Vec<u8>>,
     funcs: Vec<PipeRunningStatsFunc>,
 ) -> PipeRunningStats {
     PipeRunningStats {
@@ -119,13 +119,19 @@ impl Pipe for PipeRunningStats {
         };
         if !self.by_fields.is_empty() {
             s += " by (";
-            s += &self.by_fields.join(", ");
+            s += &crate::stats_count::field_names_string(&self.by_fields);
             s += ")";
         }
         let a: Vec<String> = self
             .funcs
             .iter()
-            .map(|f| format!("{} as {}", f.f, f.result_name))
+            .map(|f| {
+                format!(
+                    "{} as {}",
+                    f.f,
+                    crate::parser::quote_token_bytes_if_needed(&f.result_name)
+                )
+            })
             .collect();
         s += " ";
         s += &a.join(", ");
@@ -165,7 +171,7 @@ impl Pipe for PipeRunningStats {
 
 struct PipeRunningStatsProcessor {
     is_total: bool,
-    by_fields: Arc<Vec<String>>,
+    by_fields: Arc<Vec<Vec<u8>>>,
     funcs: Arc<Vec<PipeRunningStatsFunc>>,
     stop: Arc<AtomicBool>,
     pp_next: Arc<dyn PipeProcessor>,
@@ -216,7 +222,7 @@ impl PipeProcessor for PipeRunningStatsProcessor {
                     return Ok(());
                 }
                 let key = get_key(&row);
-                let timestamp = get_field_value_by_name(&row, "_time").to_vec();
+                let timestamp = get_field_value_by_name(&row, b"_time").to_vec();
                 m.entry(key).or_default().push((timestamp, row));
             }
         }
@@ -255,7 +261,7 @@ impl PipeProcessor for PipeRunningStatsProcessor {
                     }
                     let result = sp.get_running_stats();
                     out_fields.push(Field {
-                        name: funcs[i].result_name.clone().into_bytes(),
+                        name: funcs[i].result_name.clone(),
                         value: result,
                     });
                 }
@@ -370,14 +376,14 @@ mod tests {
     }
 
     fn field_value<'a>(row: &'a [Field], name: &str) -> &'a str {
-        std::str::from_utf8(get_field_value_by_name(row, name)).unwrap()
+        std::str::from_utf8(get_field_value_by_name(row, name.as_bytes())).unwrap()
     }
 
     #[test]
     fn test_running_stats_count() {
         let f = new_pipe_running_stats_func(
-            Box::new(new_running_stats_count(vec!["*".to_string()])),
-            "rc".to_string(),
+            Box::new(new_running_stats_count(vec![b"*".to_vec()])),
+            b"rc".to_vec(),
         );
         let ps = new_pipe_running_stats(false, vec![], vec![f]);
         let sink = Collector::new();
@@ -404,10 +410,10 @@ mod tests {
     #[test]
     fn test_total_stats_sum_by_field() {
         let f = new_pipe_running_stats_func(
-            Box::new(new_running_stats_sum(vec!["v".to_string()])),
-            "tot".to_string(),
+            Box::new(new_running_stats_sum(vec![b"v".to_vec()])),
+            b"tot".to_vec(),
         );
-        let ps = new_pipe_running_stats(true, vec!["g".to_string()], vec![f]);
+        let ps = new_pipe_running_stats(true, vec![b"g".to_vec()], vec![f]);
         let sink = Collector::new();
         let stop = Arc::new(AtomicBool::new(false));
         let pp = ps.new_pipe_processor(1, stop, sink.clone());

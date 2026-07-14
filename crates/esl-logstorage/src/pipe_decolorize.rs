@@ -12,11 +12,10 @@ use crate::color_sequence::drop_color_sequences;
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::pipe_update::new_pipe_update_processor;
 use crate::prefix_filter;
-use crate::stream_filter::quote_token_if_needed;
 
 /// `pipeDecolorize` implements `| decolorize [field]`.
 pub struct PipeDecolorize {
-    pub(crate) field: String,
+    pub(crate) field: Vec<u8>,
 }
 
 /// Constructs a `decolorize` pipe from an already-parsed field name.
@@ -24,7 +23,7 @@ pub struct PipeDecolorize {
 /// PORT NOTE: Go's `parsePipeDecolorize` is lexer-dependent and deferred; this
 /// constructor takes the target field directly (defaulting to `_msg` at the
 /// call site, matching the Go parser's default).
-pub(crate) fn new_pipe_decolorize(field: String) -> PipeDecolorize {
+pub(crate) fn new_pipe_decolorize(field: Vec<u8>) -> PipeDecolorize {
     PipeDecolorize { field }
 }
 
@@ -37,8 +36,11 @@ impl Pipe for PipeDecolorize {
 
     fn to_string(&self) -> String {
         let mut s = "decolorize".to_string();
-        if self.field != "_msg" {
-            s += &format!(" {}", quote_token_if_needed(&self.field));
+        if self.field != b"_msg" {
+            s += &format!(
+                " {}",
+                crate::parser::quote_token_bytes_if_needed(&self.field)
+            );
         }
         s
     }
@@ -84,7 +86,7 @@ mod tests {
     // omitted until the LogsQL parser is ported.
 
     fn decolorize(field: &str) -> PipeDecolorize {
-        new_pipe_decolorize(field.to_string())
+        new_pipe_decolorize(field.as_bytes().to_vec())
     }
 
     #[test]

@@ -6,14 +6,14 @@ use std::sync::{Arc, Mutex};
 
 use crate::block_result::{BlockResult, ColRef, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
-use crate::prefix_filter::{self, is_wildcard_filter, match_filter_bytes};
+use crate::prefix_filter::{self, is_wildcard_filter, match_filter};
 use crate::stats_count_uniq::field_names_string;
 use crate::stream_filter::quote_token_if_needed;
 
 /// `pipeCoalesce` implements `| coalesce (...) as ...`.
 pub struct PipeCoalesce {
-    pub(crate) src_field_filters: Vec<String>,
-    pub(crate) dst_field: String,
+    pub(crate) src_field_filters: Vec<Vec<u8>>,
+    pub(crate) dst_field: Vec<u8>,
     pub(crate) default_value: String,
 }
 
@@ -23,8 +23,8 @@ pub struct PipeCoalesce {
 /// constructor takes the parsed source field filters, destination field and
 /// default value directly.
 pub(crate) fn new_pipe_coalesce(
-    src_field_filters: Vec<String>,
-    dst_field: String,
+    src_field_filters: Vec<Vec<u8>>,
+    dst_field: Vec<u8>,
     default_value: String,
 ) -> PipeCoalesce {
     PipeCoalesce {
@@ -50,8 +50,11 @@ impl Pipe for PipeCoalesce {
         if !self.default_value.is_empty() {
             s += &format!(" default {}", quote_token_if_needed(&self.default_value));
         }
-        if self.dst_field != "_msg" {
-            s += &format!(" as {}", quote_token_if_needed(&self.dst_field));
+        if self.dst_field != b"_msg" {
+            s += &format!(
+                " as {}",
+                crate::parser::quote_token_bytes_if_needed(&self.dst_field)
+            );
         }
         s
     }
@@ -61,7 +64,7 @@ impl Pipe for PipeCoalesce {
     }
 
     fn can_return_last_n_results(&self) -> bool {
-        self.dst_field != "_time"
+        self.dst_field != b"_time"
     }
 
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
@@ -91,8 +94,8 @@ impl Pipe for PipeCoalesce {
 }
 
 struct PipeCoalesceProcessor {
-    src_field_filters: Vec<String>,
-    dst_field: String,
+    src_field_filters: Vec<Vec<u8>>,
+    dst_field: Vec<u8>,
     default_value: String,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<PipeCoalesceProcessorShard>>,
@@ -133,7 +136,7 @@ impl PipeProcessor for PipeCoalesceProcessor {
                 continue;
             }
             for (&c, name) in cs.iter().zip(cs_names.iter()) {
-                if match_filter_bytes(ff, name) {
+                if match_filter(ff, name) {
                     add_col(c, name, &mut selected, &mut selected_names);
                 }
             }
@@ -155,7 +158,7 @@ impl PipeProcessor for PipeCoalesceProcessor {
             shard.rc.add_value(&value);
         }
 
-        shard.rc.name = self.dst_field.clone().into_bytes();
+        shard.rc.name = self.dst_field.clone();
         let rc = std::mem::take(&mut shard.rc);
         br.add_result_column(rc);
         drop(shard);
@@ -178,8 +181,8 @@ mod tests {
 
     fn coalesce(src: &[&str], default_value: &str, dst: &str) -> PipeCoalesce {
         new_pipe_coalesce(
-            src.iter().map(|s| s.to_string()).collect(),
-            dst.to_string(),
+            src.iter().map(|s| s.as_bytes().to_vec()).collect(),
+            dst.as_bytes().to_vec(),
             default_value.to_string(),
         )
     }

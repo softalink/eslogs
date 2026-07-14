@@ -1870,24 +1870,24 @@ fn get_common_fields(n: &Node, ns: &Namespace, p: &Pod, cs: &ContainerStatus) ->
     fs.add("kubernetes.pod_node_name", &p.spec.node_name);
 
     for (k, v) in &p.metadata.labels {
-        fs.add(&format!("kubernetes.pod_labels.{k}"), v);
+        fs.add(format!("kubernetes.pod_labels.{k}"), v);
     }
     for (k, v) in &p.metadata.annotations {
-        fs.add(&format!("kubernetes.pod_annotations.{k}"), v);
+        fs.add(format!("kubernetes.pod_annotations.{k}"), v);
     }
 
     for (k, v) in &n.metadata.labels {
-        fs.add(&format!("kubernetes.node_labels.{k}"), v);
+        fs.add(format!("kubernetes.node_labels.{k}"), v);
     }
     for (k, v) in &n.metadata.annotations {
-        fs.add(&format!("kubernetes.node_annotations.{k}"), v);
+        fs.add(format!("kubernetes.node_annotations.{k}"), v);
     }
 
     for (k, v) in &ns.metadata.labels {
-        fs.add(&format!("kubernetes.namespace_labels.{k}"), v);
+        fs.add(format!("kubernetes.namespace_labels.{k}"), v);
     }
     for (k, v) in &ns.metadata.annotations {
-        fs.add(&format!("kubernetes.namespace_annotations.{k}"), v);
+        fs.add(format!("kubernetes.namespace_annotations.{k}"), v);
     }
 
     fs.fields
@@ -2194,11 +2194,11 @@ impl TailProcessor for LogFileProcessor {
                     // Display-only lossy conversions (R5): log message context.
                     let pod = String::from_utf8_lossy(must_get_field_val_by_name(
                         &self.common_fields,
-                        "kubernetes.pod_name",
+                        b"kubernetes.pod_name",
                     ));
                     let namespace = String::from_utf8_lossy(must_get_field_val_by_name(
                         &self.common_fields,
-                        "kubernetes.pod_namespace",
+                        b"kubernetes.pod_namespace",
                     ));
                     INVALID_CRI_LINE_LOGGER.errorf(format_args!(
                         "skipping invalid json-file log line {:?} from Pod {pod:?} in Namespace {namespace:?}: {err}; \
@@ -2219,11 +2219,11 @@ impl TailProcessor for LogFileProcessor {
                 // Display-only lossy conversions (R5): log message context.
                 let pod = String::from_utf8_lossy(must_get_field_val_by_name(
                     &self.common_fields,
-                    "kubernetes.pod_name",
+                    b"kubernetes.pod_name",
                 ));
                 let namespace = String::from_utf8_lossy(must_get_field_val_by_name(
                     &self.common_fields,
-                    "kubernetes.pod_namespace",
+                    b"kubernetes.pod_namespace",
                 ));
                 INVALID_CRI_LINE_LOGGER.errorf(format_args!(
                     "skipping invalid CRI log line {:?} from Pod {pod:?} in Namespace {namespace:?}: {err}; \
@@ -2326,11 +2326,11 @@ impl LogFileProcessor {
             // Display-only lossy conversions (R5): log message context.
             let pod = String::from_utf8_lossy(must_get_field_val_by_name(
                 &self.common_fields,
-                "kubernetes.pod_name",
+                b"kubernetes.pod_name",
             ));
             let namespace = String::from_utf8_lossy(must_get_field_val_by_name(
                 &self.common_fields,
-                "kubernetes.pod_namespace",
+                b"kubernetes.pod_namespace",
             ));
             LOG_LINE_EXCEEDS_MAX_LINE_SIZE_LOGGER.warnf(format_args!(
                 "skipping log entry from Pod {pod:?} in namespace {namespace:?}: entry size of {:.2} MiB exceeds the maximum allowed size of {} MiB",
@@ -3052,13 +3052,14 @@ fn should_include_metadata_field(field: &str) -> bool {
 }
 
 /// Go `mustGetFieldValByName`.
-fn must_get_field_val_by_name<'a>(common_fields: &'a [Field], field_name: &str) -> &'a [u8] {
-    match common_fields
-        .iter()
-        .find(|f| f.name == field_name.as_bytes())
-    {
+fn must_get_field_val_by_name<'a>(common_fields: &'a [Field], field_name: &[u8]) -> &'a [u8] {
+    match common_fields.iter().find(|f| f.name == field_name) {
         Some(f) => &f.value,
-        None => panic!("BUG: cannot find field {field_name:?} in commonFields"),
+        None => panic!(
+            "BUG: cannot find field {:?} in commonFields",
+            // Display-only lossy view of the raw name bytes (panic text).
+            String::from_utf8_lossy(field_name)
+        ),
     }
 }
 

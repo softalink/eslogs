@@ -131,9 +131,9 @@ impl DataBlock {
         self.columns = columns;
     }
 
-    /// Returns the column with the given name, or `None`.
-    pub fn get_column_by_name(&self, name: &str) -> Option<&BlockColumn> {
-        self.columns.iter().find(|c| c.name == name.as_bytes())
+    /// Returns the column with the given name (raw bytes), or `None`.
+    pub fn get_column_by_name(&self, name: &[u8]) -> Option<&BlockColumn> {
+        self.columns.iter().find(|c| c.name == name)
     }
 
     /// Appends the parsed `_time` column values to `dst`
@@ -142,7 +142,7 @@ impl DataBlock {
     /// Returns false when the block has no `_time` column or a value cannot be
     /// parsed as an RFC3339 timestamp.
     pub fn get_timestamps(&self, dst: &mut Vec<i64>) -> bool {
-        let Some(c) = self.get_column_by_name("_time") else {
+        let Some(c) = self.get_column_by_name(b"_time") else {
             return false;
         };
         try_parse_timestamps(dst, &c.values)
@@ -1110,7 +1110,7 @@ impl Storage {
         tenant_ids: &[TenantID],
         q: &Query,
         hidden_fields_filters: &[String],
-        field_name: &str,
+        field_name: &[u8],
         filter: &str,
         limit: u64,
         cancel: Option<&Arc<AtomicBool>>,
@@ -1120,7 +1120,7 @@ impl Storage {
 
         let mut pipe_str = format!(
             "field_values {}",
-            crate::parser::quote_token_if_needed(field_name)
+            crate::parser::quote_token_bytes_if_needed(field_name)
         );
         if !filter.is_empty() {
             pipe_str += " filter ";
@@ -1177,7 +1177,7 @@ impl Storage {
         tenant_ids: &[TenantID],
         q: &Query,
         hidden_fields_filters: &[String],
-        field_name: &str,
+        field_name: &[u8],
         filter: &str,
         limit: u64,
         cancel: Option<&Arc<AtomicBool>>,
@@ -1198,7 +1198,7 @@ impl Storage {
                 return;
             }
 
-            if f.name != field_name.as_bytes() {
+            if f.name != field_name {
                 return;
             }
             *m.entry(f.value.clone()).or_insert(0) += hits;
@@ -1252,7 +1252,7 @@ impl Storage {
             tenant_ids,
             q,
             hidden_fields_filters,
-            "_stream",
+            b"_stream",
             "",
             limit,
             cancel,
@@ -1277,7 +1277,7 @@ impl Storage {
             tenant_ids,
             q,
             hidden_fields_filters,
-            "_stream_id",
+            b"_stream_id",
             "",
             limit,
             cancel,
@@ -1350,7 +1350,7 @@ impl Storage {
 /// Port of Go `getFieldValuesFunc`: executes the subquery given as rendered
 /// text and returns the unique values of the given field
 /// (`fn(q_text, q_field_name)`).
-pub(crate) type GetFieldValuesFn<'a> = dyn FnMut(&str, &str) -> Result<Vec<Vec<u8>>, String> + 'a;
+pub(crate) type GetFieldValuesFn<'a> = dyn FnMut(&str, &[u8]) -> Result<Vec<Vec<u8>>, String> + 'a;
 
 /// Port of Go `getJoinRowsFunc`: executes the join subquery given as rendered
 /// text and returns its result rows.
@@ -1505,7 +1505,7 @@ fn get_field_values_generic(
     storage: &Arc<Storage>,
     tenant_ids: &[TenantID],
     q: &Query,
-    field_name: &str,
+    field_name: &[u8],
     hidden_fields_filters: &[String],
     cancel: Option<&Arc<AtomicBool>>,
     qs: &Arc<QueryStats>,
@@ -1515,7 +1515,7 @@ fn get_field_values_generic(
         q
     } else {
         let mut q_new = q.clone(q.get_timestamp());
-        let quoted_field_name = crate::parser::quote_token_if_needed(field_name);
+        let quoted_field_name = crate::parser::quote_token_bytes_if_needed(field_name);
         q_new.must_append_pipe(&format!("uniq by ({quoted_field_name})"));
         q_holder = q_new;
         &q_holder
@@ -1668,7 +1668,7 @@ pub(crate) fn init_subqueries(
         // keyed by the subquery string; the cache is folded into the closure.
         let mut cache: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut get_field_values =
-            |q_text: &str, field_name: &str| -> Result<Vec<Vec<u8>>, String> {
+            |q_text: &str, field_name: &[u8]| -> Result<Vec<Vec<u8>>, String> {
                 if let Some(values) = cache.get(q_text) {
                     return Ok(values.clone());
                 }
@@ -2314,6 +2314,128 @@ mod tests {
         esl_common::fs::must_remove_dir(&path);
     }
 
+    /// PORT-ONLY TEST: field NAMES parsed from QUERY TEXT are raw bytes end
+    /// to end. A stored field whose NAME contains a raw 0xFF byte must be
+    /// addressable from query text via the quoted `"\xff"` escape (Go
+    /// strconv.Unquote), both in a `"na\xffme":value` filter and in pipes
+    /// referencing the name.
+    #[test]
+    fn test_run_query_raw_byte_field_name_end_to_end() {
+        let path = run_query_temp_path("raw-byte-field-name");
+        let cfg = StorageConfig::default();
+        let s = Storage::must_open_storage(&path, &cfg);
+
+        let tenant = TenantID {
+            account_id: 0,
+            project_id: 0,
+        };
+
+        // One row carries the raw-byte NAME `na\xffme`; the other carries the
+        // plain ASCII name `name` with the same value.
+        let bad_name: &[u8] = b"na\xffme";
+        let mut lr = get_log_rows(&[], &[], &[], &[], "");
+        let base = now_nanos();
+        for (i, name) in [bad_name, b"name".as_slice()].iter().enumerate() {
+            let mut fields = vec![
+                Field {
+                    name: b"_msg".to_vec(),
+                    value: b"hello".to_vec(),
+                },
+                Field {
+                    name: name.to_vec(),
+                    value: b"target".to_vec(),
+                },
+            ];
+            lr.must_add(tenant, base + i as i64, &mut fields, -1);
+        }
+        s.must_add_rows(&lr);
+        s.debug_flush();
+
+        assert_eq!(count_rows(&s, tenant, "*"), 2, "`*` must match both rows");
+
+        // Filter by the raw-byte field name (quoted escape in query text).
+        assert_eq!(
+            count_rows(&s, tenant, r#""na\xffme":target"#),
+            1,
+            "raw-byte field name filter must match the raw-byte-name row only"
+        );
+        assert_eq!(
+            count_rows(&s, tenant, r#""na\xffme":="target""#),
+            1,
+            "raw-byte field name exact filter must match the raw-byte-name row only"
+        );
+        // The plain ASCII name matches only the other row.
+        assert_eq!(
+            count_rows(&s, tenant, "name:target"),
+            1,
+            "plain field name filter must match the plain-name row only"
+        );
+
+        // A pipe referencing the raw-byte name: `fields` keeps only that
+        // column, and its name round-trips byte-identically.
+        {
+            type CapturedFields = Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>;
+            let q = ParseQuery(r#""na\xffme":target | fields "na\xffme""#).expect("parse query");
+            let captured: CapturedFields = Arc::new(Mutex::new(Vec::new()));
+            let cap = Arc::clone(&captured);
+            let write: WriteDataBlockFn = Arc::new(move |_wid, db: &mut DataBlock| {
+                let n = db.rows_count();
+                for i in 0..n {
+                    for c in &db.columns {
+                        cap.lock()
+                            .unwrap()
+                            .push((c.name.clone(), c.values[i].clone()));
+                    }
+                }
+            });
+            s.run_query(&[tenant], &q, write).expect("run_query");
+            let rows = captured.lock().unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "fields pipe must keep exactly the raw-byte-name column; got {rows:?}"
+            );
+            assert_eq!(rows[0].0, bad_name, "column name must round-trip raw");
+            assert_eq!(rows[0].1, b"target", "column value must round-trip");
+        }
+
+        // A stats pipe grouping by the raw-byte name.
+        {
+            type CapturedFields = Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>;
+            let q = ParseQuery(r#"* | stats by ("na\xffme") count() rows | sort by (rows)"#)
+                .expect("parse stats query");
+            let captured: CapturedFields = Arc::new(Mutex::new(Vec::new()));
+            let cap = Arc::clone(&captured);
+            let write: WriteDataBlockFn = Arc::new(move |_wid, db: &mut DataBlock| {
+                let n = db.rows_count();
+                for i in 0..n {
+                    for c in &db.columns {
+                        cap.lock()
+                            .unwrap()
+                            .push((c.name.clone(), c.values[i].clone()));
+                    }
+                }
+            });
+            s.run_query(&[tenant], &q, write).expect("run_query stats");
+            let rows = captured.lock().unwrap();
+            // Two groups: `target` (the raw-byte-name row) and the empty
+            // value (the plain-name row), each with count 1.
+            let mut by_name_values: Vec<&(Vec<u8>, Vec<u8>)> =
+                rows.iter().filter(|(n, _)| n == bad_name).collect();
+            by_name_values.sort();
+            assert_eq!(
+                by_name_values.len(),
+                2,
+                "stats by raw-byte name must emit the group column per row; got {rows:?}"
+            );
+            assert_eq!(by_name_values[0].1, b"");
+            assert_eq!(by_name_values[1].1, b"target");
+        }
+
+        s.must_close();
+        esl_common::fs::must_remove_dir(&path);
+    }
+
     /// `stream_context` end-to-end: the surrounding-logs seam wired by
     /// `init_subqueries` (Go `initStreamContextPipes`) must return the
     /// before/after context rows around each matching row, and a misplaced
@@ -2768,7 +2890,16 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, &[], "_stream", "", 0, None, &test_qs())
+                .get_field_values(
+                    &all_tenant_ids,
+                    &q,
+                    &[],
+                    b"_stream",
+                    "",
+                    0,
+                    None,
+                    &test_qs(),
+                )
                 .expect("get_field_values");
             let results_expected = vec![
                 vh(r#"{instance="host-0:234",job="foobar"}"#, 385),
@@ -2786,7 +2917,7 @@ mod tests {
                     &all_tenant_ids,
                     &q,
                     &[],
-                    "_stream",
+                    b"_stream",
                     "1:23",
                     0,
                     None,
@@ -2801,7 +2932,16 @@ mod tests {
         {
             let q = parse("*");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, &[], "_stream", "", 3, None, &test_qs())
+                .get_field_values(
+                    &all_tenant_ids,
+                    &q,
+                    &[],
+                    b"_stream",
+                    "",
+                    3,
+                    None,
+                    &test_qs(),
+                )
                 .expect("get_field_values");
             let results_expected = vec![
                 vh(r#"{instance="host-0:234",job="foobar"}"#, 385),
@@ -2815,7 +2955,16 @@ mod tests {
         {
             let q = parse("instance:='host-1:234'");
             let results = s
-                .get_field_values(&all_tenant_ids, &q, &[], "_stream", "", 4, None, &test_qs())
+                .get_field_values(
+                    &all_tenant_ids,
+                    &q,
+                    &[],
+                    b"_stream",
+                    "",
+                    4,
+                    None,
+                    &test_qs(),
+                )
                 .expect("get_field_values");
             let results_expected = vec![vh(r#"{instance="host-1:234",job="foobar"}"#, 385)];
             assert_eq!(results, results_expected, "field_values-limit-not-reached");
@@ -2849,7 +2998,7 @@ mod tests {
                     &all_tenant_ids,
                     &q,
                     &[],
-                    "instance",
+                    b"instance",
                     "",
                     0,
                     None,
@@ -2872,7 +3021,7 @@ mod tests {
                     &all_tenant_ids,
                     &q,
                     &[],
-                    "instance",
+                    b"instance",
                     "t-2",
                     0,
                     None,
@@ -2891,7 +3040,7 @@ mod tests {
                     &all_tenant_ids,
                     &q,
                     &[],
-                    "instance",
+                    b"instance",
                     "",
                     3,
                     None,

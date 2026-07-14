@@ -71,12 +71,12 @@ pub type RunUnionQueryFn = Arc<
 /// `pub` because it appears in the `pub trait Pipe` surface; it is not
 /// re-exported from the crate root.
 pub struct StatsPipeFields {
-    /// Names of the `by (...)` fields (Go `ps.byFields[i].name`).
-    pub by_fields: Vec<String>,
+    /// Names of the `by (...)` fields (Go `ps.byFields[i].name`; raw bytes).
+    pub by_fields: Vec<Vec<u8>>,
     /// `(result_name, is_row_label)` per stats function, where `is_row_label`
     /// is true for `row_any` / `row_min` / `row_max` (Go type-switches on
     /// `statsRowAny` / `statsRowMin` / `statsRowMax`).
-    pub funcs: Vec<(String, bool)>,
+    pub funcs: Vec<(Vec<u8>, bool)>,
 }
 
 /// How a pipe placed after the last `| stats ...` pipe transforms the stats
@@ -99,24 +99,30 @@ pub enum StatsTailOp {
     OffsetLimit,
     /// `pipeRunningStats` (also covers `total_stats` via `is_total`).
     RunningStats {
-        by_fields: Vec<String>,
+        by_fields: Vec<Vec<u8>>,
         is_total: bool,
-        result_names: Vec<String>,
+        result_names: Vec<Vec<u8>>,
     },
     /// `pipeMath`: adds the entries' result fields as metrics.
-    Math { result_fields: Vec<String> },
+    Math { result_fields: Vec<Vec<u8>> },
     /// `pipeFields`: keeps only the matching fields.
-    Fields { field_filters: Vec<String> },
+    Fields { field_filters: Vec<Vec<u8>> },
     /// `pipeDelete`: drops the matching fields.
-    Delete { field_filters: Vec<String> },
+    Delete { field_filters: Vec<Vec<u8>> },
     /// `pipeCopy`: copies fields from `src` filters to `dst` filters.
-    Copy { src: Vec<String>, dst: Vec<String> },
+    Copy {
+        src: Vec<Vec<u8>>,
+        dst: Vec<Vec<u8>>,
+    },
     /// `pipeRename`: renames fields from `src` filters to `dst` filters.
-    Rename { src: Vec<String>, dst: Vec<String> },
+    Rename {
+        src: Vec<Vec<u8>>,
+        dst: Vec<Vec<u8>>,
+    },
     /// `pipeFormat`: generates an additional label field.
-    Format { result_field: String },
+    Format { result_field: Vec<u8> },
     /// `pipeUnpackJSON`: generates additional label fields from `fields (...)`.
-    UnpackJson { field_filters: Vec<String> },
+    UnpackJson { field_filters: Vec<Vec<u8>> },
 }
 
 /// Return type of [`Pipe::split_to_remote_and_local`]: the remote pipe (if
@@ -255,7 +261,7 @@ pub trait Pipe: Send + Sync {
     /// `in(<subquery>)` filter yields (or an error when the pipe has more than
     /// one field). `None` (the default) means the pipe cannot terminate an
     /// `in(<subquery>)` query.
-    fn in_query_field_name(&self) -> Option<Result<String, String>> {
+    fn in_query_field_name(&self) -> Option<Result<Vec<u8>, String>> {
         None
     }
 
@@ -382,14 +388,14 @@ pub trait Pipe: Send + Sync {
     /// `fields` pipe with wildcard filters — Go returns `ok == false` there,
     /// which `getFixedFields` maps to the same "cannot detect" result as the
     /// default case).
-    fn fixed_result_fields(&self) -> Option<Vec<String>> {
+    fn fixed_result_fields(&self) -> Option<Vec<Vec<u8>>> {
         None
     }
 
     /// `Query::get_fixed_fields` support (Go `pipeSort.adjustResultFieldsOrder`):
     /// reorders `fields` according to the sort pipe's rank/by fields. `None`
     /// for non-sort pipes.
-    fn sort_adjust_result_fields_order(&self, _fields: &[String]) -> Option<Vec<String>> {
+    fn sort_adjust_result_fields_order(&self, _fields: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
         None
     }
 

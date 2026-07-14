@@ -23,7 +23,7 @@ pub(crate) struct FilterValueType {
 }
 
 /// Builds a value-type filter for `field_name`.
-pub(crate) fn new_filter_value_type(field_name: &str, value_type: &str) -> FilterGeneric {
+pub(crate) fn new_filter_value_type(field_name: &[u8], value_type: &str) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterValueType {
@@ -37,7 +37,7 @@ impl FieldFilter for FilterValueType {
         format!("value_type({})", quote_token_if_needed(&self.value_type))
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         if v.is_empty() {
             // empty values have no any type
@@ -52,7 +52,7 @@ impl FieldFilter for FilterValueType {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let r = br.get_column_by_name(field_name);
         // PORT NOTE: Go returns "inmemory" when `br.bs == nil` (an in-memory,
@@ -76,7 +76,7 @@ impl FieldFilter for FilterValueType {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         // Verify whether the filter matches a const column.
         let v = bs.get_const_column_value(field_name);
@@ -124,12 +124,12 @@ mod tests {
         let f = FilterValueType {
             value_type: "string".to_string(),
         };
-        assert!(f.match_row_by_field(&fields, "foo"));
+        assert!(f.match_row_by_field(&fields, b"foo"));
         // empty value has no type
-        assert!(!f.match_row_by_field(&fields, "missing"));
+        assert!(!f.match_row_by_field(&fields, b"missing"));
         let f2 = FilterValueType {
             value_type: "uint64".to_string(),
         };
-        assert!(!f2.match_row_by_field(&fields, "foo"));
+        assert!(!f2.match_row_by_field(&fields, b"foo"));
     }
 }

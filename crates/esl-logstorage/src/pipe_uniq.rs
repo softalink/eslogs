@@ -116,17 +116,17 @@ impl HitsMap {
 
 /// The `| uniq ...` pipe.
 pub struct PipeUniq {
-    by_fields: Vec<String>,
+    by_fields: Vec<Vec<u8>>,
     filter: String,
-    hits_field_name: String,
+    hits_field_name: Vec<u8>,
     limit: u64,
 }
 
 /// Builds a [`PipeUniq`] (Go `parsePipeUniq` result).
 pub(crate) fn new_pipe_uniq(
-    by_fields: Vec<String>,
+    by_fields: Vec<Vec<u8>>,
     filter: String,
-    hits_field_name: String,
+    hits_field_name: Vec<u8>,
     limit: u64,
 ) -> PipeUniq {
     PipeUniq {
@@ -161,7 +161,10 @@ impl Pipe for PipeUniq {
     }
 
     fn to_string(&self) -> String {
-        let mut s = format!("uniq by ({})", self.by_fields.join(", "));
+        let mut s = format!(
+            "uniq by ({})",
+            crate::stats_count::field_names_string(&self.by_fields)
+        );
         if !self.filter.is_empty() {
             s += " filter ";
             s += &self.filter;
@@ -195,7 +198,7 @@ impl Pipe for PipeUniq {
     }
 
     /// Go `getFieldNameFromPipes`' `*pipeUniq` arm.
-    fn in_query_field_name(&self) -> Option<Result<String, String>> {
+    fn in_query_field_name(&self) -> Option<Result<Vec<u8>, String>> {
         if self.by_fields.len() != 1 {
             return Some(Err(format!(
                 "'{}' pipe must contain only a single non-star field name",
@@ -244,8 +247,8 @@ impl Shard {
 }
 
 struct PipeUniqProcessor {
-    by_fields: Arc<Vec<String>>,
-    hits_field_name: String,
+    by_fields: Arc<Vec<Vec<u8>>>,
+    hits_field_name: Vec<u8>,
     limit: u64,
     stop: Arc<AtomicBool>,
     pp_next: Arc<dyn PipeProcessor>,
@@ -298,7 +301,7 @@ impl PipeUniqProcessor {
         &self,
         shard: &mut Shard,
         br: &mut BlockResult,
-        column_name: &str,
+        column_name: &[u8],
         need_hits: bool,
     ) {
         let c = br.get_column_by_name(column_name);
@@ -421,13 +424,13 @@ impl PipeUniqProcessor {
             .by_fields
             .iter()
             .map(|name| ResultColumn {
-                name: name.clone().into_bytes(),
+                name: name.clone(),
                 values: Vec::new(),
             })
             .collect();
         if need_hits {
             rcs.push(ResultColumn {
-                name: self.hits_field_name.clone().into_bytes(),
+                name: self.hits_field_name.clone(),
                 values: Vec::new(),
             });
         }
@@ -549,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_uniq_single_field() {
-        let pu = new_pipe_uniq(vec!["x".to_string()], String::new(), String::new(), 0);
+        let pu = new_pipe_uniq(vec![b"x".to_vec()], String::new(), Vec::new(), 0);
         let out = run(
             &pu,
             &[
@@ -568,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_uniq_with_hits() {
-        let pu = new_pipe_uniq(vec!["x".to_string()], String::new(), "hits".to_string(), 0);
+        let pu = new_pipe_uniq(vec![b"x".to_vec()], String::new(), b"hits".to_vec(), 0);
         let out = run(
             &pu,
             &[
@@ -606,9 +609,9 @@ mod tests {
     #[test]
     fn test_uniq_two_fields() {
         let pu = new_pipe_uniq(
-            vec!["a".to_string(), "b".to_string()],
+            vec![b"a".to_vec(), b"b".to_vec()],
             String::new(),
-            String::new(),
+            Vec::new(),
             0,
         );
         let out = run(
@@ -624,7 +627,7 @@ mod tests {
 
     #[test]
     fn test_uniq_filter_substring() {
-        let pu = new_pipe_uniq(vec!["x".to_string()], "foo".to_string(), String::new(), 0);
+        let pu = new_pipe_uniq(vec![b"x".to_vec()], "foo".to_string(), Vec::new(), 0);
         let out = run(
             &pu,
             &[

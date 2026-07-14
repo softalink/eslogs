@@ -12,26 +12,25 @@ use crate::block_result::{BlockResult, ColRef, get_block_result, put_block_resul
 use crate::block_search::BlockSearch;
 use crate::filter::Filter;
 use crate::filter_generic::{clone_column_header, quote_field_name_if_needed};
-use crate::log_rows::get_canonical_column_name;
+use crate::log_rows::get_canonical_column_name_bytes;
 use crate::prefix_filter;
 use crate::rows::{Field, get_field_value_by_name};
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::ValueType;
 
 /// `FilterEqField` matches rows where `field_name` equals `other_field_name`.
 ///
 /// Example LogsQL: `fieldName:eq_field(otherField)`.
 pub(crate) struct FilterEqField {
-    pub(crate) field_name: String,
-    pub(crate) other_field_name: String,
+    pub(crate) field_name: Vec<u8>,
+    pub(crate) other_field_name: Vec<u8>,
     prefix_filter: OnceLock<prefix_filter::Filter>,
 }
 
 /// Builds an eq_field filter.
-pub(crate) fn new_filter_eq_field(field_name: &str, other_field_name: &str) -> FilterEqField {
+pub(crate) fn new_filter_eq_field(field_name: &[u8], other_field_name: &[u8]) -> FilterEqField {
     FilterEqField {
-        field_name: get_canonical_column_name(field_name).to_string(),
-        other_field_name: get_canonical_column_name(other_field_name).to_string(),
+        field_name: get_canonical_column_name_bytes(field_name).to_vec(),
+        other_field_name: get_canonical_column_name_bytes(other_field_name).to_vec(),
         prefix_filter: OnceLock::new(),
     }
 }
@@ -40,7 +39,7 @@ impl FilterEqField {
     fn get_prefix_filter(&self) -> &prefix_filter::Filter {
         self.prefix_filter.get_or_init(|| {
             let mut pf = prefix_filter::Filter::default();
-            pf.add_allow_filters(&[self.field_name.as_str(), self.other_field_name.as_str()]);
+            pf.add_allow_filters(&[self.field_name.as_slice(), self.other_field_name.as_slice()]);
             pf
         })
     }
@@ -106,7 +105,7 @@ impl Filter for FilterEqField {
         format!(
             "{}eq_field({})",
             quote_field_name_if_needed(&self.field_name),
-            quote_token_if_needed(&self.other_field_name)
+            crate::parser::quote_token_bytes_if_needed(&self.other_field_name)
         )
     }
 
@@ -256,13 +255,13 @@ mod tests {
 
     #[test]
     fn test_to_string() {
-        let f = new_filter_eq_field("foo", "bar");
+        let f = new_filter_eq_field(b"foo", b"bar");
         assert_eq!(f.to_string(), "foo:eq_field(bar)");
     }
 
     #[test]
     fn test_match_row() {
-        let f = new_filter_eq_field("foo", "bar");
+        let f = new_filter_eq_field(b"foo", b"bar");
         assert!(f.match_row(&[field("foo", "x"), field("bar", "x")]));
         assert!(!f.match_row(&[field("foo", "x"), field("bar", "y")]));
         // both missing -> both empty -> equal

@@ -29,7 +29,7 @@ pub(crate) struct FilterContainsAll {
 }
 
 pub(crate) fn new_filter_contains_all_values(
-    field_name: &str,
+    field_name: &[u8],
     values: Vec<Vec<u8>>,
 ) -> FilterGeneric {
     new_filter_generic(
@@ -43,9 +43,9 @@ pub(crate) fn new_filter_contains_all_values(
 /// Builds a `contains_all(<subquery>)` filter (Go `parseFilterContainsAll`
 /// with `iv.q` set).
 pub(crate) fn new_filter_contains_all_query(
-    field_name: &str,
+    field_name: &[u8],
     q_text: String,
-    q_field_name: String,
+    q_field_name: Vec<u8>,
 ) -> FilterGeneric {
     new_filter_generic(
         field_name,
@@ -91,11 +91,11 @@ impl FieldFilter for FilterContainsAll {
         Some(&mut self.values)
     }
 
-    fn new_with_values(&self, field_name: &str, values: Vec<Vec<u8>>) -> Option<Box<dyn Filter>> {
+    fn new_with_values(&self, field_name: &[u8], values: Vec<Vec<u8>>) -> Option<Box<dyn Filter>> {
         Some(Box::new(new_filter_contains_all_values(field_name, values)))
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_all_phrases(v, &self.values.values)
     }
@@ -104,7 +104,7 @@ impl FieldFilter for FilterContainsAll {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         if self.values.is_empty() || self.values.is_only_empty_value() {
             return;
@@ -165,7 +165,7 @@ impl FieldFilter for FilterContainsAll {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         if self.values.is_empty() || self.values.is_only_empty_value() {
             return;

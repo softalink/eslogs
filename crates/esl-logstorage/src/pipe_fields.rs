@@ -17,8 +17,8 @@ use esl_common::panicf;
 ///
 /// PORT NOTE: mirrors Go's `hasWildcardFilters` (block_result.go), which is not
 /// `pub` in the Rust `block_result` port; homed here for the field pipes.
-pub(crate) fn has_wildcard_filters(filters: &[String]) -> bool {
-    filters.iter().any(|f| prefix_filter::is_wildcard_filter(f))
+pub(crate) fn has_wildcard_filters(filters: &[Vec<u8>]) -> bool {
+    filters.iter().any(prefix_filter::is_wildcard_filter)
 }
 
 /// `PipeFields` implements the `| fields ...` pipe.
@@ -26,14 +26,14 @@ pub(crate) fn has_wildcard_filters(filters: &[String]) -> bool {
 /// See <https://docs.victoriametrics.com/victorialogs/logsql/#fields-pipe>
 pub(crate) struct PipeFields {
     /// List of field filters for the fields to fetch.
-    pub(crate) field_filters: Vec<String>,
+    pub(crate) field_filters: Vec<Vec<u8>>,
 }
 
 /// Builds a `| fields ...` pipe keeping the given field filters.
 ///
 /// PORT NOTE: the Go `parsePipeFields` reads the LogsQL lexer, which is not yet
 /// ported. This constructor exposes the parsed result for the future parser.
-pub(crate) fn new_pipe_fields(field_filters: Vec<String>) -> PipeFields {
+pub(crate) fn new_pipe_fields(field_filters: Vec<Vec<u8>>) -> PipeFields {
     PipeFields { field_filters }
 }
 
@@ -74,7 +74,7 @@ impl Pipe for PipeFields {
     }
 
     /// Port of Go `pipeFields.resultFields` (`None` for wildcard filters).
-    fn fixed_result_fields(&self) -> Option<Vec<String>> {
+    fn fixed_result_fields(&self) -> Option<Vec<Vec<u8>>> {
         if has_wildcard_filters(&self.field_filters) {
             return None;
         }
@@ -82,7 +82,7 @@ impl Pipe for PipeFields {
     }
 
     /// Go `getFieldNameFromPipes`' `*pipeFields` arm.
-    fn in_query_field_name(&self) -> Option<Result<String, String>> {
+    fn in_query_field_name(&self) -> Option<Result<Vec<u8>, String>> {
         // Go isSingleField(t.fieldFilters).
         if self.field_filters.len() != 1
             || crate::prefix_filter::is_wildcard_filter(&self.field_filters[0])
@@ -120,7 +120,7 @@ impl Pipe for PipeFields {
 }
 
 struct PipeFieldsProcessor {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
     pp_next: Arc<dyn PipeProcessor>,
 }
 
@@ -313,7 +313,7 @@ mod tests {
     use super::*;
 
     fn pf(filters: &[&str]) -> PipeFields {
-        new_pipe_fields(filters.iter().map(|s| s.to_string()).collect())
+        new_pipe_fields(filters.iter().map(|s| s.as_bytes().to_vec()).collect())
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub(crate) struct FilterLenRange {
 
 /// Builds a len-range filter for `field_name`.
 pub(crate) fn new_filter_len_range(
-    field_name: &str,
+    field_name: &[u8],
     min_len: u64,
     max_len: u64,
     string_repr: &str,
@@ -59,7 +59,7 @@ impl FieldFilter for FilterLenRange {
         format!("len_range{}", self.string_repr)
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_len_range(v, self.min_len, self.max_len)
     }
@@ -68,7 +68,7 @@ impl FieldFilter for FilterLenRange {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let min_len = self.min_len;
         let max_len = self.max_len;
@@ -99,7 +99,7 @@ impl FieldFilter for FilterLenRange {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let min_len = self.min_len;
         let max_len = self.max_len;

@@ -309,7 +309,7 @@ impl PipeProcessor for PipeStreamContextProcessor {
         // before touching the locked shard.
         let cs = br.get_columns();
         let names: Vec<Vec<u8>> = cs.iter().map(|&c| br.column_name(c).to_vec()).collect();
-        let stream_id_col = br.get_column_by_name("_stream_id");
+        let stream_id_col = br.get_column_by_name(b"_stream_id");
         let mut col_values: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cs.len());
         for &c in &cs {
             col_values.push(br.column_get_values(c).to_vec());
@@ -780,7 +780,7 @@ fn new_delimiter_row_fields(r: &StreamContextRow, stream_id: &str) -> Vec<Field>
         },
         Field {
             name: b"_stream".to_vec(),
-            value: get_field_value_by_name(&r.fields, "_stream").to_vec(),
+            value: get_field_value_by_name(&r.fields, b"_stream").to_vec(),
         },
         Field {
             name: b"_msg".to_vec(),
@@ -1217,10 +1217,13 @@ mod tests {
         let names: Vec<&[u8]> = fields.iter().map(|f| f.name.as_slice()).collect();
         let expected: Vec<&[u8]> = vec![b"_time", b"_stream_id", b"_stream", b"_msg"];
         assert_eq!(names, expected);
-        assert_eq!(get_field_value_by_name(&fields, "_stream_id"), b"stream-42");
-        assert_eq!(get_field_value_by_name(&fields, "_stream"), b"{app=\"x\"}");
-        assert_eq!(get_field_value_by_name(&fields, "_msg"), b"---");
-        assert!(!get_field_value_by_name(&fields, "_time").is_empty());
+        assert_eq!(
+            get_field_value_by_name(&fields, b"_stream_id"),
+            b"stream-42"
+        );
+        assert_eq!(get_field_value_by_name(&fields, b"_stream"), b"{app=\"x\"}");
+        assert_eq!(get_field_value_by_name(&fields, b"_msg"), b"---");
+        assert!(!get_field_value_by_name(&fields, b"_time").is_empty());
     }
 
     #[test]
@@ -1258,7 +1261,7 @@ mod tests {
         let s1_ts: Vec<i64> = shard.m["s1"].iter().map(|r| r.timestamp).collect();
         assert_eq!(s1_ts, vec![10, 30]);
         assert_eq!(
-            get_field_value_by_name(&shard.m["s2"][0].fields, "_msg"),
+            get_field_value_by_name(&shard.m["s2"][0].fields, b"_msg"),
             b"b"
         );
     }

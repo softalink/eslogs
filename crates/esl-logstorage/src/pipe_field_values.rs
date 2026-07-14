@@ -17,10 +17,10 @@ use crate::stream_filter::quote_token_if_needed;
 /// PORT NOTE: duplicated here because `parser.rs` — where this helper
 /// belongs — is deferred (matches the copy in `pipe_field_values_local`);
 /// `pub(crate)` so `pipe_field_names`' split can reuse it.
-pub(crate) fn get_unique_result_name(result_name: &str, by_fields: &[String]) -> String {
-    let mut name = result_name.to_string();
+pub(crate) fn get_unique_result_name(result_name: &[u8], by_fields: &[Vec<u8>]) -> Vec<u8> {
+    let mut name = result_name.to_vec();
     while by_fields.iter().any(|f| f == &name) {
-        name.push('s');
+        name.push(b's');
     }
     name
 }
@@ -29,7 +29,7 @@ pub(crate) fn get_unique_result_name(result_name: &str, by_fields: &[String]) ->
 ///
 /// See <https://docs.victoriametrics.com/victorialogs/logsql/#field_values-pipe>
 pub(crate) struct PipeFieldValues {
-    pub(crate) field: String,
+    pub(crate) field: Vec<u8>,
 
     /// If non-empty, only values containing this substring are returned.
     pub(crate) filter: String,
@@ -41,7 +41,7 @@ pub(crate) struct PipeFieldValues {
 ///
 /// PORT NOTE: `parsePipeFieldValues` is lexer-dependent and deferred; this
 /// constructor exposes the parsed result for the future parser.
-pub(crate) fn new_pipe_field_values(field: String, filter: String, limit: u64) -> PipeFieldValues {
+pub(crate) fn new_pipe_field_values(field: Vec<u8>, filter: String, limit: u64) -> PipeFieldValues {
     PipeFieldValues {
         field,
         filter,
@@ -64,7 +64,10 @@ impl Pipe for PipeFieldValues {
     }
 
     fn to_string(&self) -> String {
-        let mut s = format!("field_values {}", quote_token_if_needed(&self.field));
+        let mut s = format!(
+            "field_values {}",
+            crate::parser::quote_token_bytes_if_needed(&self.field)
+        );
         if !self.filter.is_empty() {
             s += &format!(" filter {}", quote_token_if_needed(&self.filter));
         }
@@ -102,8 +105,8 @@ impl Pipe for PipeFieldValues {
 }
 
 impl PipeFieldValues {
-    fn get_hits_field_name(&self) -> String {
-        get_unique_result_name("hits", std::slice::from_ref(&self.field))
+    fn get_hits_field_name(&self) -> Vec<u8> {
+        get_unique_result_name(b"hits", std::slice::from_ref(&self.field))
     }
 }
 
@@ -113,7 +116,7 @@ mod tests {
     use super::*;
 
     fn pfv(field: &str, filter: &str, limit: u64) -> PipeFieldValues {
-        new_pipe_field_values(field.to_string(), filter.to_string(), limit)
+        new_pipe_field_values(field.as_bytes().to_vec(), filter.to_string(), limit)
     }
 
     #[test]

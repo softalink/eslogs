@@ -16,13 +16,12 @@ use crate::pipe_update::{
     IfFilter, new_pipe_update_processor, update_needed_fields_for_update_pipe,
 };
 use crate::prefix_filter;
-use crate::stream_filter::quote_token_if_needed;
 use crate::tokenizer::is_token_char;
 
 /// `pipeCollapseNums` implements `| collapse_nums ...`.
 pub struct PipeCollapseNums {
     /// the field to collapse nums at
-    pub(crate) field: String,
+    pub(crate) field: Vec<u8>,
 
     /// if set, collapsed nums are prettified with common placeholders
     pub(crate) is_prettify: bool,
@@ -37,7 +36,7 @@ pub struct PipeCollapseNums {
 /// constructor takes the parsed field, prettify flag and optional `if` filter
 /// directly.
 pub(crate) fn new_pipe_collapse_nums(
-    field: String,
+    field: Vec<u8>,
     is_prettify: bool,
     iff: Option<Arc<IfFilter>>,
 ) -> PipeCollapseNums {
@@ -95,9 +94,9 @@ impl Pipe for PipeCollapseNums {
             s += " ";
             s += &iff.to_string();
         }
-        if self.field != "_msg" {
+        if self.field != b"_msg" {
             s += " at ";
-            s += &quote_token_if_needed(&self.field);
+            s += &crate::parser::quote_token_bytes_if_needed(&self.field);
         }
         if self.is_prettify {
             s += " prettify";
@@ -379,12 +378,12 @@ mod tests {
     // are omitted until the LogsQL parser is ported.
 
     fn phrase_iff(field: &str, phrase: &str) -> Arc<IfFilter> {
-        let f: Arc<dyn Filter> = Arc::new(new_filter_phrase(field, phrase));
+        let f: Arc<dyn Filter> = Arc::new(new_filter_phrase(field.as_bytes(), phrase));
         Arc::new(IfFilter::new(f))
     }
 
     fn collapse(field: &str, is_prettify: bool, iff: Option<Arc<IfFilter>>) -> PipeCollapseNums {
-        new_pipe_collapse_nums(field.to_string(), is_prettify, iff)
+        new_pipe_collapse_nums(field.as_bytes().to_vec(), is_prettify, iff)
     }
 
     fn s(v: &str) -> String {
@@ -443,7 +442,7 @@ mod tests {
 
         // collapse_nums if (-abc)
         let iff = Arc::new(IfFilter::new(Arc::new(new_filter_not(Box::new(
-            new_filter_phrase("_msg", "abc"),
+            new_filter_phrase(b"_msg", "abc"),
         )))));
         let p = collapse("_msg", false, Some(iff));
         assert_rows_eq(

@@ -44,7 +44,7 @@ pub(crate) struct FilterRegexp {
     tokens_hashes: OnceLock<Vec<u64>>,
 }
 
-pub(crate) fn new_filter_regexp(field_name: &str, re: Regex, re_str: String) -> FilterGeneric {
+pub(crate) fn new_filter_regexp(field_name: &[u8], re: Regex, re_str: String) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterRegexp {
@@ -88,7 +88,7 @@ impl FieldFilter for FilterRegexp {
         format!("~{}", quote_token_if_needed(&self.re_str))
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_regexp_bytes(&self.re, v)
     }
@@ -97,7 +97,7 @@ impl FieldFilter for FilterRegexp {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         apply_to_block_result_generic(br, bm, field_name, "", |v, _| {
             match_regexp_bytes(&self.re, v)
@@ -108,7 +108,7 @@ impl FieldFilter for FilterRegexp {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         // Verify whether filter matches const column.
         let v = bs.get_const_column_value(field_name);

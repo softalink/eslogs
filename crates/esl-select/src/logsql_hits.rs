@@ -95,7 +95,8 @@ pub fn process_hits_request(storage: &Arc<Storage>, req: &Request, w: &mut Respo
 
     // Add a pipe, which calculates hits over time with the given step and
     // offset for the given fields.
-    ca.q.add_count_by_time_pipe(step, offset, &fields);
+    let fields_bytes: Vec<Vec<u8>> = fields.iter().map(|f| f.as_bytes().to_vec()).collect();
+    ca.q.add_count_by_time_pipe(step, offset, &fields_bytes);
 
     let m: Arc<Mutex<HashMap<Vec<u8>, HitsSeries>>> = Arc::new(Mutex::new(HashMap::new()));
     let m_cl = Arc::clone(&m);

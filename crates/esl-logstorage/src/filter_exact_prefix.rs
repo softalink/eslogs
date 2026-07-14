@@ -38,7 +38,10 @@ pub(crate) struct FilterExactPrefix {
 }
 
 /// Builds an exact-prefix filter for `field_name`.
-pub(crate) fn new_filter_exact_prefix(field_name: &str, prefix: impl AsRef<[u8]>) -> FilterGeneric {
+pub(crate) fn new_filter_exact_prefix(
+    field_name: &[u8],
+    prefix: impl AsRef<[u8]>,
+) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterExactPrefix {
@@ -69,7 +72,7 @@ impl FieldFilter for FilterExactPrefix {
         )
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_exact_prefix(v, &self.prefix)
     }
@@ -78,7 +81,7 @@ impl FieldFilter for FilterExactPrefix {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         apply_to_block_result_generic(br, bm, field_name, &self.prefix, |v, prefix| {
             match_exact_prefix(v, prefix)
@@ -89,7 +92,7 @@ impl FieldFilter for FilterExactPrefix {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let prefix = self.prefix.clone();
 

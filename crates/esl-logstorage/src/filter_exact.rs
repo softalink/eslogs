@@ -42,7 +42,7 @@ pub(crate) struct FilterExact {
 }
 
 /// Builds an exact filter for `field_name`.
-pub(crate) fn new_filter_exact(field_name: &str, value: impl AsRef<[u8]>) -> FilterGeneric {
+pub(crate) fn new_filter_exact(field_name: &[u8], value: impl AsRef<[u8]>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterExact {
@@ -76,7 +76,7 @@ impl FieldFilter for FilterExact {
         )
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         v == self.value.as_slice()
     }
@@ -85,7 +85,7 @@ impl FieldFilter for FilterExact {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let value = self.value.clone();
         let value_str = crate::filter_phrase::phrase_utf8(&value);
@@ -204,7 +204,7 @@ impl FieldFilter for FilterExact {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let value = self.value.clone();
 

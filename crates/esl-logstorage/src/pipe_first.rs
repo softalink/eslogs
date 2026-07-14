@@ -79,7 +79,7 @@ mod tests {
             0,
             limit,
             rank.to_string(),
-            partition.iter().map(|s| s.to_string()).collect(),
+            partition.iter().map(|s| s.as_bytes().to_vec()).collect(),
         )
     }
 

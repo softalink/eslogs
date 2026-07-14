@@ -50,7 +50,7 @@ impl JSONScanner {
     /// Init initializes the scanner for scanning JSON messages from msg.
     ///
     /// Call `next_log_message()` for scanning the next JSON message into fields.
-    pub fn init(&mut self, msg: &[u8], preserve_keys: &[&str], field_prefix: &str) {
+    pub fn init(&mut self, msg: &[u8], preserve_keys: &[&[u8]], field_prefix: &str) {
         self.reset();
         self.s.init_bytes(msg);
         self.common
@@ -131,7 +131,8 @@ mod tests {
     fn test_json_scanner_success() {
         fn f(data: &str, field_prefix: &str, preserve_keys: &[&str], output_expected: &str) {
             let mut s = get_json_scanner();
-            s.init(data.as_bytes(), preserve_keys, field_prefix);
+            let preserve_keys: Vec<&[u8]> = preserve_keys.iter().map(|s| s.as_bytes()).collect();
+            s.init(data.as_bytes(), &preserve_keys, field_prefix);
             let mut output = Vec::new();
             while s.next_log_message() {
                 marshal_fields_to_json(&mut output, s.fields());

@@ -94,7 +94,7 @@ impl Filter for FilterStream {
     }
 
     fn match_row(&self, fields: &[Field]) -> bool {
-        let v = get_field_value_by_name(fields, "_stream");
+        let v = get_field_value_by_name(fields, b"_stream");
         self.f.match_stream_name(v)
     }
 
@@ -103,7 +103,7 @@ impl Filter for FilterStream {
             return;
         }
 
-        let r = br.get_column_by_name("_stream");
+        let r = br.get_column_by_name(b"_stream");
         if br.column_is_const(r) {
             let v = br.column_get_value_at_row(r, 0).to_vec();
             if !self.f.match_stream_name(&v) {

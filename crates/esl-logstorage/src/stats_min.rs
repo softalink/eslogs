@@ -27,7 +27,7 @@ use esl_common::encoding;
 use esl_common::stringsutil;
 
 use crate::block_result::{BlockResult, ColRef};
-use crate::filter_generic::quote_field_filter_if_needed;
+use crate::parser::quote_field_filter_if_needed;
 use crate::prefix_filter::{self, Filter};
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::values_encoder::{
@@ -143,7 +143,7 @@ fn is_likely_number(s: &str) -> bool {
 }
 
 /// Port of `fieldNamesString` (`pipe_stats.go`).
-pub(crate) fn field_names_string(fields: &[String]) -> String {
+pub(crate) fn field_names_string(fields: &[Vec<u8>]) -> String {
     fields
         .iter()
         .map(|f| quote_field_filter_if_needed(f))
@@ -152,13 +152,13 @@ pub(crate) fn field_names_string(fields: &[String]) -> String {
 }
 
 /// Port of `isSingleField` (`block_result.go`).
-pub(crate) fn is_single_field(filters: &[String]) -> bool {
+pub(crate) fn is_single_field(filters: &[Vec<u8>]) -> bool {
     filters.len() == 1 && !prefix_filter::is_wildcard_filter(&filters[0])
 }
 
 /// Port of `getMatchingColumns` / `getMatchingColumnsSlow` (`block_result.go`),
 /// returning the matching columns as [`ColRef`] handles.
-pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> Vec<ColRef> {
+pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[Vec<u8>]) -> Vec<ColRef> {
     if is_single_field(filters) {
         return vec![br.get_column_by_name(&filters[0])];
     }
@@ -166,7 +166,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
     let cols = br.get_columns();
     let mut dst = Vec::new();
     for &c in &cols {
-        if prefix_filter::match_filters_bytes(filters, br.column_name(c)) {
+        if prefix_filter::match_filters(filters, br.column_name(c)) {
             dst.push(c);
         }
     }
@@ -178,7 +178,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
         }
         let mut need_empty = true;
         for &c in &cols {
-            if br.column_name(c) == f.as_bytes() {
+            if br.column_name(c) == f.as_slice() {
                 need_empty = false;
                 break;
             }
@@ -196,15 +196,15 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
 
 /// Port of `statsMin`.
 pub(crate) struct StatsMin {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Port of `parseStatsMin` (constructor only; the lexer is supplied by the
 /// future parser). Empty filters default to `["*"]`, matching
 /// `parseStatsFuncFieldFilters`.
-pub(crate) fn new_stats_min(mut field_filters: Vec<String>) -> StatsMin {
+pub(crate) fn new_stats_min(mut field_filters: Vec<Vec<u8>>) -> StatsMin {
     if field_filters.is_empty() {
-        field_filters.push("*".to_string());
+        field_filters.push(b"*".to_vec());
     }
     StatsMin { field_filters }
 }
@@ -229,7 +229,7 @@ impl StatsFunc for StatsMin {
 
 /// Port of `statsMinProcessor`.
 pub(crate) struct StatsMinProcessor {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
     min: Vec<u8>,
     has_items: bool,
 }
@@ -362,7 +362,7 @@ mod tests {
     // an empty value inside a block). This helper mirrors that by feeding each
     // group of same-field rows as its own `BlockResult`.
     fn run_min(filters: &[&str], blocks: &[Vec<Vec<Field>>]) -> String {
-        let sf = new_stats_min(filters.iter().map(|s| s.to_string()).collect());
+        let sf = new_stats_min(filters.iter().map(|s| s.as_bytes().to_vec()).collect());
         let mut sp = sf.new_stats_processor();
         for block in blocks {
             let mut br = BlockResult::default();
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_stats_min_export_import_roundtrip() {
-        let sf = new_stats_min(vec!["a".to_string()]);
+        let sf = new_stats_min(vec![b"a".to_vec()]);
         let mut sp = sf.new_stats_processor();
         let mut br = BlockResult::default();
         br.must_init_from_rows(&[vec![field("a", "5")], vec![field("a", "2")]]);
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_stats_min_merge() {
-        let sf = new_stats_min(vec!["a".to_string()]);
+        let sf = new_stats_min(vec![b"a".to_vec()]);
         let mut a = sf.new_stats_processor();
         let mut b = sf.new_stats_processor();
 

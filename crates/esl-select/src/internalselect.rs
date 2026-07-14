@@ -609,7 +609,7 @@ fn process_field_values_request(
             &cp.tenant_ids,
             &cp.query,
             &cp.hidden_fields_filters,
-            field_name,
+            field_name.as_bytes(),
             filter,
             limit as u64,
             cancel.as_deref(),
@@ -682,7 +682,7 @@ fn process_stream_field_values_request(
             &cp.tenant_ids,
             &cp.query,
             &cp.hidden_fields_filters,
-            field_name,
+            field_name.as_bytes(),
             filter,
             limit as u64,
             cancel.as_deref(),
@@ -1229,7 +1229,7 @@ mod tests {
         let rows_wb = Arc::clone(&rows);
         let column = column.to_string();
         let write_block: WriteDataBlockFn = Arc::new(move |_, db: &mut DataBlock| {
-            if let Some(c) = db.get_column_by_name(&column) {
+            if let Some(c) = db.get_column_by_name(column.as_bytes()) {
                 let mut rows = rows_wb.lock().unwrap();
                 for v in &c.values {
                     rows.push(String::from_utf8_lossy(v).into_owned());
@@ -1328,7 +1328,7 @@ mod tests {
             );
 
             let vhs = client
-                .get_field_values(&qs, &tenants, &q, false, "host", "", 10)
+                .get_field_values(&qs, &tenants, &q, false, b"host", "", 10)
                 .expect("get_field_values failed");
             assert_eq!(vhs.len(), 1, "host values: {vhs:?}");
             assert_eq!(
@@ -1346,7 +1346,7 @@ mod tests {
             );
 
             let vhs = client
-                .get_stream_field_values(&qs, &tenants, &q, false, "host", "", 10)
+                .get_stream_field_values(&qs, &tenants, &q, false, b"host", "", 10)
                 .expect("get_stream_field_values failed");
             assert_eq!(vhs.len(), 1, "stream field values: {vhs:?}");
             assert_eq!(

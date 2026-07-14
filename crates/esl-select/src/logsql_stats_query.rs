@@ -163,7 +163,7 @@ pub fn process_stats_query_request(storage: &Arc<Storage>, req: &Request, w: &mu
         for i in 0..rows_count {
             let mut labels: Vec<Field> = Vec::with_capacity(label_fields.len());
             for c in columns {
-                if label_fields.iter().any(|lf| lf.as_bytes() == c.name) {
+                if label_fields.iter().any(|lf| lf == &c.name) {
                     labels.push(Field {
                         name: c.name.clone(),
                         value: c.values[i].clone(),
@@ -172,7 +172,7 @@ pub fn process_stats_query_request(storage: &Arc<Storage>, req: &Request, w: &mu
             }
 
             for c in columns {
-                if label_fields.iter().any(|lf| lf.as_bytes() == c.name) {
+                if label_fields.iter().any(|lf| lf == &c.name) {
                     continue;
                 }
 
@@ -334,7 +334,7 @@ pub fn process_stats_query_range_request(
                         continue;
                     }
                 }
-                if label_fields.iter().any(|lf| lf.as_bytes() == c.name) {
+                if label_fields.iter().any(|lf| lf == &c.name) {
                     labels.push(Field {
                         name: c.name.clone(),
                         value: c.values[i].clone(),
@@ -344,7 +344,7 @@ pub fn process_stats_query_range_request(
 
             let mut column_idx: u32 = 0;
             for c in columns {
-                if label_fields.iter().any(|lf| lf.as_bytes() == c.name) {
+                if label_fields.iter().any(|lf| lf == &c.name) {
                     continue;
                 }
 

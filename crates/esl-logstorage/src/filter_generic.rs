@@ -14,11 +14,10 @@ use crate::block_header::ColumnHeader;
 use crate::block_result::BlockResult;
 use crate::block_search::BlockSearch;
 use crate::filter::{FieldFilter, Filter};
-use crate::log_rows::get_canonical_column_name;
+use crate::log_rows::get_canonical_column_name_bytes;
 use crate::prefix_filter;
 use crate::prefix_filter::is_wildcard_filter;
 use crate::rows::Field;
-use crate::stream_filter::quote_token_if_needed;
 use crate::tokenizer::is_token_rune;
 
 // ---------------------------------------------------------------------------
@@ -30,9 +29,10 @@ use crate::tokenizer::is_token_rune;
 /// PORT NOTE: Go stores the concrete field filter behind the unexported
 /// `fieldFilter` interface; the port holds it as `Box<dyn FieldFilter>`.
 pub(crate) struct FilterGeneric {
-    /// The name of the field to apply `f` to. It may end with `*` when
+    /// The name of the field to apply `f` to (raw bytes: names parsed from
+    /// query text carry Go-parity raw bytes). It may end with `*` when
     /// `is_wildcard` is true.
-    pub(crate) field_name: String,
+    pub(crate) field_name: Vec<u8>,
 
     /// Indicates whether `field_name` is a wildcard ending with `*`. In this
     /// case `f` is applied to all fields with the given prefix until the first
@@ -44,16 +44,16 @@ pub(crate) struct FilterGeneric {
 }
 
 /// Wraps `f` into a [`FilterGeneric`] for the given field name.
-pub(crate) fn new_filter_generic(field_name: &str, f: Box<dyn FieldFilter>) -> FilterGeneric {
+pub(crate) fn new_filter_generic(field_name: &[u8], f: Box<dyn FieldFilter>) -> FilterGeneric {
     if is_wildcard_filter(field_name) {
         return FilterGeneric {
-            field_name: field_name.to_string(),
+            field_name: field_name.to_vec(),
             is_wildcard: true,
             f,
         };
     }
 
-    let field_name_canonical = get_canonical_column_name(field_name).to_string();
+    let field_name_canonical = get_canonical_column_name_bytes(field_name).to_vec();
     FilterGeneric {
         field_name: field_name_canonical,
         is_wildcard: false,
@@ -66,7 +66,7 @@ impl Filter for FilterGeneric {
         if !self.is_wildcard {
             return quote_field_name_if_needed(&self.field_name) + &self.f.to_string();
         }
-        quote_field_filter_if_needed(&self.field_name) + ":" + &self.f.to_string()
+        crate::parser::quote_field_filter_if_needed(&self.field_name) + ":" + &self.f.to_string()
     }
 
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
@@ -140,15 +140,10 @@ impl Filter for FilterGeneric {
         // Slow path - match the row by wildcard.
         let prefix = &self.field_name[..self.field_name.len() - 1];
         for f in fields {
-            if !f.name.starts_with(prefix.as_bytes()) {
+            if !f.name.starts_with(prefix) {
                 continue;
             }
-            // Match-only lossy view: the FieldFilter trait takes text names
-            // (query-side API); the stored name bytes stay raw.
-            if self
-                .f
-                .match_row_by_field(fields, &String::from_utf8_lossy(&f.name))
-            {
+            if self.f.match_row_by_field(fields, &f.name) {
                 return true;
             }
         }
@@ -164,7 +159,7 @@ impl Filter for FilterGeneric {
         }
 
         // Slow path - apply filter to all the matching fields.
-        let prefix = self.field_name[..self.field_name.len() - 1].to_string();
+        let prefix = self.field_name[..self.field_name.len() - 1].to_vec();
 
         let mut bm_result = get_bitmap(bm.bits_len);
         let mut bm_tmp = get_bitmap(bm.bits_len);
@@ -172,7 +167,7 @@ impl Filter for FilterGeneric {
 
         // Special columns.
         for &field_name in SPECIAL_COLUMNS.iter() {
-            if !field_name.starts_with(&prefix) {
+            if !field_name.starts_with(prefix.as_slice()) {
                 continue;
             }
             if bs.is_hidden_field(field_name) {
@@ -190,20 +185,16 @@ impl Filter for FilterGeneric {
         }
 
         // Collect const-column and column-header names before mutating bs via
-        // the per-field accessors (the columns header borrows bs).
-        // Match-only lossy views: the FieldFilter trait takes text names
-        // (query-side API); the stored name bytes stay raw in the headers.
-        let (const_names, col_names): (Vec<String>, Vec<String>) = {
+        // the per-field accessors (the columns header borrows bs). The stored
+        // name bytes flow through raw (the FieldFilter trait takes raw-byte
+        // names).
+        let (const_names, col_names): (Vec<Vec<u8>>, Vec<Vec<u8>>) = {
             let csh = bs.get_columns_header();
-            let const_names = csh
-                .const_columns
-                .iter()
-                .map(|cc| String::from_utf8_lossy(&cc.name).into_owned())
-                .collect();
+            let const_names = csh.const_columns.iter().map(|cc| cc.name.clone()).collect();
             let col_names = csh
                 .column_headers
                 .iter()
-                .map(|ch| String::from_utf8_lossy(&ch.name).into_owned())
+                .map(|ch| ch.name.clone())
                 .collect();
             (const_names, col_names)
         };
@@ -212,7 +203,7 @@ impl Filter for FilterGeneric {
             if is_special_column(name) {
                 continue;
             }
-            if !name.starts_with(&prefix) {
+            if !name.starts_with(prefix.as_slice()) {
                 continue;
             }
             if bs.is_hidden_field(name) {
@@ -232,7 +223,7 @@ impl Filter for FilterGeneric {
             if is_special_column(name) {
                 continue;
             }
-            if !name.starts_with(&prefix) {
+            if !name.starts_with(prefix.as_slice()) {
                 continue;
             }
             if bs.is_hidden_field(name) {
@@ -262,20 +253,16 @@ impl Filter for FilterGeneric {
         }
 
         // Slow path - apply filter to all the matching fields.
-        let prefix = self.field_name[..self.field_name.len() - 1].to_string();
+        let prefix = self.field_name[..self.field_name.len() - 1].to_vec();
 
         let mut bm_result = get_bitmap(bm.bits_len);
         let mut bm_tmp = get_bitmap(bm.bits_len);
         bm_result.copy_from(bm);
 
         let cols = br.get_columns();
-        // Match-only lossy views (see the block-search slow path above).
-        let names: Vec<String> = cols
-            .iter()
-            .map(|&r| String::from_utf8_lossy(br.column_name(r)).into_owned())
-            .collect();
+        let names: Vec<Vec<u8>> = cols.iter().map(|&r| br.column_name(r).to_vec()).collect();
         for name in &names {
-            if !name.starts_with(&prefix) {
+            if !name.starts_with(prefix.as_slice()) {
                 continue;
             }
             bm_tmp.copy_from(&bm_result);
@@ -298,35 +285,18 @@ impl Filter for FilterGeneric {
 // Field-name quoting helpers (Go filter_generic.go + parser.go)
 // ---------------------------------------------------------------------------
 
-/// Port of Go `quoteFieldNameIfNeeded`.
-pub(crate) fn quote_field_name_if_needed(s: &str) -> String {
+/// Port of Go `quoteFieldNameIfNeeded` (raw-byte field names; see
+/// [`crate::parser::quote_token_bytes_if_needed`] for the quoting semantics).
+pub(crate) fn quote_field_name_if_needed(s: &[u8]) -> String {
     if is_msg_field_name(s) {
         return String::new();
     }
-    quote_token_if_needed(s) + ":"
+    crate::parser::quote_token_bytes_if_needed(s) + ":"
 }
 
-/// Port of Go `isMsgFieldName`.
-pub(crate) fn is_msg_field_name(field_name: &str) -> bool {
-    field_name.is_empty() || field_name == "_msg"
-}
-
-/// Port of Go `quoteFieldFilterIfNeeded` (defined in parser.go, still unported).
-///
-/// PORT NOTE: homed here — its only current consumer is `FilterGeneric::to_string`.
-/// Go calls `needQuoteToken(wildcard)` + `strconv.Quote`; the port derives both
-/// from the `pub(crate)` `quote_token_if_needed` (which quotes iff needed),
-/// avoiding a dependency on stream_filter's private `need_quote_token`.
-pub(crate) fn quote_field_filter_if_needed(s: &str) -> String {
-    if !is_wildcard_filter(s) {
-        return quote_token_if_needed(s);
-    }
-    let wildcard = &s[..s.len() - 1];
-    let quoted = quote_token_if_needed(wildcard);
-    if wildcard.is_empty() || quoted == wildcard {
-        return s.to_string();
-    }
-    format!("{quoted}*")
+/// Port of Go `isMsgFieldName` (raw-byte field names).
+pub(crate) fn is_msg_field_name(field_name: &[u8]) -> bool {
+    field_name.is_empty() || field_name == b"_msg"
 }
 
 // ---------------------------------------------------------------------------
@@ -336,20 +306,20 @@ pub(crate) fn quote_field_filter_if_needed(s: &str) -> String {
 /// Port of Go `specialColumns` (defined in block_result.go, not yet ported
 /// there). Homed here as a shared `pub(crate)` helper; dedup with block_result
 /// once it ports this.
-pub(crate) const SPECIAL_COLUMNS: [&str; 4] = ["_msg", "_time", "_stream", "_stream_id"];
+pub(crate) const SPECIAL_COLUMNS: [&[u8]; 4] = [b"_msg", b"_time", b"_stream", b"_stream_id"];
 
 /// Port of Go `isSpecialColumn` (defined in block_result.go, not yet ported
 /// there). Homed here as a shared `pub(crate)` helper; dedup with block_result
 /// once it ports this.
-pub(crate) fn is_special_column(c: &str) -> bool {
+pub(crate) fn is_special_column(c: &[u8]) -> bool {
     if c.is_empty() {
         // This is a _msg column.
         return true;
     }
-    if !c.starts_with('_') {
+    if c[0] != b'_' {
         return false;
     }
-    c == "_time" || c == "_stream" || c == "_stream_id"
+    c == b"_time" || c == b"_stream" || c == b"_stream_id"
 }
 
 // ---------------------------------------------------------------------------

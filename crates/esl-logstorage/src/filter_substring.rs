@@ -42,7 +42,10 @@ pub(crate) struct FilterSubstring {
 }
 
 /// Builds a substring filter for `field_name`.
-pub(crate) fn new_filter_substring(field_name: &str, substring: impl AsRef<[u8]>) -> FilterGeneric {
+pub(crate) fn new_filter_substring(
+    field_name: &[u8],
+    substring: impl AsRef<[u8]>,
+) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterSubstring {
@@ -77,7 +80,7 @@ impl FieldFilter for FilterSubstring {
         )
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_substring(v, &self.substring)
     }
@@ -86,7 +89,7 @@ impl FieldFilter for FilterSubstring {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         apply_to_block_result_generic(br, bm, field_name, &self.substring, |v, substring| {
             match_substring(v, substring)
@@ -97,7 +100,7 @@ impl FieldFilter for FilterSubstring {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let substring = self.substring.clone();
 

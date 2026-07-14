@@ -41,7 +41,7 @@ pub(crate) struct FilterSequence {
 }
 
 /// Builds a sequence filter for `field_name`.
-pub(crate) fn new_filter_sequence(field_name: &str, phrases: Vec<Vec<u8>>) -> FilterGeneric {
+pub(crate) fn new_filter_sequence(field_name: &[u8], phrases: Vec<Vec<u8>>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterSequence {
@@ -89,7 +89,7 @@ impl FieldFilter for FilterSequence {
         format!("seq({})", a.join(","))
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let phrases = self.get_non_empty_phrases();
         let v = get_field_value_by_name(fields, field_name);
         match_sequence(v, phrases)
@@ -99,7 +99,7 @@ impl FieldFilter for FilterSequence {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let phrases = self.get_non_empty_phrases();
         if phrases.is_empty() {
@@ -112,7 +112,7 @@ impl FieldFilter for FilterSequence {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let phrases = self.get_non_empty_phrases().to_vec();
 

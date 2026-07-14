@@ -57,7 +57,7 @@ use esl_common::encoding::{
 use xxhash_rust::xxh64::xxh64;
 
 use crate::block_result::BlockResult;
-use crate::filter_generic::quote_field_filter_if_needed;
+use crate::parser::quote_field_filter_if_needed;
 use crate::prefix_filter::Filter;
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::values_encoder::{
@@ -90,7 +90,7 @@ pub(crate) fn need_stop(stop: Option<&AtomicBool>) -> bool {
 
 /// Joins the given field names for the `String()` representation (Go
 /// `fieldNamesString`).
-pub(crate) fn field_names_string(fields: &[String]) -> String {
+pub(crate) fn field_names_string(fields: &[Vec<u8>]) -> String {
     fields
         .iter()
         .map(|f| quote_field_filter_if_needed(f))
@@ -254,7 +254,7 @@ fn set_string_set(set: &mut HashSet<Vec<u8>>, v: Vec<u8>) -> i64 {
 /// `count_uniq(fields...)` stats function (Go `statsCountUniq`).
 #[derive(Debug, Default, Clone)]
 pub struct StatsCountUniq {
-    pub(crate) fields: Vec<String>,
+    pub(crate) fields: Vec<Vec<u8>>,
     pub(crate) limit: u64,
 }
 
@@ -262,7 +262,7 @@ impl StatsCountUniq {
     /// Constructs a `count_uniq` function over the given fields (exposed for the
     /// future stats parser).
     #[allow(dead_code)] // consumed by the not-yet-ported stats parser.
-    pub(crate) fn new(fields: Vec<String>, limit: u64) -> Self {
+    pub(crate) fn new(fields: Vec<Vec<u8>>, limit: u64) -> Self {
         Self { fields, limit }
     }
 }
@@ -388,7 +388,7 @@ fn shard_index_string(v: &[u8], len: usize) -> usize {
 /// Accumulates `count_uniq` state for one group (Go `statsCountUniqProcessor`).
 #[derive(Debug, Default)]
 pub struct StatsCountUniqProcessor {
-    pub(crate) fields: Vec<String>,
+    pub(crate) fields: Vec<Vec<u8>>,
     pub(crate) limit: u64,
     /// Number of shards used once `uniq_values` overflows.
     pub(crate) concurrency: usize,
@@ -611,7 +611,7 @@ impl StatsCountUniqProcessor {
     fn update_stats_for_all_rows_single_column(
         &mut self,
         br: &mut BlockResult,
-        column_name: &str,
+        column_name: &[u8],
     ) -> i64 {
         let mut inc = 0i64;
         let r = br.get_column_by_name(column_name);
@@ -711,7 +711,7 @@ impl StatsCountUniqProcessor {
     fn update_stats_for_row_single_column(
         &mut self,
         br: &mut BlockResult,
-        column_name: &str,
+        column_name: &[u8],
         row_idx: usize,
     ) -> i64 {
         let r = br.get_column_by_name(column_name);

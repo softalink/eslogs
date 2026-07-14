@@ -43,7 +43,7 @@ pub(crate) struct IfFilter {
     pub(crate) f: Arc<dyn Filter>,
 
     /// Fields the filter needs (Go `allowFilters`).
-    pub(crate) allow_filters: Vec<String>,
+    pub(crate) allow_filters: Vec<Vec<u8>>,
 }
 
 impl std::fmt::Display for IfFilter {
@@ -108,9 +108,9 @@ impl IfFilter {
 
 /// Port of Go's `updateNeededFieldsForUnpackPipe`.
 pub(crate) fn update_needed_fields_for_unpack_pipe(
-    from_field: &str,
+    from_field: &[u8],
     out_field_prefix: &str,
-    out_field_filters: &[String],
+    out_field_filters: &[Vec<u8>],
     keep_original_fields: bool,
     skip_empty_results: bool,
     iff: Option<&IfFilter>,
@@ -123,7 +123,10 @@ pub(crate) fn update_needed_fields_for_unpack_pipe(
 
     let mut need_from_field = out_field_filters.is_empty();
     for f in out_field_filters {
-        if pf.match_string_or_wildcard(&format!("{out_field_prefix}{f}")) {
+        // Byte concat of prefix + filter (Go string concat over raw bytes).
+        let mut prefixed = out_field_prefix.as_bytes().to_vec();
+        prefixed.extend_from_slice(f);
+        if pf.match_string_or_wildcard(&prefixed) {
             need_from_field = true;
             break;
         }
@@ -131,7 +134,9 @@ pub(crate) fn update_needed_fields_for_unpack_pipe(
     if !keep_original_fields && !skip_empty_results {
         for f in out_field_filters {
             if !prefix_filter::is_wildcard_filter(f) {
-                pf.add_deny_filter(&format!("{out_field_prefix}{f}"));
+                let mut prefixed = out_field_prefix.as_bytes().to_vec();
+                prefixed.extend_from_slice(f);
+                pf.add_deny_filter(&prefixed);
             }
         }
     }
@@ -348,7 +353,7 @@ pub(crate) struct PipeUnpackProcessor {
     unpack_func: UnpackFunc,
     pp_next: Arc<dyn PipeProcessor>,
 
-    from_field: String,
+    from_field: Vec<u8>,
     field_prefix: String,
     keep_original_fields: bool,
     skip_empty_results: bool,
@@ -370,7 +375,7 @@ struct PipeUnpackProcessorShard {
 pub(crate) fn new_pipe_unpack_processor(
     unpack_func: UnpackFunc,
     pp_next: Arc<dyn PipeProcessor>,
-    from_field: String,
+    from_field: Vec<u8>,
     field_prefix: String,
     keep_original_fields: bool,
     skip_empty_results: bool,

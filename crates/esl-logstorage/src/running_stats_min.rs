@@ -13,13 +13,13 @@ use crate::stats_min::{field_names_string, less_bytes};
 
 /// Running `min(...)` stats function.
 pub struct RunningStatsMin {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Port of `parseRunningStatsMin`. Empty filters default to `["*"]`.
-pub(crate) fn new_running_stats_min(mut field_filters: Vec<String>) -> RunningStatsMin {
+pub(crate) fn new_running_stats_min(mut field_filters: Vec<Vec<u8>>) -> RunningStatsMin {
     if field_filters.is_empty() {
-        field_filters.push("*".to_string());
+        field_filters.push(b"*".to_vec());
     }
     RunningStatsMin { field_filters }
 }
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_running_min() {
-        let sf = new_running_stats_min(vec!["a".to_string()]);
+        let sf = new_running_stats_min(vec![b"a".to_vec()]);
         let mut sp = sf.new_running_stats_processor();
         for v in ["5", "3", "8", "1", "9"] {
             sp.update_running_stats(&sf, &[field("a", v)]);
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_running_min_to_string_and_needed_fields() {
-        let sf = new_running_stats_min(vec!["a".to_string()]);
+        let sf = new_running_stats_min(vec![b"a".to_vec()]);
         assert_eq!(sf.to_string(), "min(a)");
         let mut pf = Filter::default();
         sf.update_needed_fields(&mut pf);

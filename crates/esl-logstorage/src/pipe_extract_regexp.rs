@@ -19,12 +19,12 @@ use crate::stream_filter::quote_token_if_needed;
 
 /// `| extract_regexp ...` pipe (Go `pipeExtractRegexp`).
 pub(crate) struct PipeExtractRegexp {
-    from_field: String,
+    from_field: Vec<u8>,
     re: Regex,
     re_str: String,
     /// Named capture fields, indexed by capture-group number (index 0 and
     /// unnamed groups are `""`).
-    re_fields: Vec<String>,
+    re_fields: Vec<Vec<u8>>,
     keep_original_fields: bool,
     skip_empty_results: bool,
     iff: Option<IfFilter>,
@@ -39,16 +39,16 @@ fn regexp_compile(s: &str) -> Result<Regex, String> {
 /// `parsePipeExtractRegexp`; lexer parsing of the surrounding pipe is deferred).
 pub(crate) fn new_pipe_extract_regexp(
     pattern_str: &str,
-    from_field: impl Into<String>,
+    from_field: impl Into<Vec<u8>>,
     keep_original_fields: bool,
     skip_empty_results: bool,
     iff: Option<IfFilter>,
 ) -> Result<PipeExtractRegexp, String> {
     let re = regexp_compile(pattern_str)
         .map_err(|e| format!("cannot parse 'pattern' {pattern_str:?}: {e}"))?;
-    let re_fields: Vec<String> = re
+    let re_fields: Vec<Vec<u8>> = re
         .capture_names()
-        .map(|o| o.unwrap_or("").to_string())
+        .map(|o| o.unwrap_or("").as_bytes().to_vec())
         .collect();
     let has_named_fields = re_fields.iter().any(|f| !f.is_empty());
     if !has_named_fields {
@@ -115,7 +115,10 @@ impl Pipe for PipeExtractRegexp {
         }
         s += &format!(" {}", quote_token_if_needed(&self.re_str));
         if !crate::filter_generic::is_msg_field_name(&self.from_field) {
-            s += &format!(" from {}", quote_token_if_needed(&self.from_field));
+            s += &format!(
+                " from {}",
+                crate::parser::quote_token_bytes_if_needed(&self.from_field)
+            );
         }
         if self.keep_original_fields {
             s += " keep_original_fields";
@@ -181,9 +184,9 @@ impl Pipe for PipeExtractRegexp {
 }
 
 struct PipeExtractRegexpProcessor {
-    from_field: String,
+    from_field: Vec<u8>,
     re: Regex,
-    re_fields: Vec<String>,
+    re_fields: Vec<Vec<u8>>,
     keep_original_fields: bool,
     skip_empty_results: bool,
     has_iff: bool,
@@ -198,19 +201,19 @@ struct PipeExtractRegexpProcessorShard {
     result_columns: Vec<Option<ColRef>>,
     result_values: Vec<Vec<u8>>,
     rcs: Vec<ResultColumn>,
-    fields: Vec<String>,
+    fields: Vec<Vec<u8>>,
 }
 
 impl PipeExtractRegexpProcessor {
     /// Port of Go's `pipeExtractRegexpProcessorShard.apply`.
-    fn apply(&self, v: &str, fields: &mut Vec<String>) {
+    fn apply(&self, v: &str, fields: &mut Vec<Vec<u8>>) {
         let nfields = self.re_fields.len();
         fields.clear();
-        fields.resize(nfields, String::new());
+        fields.resize(nfields, Vec::new());
         if let Some(caps) = self.re.captures(v) {
             for (i, slot) in fields.iter_mut().enumerate() {
                 if let Some(m) = caps.get(i) {
-                    *slot = m.as_str().to_string();
+                    *slot = m.as_str().as_bytes().to_vec();
                 }
             }
         }
@@ -287,7 +290,7 @@ impl PipeProcessor for PipeExtractRegexpProcessor {
                         if re_fields[i].is_empty() {
                             continue;
                         }
-                        let mut val = std::mem::take(&mut fields[i]).into_bytes();
+                        let mut val = std::mem::take(&mut fields[i]);
                         let want_original = (val.is_empty() && self.skip_empty_results)
                             || self.keep_original_fields;
                         if let (true, Some(rc_col)) = (want_original, result_columns[i]) {

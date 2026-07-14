@@ -10,23 +10,22 @@ use crate::pipe::{Pipe, PipeProcessor};
 use crate::pipe_pack::{new_pipe_pack_processor, update_needed_fields_for_pipe_pack};
 use crate::prefix_filter;
 use crate::rows::marshal_fields_to_json;
-use crate::stream_filter::quote_token_if_needed;
 
 /// `| pack_json ...` pipe (Go `pipePackJSON`).
 pub(crate) struct PipePackJSON {
-    result_field: String,
+    result_field: Vec<u8>,
     /// Field names and/or prefixes to put inside the packed JSON.
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Constructs a `PipePackJSON` (Go `parsePipePackJSON`; lexer parsing is
 /// deferred). Mirrors Go's normalization: a `fields` list containing `*`
 /// becomes empty (pack everything).
 pub(crate) fn new_pipe_pack_json(
-    field_filters: Vec<String>,
-    result_field: impl Into<String>,
+    field_filters: Vec<Vec<u8>>,
+    result_field: impl Into<Vec<u8>>,
 ) -> PipePackJSON {
-    let field_filters = if field_filters.iter().any(|f| f == "*") {
+    let field_filters = if field_filters.iter().any(|f| f == b"*") {
         Vec::new()
     } else {
         field_filters
@@ -50,7 +49,10 @@ impl Pipe for PipePackJSON {
             s += &format!(" fields ({})", field_names_string(&self.field_filters));
         }
         if !crate::filter_generic::is_msg_field_name(&self.result_field) {
-            s += &format!(" as {}", quote_token_if_needed(&self.result_field));
+            s += &format!(
+                " as {}",
+                crate::parser::quote_token_bytes_if_needed(&self.result_field)
+            );
         }
         s
     }
@@ -64,7 +66,7 @@ impl Pipe for PipePackJSON {
     }
 
     fn can_return_last_n_results(&self) -> bool {
-        self.result_field != "_time"
+        self.result_field != b"_time"
     }
 
     fn new_pipe_processor(
@@ -83,10 +85,10 @@ impl Pipe for PipePackJSON {
 }
 
 /// Port of Go's `fieldNamesString`.
-fn field_names_string(fields: &[String]) -> String {
+fn field_names_string(fields: &[Vec<u8>]) -> String {
     fields
         .iter()
-        .map(|f| quote_token_if_needed(f))
+        .map(|f| crate::parser::quote_token_bytes_if_needed(f))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -144,7 +146,7 @@ mod tests {
     #[test]
     fn test_pipe_pack_json_only_needed_fields() {
         run(
-            new_pipe_pack_json(vec!["foo".to_string(), "baz".to_string()], "a"),
+            new_pipe_pack_json(vec![b"foo".to_vec(), b"baz".to_vec()], "a"),
             &[
                 &[("_msg", "x"), ("foo", "abc"), ("bar", "cde")],
                 &[("a", "b"), ("c", "d")],
@@ -164,7 +166,7 @@ mod tests {
     #[test]
     fn test_pipe_pack_json_wildcard_fields() {
         run(
-            new_pipe_pack_json(vec!["x*".to_string(), "y".to_string()], "a"),
+            new_pipe_pack_json(vec![b"x*".to_vec(), b"y".to_vec()], "a"),
             &[&[("x", "abc"), ("xx", "xabc"), ("yy", "cde"), ("y", "xcde")]],
             &[&[
                 ("x", "abc"),

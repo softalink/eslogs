@@ -354,12 +354,16 @@ what remains in section (a) is confirmed-present divergence.
   `*_common_case` (Go `strings.ToUpper`-exact case expansion),
   `json_array_contains_any`, stream-filter tag values (`{label="value"}` —
   byte-exact `=`/`!=`, Go byte-wise `QuoteMeta` for `in`), and the `replace`
-  pipe's from/to. Still on the scalar `String` token path (behavior unchanged,
-  no lossy): quoted field NAMES (the `FieldFilter`/grammar `&str` cascade:
-  ~160 sites / 37 files — a raw-byte quoted field name scalar-decodes),
-  `re()` args (regex engine is `&str`-bound), `pattern_match*` pattern text
-  (str-native `PatternMatcher` module), and the remaining pipe args (`format`
-  patterns, `split` separator, `unpack_*` prefixes, ...).
+  pipe's from/to. Quoted field NAMES from query text are raw bytes too (the
+  `FieldFilter` trait, `FilterGeneric.field_name`, the grammar's name threading,
+  `prefix_filter`, and every pipe/stats by-field config are byte-native, with
+  the redundant `_bytes` lookup twins consolidated into single byte APIs) — a
+  quoted `"\xff"` name matches an ingested raw-byte name end-to-end, and name
+  rendering quotes invalid bytes as `\xNN` like Go's `needQuoteToken`
+  (`RuneError` ⇒ quoted). Residuals (each PORT-NOTEd): the cluster netselect
+  form channel rejects non-UTF-8 field-name args (String-typed multipart seam;
+  single-node is fully raw-byte); `extract`-pipe PATTERN literals and
+  `re()`/`pattern_match*` args stay scalar/`&str`-bound (str-native engines).
 
 **Input handling edge cases (esl-logstorage)**
 

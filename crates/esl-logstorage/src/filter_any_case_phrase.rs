@@ -43,7 +43,7 @@ pub(crate) struct FilterAnyCasePhrase {
 }
 
 pub(crate) fn new_filter_any_case_phrase(
-    field_name: &str,
+    field_name: &[u8],
     phrase: impl AsRef<[u8]>,
 ) -> FilterGeneric {
     new_filter_generic(
@@ -137,7 +137,7 @@ impl FieldFilter for FilterAnyCasePhrase {
         )
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_any_case_phrase(v, self.get_phrase_lowercase())
     }
@@ -146,7 +146,7 @@ impl FieldFilter for FilterAnyCasePhrase {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let phrase_lowercase = self.get_phrase_lowercase().to_vec();
         apply_to_block_result_generic(br, bm, field_name, &phrase_lowercase, match_any_case_phrase);
@@ -156,7 +156,7 @@ impl FieldFilter for FilterAnyCasePhrase {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let phrase_lowercase = self.get_phrase_lowercase().to_vec();
 

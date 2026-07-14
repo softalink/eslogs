@@ -583,10 +583,10 @@ impl Query {
     /// Adds `| fields ...` pipe for the given fields to q (Go `AddPipeFields`).
     ///
     /// See <https://docs.victoriametrics.com/victorialogs/logsql/#fields-pipe>
-    pub fn add_pipe_fields(&mut self, fields: &[String]) {
+    pub fn add_pipe_fields(&mut self, fields: &[Vec<u8>]) {
         let a: Vec<String> = fields
             .iter()
-            .map(|field| crate::parser::quote_token_if_needed(field))
+            .map(|field| crate::parser::quote_token_bytes_if_needed(field))
             .collect();
         let s = format!("fields {}", a.join(", "));
         self.must_append_pipe(&s);

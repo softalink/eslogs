@@ -20,7 +20,7 @@ use crate::stats_count_uniq::field_names_string;
 /// `pipeUnroll` implements `| unroll ...`.
 pub struct PipeUnroll {
     /// fields to unroll
-    pub(crate) fields: Vec<String>,
+    pub(crate) fields: Vec<Vec<u8>>,
 
     /// optional filter for skipping the unroll
     pub(crate) iff: Option<Arc<IfFilter>>,
@@ -31,7 +31,7 @@ pub struct PipeUnroll {
 /// PORT NOTE: Go's `parsePipeUnroll` is lexer-dependent and deferred; this
 /// constructor takes the parsed fields and optional `if` filter directly. The
 /// parser guarantees `fields` is non-empty and free of `*`.
-pub(crate) fn new_pipe_unroll(fields: Vec<String>, iff: Option<Arc<IfFilter>>) -> PipeUnroll {
+pub(crate) fn new_pipe_unroll(fields: Vec<Vec<u8>>, iff: Option<Arc<IfFilter>>) -> PipeUnroll {
     PipeUnroll { fields, iff }
 }
 
@@ -123,7 +123,7 @@ impl Pipe for PipeUnroll {
 }
 
 struct PipeUnrollProcessor {
-    fields: Vec<String>,
+    fields: Vec<Vec<u8>>,
     iff: Option<Arc<IfFilter>>,
     stop: Arc<AtomicBool>,
     pp_next: Arc<dyn PipeProcessor>,
@@ -195,7 +195,7 @@ impl PipeProcessor for PipeUnrollProcessor {
                     .iter()
                     .enumerate()
                     .map(|(i, f)| Field {
-                        name: f.clone().into_bytes(),
+                        name: f.clone(),
                         value: field_values[i][row_idx].clone(),
                     })
                     .collect();
@@ -259,7 +259,7 @@ impl PipeUnrollProcessor {
                 .iter()
                 .enumerate()
                 .map(|(i, name)| Field {
-                    name: name.clone().into_bytes(),
+                    name: name.clone(),
                     value: unrolled[i].get(unroll_idx).cloned().unwrap_or_default(),
                 })
                 .collect();
@@ -380,12 +380,12 @@ mod tests {
     // omitted until the LogsQL parser is ported.
 
     fn phrase_iff(field: &str, phrase: &str) -> Arc<IfFilter> {
-        let f: Arc<dyn Filter> = Arc::new(new_filter_phrase(field, phrase));
+        let f: Arc<dyn Filter> = Arc::new(new_filter_phrase(field.as_bytes(), phrase));
         Arc::new(IfFilter::new(f))
     }
 
     fn unroll(fields: &[&str], iff: Option<Arc<IfFilter>>) -> PipeUnroll {
-        new_pipe_unroll(fields.iter().map(|s| s.to_string()).collect(), iff)
+        new_pipe_unroll(fields.iter().map(|s| s.as_bytes().to_vec()).collect(), iff)
     }
 
     #[test]

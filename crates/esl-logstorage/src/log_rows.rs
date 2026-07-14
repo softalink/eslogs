@@ -217,7 +217,7 @@ impl LogRows {
                     return;
                 }
 
-                if !self.ignore_fields.match_string_bytes(field_name) {
+                if !self.ignore_fields.match_string(field_name) {
                     st.add(field_name, &f.value);
                 }
             }
@@ -400,7 +400,7 @@ impl LogRows {
         for (i, f) in fields.iter().enumerate() {
             let field_name = get_canonical_field_name_bytes(&f.name);
 
-            if use_filters && self.ignore_fields.match_string_bytes(field_name) {
+            if use_filters && self.ignore_fields.match_string(field_name) {
                 continue;
             }
             if f.value.is_empty() {
@@ -461,7 +461,7 @@ impl LogRows {
                     }
 
                     if use_filters
-                        && self.decolorize_fields.match_string_bytes(field_name)
+                        && self.decolorize_fields.match_string(field_name)
                         && has_color_sequences(&dst_field.value)
                     {
                         let mut b = Vec::new();
@@ -546,15 +546,6 @@ static UNEXPECTED_TIME_FIELD_LOGGER: LazyLock<&'static LogThrottler> =
 static UNEXPECTED_STREAM_FIELD_LOGGER: LazyLock<&'static LogThrottler> =
     LazyLock::new(|| with_throttler("unexpected_stream_field", Duration::from_secs(5)));
 
-pub(crate) fn get_canonical_field_name(field_name: &str) -> &str {
-    if field_name == "_msg" {
-        return "";
-    }
-    field_name
-}
-
-/// Byte-name variant of [`get_canonical_field_name`] for `Field.name`
-/// (raw bytes) call sites.
 pub(crate) fn get_canonical_field_name_bytes(field_name: &[u8]) -> &[u8] {
     if field_name == b"_msg" {
         return b"";
@@ -562,15 +553,6 @@ pub(crate) fn get_canonical_field_name_bytes(field_name: &[u8]) -> &[u8] {
     field_name
 }
 
-pub(crate) fn get_canonical_column_name(field_name: &str) -> &str {
-    if field_name.is_empty() {
-        return "_msg";
-    }
-    field_name
-}
-
-/// Byte-name variant of [`get_canonical_column_name`] for `Field.name`
-/// (raw bytes) call sites.
 pub(crate) fn get_canonical_column_name_bytes(field_name: &[u8]) -> &[u8] {
     if field_name.is_empty() {
         return b"_msg";
@@ -614,30 +596,29 @@ pub fn get_log_rows(
 
     // initialize ignore_fields
     for f in ignore_fields {
-        let f = get_canonical_field_name(f);
+        let f = get_canonical_field_name_bytes(f.as_bytes());
         lr.ignore_fields.add_allow_filter(f);
     }
     for f in extra_fields {
         // Extra fields must override the existing fields for the sake of consistency and security,
-        // so the client won't be able to override them.
-        // Extra-field names come from query args (valid UTF-8); the lossy
-        // view only feeds the filter set, the stored name stays raw.
-        let field_name = String::from_utf8_lossy(&f.name);
+        // so the client won't be able to override them. The raw name bytes
+        // flow into the filter set unchanged (byte-wise matching, like Go).
         lr.ignore_fields
-            .add_allow_filter(get_canonical_field_name(&field_name));
+            .add_allow_filter(get_canonical_field_name_bytes(&f.name));
     }
 
     // initialize decolorize_fields
     for f in decolorize_fields {
-        let f = get_canonical_field_name(f);
+        let f = get_canonical_field_name_bytes(f.as_bytes());
         lr.decolorize_fields.add_allow_filter(f);
     }
 
     // Initialize stream_fields
     for f in stream_fields {
-        let f = get_canonical_field_name(f);
+        let f = get_canonical_field_name_bytes(f.as_bytes());
         if !lr.ignore_fields.match_string(f) {
-            lr.stream_fields.push(f.to_string());
+            lr.stream_fields
+                .push(String::from_utf8(f.to_vec()).unwrap());
         }
     }
 

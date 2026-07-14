@@ -6,22 +6,25 @@
 
 use crate::prefix_filter::Filter;
 use crate::rows::Field;
-use crate::stream_filter::quote_token_if_needed;
 
 /// Running `last(field)` stats function.
 pub struct RunningStatsLast {
-    field_name: String,
+    field_name: Vec<u8>,
     offset: usize,
 }
 
 /// Port of `parseRunningStatsLast` (constructor form). `offset` defaults to 0.
-pub(crate) fn new_running_stats_last(field_name: String, offset: usize) -> RunningStatsLast {
+pub(crate) fn new_running_stats_last(field_name: Vec<u8>, offset: usize) -> RunningStatsLast {
     RunningStatsLast { field_name, offset }
 }
 
 impl std::fmt::Display for RunningStatsLast {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "last({})", quote_token_if_needed(&self.field_name))?;
+        write!(
+            f,
+            "last({})",
+            crate::parser::quote_token_bytes_if_needed(&self.field_name)
+        )?;
         if self.offset > 0 {
             write!(f, " offset {}", self.offset)?;
         }
@@ -52,7 +55,7 @@ impl RunningStatsLastProcessor {
     pub(crate) fn update_running_stats(&mut self, sf: &RunningStatsLast, row: &[Field]) {
         let mut value = Vec::new();
         for f in row {
-            if f.name == sf.field_name.as_bytes() {
+            if f.name == sf.field_name {
                 value = f.value.clone();
                 break;
             }
@@ -122,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_last_no_offset() {
-        let sf = new_running_stats_last("a".to_string(), 0);
+        let sf = new_running_stats_last(b"a".to_vec(), 0);
         let mut sp = sf.new_running_stats_processor();
         for v in ["one", "two", "three"] {
             sp.update_running_stats(&sf, &[field("a", v)]);
@@ -132,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_last_with_offset() {
-        let sf = new_running_stats_last("a".to_string(), 1);
+        let sf = new_running_stats_last(b"a".to_vec(), 1);
         let mut sp = sf.new_running_stats_processor();
         for v in ["r0", "r1", "r2", "r3"] {
             sp.update_running_stats(&sf, &[field("a", v)]);
@@ -143,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_last_offset_beyond_seen_is_empty() {
-        let sf = new_running_stats_last("a".to_string(), 5);
+        let sf = new_running_stats_last(b"a".to_vec(), 5);
         let mut sp = sf.new_running_stats_processor();
         sp.update_running_stats(&sf, &[field("a", "r0")]);
         assert_eq!(sp.get_running_stats(), b"");
@@ -151,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_last_to_string_and_needed_fields() {
-        let sf = new_running_stats_last("a".to_string(), 2);
+        let sf = new_running_stats_last(b"a".to_vec(), 2);
         assert_eq!(sf.to_string(), "last(a) offset 2");
         let mut pf = Filter::default();
         sf.update_needed_fields(&mut pf);

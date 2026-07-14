@@ -20,8 +20,8 @@ pub(crate) type MarshalFieldsFn = fn(&mut Vec<u8>, &[Field]);
 /// Port of Go's `updateNeededFieldsForPipePack`.
 pub(crate) fn update_needed_fields_for_pipe_pack(
     pf: &mut prefix_filter::Filter,
-    result_field: &str,
-    field_filters: &[String],
+    result_field: &[u8],
+    field_filters: &[Vec<u8>],
 ) {
     if pf.match_string(result_field) {
         pf.add_deny_filter(result_field);
@@ -36,8 +36,8 @@ pub(crate) fn update_needed_fields_for_pipe_pack(
 /// Port of Go's `newPipePackProcessor`.
 pub(crate) fn new_pipe_pack_processor(
     pp_next: Arc<dyn PipeProcessor>,
-    result_field: String,
-    fields: Vec<String>,
+    result_field: Vec<u8>,
+    fields: Vec<Vec<u8>>,
     marshal_fields: MarshalFieldsFn,
 ) -> Arc<dyn PipeProcessor> {
     Arc::new(PipePackProcessor {
@@ -51,8 +51,8 @@ pub(crate) fn new_pipe_pack_processor(
 
 struct PipePackProcessor {
     pp_next: Arc<dyn PipeProcessor>,
-    result_field: String,
-    fields: Vec<String>,
+    result_field: Vec<u8>,
+    fields: Vec<Vec<u8>>,
     marshal_fields: MarshalFieldsFn,
     shards: Slice<std::sync::Mutex<PipePackProcessorShard>>,
 }
@@ -76,7 +76,7 @@ impl PipeProcessor for PipePackProcessor {
         let mut guard = shard_arc.lock().unwrap();
         let shard = &mut *guard;
 
-        shard.rc.name = self.result_field.clone().into_bytes();
+        shard.rc.name = self.result_field.clone();
 
         let cs_all = br.get_columns();
         let cs_all_names: Vec<Vec<u8>> =
@@ -93,8 +93,7 @@ impl PipeProcessor for PipePackProcessor {
             for (i, &c) in cs_all.iter().enumerate() {
                 let name = &cs_all_names[i];
                 for f in &self.fields {
-                    if *name == f.as_bytes()
-                        || (f.ends_with('*') && name.starts_with(&f.as_bytes()[..f.len() - 1]))
+                    if name == f || (f.last() == Some(&b'*') && name.starts_with(&f[..f.len() - 1]))
                     {
                         shard.cs.push(c);
                         shard.cs_names.push(name.clone());

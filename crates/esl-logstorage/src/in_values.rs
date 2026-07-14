@@ -35,7 +35,7 @@ pub struct InValues {
 
     /// The field name for obtaining values from if `q_text` is set
     /// (Go `qFieldName`).
-    pub q_field_name: String,
+    pub q_field_name: Vec<u8>,
 
     tokens_hashes_any: OnceLock<(Vec<u64>, Vec<Vec<u64>>)>,
 
@@ -74,7 +74,7 @@ impl InValues {
 
     /// Builds an `InValues` whose values are populated from the given subquery
     /// before filter execution (Go `inValues{q: ..., qFieldName: ...}`).
-    pub fn new_from_query(q_text: String, q_field_name: String) -> InValues {
+    pub fn new_from_query(q_text: String, q_field_name: Vec<u8>) -> InValues {
         InValues {
             q_text: Some(q_text),
             q_field_name,

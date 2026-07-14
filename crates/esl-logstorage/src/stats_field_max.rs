@@ -20,19 +20,18 @@ use crate::block_result::BlockResult;
 use crate::prefix_filter::Filter;
 use crate::stats::{StatsFunc, StatsProcessor};
 use crate::stats_min::less_bytes;
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{
     marshal_timestamp_rfc3339_nano_string, try_parse_timestamp_rfc3339_nano,
 };
 
 /// Port of `statsFieldMax`.
 pub(crate) struct StatsFieldMax {
-    src_field: String,
-    field_name: String,
+    src_field: Vec<u8>,
+    field_name: Vec<u8>,
 }
 
 /// Port of `parseStatsFieldMax`; expects exactly two args (src, field).
-pub(crate) fn new_stats_field_max(args: Vec<String>) -> Result<StatsFieldMax, String> {
+pub(crate) fn new_stats_field_max(args: Vec<Vec<u8>>) -> Result<StatsFieldMax, String> {
     if args.len() != 2 {
         return Err(format!(
             "unexpected number of arguments for 'field_max' func; got {} args; want 2; args={:?}",
@@ -50,8 +49,8 @@ impl StatsFunc for StatsFieldMax {
     fn to_string(&self) -> String {
         format!(
             "field_max({}, {})",
-            quote_token_if_needed(&self.src_field),
-            quote_token_if_needed(&self.field_name)
+            crate::parser::quote_token_bytes_if_needed(&self.src_field),
+            crate::parser::quote_token_bytes_if_needed(&self.field_name)
         )
     }
 
@@ -72,8 +71,8 @@ impl StatsFunc for StatsFieldMax {
 
 /// Port of `statsFieldMaxProcessor`.
 pub(crate) struct StatsFieldMaxProcessor {
-    src_field: String,
-    field_name: String,
+    src_field: Vec<u8>,
+    field_name: Vec<u8>,
     max: Vec<u8>,
     value: Vec<u8>,
 }
@@ -90,7 +89,7 @@ impl StatsFieldMaxProcessor {
         &mut self,
         v: &[u8],
         br: &mut BlockResult,
-        field_name: &str,
+        field_name: &[u8],
         row_idx: usize,
     ) -> i64 {
         if !self.need_update_state_string(v) {
@@ -222,7 +221,8 @@ mod tests {
     }
 
     fn run(src: &str, fname: &str, blocks: &[Vec<Vec<Field>>]) -> String {
-        let sf = new_stats_field_max(vec![src.to_string(), fname.to_string()]).unwrap();
+        let sf =
+            new_stats_field_max(vec![src.as_bytes().to_vec(), fname.as_bytes().to_vec()]).unwrap();
         let mut sp = sf.new_stats_processor();
         for block in blocks {
             let mut br = BlockResult::default();
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_field_max_requires_two_args() {
-        assert!(new_stats_field_max(vec!["a".to_string()]).is_err());
+        assert!(new_stats_field_max(vec![b"a".to_vec()]).is_err());
     }
 
     #[test]

@@ -312,7 +312,7 @@ fn parse_pipe_block_stats(lex: &mut Lexer) -> Result<BoxPipe, String> {
 fn parse_pipe_blocks_count(lex: &mut Lexer) -> Result<BoxPipe, String> {
     expect_keyword(lex, &["blocks_count"], "blocks_count")?;
     lex.next_token();
-    let mut result_name = "blocks_count".to_string();
+    let mut result_name = b"blocks_count".to_vec();
     if lex.is_keyword(&["as"]) {
         lex.next_token();
         result_name = parse_field_name(lex)
@@ -341,7 +341,7 @@ fn parse_pipe_coalesce(lex: &mut Lexer) -> Result<BoxPipe, String> {
             .next_compound_token()
             .map_err(|e| format!("cannot parse default value: {e}"))?;
     }
-    let mut dst_field = "_msg".to_string();
+    let mut dst_field = b"_msg".to_vec();
     if lex.is_keyword(&["as"]) {
         lex.next_token();
         dst_field =
@@ -358,7 +358,7 @@ fn parse_pipe_collapse_nums(lex: &mut Lexer) -> Result<BoxPipe, String> {
     expect_keyword(lex, &["collapse_nums"], "collapse_nums")?;
     lex.next_token();
     let iff = parse_optional_if(lex)?;
-    let mut field = "_msg".to_string();
+    let mut field = b"_msg".to_vec();
     if lex.is_keyword(&["at"]) {
         lex.next_token();
         field = parse_field_name(lex)
@@ -388,7 +388,10 @@ fn parse_pipe_rename(lex: &mut Lexer) -> Result<BoxPipe, String> {
     Ok(Box::new(crate::pipe_rename::new_pipe_rename(src, dst)))
 }
 
-fn parse_src_dst_pairs(lex: &mut Lexer, _tail: &str) -> Result<(Vec<String>, Vec<String>), String> {
+/// `(src_field_filters, dst_field_filters)` pair of a `copy`/`rename` pipe.
+type SrcDstPairs = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+fn parse_src_dst_pairs(lex: &mut Lexer, _tail: &str) -> Result<SrcDstPairs, String> {
     let mut src = Vec::new();
     let mut dst = Vec::new();
     loop {
@@ -415,7 +418,7 @@ fn parse_src_dst_pairs(lex: &mut Lexer, _tail: &str) -> Result<(Vec<String>, Vec
 fn parse_pipe_decolorize(lex: &mut Lexer) -> Result<BoxPipe, String> {
     expect_keyword(lex, &["decolorize"], "decolorize")?;
     lex.next_token();
-    let mut field = "_msg".to_string();
+    let mut field = b"_msg".to_vec();
     if !lex.is_query_part_trailer() {
         field = parse_field_name(lex)
             .map_err(|e| format!("cannot parse field name after 'decolorize': {e}"))?;
@@ -445,7 +448,7 @@ fn parse_pipe_extract(lex: &mut Lexer) -> Result<BoxPipe, String> {
     let pattern_str = lex
         .next_compound_token()
         .map_err(|e| format!("cannot read 'pattern': {e}"))?;
-    let mut from_field = "_msg".to_string();
+    let mut from_field = b"_msg".to_vec();
     if lex.is_keyword(&["from"]) {
         lex.next_token();
         from_field =
@@ -469,7 +472,7 @@ fn parse_pipe_extract_regexp(lex: &mut Lexer) -> Result<BoxPipe, String> {
     let pattern_str = lex
         .next_compound_token()
         .map_err(|e| format!("cannot read 'pattern': {e}"))?;
-    let mut from_field = "_msg".to_string();
+    let mut from_field = b"_msg".to_vec();
     if lex.is_keyword(&["from"]) {
         lex.next_token();
         from_field =
@@ -559,7 +562,7 @@ fn parse_pipe_field_names(lex: &mut Lexer) -> Result<BoxPipe, String> {
             .next_compound_token()
             .map_err(|e| format!("cannot parse filter inside 'field_names' pipe: {e}"))?;
     }
-    let mut result_name = "name".to_string();
+    let mut result_name = b"name".to_vec();
     if lex.is_keyword(&["as"]) {
         lex.next_token();
         result_name = parse_field_name(lex)
@@ -631,7 +634,7 @@ fn parse_pipe_format(lex: &mut Lexer) -> Result<BoxPipe, String> {
     let format_str = lex
         .next_compound_token()
         .map_err(|e| format!("cannot read 'format': {e}"))?;
-    let mut result_field = "_msg".to_string();
+    let mut result_field = b"_msg".to_vec();
     if lex.is_keyword(&["as"]) {
         lex.next_token();
         result_field = parse_field_name(lex).map_err(|e| {
@@ -701,10 +704,13 @@ fn parse_pipe_json_array_len(lex: &mut Lexer) -> Result<BoxPipe, String> {
 
 /// Shared body for `len`/`hash`/`json_array_len`: field(optional parens),
 /// optional `as`, optional result field defaulting to `_msg`.
-fn parse_field_optparen_as_result(lex: &mut Lexer, func: &str) -> Result<(String, String), String> {
+fn parse_field_optparen_as_result(
+    lex: &mut Lexer,
+    func: &str,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
     let field_name = parse_field_name_with_optional_parens(lex)
         .map_err(|e| format!("cannot parse field name for '{func}' pipe: {e}"))?;
-    let mut result_field = "_msg".to_string();
+    let mut result_field = b"_msg".to_vec();
     if lex.is_keyword(&["as"]) {
         lex.next_token();
     }
@@ -712,7 +718,7 @@ fn parse_field_optparen_as_result(lex: &mut Lexer, func: &str) -> Result<(String
         result_field = parse_field_name(lex).map_err(|e| {
             format!(
                 "cannot parse result field after '{func}({})': {e}",
-                quote_token_if_needed(&field_name)
+                crate::parser::quote_token_bytes_if_needed(&field_name)
             )
         })?;
     }
@@ -760,7 +766,7 @@ fn parse_pipe_pack_logfmt(lex: &mut Lexer) -> Result<BoxPipe, String> {
     )))
 }
 
-fn parse_pack_common(lex: &mut Lexer, name: &str) -> Result<(Vec<String>, String), String> {
+fn parse_pack_common(lex: &mut Lexer, name: &str) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
     expect_keyword(lex, &[name], name)?;
     lex.next_token();
     let mut field_filters = Vec::new();
@@ -769,7 +775,7 @@ fn parse_pack_common(lex: &mut Lexer, name: &str) -> Result<(Vec<String>, String
         field_filters =
             parse_field_filters_in_parens(lex).map_err(|e| format!("cannot parse fields: {e}"))?;
     }
-    let mut result_field = "_msg".to_string();
+    let mut result_field = b"_msg".to_vec();
     if lex.is_keyword(&["as"]) {
         lex.next_token();
     }
@@ -820,7 +826,7 @@ fn parse_pipe_replace(lex: &mut Lexer) -> Result<BoxPipe, String> {
         ));
     }
     lex.next_token();
-    let mut field = "_msg".to_string();
+    let mut field = b"_msg".to_vec();
     if lex.is_keyword(&["at"]) {
         lex.next_token();
         field = parse_field_name(lex).map_err(|e| format!("cannot parse 'at' field: {e}"))?;
@@ -876,7 +882,7 @@ fn parse_pipe_replace_regexp(lex: &mut Lexer) -> Result<BoxPipe, String> {
         ));
     }
     lex.next_token();
-    let mut field = "_msg".to_string();
+    let mut field = b"_msg".to_vec();
     if lex.is_keyword(&["at"]) {
         lex.next_token();
         field = parse_field_name(lex).map_err(|e| format!("cannot parse 'at' field: {e}"))?;
@@ -938,7 +944,7 @@ fn parse_pipe_split(lex: &mut Lexer) -> Result<BoxPipe, String> {
     let separator = lex
         .next_compound_token()
         .map_err(|e| format!("cannot read split separator: {e}"))?;
-    let mut src_field = "_msg".to_string();
+    let mut src_field = b"_msg".to_vec();
     if !lex.is_keyword(&["as"]) && !lex.is_query_part_trailer() {
         if lex.is_keyword(&["from"]) {
             lex.next_token();
@@ -1023,7 +1029,7 @@ fn parse_pipe_time_add(lex: &mut Lexer) -> Result<BoxPipe, String> {
     lex.next_token();
     let (offset, offset_str) =
         parse_duration(lex).map_err(|e| format!("cannot parse offset: {e}"))?;
-    let mut field = "_time".to_string();
+    let mut field = b"_time".to_vec();
     if lex.is_keyword(&["at"]) {
         lex.next_token();
         field = parse_field_name(lex).map_err(|e| format!("cannot read field name: {e}"))?;
@@ -1066,16 +1072,17 @@ fn parse_pipe_top(lex: &mut Lexer) -> Result<BoxPipe, String> {
     if by_fields.is_empty() {
         return Err("expecting at least a single field in 'by(...)'".to_string());
     }
-    let mut hits_field_name = "hits".to_string();
-    let mut rank_field_name = String::new();
+    let mut hits_field_name = b"hits".to_vec();
+    let mut rank_field_name = Vec::new();
     loop {
         if lex.is_keyword(&["hits"]) {
             lex.next_token();
             if lex.is_keyword(&["as"]) {
                 lex.next_token();
             }
+            // Raw-byte name (quoted tokens carry Go-parity raw bytes).
             hits_field_name = lex
-                .next_compound_token()
+                .next_compound_token_bytes()
                 .map_err(|e| format!("cannot parse 'hits' name: {e}"))?;
         } else if lex.is_keyword(&["rank"]) {
             let r = parse_rank_field_name(lex)
@@ -1136,10 +1143,10 @@ fn parse_pipe_uniq(lex: &mut Lexer) -> Result<BoxPipe, String> {
             return Err("missing 'hits' after 'with'".to_string());
         }
     }
-    let mut hits_field_name = String::new();
+    let mut hits_field_name = Vec::new();
     if lex.is_keyword(&["hits"]) {
         lex.next_token();
-        hits_field_name = get_unique_result_name("hits", &by_fields);
+        hits_field_name = get_unique_result_name(b"hits", &by_fields);
     }
     let mut limit = 0;
     if lex.is_keyword(&["limit"]) {
@@ -1174,8 +1181,8 @@ fn parse_pipe_sort(lex: &mut Lexer) -> Result<BoxPipe, String> {
     }
     let mut offset = 0u64;
     let mut limit = 0u64;
-    let mut rank_field_name = String::new();
-    let mut partition_by_fields: Vec<String> = Vec::new();
+    let mut rank_field_name = Vec::new();
+    let mut partition_by_fields: Vec<Vec<u8>> = Vec::new();
     loop {
         if lex.is_keyword(&["offset"]) {
             let n = parse_offset(lex)?;
@@ -1274,7 +1281,7 @@ fn parse_pipe_last_first(lex: &mut Lexer) -> Result<PipeSort, String> {
         partition_by_fields = parse_field_names_in_parens(lex)
             .map_err(|e| format!("cannot parse 'partition by' args: {e}"))?;
     }
-    let mut rank_field_name = String::new();
+    let mut rank_field_name = Vec::new();
     if lex.is_keyword(&["rank"]) {
         rank_field_name =
             parse_rank_field_name(lex).map_err(|e| format!("cannot read rank field name: {e}"))?;
@@ -1302,7 +1309,7 @@ fn parse_pipe_join(lex: &mut Lexer) -> Result<BoxPipe, String> {
     if by_fields.is_empty() {
         return Err("'by(...)' at 'join' must contain at least a single field".to_string());
     }
-    if by_fields.iter().any(|f| f == "*") {
+    if by_fields.iter().any(|f| f == b"*") {
         return Err("join by '*' isn't supported".to_string());
     }
     let mut query_text = None;
@@ -1427,7 +1434,7 @@ fn parse_pipe_unpack_json(lex: &mut Lexer) -> Result<BoxPipe, String> {
     expect_keyword(lex, &["unpack_json"], "unpack_json")?;
     lex.next_token();
     let iff = parse_optional_if(lex)?;
-    let mut from_field = "_msg".to_string();
+    let mut from_field = b"_msg".to_vec();
     if !lex.is_keyword(&[
         "fields",
         "preserve_keys",
@@ -1477,7 +1484,7 @@ fn parse_pipe_unpack_logfmt(lex: &mut Lexer) -> Result<BoxPipe, String> {
     expect_keyword(lex, &["unpack_logfmt"], "unpack_logfmt")?;
     lex.next_token();
     let iff = parse_optional_if(lex)?;
-    let mut from_field = "_msg".to_string();
+    let mut from_field = b"_msg".to_vec();
     if !lex.is_keyword(&[
         "fields",
         "result_prefix",
@@ -1519,7 +1526,7 @@ fn parse_pipe_unpack_syslog(lex: &mut Lexer) -> Result<BoxPipe, String> {
     expect_keyword(lex, &["unpack_syslog"], "unpack_syslog")?;
     lex.next_token();
     let iff = parse_optional_if(lex)?;
-    let mut from_field = "_msg".to_string();
+    let mut from_field = b"_msg".to_vec();
     if !lex.is_keyword(&["offset", "result_prefix", "keep_original_fields"])
         && !lex.is_query_part_trailer()
     {
@@ -1566,7 +1573,7 @@ fn parse_pipe_unpack_syslog(lex: &mut Lexer) -> Result<BoxPipe, String> {
 fn parse_pipe_unpack_words(lex: &mut Lexer) -> Result<BoxPipe, String> {
     expect_keyword(lex, &["unpack_words"], "unpack_words")?;
     lex.next_token();
-    let mut src_field = "_msg".to_string();
+    let mut src_field = b"_msg".to_vec();
     if !lex.is_keyword(&["drop_duplicates", "as"]) && !lex.is_query_part_trailer() {
         if lex.is_keyword(&["from"]) {
             lex.next_token();
@@ -1609,7 +1616,7 @@ fn parse_pipe_unroll(lex: &mut Lexer) -> Result<BoxPipe, String> {
     if fields.is_empty() {
         return Err("'by(...)' at 'unroll' must contain at least a single field".to_string());
     }
-    if fields.iter().any(|f| f == "*") {
+    if fields.iter().any(|f| f == b"*") {
         return Err("unroll by '*' isn't supported".to_string());
     }
     Ok(Box::new(crate::pipe_unroll::new_pipe_unroll(
@@ -1654,7 +1661,7 @@ fn parse_math_entry(lex: &mut Lexer) -> Result<MathEntry, String> {
     let me = parse_math_expr(lex)?;
 
     let result_field = if lex.is_keyword(&[","]) || lex.is_query_part_trailer() {
-        me.to_string()
+        me.to_string().into_bytes()
     } else {
         if lex.is_keyword(&["as"]) {
             // skip optional 'as'
@@ -1900,8 +1907,9 @@ fn parse_math_expr_const_number(lex: &mut Lexer) -> Result<MathExpr, String> {
 
 /// Port of Go `parseMathExprFieldName` (pipe_math.go).
 fn parse_math_expr_field_name(lex: &mut Lexer) -> Result<MathExpr, String> {
-    let field_name = lex.next_compound_math_token()?;
-    let field_name = crate::log_rows::get_canonical_column_name(&field_name);
+    // Raw-byte field name (quoted tokens carry Go-parity raw bytes).
+    let field_name = lex.next_compound_math_token_bytes()?;
+    let field_name = crate::log_rows::get_canonical_column_name_bytes(&field_name);
     Ok(MathExpr::new_field(field_name))
 }
 

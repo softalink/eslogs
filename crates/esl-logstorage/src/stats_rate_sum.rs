@@ -24,7 +24,7 @@ pub struct StatsRateSum {
 
 /// Builds a [`StatsRateSum`] from already-parsed field filters
 /// (Go `parseStatsRateSum`).
-pub(crate) fn new_stats_rate_sum(field_filters: Vec<String>) -> StatsRateSum {
+pub(crate) fn new_stats_rate_sum(field_filters: Vec<Vec<u8>>) -> StatsRateSum {
     StatsRateSum {
         ss: new_stats_sum(field_filters),
         step_seconds: 0.0,

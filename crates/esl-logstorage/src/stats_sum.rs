@@ -19,7 +19,7 @@ use crate::values_encoder::{marshal_float64, unmarshal_float64};
 /// `Vec<ColRef>` since `ColRef` is a cheap index handle. Empty columns for
 /// unmatched non-wildcard filters are materialized via `get_column_by_name`,
 /// matching `getMatchingColumnsSlow`.
-pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> Vec<ColRef> {
+pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[Vec<u8>]) -> Vec<ColRef> {
     if is_single_field(filters) {
         return vec![br.get_column_by_name(&filters[0])];
     }
@@ -27,7 +27,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
     let cs = br.get_columns();
     let mut dst = Vec::new();
     for &c in &cs {
-        if prefix_filter::match_filters_bytes(filters, br.column_name(c)) {
+        if prefix_filter::match_filters(filters, br.column_name(c)) {
             dst.push(c);
         }
     }
@@ -37,7 +37,7 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
         }
         let mut need_empty = true;
         for &c in &cs {
-            if br.column_name(c) == f.as_bytes() {
+            if br.column_name(c) == f.as_slice() {
                 need_empty = false;
                 break;
             }
@@ -51,11 +51,11 @@ pub(crate) fn get_matching_columns(br: &mut BlockResult, filters: &[String]) -> 
 
 /// `sum(...)` stats function.
 pub struct StatsSum {
-    pub(crate) field_filters: Vec<String>,
+    pub(crate) field_filters: Vec<Vec<u8>>,
 }
 
 /// Builds a [`StatsSum`] from already-parsed field filters (Go `parseStatsSum`).
-pub(crate) fn new_stats_sum(field_filters: Vec<String>) -> StatsSum {
+pub(crate) fn new_stats_sum(field_filters: Vec<Vec<u8>>) -> StatsSum {
     StatsSum { field_filters }
 }
 
@@ -79,7 +79,7 @@ impl StatsFunc for StatsSum {
 #[derive(Default, Debug)]
 pub(crate) struct StatsSumProcessor {
     pub(crate) sum: f64,
-    pub(crate) field_filters: Vec<String>,
+    pub(crate) field_filters: Vec<Vec<u8>>,
 }
 
 impl StatsSumProcessor {

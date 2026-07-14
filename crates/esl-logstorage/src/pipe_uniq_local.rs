@@ -37,16 +37,16 @@ struct ValueWithHits {
 
 /// The `| uniq_local ...` pipe.
 pub struct PipeUniqLocal {
-    by_fields: Vec<String>,
-    hits_field_name: String,
+    by_fields: Vec<Vec<u8>>,
+    hits_field_name: Vec<u8>,
     limit: u64,
 }
 
 /// Builds a [`PipeUniqLocal`] (Go `pipeUniqLocal` wrapping the parent
 /// `uniq`); produced by `pipeUniq.splitToRemoteAndLocal` (the cluster split).
 pub(crate) fn new_pipe_uniq_local(
-    by_fields: Vec<String>,
-    hits_field_name: String,
+    by_fields: Vec<Vec<u8>>,
+    hits_field_name: Vec<u8>,
     limit: u64,
 ) -> PipeUniqLocal {
     PipeUniqLocal {
@@ -68,7 +68,7 @@ impl Pipe for PipeUniqLocal {
         let mut s = "uniq_local".to_string();
         if !self.by_fields.is_empty() {
             s += " by (";
-            s += &self.by_fields.join(", ");
+            s += &crate::stats_count::field_names_string(&self.by_fields);
             s += ")";
         }
         s += &format!(" limit {}", self.limit);
@@ -107,8 +107,8 @@ impl Pipe for PipeUniqLocal {
 }
 
 struct PipeUniqLocalProcessor {
-    by_fields: Arc<Vec<String>>,
-    hits_field_name: String,
+    by_fields: Arc<Vec<Vec<u8>>>,
+    hits_field_name: Vec<u8>,
     limit: u64,
     pp_next: Arc<dyn PipeProcessor>,
     // Per-worker collected (key, hits) pairs.
@@ -182,12 +182,12 @@ impl PipeProcessor for PipeUniqLocalProcessor {
             .by_fields
             .iter()
             .map(|name| ResultColumn {
-                name: name.clone().into_bytes(),
+                name: name.clone(),
                 values: Vec::new(),
             })
             .collect();
         rcs.push(ResultColumn {
-            name: self.hits_field_name.clone().into_bytes(),
+            name: self.hits_field_name.clone(),
             values: Vec::new(),
         });
 
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_uniq_local_single_field_sums_hits() {
-        let pu = new_pipe_uniq_local(vec!["x".to_string()], "hits".to_string(), 0);
+        let pu = new_pipe_uniq_local(vec![b"x".to_vec()], b"hits".to_vec(), 0);
         // Two blocks emit the same key "a" with hits 2 and 3 → merged 5.
         let out = run(
             &pu,
@@ -343,11 +343,7 @@ mod tests {
 
     #[test]
     fn test_uniq_local_two_fields() {
-        let pu = new_pipe_uniq_local(
-            vec!["a".to_string(), "b".to_string()],
-            "hits".to_string(),
-            0,
-        );
+        let pu = new_pipe_uniq_local(vec![b"a".to_vec(), b"b".to_vec()], b"hits".to_vec(), 0);
         let out = run(
             &pu,
             &[vec![
@@ -378,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_uniq_local_limit_keeps_top_hits() {
-        let pu = new_pipe_uniq_local(vec!["x".to_string()], "hits".to_string(), 2);
+        let pu = new_pipe_uniq_local(vec![b"x".to_vec()], b"hits".to_vec(), 2);
         let out = run(
             &pu,
             &[vec![

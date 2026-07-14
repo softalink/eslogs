@@ -27,7 +27,7 @@ pub(crate) struct FilterEqualsCommonCase {
 }
 
 pub(crate) fn new_filter_equals_common_case(
-    field_name: &str,
+    field_name: &[u8],
     phrases: Vec<Vec<u8>>,
 ) -> Result<FilterGeneric, String> {
     let common_case_phrases = get_common_case_phrases(&phrases)?;
@@ -55,7 +55,7 @@ impl FieldFilter for FilterEqualsCommonCase {
         format!("equals_common_case({phrases})")
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         self.equals_any.match_row_by_field(fields, field_name)
     }
 
@@ -63,7 +63,7 @@ impl FieldFilter for FilterEqualsCommonCase {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         self.equals_any
             .apply_to_block_result_by_field(br, bm, field_name);
@@ -73,7 +73,7 @@ impl FieldFilter for FilterEqualsCommonCase {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         self.equals_any
             .apply_to_block_search_by_field(bs, bm, field_name);

@@ -40,7 +40,6 @@ use esl_common::stringsutil::less_natural;
 use crate::block_result::{BlockResult, ResultColumn, get_block_result, put_block_result};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{
     marshal_timestamp_rfc3339_nano_string, marshal_uint64_string, try_parse_float64,
     try_parse_int64, try_parse_ipv4,
@@ -60,13 +59,13 @@ const MAX_VALUES_LEN: usize = 1_000_000;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BySortField {
     /// The name of the field to sort by.
-    pub(crate) name: String,
+    pub(crate) name: Vec<u8>,
     /// Whether sorting for this field is in descending order.
     pub(crate) is_desc: bool,
 }
 
 impl BySortField {
-    pub(crate) fn new(name: impl Into<String>, is_desc: bool) -> Self {
+    pub(crate) fn new(name: impl Into<Vec<u8>>, is_desc: bool) -> Self {
         Self {
             name: name.into(),
             is_desc,
@@ -76,7 +75,7 @@ impl BySortField {
 
 impl std::fmt::Display for BySortField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&quote_token_if_needed(&self.name))?;
+        f.write_str(&crate::parser::quote_token_bytes_if_needed(&self.name))?;
         if self.is_desc {
             f.write_str(" desc")?;
         }
@@ -100,9 +99,9 @@ pub(crate) struct PipeSort {
     /// How many results to return (0 means all).
     pub(crate) limit: u64,
     /// The name of the field to store the row rank; empty if unset.
-    pub(crate) rank_field_name: String,
+    pub(crate) rank_field_name: Vec<u8>,
     /// Fields for partitioning the sorted rows (only meaningful with `limit`).
-    pub(crate) partition_by_fields: Vec<String>,
+    pub(crate) partition_by_fields: Vec<Vec<u8>>,
 }
 
 impl PipeSort {
@@ -114,8 +113,8 @@ impl PipeSort {
         is_desc: bool,
         offset: u64,
         limit: u64,
-        rank_field_name: impl Into<String>,
-        partition_by_fields: Vec<String>,
+        rank_field_name: impl Into<Vec<u8>>,
+        partition_by_fields: Vec<Vec<u8>>,
     ) -> Self {
         Self {
             by_fields,
@@ -148,7 +147,7 @@ pub(crate) fn get_offset_limit_from_pipe_sort(ps: &PipeSort) -> Option<(u64, u64
     if ps.by_fields.len() != 1 {
         return None;
     }
-    if ps.by_fields[0].name != "_time" {
+    if ps.by_fields[0].name != b"_time" {
         return None;
     }
     let mut is_desc = ps.by_fields[0].is_desc;
@@ -191,7 +190,7 @@ impl Pipe for PipeSort {
         self.limit > 0
             && self.partition_by_fields.is_empty()
             && self.by_fields.len() == 1
-            && self.by_fields[0].name == "_time"
+            && self.by_fields[0].name == b"_time"
             && (self.is_desc != self.by_fields[0].is_desc)
     }
 
@@ -203,8 +202,8 @@ impl Pipe for PipeSort {
         if self.limit == 0 {
             return;
         }
-        if !self.partition_by_fields.iter().any(|f| f == "_time") {
-            self.partition_by_fields.push("_time".to_string());
+        if !self.partition_by_fields.iter().any(|f| f == b"_time") {
+            self.partition_by_fields.push(b"_time".to_vec());
         }
     }
 
@@ -219,7 +218,7 @@ impl Pipe for PipeSort {
         let mut p_remote = self.clone();
         p_remote.limit += p_remote.offset;
         p_remote.offset = 0;
-        p_remote.rank_field_name = String::new();
+        p_remote.rank_field_name = Vec::new();
 
         (Some(Box::new(p_remote)), vec![Box::new(self.clone())])
     }
@@ -229,8 +228,8 @@ impl Pipe for PipeSort {
     }
 
     /// Port of Go `pipeSort.adjustResultFieldsOrder`.
-    fn sort_adjust_result_fields_order(&self, fields: &[String]) -> Option<Vec<String>> {
-        let mut result: Vec<String> = Vec::new();
+    fn sort_adjust_result_fields_order(&self, fields: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+        let mut result: Vec<Vec<u8>> = Vec::new();
 
         if !self.rank_field_name.is_empty() {
             result.push(self.rank_field_name.clone());
@@ -318,11 +317,11 @@ impl Pipe for PipeSort {
 
 /// PORT NOTE: Go's `rankFieldNameString` lives in `pipe_top.go`, which is not
 /// ported yet; this is a local copy until that module lands.
-fn rank_field_name_string(rank_field_name: &str) -> String {
+fn rank_field_name_string(rank_field_name: &[u8]) -> String {
     let mut s = String::from(" rank");
-    if rank_field_name != "rank" {
+    if rank_field_name != b"rank" {
         s.push_str(" as ");
-        s.push_str(&quote_token_if_needed(rank_field_name));
+        s.push_str(&crate::parser::quote_token_bytes_if_needed(rank_field_name));
     }
     s
 }
@@ -517,7 +516,7 @@ impl PipeSortProcessor {
             let mut other_columns = Vec::new();
             for &r in &cols {
                 let name = br.column_name(r).to_vec();
-                if by_fields.iter().any(|bf| bf.name.as_bytes() == name) {
+                if by_fields.iter().any(|bf| bf.name == name) {
                     continue;
                 }
                 let values = br.column_get_values(r).to_vec();
@@ -640,10 +639,10 @@ impl PipeSortProcessor {
 
             let mut names: Vec<Vec<u8>> = Vec::new();
             if has_rank {
-                names.push(ps.rank_field_name.clone().into_bytes());
+                names.push(ps.rank_field_name.clone());
             }
             for bf in &ps.by_fields {
-                names.push(bf.name.clone().into_bytes());
+                names.push(bf.name.clone());
             }
             for oc in &block.other_columns {
                 names.push(oc.name.clone());
@@ -888,17 +887,17 @@ mod tests {
                 0,
                 10,
                 "",
-                vec!["y".to_string(), "z".to_string()],
+                vec![b"y".to_vec(), b"z".to_vec()],
             ),
             "sort by (a, b) partition by (y, z) limit 10",
         );
     }
 
-    fn split(s: &str) -> Vec<String> {
+    fn split(s: &str) -> Vec<Vec<u8>> {
         if s.is_empty() {
             Vec::new()
         } else {
-            s.split(',').map(|x| x.to_string()).collect()
+            s.split(',').map(|x| x.as_bytes().to_vec()).collect()
         }
     }
 

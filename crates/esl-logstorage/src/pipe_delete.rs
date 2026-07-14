@@ -18,14 +18,14 @@ use esl_common::panicf;
 /// See <https://docs.victoriametrics.com/victorialogs/logsql/#delete-pipe>
 pub(crate) struct PipeDelete {
     /// List of field filters for the fields to delete.
-    pub(crate) field_filters: Vec<String>,
+    pub(crate) field_filters: Vec<Vec<u8>>,
 }
 
 /// Builds a `| delete ...` pipe.
 ///
 /// PORT NOTE: `parsePipeDelete` is lexer-dependent and deferred; this
 /// constructor exposes the parsed result for the future parser.
-pub(crate) fn new_pipe_delete(field_filters: Vec<String>) -> PipeDelete {
+pub(crate) fn new_pipe_delete(field_filters: Vec<Vec<u8>>) -> PipeDelete {
     PipeDelete { field_filters }
 }
 
@@ -79,7 +79,7 @@ impl Pipe for PipeDelete {
 }
 
 struct PipeDeleteProcessor {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
     pp_next: Arc<dyn PipeProcessor>,
 }
 
@@ -104,7 +104,7 @@ mod tests {
     use super::*;
 
     fn pd(filters: &[&str]) -> PipeDelete {
-        new_pipe_delete(filters.iter().map(|s| s.to_string()).collect())
+        new_pipe_delete(filters.iter().map(|s| s.as_bytes().to_vec()).collect())
     }
 
     #[test]

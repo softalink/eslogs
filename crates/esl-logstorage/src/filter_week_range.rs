@@ -90,7 +90,7 @@ impl Filter for FilterWeekRange {
     }
 
     fn match_row(&self, fields: &[Field]) -> bool {
-        let v = get_field_value_by_name(fields, "_time");
+        let v = get_field_value_by_name(fields, b"_time");
         self.match_timestamp_string(v)
     }
 
@@ -103,7 +103,7 @@ impl Filter for FilterWeekRange {
             return;
         }
 
-        let r = br.get_column_by_name("_time");
+        let r = br.get_column_by_name(b"_time");
         if br.column_is_const(r) {
             let v = br.column_get_value_at_row(r, 0);
             if !self.match_timestamp_string(v) {

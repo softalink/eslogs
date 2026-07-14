@@ -12,7 +12,6 @@ use esl_common::stringsutil::less_natural;
 use crate::block_result::{BlockResult, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{marshal_uint64_string, try_parse_uint64_bytes};
 
 /// Port of Go `ValueWithHits` — declared in `storage_search.go` upstream; the
@@ -25,7 +24,7 @@ pub use crate::storage_search::ValueWithHits;
 /// ported, this struct stores only the two fields it actually reads — `field`
 /// and `limit`. `filter` is not used by the local processor.
 pub struct PipeFieldValuesLocal {
-    pub(crate) field: String,
+    pub(crate) field: Vec<u8>,
     pub(crate) limit: u64,
 }
 
@@ -34,14 +33,14 @@ pub struct PipeFieldValuesLocal {
 /// This pipe is produced only by `pipeFieldValues.splitToRemoteAndLocal`
 /// (the cluster split); the constructor takes the parsed `field` and `limit`
 /// directly.
-pub(crate) fn new_pipe_field_values_local(field: String, limit: u64) -> PipeFieldValuesLocal {
+pub(crate) fn new_pipe_field_values_local(field: Vec<u8>, limit: u64) -> PipeFieldValuesLocal {
     PipeFieldValuesLocal { field, limit }
 }
 
 impl PipeFieldValuesLocal {
     /// Port of Go `(*pipeFieldValues).getHitsFieldName`.
-    fn get_hits_field_name(&self) -> String {
-        get_unique_result_name("hits", std::slice::from_ref(&self.field))
+    fn get_hits_field_name(&self) -> Vec<u8> {
+        get_unique_result_name(b"hits", std::slice::from_ref(&self.field))
     }
 }
 
@@ -54,7 +53,10 @@ impl Pipe for PipeFieldValuesLocal {
     }
 
     fn to_string(&self) -> String {
-        let mut s = format!("field_values_local {}", quote_token_if_needed(&self.field));
+        let mut s = format!(
+            "field_values_local {}",
+            crate::parser::quote_token_bytes_if_needed(&self.field)
+        );
         if self.limit > 0 {
             s += &format!(" limit {}", self.limit);
         }
@@ -95,9 +97,9 @@ impl Pipe for PipeFieldValuesLocal {
 }
 
 struct PipeFieldValuesLocalProcessor {
-    field: String,
+    field: Vec<u8>,
     limit: u64,
-    hits_field_name: String,
+    hits_field_name: Vec<u8>,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<PipeFieldValuesLocalProcessorShard>>,
 }
@@ -158,10 +160,10 @@ impl PipeProcessor for PipeFieldValuesLocalProcessor {
 ///
 /// PORT NOTE: duplicated here (private) because `parser.rs` — where this helper
 /// belongs — is deferred.
-fn get_unique_result_name(result_name: &str, by_fields: &[String]) -> String {
-    let mut name = result_name.to_string();
+fn get_unique_result_name(result_name: &[u8], by_fields: &[Vec<u8>]) -> Vec<u8> {
+    let mut name = result_name.to_vec();
     while by_fields.iter().any(|f| f == &name) {
-        name.push('s');
+        name.push(b's');
     }
     name
 }
@@ -253,7 +255,7 @@ fn has_zero_hits(vhs: &[ValueWithHits]) -> bool {
 /// ported. It should move to a shared location once that module lands.
 struct PipeFixedFieldsWriteContext<'a> {
     pp_next: &'a dyn PipeProcessor,
-    fields: Vec<String>,
+    fields: Vec<Vec<u8>>,
     rcs: Vec<ResultColumn>,
     br: BlockResult,
     rows_count: usize,
@@ -261,11 +263,11 @@ struct PipeFixedFieldsWriteContext<'a> {
 }
 
 impl<'a> PipeFixedFieldsWriteContext<'a> {
-    fn new(pp_next: &'a dyn PipeProcessor, fields: Vec<String>) -> Self {
+    fn new(pp_next: &'a dyn PipeProcessor, fields: Vec<Vec<u8>>) -> Self {
         let rcs = fields
             .iter()
             .map(|name| ResultColumn {
-                name: name.as_bytes().to_vec(),
+                name: name.to_vec(),
                 values: Vec::new(),
             })
             .collect();
@@ -308,7 +310,7 @@ impl<'a> PipeFixedFieldsWriteContext<'a> {
             .fields
             .iter()
             .map(|name| ResultColumn {
-                name: name.as_bytes().to_vec(),
+                name: name.to_vec(),
                 values: Vec::new(),
             })
             .collect();
@@ -361,7 +363,7 @@ mod tests {
     #[test]
     fn test_pipe_field_values_local_update_needed_fields() {
         // getHitsFieldName("foo") == "hits" (no collision with the field name).
-        let p = new_pipe_field_values_local("foo".to_string(), 0);
+        let p = new_pipe_field_values_local(b"foo".to_vec(), 0);
         assert_needed_fields(&p, "*", "", "foo,hits", "");
         assert_needed_fields(&p, "a,b", "", "foo,hits", "");
     }

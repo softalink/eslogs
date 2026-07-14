@@ -62,6 +62,20 @@ pub(crate) fn quote_token_if_needed(s: &str) -> String {
     go_quote(s)
 }
 
+/// Byte form of [`quote_token_if_needed`] for raw-byte name payloads (parsed
+/// field names are raw bytes end-to-end).
+///
+/// Valid UTF-8 renders bit-identically to the `&str` form; invalid UTF-8
+/// always needs quoting in Go too (`needQuoteToken` sees the non-token
+/// `RuneError` rune), and quotes with Go `strconv.Quote` byte semantics
+/// (`\xNN` per invalid byte) — exactly what Go produces.
+pub(crate) fn quote_token_bytes_if_needed(v: &[u8]) -> String {
+    match std::str::from_utf8(v) {
+        Ok(s) => quote_token_if_needed(s),
+        Err(_) => crate::stream_filter::go_quote_bytes(v),
+    }
+}
+
 /// Port of Go `quoteStringTokenIfNeeded`.
 pub(crate) fn quote_string_token_if_needed(s: &str) -> String {
     if !need_quote_string_token(s) {
@@ -83,20 +97,26 @@ pub(crate) fn quote_string_value_bytes_if_needed(v: &[u8]) -> String {
     }
 }
 
-/// Port of Go `quoteFieldFilterIfNeeded`.
-/// Port of Go `quoteFieldFilterIfNeeded` (used by field-filter Display in the
-/// upstream code; kept for parity though pipe/filter Display currently routes
-/// through `stream_filter::quote_token_if_needed`).
-#[allow(dead_code)]
-pub(crate) fn quote_field_filter_if_needed(s: &str) -> String {
-    if !crate::prefix_filter::is_wildcard_filter(s) {
-        return quote_token_if_needed(s);
+/// Port of Go `quoteFieldFilterIfNeeded`, over raw-byte field-filter payloads
+/// (parsed field names/filters are raw bytes end-to-end). Valid UTF-8 renders
+/// exactly like Go's string form; an invalid-UTF-8 wildcard prefix always
+/// needs quoting in Go too (`needQuoteToken` sees the non-token `RuneError`
+/// rune) and quotes with Go `strconv.Quote` byte semantics (`\xNN`).
+pub(crate) fn quote_field_filter_if_needed(v: &[u8]) -> String {
+    if !crate::prefix_filter::is_wildcard_filter(v) {
+        return quote_token_bytes_if_needed(v);
     }
-    let wildcard = &s[..s.len() - 1];
-    if wildcard.is_empty() || !need_quote_token(wildcard) {
-        return s.to_string();
+    let wildcard = &v[..v.len() - 1];
+    match std::str::from_utf8(wildcard) {
+        Ok(s) => {
+            if s.is_empty() || !need_quote_token(s) {
+                // `v` = valid-UTF-8 prefix + `'*'` — valid UTF-8 as a whole.
+                return String::from_utf8(v.to_vec()).unwrap();
+            }
+            go_quote(s) + "*"
+        }
+        Err(_) => crate::stream_filter::go_quote_bytes(wildcard) + "*",
     }
-    go_quote(wildcard) + "*"
 }
 
 /// Port of Go `needQuoteStringToken`.

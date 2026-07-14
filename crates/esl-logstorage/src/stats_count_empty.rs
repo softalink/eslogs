@@ -18,12 +18,12 @@ use crate::values_encoder::ValueType;
 
 /// `count_empty(...)` stats function.
 pub struct StatsCountEmpty {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Builds a [`StatsCountEmpty`] from already-parsed field filters
 /// (Go `parseStatsCountEmpty`'s tail).
-pub(crate) fn new_stats_count_empty(field_filters: Vec<String>) -> StatsCountEmpty {
+pub(crate) fn new_stats_count_empty(field_filters: Vec<Vec<u8>>) -> StatsCountEmpty {
     StatsCountEmpty { field_filters }
 }
 
@@ -50,7 +50,7 @@ impl StatsFunc for StatsCountEmpty {
 #[derive(Default, PartialEq, Debug)]
 pub(crate) struct StatsCountEmptyProcessor {
     rows_count: u64,
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 impl StatsProcessor for StatsCountEmptyProcessor {
@@ -82,7 +82,7 @@ impl StatsProcessor for StatsCountEmptyProcessor {
         // enumerated inside count_empty().
         let mut non_empty = vec![false; rows_len];
         for c in br.get_columns() {
-            if !prefix_filter::match_filters_bytes(&self.field_filters, br.column_name(c)) {
+            if !prefix_filter::match_filters(&self.field_filters, br.column_name(c)) {
                 continue;
             }
             if br.column_is_const(c) {
@@ -125,7 +125,7 @@ impl StatsProcessor for StatsCountEmptyProcessor {
 
         // Slow path - count the row if all enumerated fields are empty.
         for c in br.get_columns() {
-            if !prefix_filter::match_filters_bytes(&self.field_filters, br.column_name(c)) {
+            if !prefix_filter::match_filters(&self.field_filters, br.column_name(c)) {
                 continue;
             }
             if !br.column_get_value_at_row(c, row_index).is_empty() {

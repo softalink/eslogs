@@ -14,13 +14,13 @@ use crate::stats_quantile::{StatsQuantileProcessor, new_stats_quantile_processor
 
 /// Port of `statsMedian` (a thin wrapper over `statsQuantile` with phi=0.5).
 pub(crate) struct StatsMedian {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Port of `parseStatsMedian`. Empty filters default to `["*"]`.
-pub(crate) fn new_stats_median(mut field_filters: Vec<String>) -> StatsMedian {
+pub(crate) fn new_stats_median(mut field_filters: Vec<Vec<u8>>) -> StatsMedian {
     if field_filters.is_empty() {
-        field_filters.push("*".to_string());
+        field_filters.push(b"*".to_vec());
     }
     StatsMedian { field_filters }
 }
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn test_median_is_quantile_half() {
-        let sf = new_stats_median(vec!["a".to_string()]);
+        let sf = new_stats_median(vec![b"a".to_vec()]);
         let mut sp = sf.new_stats_processor();
         let mut br = BlockResult::default();
         let rows: Vec<Vec<Field>> = (1..=5).map(|i| vec![field("a", &i.to_string())]).collect();
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_median_to_string() {
-        let sf = new_stats_median(vec!["a".to_string()]);
+        let sf = new_stats_median(vec![b"a".to_vec()]);
         assert_eq!(sf.to_string(), "median(a)");
     }
 }

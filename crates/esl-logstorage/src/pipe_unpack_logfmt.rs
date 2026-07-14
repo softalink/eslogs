@@ -17,8 +17,8 @@ use crate::stream_filter::quote_token_if_needed;
 
 /// `| unpack_logfmt ...` pipe (Go `pipeUnpackLogfmt`).
 pub(crate) struct PipeUnpackLogfmt {
-    from_field: String,
-    field_filters: Vec<String>,
+    from_field: Vec<u8>,
+    field_filters: Vec<Vec<u8>>,
     result_prefix: String,
     keep_original_fields: bool,
     skip_empty_results: bool,
@@ -28,15 +28,15 @@ pub(crate) struct PipeUnpackLogfmt {
 /// Constructs a `PipeUnpackLogfmt` (Go `parsePipeUnpackLogfmt`; lexer parsing
 /// is deferred).
 pub(crate) fn new_pipe_unpack_logfmt(
-    from_field: impl Into<String>,
-    field_filters: Vec<String>,
+    from_field: impl Into<Vec<u8>>,
+    field_filters: Vec<Vec<u8>>,
     result_prefix: impl Into<String>,
     keep_original_fields: bool,
     skip_empty_results: bool,
     iff: Option<IfFilter>,
 ) -> PipeUnpackLogfmt {
     let field_filters = if field_filters.is_empty() {
-        vec!["*".to_string()]
+        vec![b"*".to_vec()]
     } else {
         field_filters
     };
@@ -97,7 +97,10 @@ impl Pipe for PipeUnpackLogfmt {
             s += &format!(" {iff}");
         }
         if !crate::filter_generic::is_msg_field_name(&self.from_field) {
-            s += &format!(" from {}", quote_token_if_needed(&self.from_field));
+            s += &format!(
+                " from {}",
+                crate::parser::quote_token_bytes_if_needed(&self.from_field)
+            );
         }
         if !prefix_filter::match_all(&self.field_filters) {
             s += &format!(" fields ({})", field_names_string(&self.field_filters));
@@ -152,7 +155,7 @@ impl Pipe for PipeUnpackLogfmt {
                 p.parse(s);
             }
             for f in &p.fields {
-                if !prefix_filter::match_filters_bytes(&field_filters, &f.name) {
+                if !prefix_filter::match_filters(&field_filters, &f.name) {
                     continue;
                 }
                 uctx.add_field(&f.name, &f.value);
@@ -161,9 +164,9 @@ impl Pipe for PipeUnpackLogfmt {
                 if prefix_filter::is_wildcard_filter(filter) {
                     continue;
                 }
-                let add_empty_field = !p.fields.iter().any(|f| f.name == filter.as_bytes());
+                let add_empty_field = !p.fields.iter().any(|f| &f.name == filter);
                 if add_empty_field {
-                    uctx.add_field(filter.as_bytes(), "");
+                    uctx.add_field(filter, "");
                 }
             }
             put_logfmt_parser(p);
@@ -182,10 +185,10 @@ impl Pipe for PipeUnpackLogfmt {
 }
 
 /// Port of Go's `fieldNamesString`.
-fn field_names_string(fields: &[String]) -> String {
+fn field_names_string(fields: &[Vec<u8>]) -> String {
     fields
         .iter()
-        .map(|f| quote_token_if_needed(f))
+        .map(|f| crate::parser::quote_token_bytes_if_needed(f))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -209,7 +212,7 @@ mod tests {
         run(
             new_pipe_unpack_logfmt(
                 "_msg",
-                vec!["foo".to_string(), "a".to_string(), "b".to_string()],
+                vec![b"foo".to_vec(), b"a".to_vec(), b"b".to_vec()],
                 "",
                 false,
                 false,

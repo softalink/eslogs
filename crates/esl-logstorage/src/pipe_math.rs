@@ -25,7 +25,6 @@ use esl_common::{decimal, encoding};
 use crate::block_result::{BlockResult, ColRef, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{
     try_parse_bytes, try_parse_duration, try_parse_float64, try_parse_ipv4,
     try_parse_timestamp_rfc3339_nano,
@@ -43,7 +42,7 @@ pub(crate) struct PipeMath {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MathEntry {
     /// The calculated expr result is stored in `result_field`.
-    pub(crate) result_field: String,
+    pub(crate) result_field: Vec<u8>,
     /// The expression to calculate.
     pub(crate) expr: MathExpr,
 }
@@ -62,7 +61,7 @@ pub(crate) struct MathExpr {
     const_value_str: String,
 
     /// If non-empty, the expr fetches numeric values from this field.
-    field_name: String,
+    field_name: Vec<u8>,
 
     /// Args for the expr.
     args: Vec<MathExpr>,
@@ -81,7 +80,7 @@ impl PipeMath {
 }
 
 impl MathEntry {
-    pub(crate) fn new(result_field: impl Into<String>, expr: MathExpr) -> Self {
+    pub(crate) fn new(result_field: impl Into<Vec<u8>>, expr: MathExpr) -> Self {
         Self {
             result_field: result_field.into(),
             expr,
@@ -99,7 +98,7 @@ impl std::fmt::Display for MathEntry {
             s = format!("({s})");
         }
         s += " as ";
-        s += &quote_token_if_needed(&self.result_field);
+        s += &crate::parser::quote_token_bytes_if_needed(&self.result_field);
         f.write_str(&s)
     }
 }
@@ -112,7 +111,9 @@ impl std::fmt::Display for MathExpr {
             return f.write_str(&self.const_value_str);
         }
         if !self.field_name.is_empty() {
-            return f.write_str(&quote_token_if_needed(&self.field_name));
+            return f.write_str(&crate::parser::quote_token_bytes_if_needed(
+                &self.field_name,
+            ));
         }
 
         if is_math_binary_op(&self.op) {
@@ -151,7 +152,7 @@ impl MathExpr {
             is_const: true,
             const_value: value,
             const_value_str: str_repr.into(),
-            field_name: String::new(),
+            field_name: Vec::new(),
             args: Vec::new(),
             op: String::new(),
             wrapped_in_parens: false,
@@ -159,7 +160,7 @@ impl MathExpr {
     }
 
     /// Builds a field-reference expr.
-    pub(crate) fn new_field(name: impl Into<String>) -> Self {
+    pub(crate) fn new_field(name: impl Into<Vec<u8>>) -> Self {
         Self {
             is_const: false,
             const_value: 0.0,
@@ -177,7 +178,7 @@ impl MathExpr {
             is_const: false,
             const_value: 0.0,
             const_value_str: String::new(),
-            field_name: String::new(),
+            field_name: Vec::new(),
             args: vec![left, right],
             op: op.into(),
             wrapped_in_parens: false,
@@ -190,7 +191,7 @@ impl MathExpr {
             is_const: false,
             const_value: 0.0,
             const_value_str: String::new(),
-            field_name: String::new(),
+            field_name: Vec::new(),
             args,
             op: op.into(),
             wrapped_in_parens: false,
@@ -348,7 +349,7 @@ impl PipeProcessor for PipeMathProcessor {
         for e in &self.entries {
             let (values, min_value, max_value) = execute_math_entry(e, br);
             let rc = ResultColumn {
-                name: e.result_field.clone().into_bytes(),
+                name: e.result_field.clone(),
                 values,
             };
             br.add_result_column_float64(rc, min_value, max_value);

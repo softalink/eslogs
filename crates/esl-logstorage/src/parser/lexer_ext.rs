@@ -47,6 +47,7 @@ pub(crate) trait LexerExt {
         stop_tokens: &[&str],
     ) -> Result<(String, Vec<u8>), String>;
     fn next_compound_math_token(&mut self) -> Result<String, String>;
+    fn next_compound_math_token_bytes(&mut self) -> Result<Vec<u8>, String>;
     fn is_allowed_compound_token(&self, stop_tokens: &[&str]) -> bool;
 }
 
@@ -175,5 +176,12 @@ impl LexerExt for Lexer<'_> {
 
     fn next_compound_math_token(&mut self) -> Result<String, String> {
         self.next_compound_token_ext(MATH_STOP_COMPOUND_TOKENS)
+    }
+
+    /// Raw-byte form of [`LexerExt::next_compound_math_token`] for field
+    /// names (quoted tokens carry Go-parity raw bytes).
+    fn next_compound_math_token_bytes(&mut self) -> Result<Vec<u8>, String> {
+        let (_, b) = self.next_compound_token_ext_pair(MATH_STOP_COMPOUND_TOKENS)?;
+        Ok(b)
     }
 }

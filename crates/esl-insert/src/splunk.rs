@@ -226,7 +226,7 @@ fn handle_collector_event<S: LogRowsStorage>(
 
     let time_fields: Vec<&str> = cp.time_fields.iter().map(String::as_str).collect();
     let msg_fields: Vec<&str> = cp.msg_fields.iter().map(String::as_str).collect();
-    let preserve_keys: Vec<&str> = cp.preserve_json_keys.iter().map(String::as_str).collect();
+    let preserve_keys: Vec<&[u8]> = cp.preserve_json_keys.iter().map(|s| s.as_bytes()).collect();
 
     let mut lmp = cp.new_log_message_processor(storage, "splunk");
     let res = process_event(&data, &mut lmp, &time_fields, &msg_fields, &preserve_keys);
@@ -245,7 +245,7 @@ fn process_event(
     lmp: &mut impl LogMessageProcessorTrait,
     time_fields: &[&str],
     msg_fields: &[&str],
-    preserve_keys: &[&str],
+    preserve_keys: &[&[u8]],
 ) -> Result<(), String> {
     let mut s = get_json_scanner();
 

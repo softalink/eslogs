@@ -12,12 +12,12 @@ use crate::values_encoder::{marshal_float64_string, try_parse_float64_bytes};
 
 /// Running `sum(...)` stats function.
 pub struct RunningStatsSum {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Builds a [`RunningStatsSum`] from already-parsed field filters
 /// (Go `parseRunningStatsSum`).
-pub(crate) fn new_running_stats_sum(field_filters: Vec<String>) -> RunningStatsSum {
+pub(crate) fn new_running_stats_sum(field_filters: Vec<Vec<u8>>) -> RunningStatsSum {
     RunningStatsSum { field_filters }
 }
 

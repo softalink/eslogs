@@ -19,12 +19,12 @@ use crate::values_encoder::marshal_uint64_string;
 pub struct PipeBlocksCount {
     /// Optional name of the column to write results to. Defaults to
     /// `blocks_count`.
-    result_name: String,
+    result_name: Vec<u8>,
 }
 
 /// Builds a [`PipeBlocksCount`] with the given result column name
 /// (Go `parsePipeBlocksCount` result).
-pub(crate) fn new_pipe_blocks_count(result_name: String) -> PipeBlocksCount {
+pub(crate) fn new_pipe_blocks_count(result_name: Vec<u8>) -> PipeBlocksCount {
     PipeBlocksCount { result_name }
 }
 
@@ -32,7 +32,7 @@ impl Pipe for PipeBlocksCount {
     /// Port of Go `pipeBlocksCount.splitToRemoteAndLocal`: per-node block
     /// counts are summed locally.
     fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
-        let result_name_quoted = crate::stream_filter::quote_token_if_needed(&self.result_name);
+        let result_name_quoted = crate::parser::quote_token_bytes_if_needed(&self.result_name);
 
         let p_str = format!("stats sum({result_name_quoted}) as {result_name_quoted}");
         let p_local = crate::pipe::must_parse_pipe(&p_str, timestamp);
@@ -45,9 +45,11 @@ impl Pipe for PipeBlocksCount {
 
     fn to_string(&self) -> String {
         let mut s = "blocks_count".to_string();
-        if self.result_name != "blocks_count" {
+        if self.result_name != b"blocks_count" {
             s += " as ";
-            s += &self.result_name;
+            // Go: quoteTokenIfNeeded(pc.resultName) (raw-byte names quote
+            // with Go strconv.Quote byte semantics).
+            s += &crate::parser::quote_token_bytes_if_needed(&self.result_name);
         }
         s
     }
@@ -76,7 +78,7 @@ impl Pipe for PipeBlocksCount {
 }
 
 struct PipeBlocksCountProcessor {
-    result_name: String,
+    result_name: Vec<u8>,
     stop: Arc<AtomicBool>,
     pp_next: Arc<dyn PipeProcessor>,
     // Per-worker block counters (Go's atomicutil.Slice[shard]). Each worker
@@ -103,7 +105,7 @@ impl PipeProcessor for PipeBlocksCountProcessor {
         let mut value = Vec::new();
         marshal_uint64_string(&mut value, blocks_count);
         let rc = ResultColumn {
-            name: self.result_name.clone().into_bytes(),
+            name: self.result_name.clone(),
             values: vec![value],
         };
 
@@ -165,7 +167,7 @@ mod tests {
 
     #[test]
     fn test_pipe_blocks_count_counts_blocks() {
-        let pipe = new_pipe_blocks_count("blocks_count".to_string());
+        let pipe = new_pipe_blocks_count(b"blocks_count".to_vec());
         let sink = Collector::new();
         let stop = Arc::new(AtomicBool::new(false));
         let pp = pipe.new_pipe_processor(1, stop, sink.clone());
@@ -189,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_pipe_blocks_count_custom_name() {
-        let pipe = new_pipe_blocks_count("cnt".to_string());
+        let pipe = new_pipe_blocks_count(b"cnt".to_vec());
         assert_eq!(pipe.to_string(), "blocks_count as cnt");
 
         let sink = Collector::new();

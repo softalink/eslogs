@@ -35,7 +35,7 @@ use crate::stream_filter::quote_token_if_needed;
 #[derive(Clone)]
 pub(crate) struct PipeReplaceRegexp {
     /// The field whose value is rewritten (defaults to `_msg`).
-    pub(crate) field: String,
+    pub(crate) field: Vec<u8>,
     /// The compiled regular expression.
     pub(crate) re: Regex,
     /// String representation of `re` (as written by the user, before wrapping).
@@ -52,7 +52,7 @@ pub(crate) struct PipeReplaceRegexp {
 impl PipeReplaceRegexp {
     /// Builds a `replace_regexp` pipe from parsed arguments.
     pub(crate) fn new(
-        field: impl Into<String>,
+        field: impl Into<Vec<u8>>,
         re: Regex,
         re_str: impl Into<String>,
         replacement: impl Into<String>,
@@ -88,8 +88,11 @@ impl Pipe for PipeReplaceRegexp {
             quote_token_if_needed(&self.re_str),
             quote_token_if_needed(&self.replacement)
         ));
-        if self.field != "_msg" {
-            s.push_str(&format!(" at {}", quote_token_if_needed(&self.field)));
+        if self.field != b"_msg" {
+            s.push_str(&format!(
+                " at {}",
+                crate::parser::quote_token_bytes_if_needed(&self.field)
+            ));
         }
         if self.limit > 0 {
             s.push_str(&format!(" limit {}", self.limit));
@@ -275,7 +278,7 @@ mod tests {
 
     /// Builds the `if (field:phrase)` filter used by the conditional Go tests.
     fn phrase_iff(field: &str, phrase: &str) -> Arc<IfFilter> {
-        let f: Arc<dyn Filter> = Arc::new(new_filter_phrase(field, phrase));
+        let f: Arc<dyn Filter> = Arc::new(new_filter_phrase(field.as_bytes(), phrase));
         Arc::new(IfFilter::new(f))
     }
 

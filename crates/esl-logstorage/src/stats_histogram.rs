@@ -38,13 +38,13 @@ use crate::values_encoder::{
 /// Port of Go's `statsHistogram`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StatsHistogram {
-    pub(crate) field_name: String,
+    pub(crate) field_name: Vec<u8>,
 }
 
 impl StatsHistogram {
     /// PORT NOTE: replaces the parser-driven `parseStatsHistogram`
     /// constructor (deferred). Exposed for the future parser and tests.
-    pub(crate) fn new(field_name: impl Into<String>) -> Self {
+    pub(crate) fn new(field_name: impl Into<Vec<u8>>) -> Self {
         Self {
             field_name: field_name.into(),
         }
@@ -55,7 +55,7 @@ impl StatsFunc for StatsHistogram {
     fn to_string(&self) -> String {
         format!(
             "histogram({})",
-            crate::stream_filter::quote_token_if_needed(&self.field_name)
+            crate::parser::quote_token_bytes_if_needed(&self.field_name)
         )
     }
 
@@ -81,7 +81,7 @@ pub(crate) struct StatsHistogramProcessor {
     buckets_map: Option<HashMap<String, u64>>,
 
     // Captured config (see module docs).
-    field_name: String,
+    field_name: Vec<u8>,
 }
 
 impl StatsHistogramProcessor {

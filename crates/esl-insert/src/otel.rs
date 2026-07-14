@@ -287,7 +287,7 @@ fn decode_resource(src: &[u8], fs: &mut Fields) -> Result<(), String> {
                 .message_data()
                 .ok_or_else(|| "cannot read Attributes data".to_string())?;
 
-            decode_key_value(data, fs, "")
+            decode_key_value(data, fs, b"")
                 .map_err(|err| format!("cannot decode Attributes: {err}"))?;
         }
     }
@@ -386,7 +386,7 @@ fn decode_instrumentation_scope(src: &[u8], fs: &mut Fields) -> Result<(), Strin
             let attributes_data = fc
                 .message_data()
                 .ok_or_else(|| "cannot read Attributes data".to_string())?;
-            decode_key_value(attributes_data, fs, "scope.attributes")
+            decode_key_value(attributes_data, fs, b"scope.attributes")
                 .map_err(|err| format!("cannot decode Attributes: {err}"))?;
         }
     }
@@ -447,14 +447,14 @@ fn decode_log_record(src: &[u8], fs: &mut Fields) -> Result<(Vec<u8>, i64), Stri
                 let body = fc
                     .message_data()
                     .ok_or_else(|| "cannot read Body".to_string())?;
-                decode_any_value(body, fs, "")
+                decode_any_value(body, fs, b"")
                     .map_err(|err| format!("cannot decode Body: {err}"))?;
             }
             6 => {
                 let attributes_data = fc
                     .message_data()
                     .ok_or_else(|| "cannot read Attributes data".to_string())?;
-                decode_key_value(attributes_data, fs, "")
+                decode_key_value(attributes_data, fs, b"")
                     .map_err(|err| format!("cannot decode Attributes: {err}"))?;
             }
             9 => {
@@ -500,7 +500,7 @@ fn decode_log_record(src: &[u8], fs: &mut Fields) -> Result<(Vec<u8>, i64), Stri
     Ok((event_name.to_vec(), timestamp))
 }
 
-fn decode_key_value(src: &[u8], fs: &mut Fields, field_name_prefix: &str) -> Result<(), String> {
+fn decode_key_value(src: &[u8], fs: &mut Fields, field_name_prefix: &[u8]) -> Result<(), String> {
     // message KeyValue {
     //   string key = 1;
     //   AnyValue value = 2;
@@ -517,7 +517,7 @@ fn decode_key_value(src: &[u8], fs: &mut Fields, field_name_prefix: &str) -> Res
             return Ok(());
         }
     };
-    let field_name = format_sub_field_name(field_name_prefix, key);
+    let field_name = format_sub_field_name(field_name_prefix, key.as_bytes());
 
     // Decode value
     let value_data = match easyproto::get_message_data(src, 2)
@@ -536,7 +536,7 @@ fn decode_key_value(src: &[u8], fs: &mut Fields, field_name_prefix: &str) -> Res
     Ok(())
 }
 
-fn decode_any_value(src: &[u8], fs: &mut Fields, field_name: &str) -> Result<(), String> {
+fn decode_any_value(src: &[u8], fs: &mut Fields, field_name: &[u8]) -> Result<(), String> {
     // message AnyValue {
     //   oneof value {
     //     string string_value = 1;
@@ -619,7 +619,7 @@ fn decode_any_value(src: &[u8], fs: &mut Fields, field_name: &str) -> Result<(),
 fn decode_key_value_list(
     src: &[u8],
     fs: &mut Fields,
-    field_name_prefix: &str,
+    field_name_prefix: &[u8],
 ) -> Result<(), String> {
     // message KeyValueList {
     //   repeated KeyValue values = 1;
@@ -932,12 +932,18 @@ fn format_float(v: f64) -> String {
     v.to_string()
 }
 
-fn format_sub_field_name(prefix: &str, suffix: &str) -> String {
+/// Byte concat of `prefix + "." + suffix` (Go string concat over raw bytes;
+/// field names are raw bytes end-to-end).
+fn format_sub_field_name(prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
     if prefix.is_empty() {
         // There is no prefix, so just return the suffix as is.
-        return suffix.to_string();
+        return suffix.to_vec();
     }
-    format!("{prefix}.{suffix}")
+    let mut out = Vec::with_capacity(prefix.len() + 1 + suffix.len());
+    out.extend_from_slice(prefix);
+    out.push(b'.');
+    out.extend_from_slice(suffix);
+    out
 }
 
 fn format_hex(src: &[u8]) -> String {
@@ -2121,10 +2127,10 @@ mod tests {
 
     #[test]
     fn test_format_sub_field_name() {
-        assert_eq!(format_sub_field_name("", "key"), "key");
+        assert_eq!(format_sub_field_name(b"", b"key"), b"key");
         assert_eq!(
-            format_sub_field_name("scope.attributes", "k"),
-            "scope.attributes.k"
+            format_sub_field_name(b"scope.attributes", b"k"),
+            b"scope.attributes.k"
         );
     }
 }

@@ -10,14 +10,13 @@ use std::sync::{Arc, Mutex};
 use crate::block_result::{BlockResult, ResultColumn};
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{
     marshal_timestamp_rfc3339_nano_string, sub_int64_no_overflow, try_parse_timestamp_rfc3339_nano,
 };
 
 /// `pipeTimeAdd` processes `| time_add ...`.
 pub(crate) struct PipeTimeAdd {
-    pub(crate) field: String,
+    pub(crate) field: Vec<u8>,
 
     /// The offset (in nanoseconds) that is subtracted from each timestamp.
     ///
@@ -35,7 +34,7 @@ pub(crate) struct PipeTimeAdd {
 /// parsed duration via `SubInt64NoOverflow(ts, offset)`. This constructor takes
 /// the field, the already-negated internal `offset`, and the original
 /// `offset_str` directly; callers reproduce the parser's negation.
-pub(crate) fn new_pipe_time_add(field: String, offset: i64, offset_str: String) -> PipeTimeAdd {
+pub(crate) fn new_pipe_time_add(field: Vec<u8>, offset: i64, offset_str: String) -> PipeTimeAdd {
     PipeTimeAdd {
         field,
         offset,
@@ -52,8 +51,11 @@ impl Pipe for PipeTimeAdd {
 
     fn to_string(&self) -> String {
         let mut s = format!("time_add {}", self.offset_str);
-        if self.field != "_time" {
-            s += &format!(" at {}", quote_token_if_needed(&self.field));
+        if self.field != b"_time" {
+            s += &format!(
+                " at {}",
+                crate::parser::quote_token_bytes_if_needed(&self.field)
+            );
         }
         s
     }
@@ -89,7 +91,7 @@ impl Pipe for PipeTimeAdd {
 }
 
 struct PipeTimeAddProcessor {
-    field: String,
+    field: Vec<u8>,
     offset: i64,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<PipeTimeAddProcessorShard>>,
@@ -113,7 +115,7 @@ impl PipeProcessor for PipeTimeAddProcessor {
             // Reborrow to a plain `&mut Shard` so `rc` and `buf` can be borrowed
             // as disjoint fields in the same expression.
             let shard = &mut *guard;
-            shard.rc.name = self.field.clone().into_bytes();
+            shard.rc.name = self.field.clone();
 
             let c = br.get_column_by_name(&self.field);
             let rows_len = br.rows_len();
@@ -163,7 +165,7 @@ mod tests {
     /// offset duration and store its negation.
     fn time_add(offset_str: &str, field: &str) -> PipeTimeAdd {
         let offset = esl_common::timeutil::parse_duration(offset_str).unwrap();
-        new_pipe_time_add(field.to_string(), -offset, offset_str.to_string())
+        new_pipe_time_add(field.as_bytes().to_vec(), -offset, offset_str.to_string())
     }
 
     #[test]

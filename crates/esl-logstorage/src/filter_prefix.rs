@@ -45,7 +45,7 @@ pub(crate) struct FilterPrefix {
 }
 
 /// Builds a prefix filter for `field_name`.
-pub(crate) fn new_filter_prefix(field_name: &str, prefix: impl AsRef<[u8]>) -> FilterGeneric {
+pub(crate) fn new_filter_prefix(field_name: &[u8], prefix: impl AsRef<[u8]>) -> FilterGeneric {
     new_filter_generic(
         field_name,
         Box::new(FilterPrefix {
@@ -83,7 +83,7 @@ impl FieldFilter for FilterPrefix {
         )
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_prefix(v, &self.prefix)
     }
@@ -92,7 +92,7 @@ impl FieldFilter for FilterPrefix {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         apply_to_block_result_generic(br, bm, field_name, &self.prefix, |v, prefix| {
             match_prefix(v, prefix)
@@ -103,7 +103,7 @@ impl FieldFilter for FilterPrefix {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let prefix = self.prefix.clone();
 

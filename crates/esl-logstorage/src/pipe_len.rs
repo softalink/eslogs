@@ -10,22 +10,21 @@ use crate::block_result::{BlockResult, ResultColumn};
 use crate::filter_generic::is_msg_field_name;
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
-use crate::stream_filter::quote_token_if_needed;
 use crate::values_encoder::{marshal_float64, marshal_uint64_string};
 
 /// `PipeLen` implements the `| len(...)` pipe.
 ///
 /// See <https://docs.victoriametrics.com/victorialogs/logsql/#len-pipe>
 pub(crate) struct PipeLen {
-    pub(crate) field_name: String,
-    pub(crate) result_field: String,
+    pub(crate) field_name: Vec<u8>,
+    pub(crate) result_field: Vec<u8>,
 }
 
 /// Builds a `| len(field) as result` pipe.
 ///
 /// PORT NOTE: `parsePipeLen` is lexer-dependent and deferred; this constructor
 /// exposes the parsed result for the future parser.
-pub(crate) fn new_pipe_len(field_name: String, result_field: String) -> PipeLen {
+pub(crate) fn new_pipe_len(field_name: Vec<u8>, result_field: Vec<u8>) -> PipeLen {
     PipeLen {
         field_name,
         result_field,
@@ -40,9 +39,15 @@ impl Pipe for PipeLen {
     }
 
     fn to_string(&self) -> String {
-        let mut s = format!("len({})", quote_token_if_needed(&self.field_name));
+        let mut s = format!(
+            "len({})",
+            crate::parser::quote_token_bytes_if_needed(&self.field_name)
+        );
         if !is_msg_field_name(&self.result_field) {
-            s += &format!(" as {}", quote_token_if_needed(&self.result_field));
+            s += &format!(
+                " as {}",
+                crate::parser::quote_token_bytes_if_needed(&self.result_field)
+            );
         }
         s
     }
@@ -52,7 +57,7 @@ impl Pipe for PipeLen {
     }
 
     fn can_return_last_n_results(&self) -> bool {
-        self.result_field != "_time"
+        self.result_field != b"_time"
     }
 
     fn update_needed_fields(&self, pf: &mut prefix_filter::Filter) {
@@ -81,8 +86,8 @@ impl Pipe for PipeLen {
 }
 
 struct PipeLenProcessor {
-    field_name: String,
-    result_field: String,
+    field_name: Vec<u8>,
+    result_field: Vec<u8>,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<PipeLenProcessorShard>>,
 }
@@ -139,7 +144,7 @@ impl PipeProcessor for PipeLenProcessor {
         }
 
         let mut shard = self.shards[worker_id].lock().unwrap();
-        shard.rc.name = self.result_field.clone().into_bytes();
+        shard.rc.name = self.result_field.clone();
 
         let c = br.get_column_by_name(&self.field_name);
         if br.column_is_const(c) {
@@ -178,14 +183,14 @@ mod tests {
     use super::super::pipe_fields::pipe_test_util::*;
     use super::*;
 
-    fn pl(field_name: &str, result_field: &str) -> PipeLen {
-        new_pipe_len(field_name.to_string(), result_field.to_string())
+    fn pl(field_name: &[u8], result_field: &str) -> PipeLen {
+        new_pipe_len(field_name.to_vec(), result_field.as_bytes().to_vec())
     }
 
     #[test]
     fn test_pipe_len_string() {
-        assert_eq!(pl("foo", "_msg").to_string(), "len(foo)");
-        assert_eq!(pl("foo", "bar").to_string(), "len(foo) as bar");
+        assert_eq!(pl(b"foo", "_msg").to_string(), "len(foo)");
+        assert_eq!(pl(b"foo", "bar").to_string(), "len(foo) as bar");
     }
 
     #[test]
@@ -195,7 +200,7 @@ mod tests {
             vec![field("foo", "abc"), field("bar", "de")],
             vec![field("baz", "xyz")],
         ];
-        let got = run_pipe(&pl("foo", "x"), &rows);
+        let got = run_pipe(&pl(b"foo", "x"), &rows);
         assert_rows_eq(
             got,
             &[
@@ -218,7 +223,7 @@ mod tests {
             vec![field("foo", "abcd")],
             vec![field("foo", "abcdefg")],
         ];
-        let got = run_pipe(&pl("foo", "x"), &rows);
+        let got = run_pipe(&pl(b"foo", "x"), &rows);
         assert_rows_eq(
             got,
             &[
@@ -232,25 +237,25 @@ mod tests {
     #[test]
     fn test_pipe_len_update_needed_fields() {
         // all the needed fields
-        expect_needed_fields(&pl("y", "x"), "*", "", "*", "x");
-        expect_needed_fields(&pl("x", "x"), "*", "", "*", "");
+        expect_needed_fields(&pl(b"y", "x"), "*", "", "*", "x");
+        expect_needed_fields(&pl(b"x", "x"), "*", "", "*", "");
 
         // unneeded fields do not intersect with output field
-        expect_needed_fields(&pl("y", "x"), "*", "f1,f2", "*", "f1,f2,x");
-        expect_needed_fields(&pl("x", "x"), "*", "f1,f2", "*", "f1,f2");
+        expect_needed_fields(&pl(b"y", "x"), "*", "f1,f2", "*", "f1,f2,x");
+        expect_needed_fields(&pl(b"x", "x"), "*", "f1,f2", "*", "f1,f2");
 
         // unneeded fields intersect with output field
-        expect_needed_fields(&pl("z", "x"), "*", "x,y", "*", "x,y");
-        expect_needed_fields(&pl("y", "x"), "*", "x,y", "*", "x,y");
-        expect_needed_fields(&pl("x", "x"), "*", "x,y", "*", "x,y");
+        expect_needed_fields(&pl(b"z", "x"), "*", "x,y", "*", "x,y");
+        expect_needed_fields(&pl(b"y", "x"), "*", "x,y", "*", "x,y");
+        expect_needed_fields(&pl(b"x", "x"), "*", "x,y", "*", "x,y");
 
         // needed fields do not intersect with output field
-        expect_needed_fields(&pl("y", "z"), "x,y", "", "x,y", "");
-        expect_needed_fields(&pl("z", "z"), "x,y", "", "x,y", "");
+        expect_needed_fields(&pl(b"y", "z"), "x,y", "", "x,y", "");
+        expect_needed_fields(&pl(b"z", "z"), "x,y", "", "x,y", "");
 
         // needed fields intersect with output field
-        expect_needed_fields(&pl("z", "f2"), "f2,y", "", "y,z", "");
-        expect_needed_fields(&pl("y", "f2"), "f2,y", "", "y", "");
-        expect_needed_fields(&pl("y", "y"), "f2,y", "", "f2,y", "");
+        expect_needed_fields(&pl(b"z", "f2"), "f2,y", "", "y,z", "");
+        expect_needed_fields(&pl(b"y", "f2"), "f2,y", "", "y", "");
+        expect_needed_fields(&pl(b"y", "y"), "f2,y", "", "f2,y", "");
     }
 }

@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn test_pipe_filter_no_match() {
         let rows = vec![vec![field("a", "1")], vec![field("a", "2")]];
-        let f = new_pipe_filter(Arc::new(new_filter_exact("a", "zzz")));
+        let f = new_pipe_filter(Arc::new(new_filter_exact(b"a", "zzz")));
         let got = run_pipe(&f, &rows);
         assert_rows_eq(got, &[]);
     }
@@ -198,7 +198,7 @@ mod tests {
             vec![field("a", "2"), field("b", "y")],
             vec![field("a", "3"), field("b", "z")],
         ];
-        let f = new_pipe_filter(Arc::new(new_filter_exact("a", "2")));
+        let f = new_pipe_filter(Arc::new(new_filter_exact(b"a", "2")));
         let got = run_pipe(&f, &rows);
         assert_rows_eq(got, &[vec![field("a", "2"), field("b", "y")]]);
     }
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn test_pipe_filter_update_needed_fields() {
         // A field-scoped filter contributes its field to the allow list.
-        let f = new_pipe_filter(Arc::new(new_filter_exact("f1", "bar")));
+        let f = new_pipe_filter(Arc::new(new_filter_exact(b"f1", "bar")));
         expect_needed_fields(&f, "*", "", "*", "");
         expect_needed_fields(&f, "f2,f3", "", "f1,f2,f3", "");
     }

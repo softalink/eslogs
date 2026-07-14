@@ -113,8 +113,10 @@ fn parse_pipe_stats_ext(
         }
         if !lex.is_keyword(&[","]) {
             return Err(format!(
-                "unexpected token {} after [{e_str}]; want ',', '|', ';' or ')'",
-                go_quote(&lex.token)
+                "unexpected token {} after [{}]; want ',', '|', ';' or ')'",
+                go_quote(&lex.token),
+                // Display-only: result-name bytes in an error message.
+                String::from_utf8_lossy(&e_str)
             ));
         }
         lex.next_token();
@@ -139,10 +141,12 @@ fn parse_by_stats_fields(lex: &mut Lexer) -> Result<Vec<ByStatsField>, String> {
             lex.next_token();
             return Ok(bfs);
         }
-        let field_name = lex
-            .next_compound_token_ext(&[":"])
+        // Field names are raw bytes: quoted tokens carry Go-parity raw bytes
+        // (`Lexer::token_bytes`, Go strconv.Unquote).
+        let (_, field_name) = lex
+            .next_compound_token_ext_pair(&[":"])
             .map_err(|e| format!("cannot parse field name: {e}"))?;
-        let field_name = crate::log_rows::get_canonical_column_name(&field_name).to_string();
+        let field_name = crate::log_rows::get_canonical_column_name_bytes(&field_name).to_vec();
         let mut bf = ByStatsField {
             name: field_name.clone(),
             ..Default::default()
@@ -152,14 +156,14 @@ fn parse_by_stats_fields(lex: &mut Lexer) -> Result<Vec<ByStatsField>, String> {
             let bucket_size_str = lex.next_compound_token().map_err(|e| {
                 format!(
                     "cannot parse bucket size for field {}: {e}",
-                    go_quote(&field_name)
+                    crate::stream_filter::go_quote_bytes(&field_name)
                 )
             })?;
             if bucket_size_str != "year" && bucket_size_str != "month" {
                 let bucket_size = try_parse_bucket_size(&bucket_size_str).ok_or_else(|| {
                     format!(
                         "cannot parse bucket size for field {}: {}",
-                        go_quote(&field_name),
+                        crate::stream_filter::go_quote_bytes(&field_name),
                         go_quote(&bucket_size_str)
                     )
                 })?;
@@ -171,14 +175,14 @@ fn parse_by_stats_fields(lex: &mut Lexer) -> Result<Vec<ByStatsField>, String> {
                 let bucket_offset_str = lex.next_compound_token().map_err(|e| {
                     format!(
                         "cannot parse offset token for {}: {e}",
-                        go_quote(&field_name)
+                        crate::stream_filter::go_quote_bytes(&field_name)
                     )
                 })?;
                 let bucket_offset =
                     try_parse_bucket_offset(&bucket_offset_str).ok_or_else(|| {
                         format!(
                             "cannot parse bucket offset for field {}: {}",
-                            go_quote(&field_name),
+                            crate::stream_filter::go_quote_bytes(&field_name),
                             go_quote(&bucket_offset_str)
                         )
                     })?;
@@ -232,7 +236,7 @@ fn try_parse_bucket_offset(s: &str) -> Option<f64> {
 /// `switch(...)`) plus a result-name string for the caller's error messages.
 fn parse_stats_entry(
     lex: &mut Lexer,
-) -> Result<(Vec<crate::pipe_stats::PipeStatsFunc>, String), String> {
+) -> Result<(Vec<crate::pipe_stats::PipeStatsFunc>, Vec<u8>), String> {
     let sf = parse_stats_func(lex)?;
     let sf_str = sf.to_string();
 
@@ -252,9 +256,9 @@ fn parse_stats_entry(
 
     let result_name = if lex.is_keyword(&[","]) || lex.is_query_part_trailer() {
         if iff_str.is_empty() {
-            sf_str.clone()
+            sf_str.clone().into_bytes()
         } else {
-            format!("{sf_str} {iff_str}")
+            format!("{sf_str} {iff_str}").into_bytes()
         }
     } else {
         if lex.is_keyword(&["as"]) {
@@ -281,7 +285,7 @@ fn parse_stats_entry(
 fn parse_stats_switch(
     lex: &mut Lexer,
     sf_str: &str,
-) -> Result<(Vec<crate::pipe_stats::PipeStatsFunc>, String), String> {
+) -> Result<(Vec<crate::pipe_stats::PipeStatsFunc>, Vec<u8>), String> {
     lex.next_token(); // consume "switch"
     if !lex.is_keyword(&["("]) {
         return Err("missing '(' after the 'switch'".to_string());
@@ -290,7 +294,7 @@ fn parse_stats_switch(
 
     struct SwitchCase {
         filter: Option<Box<dyn Filter>>,
-        result_name: String,
+        result_name: Vec<u8>,
     }
     let mut cases: Vec<SwitchCase> = Vec::new();
     let mut default_set = false;
@@ -384,7 +388,7 @@ fn parse_stats_switch(
             case.result_name,
         ));
     }
-    Ok((funcs, sf_str.to_string()))
+    Ok((funcs, sf_str.as_bytes().to_vec()))
 }
 
 /// Re-parses a stats function from its rendered text, cloning it for each
@@ -476,17 +480,20 @@ fn parse_stats_func(lex: &mut Lexer) -> Result<BoxStats, String> {
 
 // ---- shared arg helpers ----
 
-fn parse_stats_func_field_filters(lex: &mut Lexer, func_name: &str) -> Result<Vec<String>, String> {
+fn parse_stats_func_field_filters(
+    lex: &mut Lexer,
+    func_name: &str,
+) -> Result<Vec<Vec<u8>>, String> {
     consume_func_keyword(lex, func_name)?;
     let mut fields = parse_field_filters_in_parens(lex)
         .map_err(|e| format!("cannot parse {} args: {e}", go_quote(func_name)))?;
     if fields.is_empty() {
-        fields = vec!["*".to_string()];
+        fields = vec![b"*".to_vec()];
     }
     Ok(fields)
 }
 
-fn parse_stats_func_fields(lex: &mut Lexer, func_name: &str) -> Result<Vec<String>, String> {
+fn parse_stats_func_fields(lex: &mut Lexer, func_name: &str) -> Result<Vec<Vec<u8>>, String> {
     consume_func_keyword(lex, func_name)?;
     let fields = parse_field_filters_in_parens(lex)
         .map_err(|e| format!("cannot parse {} args: {e}", go_quote(func_name)))?;
@@ -494,14 +501,16 @@ fn parse_stats_func_fields(lex: &mut Lexer, func_name: &str) -> Result<Vec<Strin
         if prefix_filter::is_wildcard_filter(f) {
             return Err(format!(
                 "unexpected wildcard filter {} inside {func_name}()",
-                go_quote(f)
+                // go_quote_bytes: display-only quoting of a raw-byte name in
+                // the error message (Go %q over raw bytes).
+                crate::stream_filter::go_quote_bytes(f)
             ));
         }
     }
     Ok(fields)
 }
 
-fn parse_stats_func_args(lex: &mut Lexer, func_name: &str) -> Result<Vec<String>, String> {
+fn parse_stats_func_args(lex: &mut Lexer, func_name: &str) -> Result<Vec<Vec<u8>>, String> {
     consume_func_keyword(lex, func_name)?;
     parse_field_names_in_parens(lex)
         .map_err(|e| format!("cannot parse {} args: {e}", go_quote(func_name)))
@@ -635,12 +644,26 @@ fn parse_stats_histogram(lex: &mut Lexer) -> Result<BoxStats, String> {
     )))
 }
 
+/// Display-only byte form of Go `strings.Join(names, sep)` for error
+/// messages: raw-byte names concatenated byte-wise, then quoted by the caller
+/// with `go_quote_bytes` (Go %q over the joined raw bytes).
+fn join_names_bytes(names: &[Vec<u8>], sep: u8) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for (i, n) in names.iter().enumerate() {
+        if i > 0 {
+            out.push(sep);
+        }
+        out.extend_from_slice(n);
+    }
+    out
+}
+
 fn parse_stats_rate(lex: &mut Lexer) -> Result<BoxStats, String> {
     let fields = parse_stats_func_fields(lex, "rate")?;
     if !fields.is_empty() {
         return Err(format!(
             "unexpected non-empty args for 'rate()' function: {}",
-            go_quote(&fields.join(","))
+            crate::stream_filter::go_quote_bytes(&join_names_bytes(&fields, b','))
         ));
     }
     Ok(Box::new(crate::stats_rate::new_stats_rate()))
@@ -707,7 +730,7 @@ fn parse_stats_any(lex: &mut Lexer) -> Result<BoxStats, String> {
         return Err(format!(
             "unexpected number of args for 'any' function; got {}; want 1; args: {}",
             args.len(),
-            go_quote(&args.join(","))
+            crate::stream_filter::go_quote_bytes(&join_names_bytes(&args, b','))
         ));
     }
     Ok(Box::new(crate::stats_any::new_stats_any(args[0].clone())))
@@ -755,13 +778,13 @@ fn parse_pipe_running_stats_ext(lex: &mut Lexer, is_total: bool) -> Result<Box<d
             .map_err(|e| format!("cannot parse 'by' clause: {e}"))?;
     }
 
-    let mut seen_result_names: Vec<String> = Vec::new();
+    let mut seen_result_names: Vec<Vec<u8>> = Vec::new();
     let mut funcs = Vec::new();
     loop {
         let sf = parse_running_stats_func(lex)?;
         let sf_str = sf.to_string();
         let result_name = if lex.is_keyword(&[","]) || lex.is_query_part_trailer() {
-            sf_str.clone()
+            sf_str.clone().into_bytes()
         } else {
             if lex.is_keyword(&["as"]) {
                 lex.next_token();
@@ -772,7 +795,7 @@ fn parse_pipe_running_stats_ext(lex: &mut Lexer, is_total: bool) -> Result<Box<d
         if seen_result_names.contains(&result_name) {
             return Err(format!(
                 "cannot use identical result name {} for [{sf_str}] and [{sf_str}]",
-                go_quote(&result_name)
+                crate::stream_filter::go_quote_bytes(&result_name)
             ));
         }
         seen_result_names.push(result_name.clone());
@@ -851,13 +874,13 @@ fn parse_running_stats_last(lex: &mut Lexer) -> Result<BoxRunning, String> {
     )))
 }
 
-fn parse_running_first_last(lex: &mut Lexer, func_name: &str) -> Result<(String, usize), String> {
+fn parse_running_first_last(lex: &mut Lexer, func_name: &str) -> Result<(Vec<u8>, usize), String> {
     let args = parse_stats_func_args(lex, func_name)?;
     if args.len() != 1 {
         return Err(format!(
             "unexpected number of args for the {func_name}() function; got {}; want 1; args: {}",
             args.len(),
-            go_quote(&args.join(","))
+            crate::stream_filter::go_quote_bytes(&join_names_bytes(&args, b','))
         ));
     }
     let field_name = args[0].clone();
@@ -870,13 +893,13 @@ fn parse_running_first_last(lex: &mut Lexer, func_name: &str) -> Result<(String,
             format!(
                 "cannot parse offset={} at {func_name}({}): invalid integer",
                 go_quote(&offset_str),
-                go_quote(&field_name)
+                crate::stream_filter::go_quote_bytes(&field_name)
             )
         })?;
         if n < 0 {
             return Err(format!(
                 "offset={n} cannot be negative at {func_name}({})",
-                go_quote(&field_name)
+                crate::stream_filter::go_quote_bytes(&field_name)
             ));
         }
         offset = n as usize;

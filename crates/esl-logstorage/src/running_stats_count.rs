@@ -19,7 +19,7 @@ use crate::stats_count::{field_names_string, is_single_field};
 /// invoked once, mirroring the Go fast path.
 pub(crate) fn for_each_matching_field(
     fields: &[Field],
-    field_filters: &[String],
+    field_filters: &[Vec<u8>],
     mut callback: impl FnMut(&[u8]),
 ) {
     if is_single_field(field_filters) {
@@ -27,7 +27,7 @@ pub(crate) fn for_each_matching_field(
         let mut found = false;
         let field_name = &field_filters[0];
         for f in fields {
-            if f.name == field_name.as_bytes() {
+            if &f.name == field_name {
                 callback(&f.value);
                 found = true;
             }
@@ -39,7 +39,7 @@ pub(crate) fn for_each_matching_field(
     }
 
     for f in fields {
-        if prefix_filter::match_filters_bytes(field_filters, &f.name) {
+        if prefix_filter::match_filters(field_filters, &f.name) {
             callback(&f.value);
         }
     }
@@ -47,12 +47,12 @@ pub(crate) fn for_each_matching_field(
 
 /// Running `count(...)` stats function.
 pub struct RunningStatsCount {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Builds a [`RunningStatsCount`] from already-parsed field filters
 /// (Go `parseRunningStatsCount`).
-pub(crate) fn new_running_stats_count(field_filters: Vec<String>) -> RunningStatsCount {
+pub(crate) fn new_running_stats_count(field_filters: Vec<Vec<u8>>) -> RunningStatsCount {
     RunningStatsCount { field_filters }
 }
 

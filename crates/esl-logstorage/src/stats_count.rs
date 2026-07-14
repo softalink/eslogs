@@ -19,29 +19,29 @@ use crate::stats::{StatsFunc, StatsProcessor};
 
 /// Renders a list of field filters as a comma-separated, quoted string
 /// (Go `fieldNamesString`).
-pub(crate) fn field_names_string(fields: &[String]) -> String {
+pub(crate) fn field_names_string(fields: &[Vec<u8>]) -> String {
     fields
         .iter()
-        .map(|f| crate::filter_generic::quote_field_filter_if_needed(f))
+        .map(|f| crate::parser::quote_field_filter_if_needed(f))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 /// Reports whether `filters` selects exactly one concrete (non-wildcard) field
 /// (Go `isSingleField`).
-pub(crate) fn is_single_field(filters: &[String]) -> bool {
+pub(crate) fn is_single_field(filters: &[Vec<u8>]) -> bool {
     filters.len() == 1 && !prefix_filter::is_wildcard_filter(&filters[0])
 }
 
 /// `count(...)` stats function.
 pub struct StatsCount {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Builds a [`StatsCount`] from already-parsed field filters (Go
 /// `parseStatsCount`'s tail; the `parseStatsFuncFieldFilters` lexer step is part
 /// of the not-yet-ported parser).
-pub(crate) fn new_stats_count(field_filters: Vec<String>) -> StatsCount {
+pub(crate) fn new_stats_count(field_filters: Vec<Vec<u8>>) -> StatsCount {
     StatsCount { field_filters }
 }
 
@@ -69,7 +69,7 @@ impl StatsFunc for StatsCount {
 #[derive(Default, PartialEq, Debug)]
 pub(crate) struct StatsCountProcessor {
     rows_count: u64,
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 impl StatsProcessor for StatsCountProcessor {
@@ -104,7 +104,7 @@ impl StatsProcessor for StatsCountProcessor {
         // for the fields enumerated inside count().
         let mut non_empty = vec![false; rows_len];
         for c in br.get_columns() {
-            if !prefix_filter::match_filters_bytes(&self.field_filters, br.column_name(c)) {
+            if !prefix_filter::match_filters(&self.field_filters, br.column_name(c)) {
                 continue;
             }
             if br.column_is_const(c) {
@@ -145,7 +145,7 @@ impl StatsProcessor for StatsCountProcessor {
 
         // Slow path - count the row if at least a single enumerated field is non-empty.
         for c in br.get_columns() {
-            if !prefix_filter::match_filters_bytes(&self.field_filters, br.column_name(c)) {
+            if !prefix_filter::match_filters(&self.field_filters, br.column_name(c)) {
                 continue;
             }
             if !br.column_get_value_at_row(c, row_index).is_empty() {

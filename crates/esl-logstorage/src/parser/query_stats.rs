@@ -12,7 +12,6 @@
 
 use std::collections::HashSet;
 
-use crate::parser::quote_token_if_needed;
 use crate::pipe::{Pipe, StatsTailOp};
 use crate::prefix_filter;
 use crate::values_encoder::marshal_duration_string;
@@ -22,7 +21,7 @@ use super::query::Query;
 impl Query {
     /// Adds `| stats by (_time:step offset off, field1, ..., fieldN) count() hits`
     /// to the end of q (Go `AddCountByTimePipe`).
-    pub fn add_count_by_time_pipe(&mut self, step: i64, off: i64, fields: &[String]) {
+    pub fn add_count_by_time_pipe(&mut self, step: i64, off: i64, fields: &[Vec<u8>]) {
         // Drop pipes from q, which modify or delete _time field, since they
         // make impossible to calculate stats grouped by _time.
         self.drop_pipes_unsafe_for_hits();
@@ -38,12 +37,12 @@ impl Query {
             }
             for f in fields {
                 by_fields_str += ", ";
-                by_fields_str += &quote_token_if_needed(f);
+                by_fields_str += &crate::parser::quote_token_bytes_if_needed(f);
             }
-            let hits_field_name = get_unique_result_name("hits", fields);
+            let hits_field_name = get_unique_result_name(b"hits", fields);
             let s = format!(
                 "stats by ({by_fields_str}) count() {}",
-                quote_token_if_needed(&hits_field_name)
+                crate::parser::quote_token_bytes_if_needed(&hits_field_name)
             );
 
             self.must_append_pipe(&s);
@@ -55,7 +54,7 @@ impl Query {
             let mut sort_fields_str = "_time".to_string();
             for f in fields {
                 sort_fields_str += ", ";
-                sort_fields_str += &quote_token_if_needed(f);
+                sort_fields_str += &crate::parser::quote_token_bytes_if_needed(f);
             }
             let s = format!("sort by ({sort_fields_str})");
 
@@ -80,7 +79,7 @@ impl Query {
     /// Returns stats labels from q for the `/select/logsql/stats_query`
     /// endpoint (Go `GetStatsLabels`). The remaining fields are considered
     /// metrics.
-    pub fn get_stats_labels(&mut self) -> Result<Vec<String>, String> {
+    pub fn get_stats_labels(&mut self) -> Result<Vec<Vec<u8>>, String> {
         self.get_stats_labels_add_grouping_by_time(0, 0)
     }
 
@@ -94,7 +93,7 @@ impl Query {
         &mut self,
         step: i64,
         offset: i64,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<Vec<u8>>, String> {
         let Some(idx) = get_last_pipe_stats_idx(&self.pipes) else {
             return Err(format!("missing `| stats ...` pipe in the query [{self}]"));
         };
@@ -138,8 +137,8 @@ impl Query {
             .expect("BUG: pipes[idx] must be a stats pipe");
         let ps_str = self.pipes[idx].to_string();
 
-        let mut label_fields: Vec<String> = Vec::with_capacity(ps.by_fields.len());
-        let mut metric_fields: HashSet<String> = HashSet::with_capacity(ps.funcs.len());
+        let mut label_fields: Vec<Vec<u8>> = Vec::with_capacity(ps.by_fields.len());
+        let mut metric_fields: HashSet<Vec<u8>> = HashSet::with_capacity(ps.funcs.len());
 
         // extract by(...) field names from ps
         for f in &ps.by_fields {
@@ -233,7 +232,7 @@ impl Query {
                             }
                         }
 
-                        let metric_fields_snapshot: Vec<String> =
+                        let metric_fields_snapshot: Vec<Vec<u8>> =
                             metric_fields.iter().cloned().collect();
                         for f in &metric_fields_snapshot {
                             if prefix_filter::match_filter(f_dst, f) {
@@ -267,7 +266,7 @@ impl Query {
                             }
                         }
 
-                        let metric_fields_snapshot: Vec<String> =
+                        let metric_fields_snapshot: Vec<Vec<u8>> =
                             metric_fields.iter().cloned().collect();
                         for f in &metric_fields_snapshot {
                             if prefix_filter::match_filter(f_dst, f) {
@@ -302,8 +301,10 @@ impl Query {
                     for f in &field_filters {
                         if prefix_filter::is_wildcard_filter(f) {
                             return Err(format!(
-                                "fields(...) at {:?} cannot contain wildcard filter; got {f}; query [{self}]",
-                                p.to_string()
+                                "fields(...) at {:?} cannot contain wildcard filter; got {}; query [{self}]",
+                                p.to_string(),
+                                // Display-only lossy view of the raw-byte name.
+                                String::from_utf8_lossy(f)
                             ));
                         }
                         add_to_label_fields(&mut label_fields, &mut metric_fields, f);
@@ -340,7 +341,7 @@ impl Query {
     ///
     /// `None` is returned if it is impossible to detect the set of fields to
     /// return for the given q (Go returns `ok == false`).
-    pub fn get_fixed_fields(&self) -> Option<Vec<String>> {
+    pub fn get_fixed_fields(&self) -> Option<Vec<Vec<u8>>> {
         let (mut fields, pipe_idx) = get_fixed_fields(&self.pipes)?;
 
         // fix the order of fields if sort pipe is present
@@ -370,7 +371,7 @@ impl Query {
 
 /// Port of Go `getFixedFields` (free function): returns the fixed fields and
 /// the index of the pipe that produced them.
-fn get_fixed_fields(pipes: &[Box<dyn Pipe>]) -> Option<(Vec<String>, usize)> {
+fn get_fixed_fields(pipes: &[Box<dyn Pipe>]) -> Option<(Vec<Vec<u8>>, usize)> {
     for i in (0..pipes.len()).rev() {
         let p = &pipes[i];
         if p.fixed_fields_transparent() {
@@ -391,42 +392,42 @@ fn get_last_pipe_stats_idx(pipes: &[Box<dyn Pipe>]) -> Option<usize> {
 }
 
 /// Port of Go `getUniqueResultName` (parser.go).
-pub(crate) fn get_unique_result_name(result_name: &str, by_fields: &[String]) -> String {
-    let mut name = result_name.to_string();
+pub(crate) fn get_unique_result_name(result_name: &[u8], by_fields: &[Vec<u8>]) -> Vec<u8> {
+    let mut name = result_name.to_vec();
     while by_fields.iter().any(|f| f == &name) {
-        name.push('s');
+        name.push(b's');
     }
     name
 }
 
 /// Go `addToLabelFields` closure in `GetStatsLabelsAddGroupingByTime`.
 fn add_to_label_fields(
-    label_fields: &mut Vec<String>,
-    metric_fields: &mut HashSet<String>,
-    f: &str,
+    label_fields: &mut Vec<Vec<u8>>,
+    metric_fields: &mut HashSet<Vec<u8>>,
+    f: &[u8],
 ) {
     if !label_fields.iter().any(|x| x == f) {
-        label_fields.push(f.to_string());
+        label_fields.push(f.to_vec());
     }
     metric_fields.remove(f);
 }
 
 /// Go `addToMetricFields` closure in `GetStatsLabelsAddGroupingByTime`.
 fn add_to_metric_fields(
-    label_fields: &mut Vec<String>,
-    metric_fields: &mut HashSet<String>,
-    f: &str,
+    label_fields: &mut Vec<Vec<u8>>,
+    metric_fields: &mut HashSet<Vec<u8>>,
+    f: &[u8],
 ) {
     if let Some(idx) = label_fields.iter().position(|x| x == f) {
         label_fields.remove(idx);
     }
-    metric_fields.insert(f.to_string());
+    metric_fields.insert(f.to_vec());
 }
 
 /// Port of Go `hasNeededFieldsExceptTime`.
-fn has_needed_fields_except_time(fields: &[String], needed_fields: &[String]) -> bool {
+fn has_needed_fields_except_time(fields: &[Vec<u8>], needed_fields: &[Vec<u8>]) -> bool {
     for f in needed_fields {
-        if f == "_time" {
+        if f == b"_time" {
             continue;
         }
         if !fields.contains(f) {
@@ -444,16 +445,16 @@ fn has_needed_fields_except_time(fields: &[String], needed_fields: &[String]) ->
 }
 
 /// Port of Go `hasOnlyKnownFields`.
-fn has_only_known_fields(fields: &[String], known_fields: &[String]) -> bool {
+fn has_only_known_fields(fields: &[Vec<u8>], known_fields: &[Vec<u8>]) -> bool {
     fields.iter().all(|f| known_fields.contains(f))
 }
 
 /// String-returning wrapper around [`prefix_filter::append_replace`]
 /// (Go `prefixfilter.AppendReplace`).
-fn append_replace(src_filter: &str, dst_filter: &str, s: &str) -> String {
+fn append_replace(src_filter: &[u8], dst_filter: &[u8], s: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
     prefix_filter::append_replace(&mut buf, src_filter, dst_filter, s);
-    String::from_utf8_lossy(&buf).into_owned()
+    buf
 }
 
 /// String-returning wrapper around

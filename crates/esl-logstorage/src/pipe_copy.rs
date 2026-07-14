@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::block_result::BlockResult;
-use crate::filter_generic::quote_field_filter_if_needed;
+use crate::parser::quote_field_filter_if_needed;
 use crate::pipe::{Pipe, PipeProcessor};
 use crate::prefix_filter;
 
@@ -18,9 +18,9 @@ use esl_common::panicf;
 /// See <https://docs.victoriametrics.com/victorialogs/logsql/#copy-pipe>
 pub(crate) struct PipeCopy {
     /// Source field filters to copy from.
-    pub(crate) src_field_filters: Vec<String>,
+    pub(crate) src_field_filters: Vec<Vec<u8>>,
     /// Destination field filters to copy to.
-    pub(crate) dst_field_filters: Vec<String>,
+    pub(crate) dst_field_filters: Vec<Vec<u8>>,
 }
 
 /// Builds a `| copy ...` pipe.
@@ -28,8 +28,8 @@ pub(crate) struct PipeCopy {
 /// PORT NOTE: `parsePipeCopy` is lexer-dependent and deferred; this constructor
 /// exposes the parsed result for the future parser.
 pub(crate) fn new_pipe_copy(
-    src_field_filters: Vec<String>,
-    dst_field_filters: Vec<String>,
+    src_field_filters: Vec<Vec<u8>>,
+    dst_field_filters: Vec<Vec<u8>>,
 ) -> PipeCopy {
     PipeCopy {
         src_field_filters,
@@ -108,8 +108,8 @@ impl Pipe for PipeCopy {
 }
 
 struct PipeCopyProcessor {
-    src_field_filters: Vec<String>,
-    dst_field_filters: Vec<String>,
+    src_field_filters: Vec<Vec<u8>>,
+    dst_field_filters: Vec<Vec<u8>>,
     pp_next: Arc<dyn PipeProcessor>,
 }
 
@@ -135,8 +135,8 @@ mod tests {
 
     fn pc(pairs: &[(&str, &str)]) -> PipeCopy {
         new_pipe_copy(
-            pairs.iter().map(|(s, _)| s.to_string()).collect(),
-            pairs.iter().map(|(_, d)| d.to_string()).collect(),
+            pairs.iter().map(|(s, _)| s.as_bytes().to_vec()).collect(),
+            pairs.iter().map(|(_, d)| d.as_bytes().to_vec()).collect(),
         )
     }
 

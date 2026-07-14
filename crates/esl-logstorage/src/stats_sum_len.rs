@@ -13,12 +13,12 @@ use crate::stats_sum::get_matching_columns;
 
 /// `sum_len(...)` stats function.
 pub struct StatsSumLen {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Builds a [`StatsSumLen`] from already-parsed field filters
 /// (Go `parseStatsSumLen`).
-pub(crate) fn new_stats_sum_len(field_filters: Vec<String>) -> StatsSumLen {
+pub(crate) fn new_stats_sum_len(field_filters: Vec<Vec<u8>>) -> StatsSumLen {
     StatsSumLen { field_filters }
 }
 
@@ -42,7 +42,7 @@ impl StatsFunc for StatsSumLen {
 #[derive(Default, PartialEq, Debug)]
 pub(crate) struct StatsSumLenProcessor {
     sum_len: u64,
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 impl StatsProcessor for StatsSumLenProcessor {

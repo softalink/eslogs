@@ -17,7 +17,6 @@ use crate::pipe_update::{
     IfFilter, UpdateFunc, new_pipe_update_processor, update_needed_fields_for_update_pipe,
 };
 use crate::prefix_filter;
-use crate::stream_filter::quote_token_if_needed;
 
 /// `| replace [if (...)] (old, new) [at field] [limit N]` pipe.
 ///
@@ -25,7 +24,7 @@ use crate::stream_filter::quote_token_if_needed;
 #[derive(Clone)]
 pub(crate) struct PipeReplace {
     /// The field whose value is rewritten (defaults to `_msg`).
-    pub(crate) field: String,
+    pub(crate) field: Vec<u8>,
     /// The literal substring to replace. Raw bytes (Go strings are arbitrary
     /// bytes; raw `\xNN` escapes in the query text carry through byte-exact).
     pub(crate) old_substr: Vec<u8>,
@@ -40,7 +39,7 @@ pub(crate) struct PipeReplace {
 impl PipeReplace {
     /// Builds a `replace` pipe from parsed arguments.
     pub(crate) fn new(
-        field: impl Into<String>,
+        field: impl Into<Vec<u8>>,
         old_substr: impl Into<Vec<u8>>,
         new_substr: impl Into<Vec<u8>>,
         limit: u64,
@@ -76,8 +75,11 @@ impl Pipe for PipeReplace {
             crate::stream_filter::quote_value_bytes_if_needed(&self.old_substr),
             crate::stream_filter::quote_value_bytes_if_needed(&self.new_substr)
         ));
-        if self.field != "_msg" {
-            s.push_str(&format!(" at {}", quote_token_if_needed(&self.field)));
+        if self.field != b"_msg" {
+            s.push_str(&format!(
+                " at {}",
+                crate::parser::quote_token_bytes_if_needed(&self.field)
+            ));
         }
         if self.limit > 0 {
             s.push_str(&format!(" limit {}", self.limit));
@@ -251,7 +253,7 @@ mod tests {
 
     /// Builds the `if (field:phrase)` filter used by the conditional Go tests.
     fn phrase_iff(field: &str, phrase: &str) -> Arc<IfFilter> {
-        let f: Arc<dyn Filter> = Arc::new(new_filter_phrase(field, phrase));
+        let f: Arc<dyn Filter> = Arc::new(new_filter_phrase(field.as_bytes(), phrase));
         Arc::new(IfFilter::new(f))
     }
 

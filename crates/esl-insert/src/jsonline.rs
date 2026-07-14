@@ -50,7 +50,7 @@ pub fn request_handler<S: LogRowsStorage>(
     );
     let time_fields: Vec<&str> = cp.time_fields.iter().map(String::as_str).collect();
     let msg_fields: Vec<&str> = cp.msg_fields.iter().map(String::as_str).collect();
-    let preserve_keys: Vec<&str> = cp.preserve_json_keys.iter().map(String::as_str).collect();
+    let preserve_keys: Vec<&[u8]> = cp.preserve_json_keys.iter().map(|s| s.as_bytes()).collect();
 
     let res = {
         // Go wraps r.Body with writeconcurrencylimiter.GetReader; on failure
@@ -88,7 +88,7 @@ fn process_stream_internal<S: LogRowsStorage>(
     r: &mut dyn Read,
     time_fields: &[&str],
     msg_fields: &[&str],
-    preserve_keys: &[&str],
+    preserve_keys: &[&[u8]],
     lmp: &mut LogMessageProcessor<'_, S>,
 ) -> Result<(), String> {
     let mut lr = LineReader::new(stream_name, r);
@@ -121,7 +121,7 @@ fn read_line<S: LogRowsStorage>(
     lr: &mut LineReader,
     time_fields: &[&str],
     msg_fields: &[&str],
-    preserve_keys: &[&str],
+    preserve_keys: &[&[u8]],
     lmp: &mut LogMessageProcessor<'_, S>,
 ) -> (bool, Option<String>) {
     loop {
@@ -186,14 +186,9 @@ mod tests {
                 .to_vec();
         let mut cur = Cursor::new(body);
         let no_fields: [&str; 0] = [];
-        let res = process_stream_internal(
-            "test",
-            &mut cur,
-            &["_time"],
-            &no_fields,
-            &no_fields,
-            &mut lmp,
-        );
+        let no_keys: [&[u8]; 0] = [];
+        let res =
+            process_stream_internal("test", &mut cur, &["_time"], &no_fields, &no_keys, &mut lmp);
         assert!(res.is_ok(), "unexpected error: {res:?}");
 
         lmp.close();
@@ -221,14 +216,9 @@ mod tests {
         let body = b"{\"_msg\":\"a\xff b\"}\n".to_vec();
         let mut cur = Cursor::new(body);
         let no_fields: [&str; 0] = [];
-        let res = process_stream_internal(
-            "test",
-            &mut cur,
-            &["_time"],
-            &no_fields,
-            &no_fields,
-            &mut lmp,
-        );
+        let no_keys: [&[u8]; 0] = [];
+        let res =
+            process_stream_internal("test", &mut cur, &["_time"], &no_fields, &no_keys, &mut lmp);
         assert!(res.is_ok(), "unexpected error: {res:?}");
         lmp.close();
         assert_eq!(rows_count(&s), 1, "expected 1 row ingested");
@@ -271,14 +261,9 @@ mod tests {
         let body = b"\n{\"_msg\":\"only\"}\n\n".to_vec();
         let mut cur = Cursor::new(body);
         let no_fields: [&str; 0] = [];
-        let res = process_stream_internal(
-            "test",
-            &mut cur,
-            &["_time"],
-            &no_fields,
-            &no_fields,
-            &mut lmp,
-        );
+        let no_keys: [&[u8]; 0] = [];
+        let res =
+            process_stream_internal("test", &mut cur, &["_time"], &no_fields, &no_keys, &mut lmp);
         assert!(res.is_ok(), "unexpected error: {res:?}");
 
         lmp.close();

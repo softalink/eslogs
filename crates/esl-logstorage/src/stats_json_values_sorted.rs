@@ -92,13 +92,13 @@ pub(crate) struct StatsJSONValuesSortedProcessor {
     sort_values_buf: Vec<Vec<u8>>,
 
     // Captured config (see `crate::stats_json_values` docs).
-    pub(crate) field_filters: Vec<String>,
+    pub(crate) field_filters: Vec<Vec<u8>>,
     pub(crate) sort_fields: Vec<BySortField>,
 }
 
 impl StatsJSONValuesSortedProcessor {
     fn init_sort_columns(&mut self, br: &mut BlockResult) {
-        let names: Vec<String> = self.sort_fields.iter().map(|sf| sf.name.clone()).collect();
+        let names: Vec<Vec<u8>> = self.sort_fields.iter().map(|sf| sf.name.clone()).collect();
         self.sort_columns.clear();
         for name in &names {
             let c = br.get_column_by_name(name);

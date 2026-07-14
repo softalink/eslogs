@@ -15,13 +15,13 @@ use crate::stats_min::{field_names_string, get_matching_columns, less_bytes};
 
 /// Port of `statsMax`.
 pub(crate) struct StatsMax {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
 }
 
 /// Port of `parseStatsMax`. Empty filters default to `["*"]`.
-pub(crate) fn new_stats_max(mut field_filters: Vec<String>) -> StatsMax {
+pub(crate) fn new_stats_max(mut field_filters: Vec<Vec<u8>>) -> StatsMax {
     if field_filters.is_empty() {
-        field_filters.push("*".to_string());
+        field_filters.push(b"*".to_vec());
     }
     StatsMax { field_filters }
 }
@@ -46,7 +46,7 @@ impl StatsFunc for StatsMax {
 
 /// Port of `statsMaxProcessor`.
 pub(crate) struct StatsMaxProcessor {
-    field_filters: Vec<String>,
+    field_filters: Vec<Vec<u8>>,
     max: Vec<u8>,
     has_items: bool,
 }
@@ -172,7 +172,7 @@ mod tests {
     }
 
     fn run_max(filters: &[&str], blocks: &[Vec<Vec<Field>>]) -> String {
-        let sf = new_stats_max(filters.iter().map(|s| s.to_string()).collect());
+        let sf = new_stats_max(filters.iter().map(|s| s.as_bytes().to_vec()).collect());
         let mut sp = sf.new_stats_processor();
         for block in blocks {
             let mut br = BlockResult::default();
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_stats_max_export_import_roundtrip() {
-        let sf = new_stats_max(vec!["a".to_string()]);
+        let sf = new_stats_max(vec![b"a".to_vec()]);
         let mut sp = sf.new_stats_processor();
         let mut br = BlockResult::default();
         br.must_init_from_rows(&[vec![field("a", "5")], vec![field("a", "9")]]);
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_stats_max_merge() {
-        let sf = new_stats_max(vec!["a".to_string()]);
+        let sf = new_stats_max(vec![b"a".to_vec()]);
         let mut a = sf.new_stats_processor();
         let mut b = sf.new_stats_processor();
 

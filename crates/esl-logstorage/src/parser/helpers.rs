@@ -5,7 +5,7 @@
 use esl_common::timeutil;
 
 use crate::filter_range::parse_math_number;
-use crate::log_rows::get_canonical_column_name;
+use crate::log_rows::get_canonical_column_name_bytes;
 use crate::parser::go_quote;
 use crate::parser::lexer_ext::LexerExt;
 use crate::prefix_filter;
@@ -381,28 +381,33 @@ pub(crate) fn try_parse_hhmm(s: &str) -> Option<i64> {
 // ---------------------------------------------------------------------------
 
 /// Port of Go `parseFieldName`.
-pub(crate) fn parse_field_name(lex: &mut Lexer) -> Result<String, String> {
-    let field_name = lex.next_compound_token()?;
-    Ok(get_canonical_column_name(&field_name).to_string())
+///
+/// Field names are raw bytes end-to-end: quoted tokens carry Go-parity raw
+/// bytes (`Lexer::token_bytes`, Go `strconv.Unquote`); unquoted compound
+/// tokens are slices of the query text (valid UTF-8) in both forms.
+pub(crate) fn parse_field_name(lex: &mut Lexer) -> Result<Vec<u8>, String> {
+    let field_name = lex.next_compound_token_bytes()?;
+    Ok(get_canonical_column_name_bytes(&field_name).to_vec())
 }
 
-/// Port of Go `parseFieldFilter`.
-pub(crate) fn parse_field_filter(lex: &mut Lexer) -> Result<String, String> {
+/// Port of Go `parseFieldFilter` (raw-byte field names; see
+/// [`parse_field_name`]).
+pub(crate) fn parse_field_filter(lex: &mut Lexer) -> Result<Vec<u8>, String> {
     if lex.is_keyword(&["*"]) {
         lex.next_token();
-        return Ok("*".to_string());
+        return Ok(b"*".to_vec());
     }
-    let mut field_name = lex.next_compound_token()?;
-    field_name = get_canonical_column_name(&field_name).to_string();
+    let field_name = lex.next_compound_token_bytes()?;
+    let mut field_name = get_canonical_column_name_bytes(&field_name).to_vec();
     if !lex.is_skipped_space() && lex.is_keyword(&["*"]) {
         lex.next_token();
-        field_name.push('*');
+        field_name.push(b'*');
     }
     Ok(field_name)
 }
 
 /// Port of Go `parseCommaSeparatedFields`.
-pub(crate) fn parse_comma_separated_fields(lex: &mut Lexer) -> Result<Vec<String>, String> {
+pub(crate) fn parse_comma_separated_fields(lex: &mut Lexer) -> Result<Vec<Vec<u8>>, String> {
     let mut fields = Vec::new();
     loop {
         let field = parse_field_filter(lex).map_err(|e| format!("cannot parse field name: {e}"))?;
@@ -415,7 +420,7 @@ pub(crate) fn parse_comma_separated_fields(lex: &mut Lexer) -> Result<Vec<String
 }
 
 /// Port of Go `parseFieldFiltersInParens`.
-pub(crate) fn parse_field_filters_in_parens(lex: &mut Lexer) -> Result<Vec<String>, String> {
+pub(crate) fn parse_field_filters_in_parens(lex: &mut Lexer) -> Result<Vec<Vec<u8>>, String> {
     if !lex.is_keyword(&["("]) {
         return Err("missing `(`".to_string());
     }
@@ -445,13 +450,15 @@ pub(crate) fn parse_field_filters_in_parens(lex: &mut Lexer) -> Result<Vec<Strin
 }
 
 /// Port of Go `parseFieldNamesInParens`.
-pub(crate) fn parse_field_names_in_parens(lex: &mut Lexer) -> Result<Vec<String>, String> {
+pub(crate) fn parse_field_names_in_parens(lex: &mut Lexer) -> Result<Vec<Vec<u8>>, String> {
     let field_names = parse_field_filters_in_parens(lex)?;
     for field_name in &field_names {
         if prefix_filter::is_wildcard_filter(field_name) {
             return Err(format!(
                 "the field name {} cannot end with '*'",
-                go_quote(field_name)
+                // go_quote_bytes: display-only quoting of a raw-byte name in
+                // the error message (Go %q over raw bytes).
+                crate::stream_filter::go_quote_bytes(field_name)
             ));
         }
     }
@@ -459,7 +466,7 @@ pub(crate) fn parse_field_names_in_parens(lex: &mut Lexer) -> Result<Vec<String>
 }
 
 /// Port of Go `parseFieldNameWithOptionalParens`.
-pub(crate) fn parse_field_name_with_optional_parens(lex: &mut Lexer) -> Result<String, String> {
+pub(crate) fn parse_field_name_with_optional_parens(lex: &mut Lexer) -> Result<Vec<u8>, String> {
     let has_parens = lex.is_keyword(&["("]);
     if has_parens {
         lex.next_token();
@@ -469,7 +476,7 @@ pub(crate) fn parse_field_name_with_optional_parens(lex: &mut Lexer) -> Result<S
         if !lex.is_keyword(&[")"]) {
             return Err(format!(
                 "missing ')' after '{}'",
-                crate::parser::quote_token_if_needed(&field_name)
+                crate::parser::quote_token_bytes_if_needed(&field_name)
             ));
         }
         lex.next_token();
@@ -580,10 +587,10 @@ pub(crate) fn parse_offset(lex: &mut Lexer) -> Result<u64, String> {
 }
 
 /// Port of Go `getUniqueResultName`.
-pub(crate) fn get_unique_result_name(result_name: &str, by_fields: &[String]) -> String {
-    let mut result_name = result_name.to_string();
+pub(crate) fn get_unique_result_name(result_name: &[u8], by_fields: &[Vec<u8>]) -> Vec<u8> {
+    let mut result_name = result_name.to_vec();
     while by_fields.iter().any(|f| f == &result_name) {
-        result_name.push('s');
+        result_name.push(b's');
     }
     result_name
 }
@@ -591,7 +598,7 @@ pub(crate) fn get_unique_result_name(result_name: &str, by_fields: &[String]) ->
 /// Port of Go `parseBySortFields`, returning `(name, is_desc)` pairs. Callers
 /// map these to their own `bySortField` type (`pipe_sort` vs `stats_json_values`
 /// have distinct types).
-pub(crate) fn parse_by_sort_fields_raw(lex: &mut Lexer) -> Result<Vec<(String, bool)>, String> {
+pub(crate) fn parse_by_sort_fields_raw(lex: &mut Lexer) -> Result<Vec<(Vec<u8>, bool)>, String> {
     if !lex.is_keyword(&["("]) {
         return Err("missing `(`".to_string());
     }
@@ -625,7 +632,7 @@ pub(crate) fn parse_by_sort_fields_raw(lex: &mut Lexer) -> Result<Vec<(String, b
 }
 
 /// Port of Go `parseRankFieldName`.
-pub(crate) fn parse_rank_field_name(lex: &mut Lexer) -> Result<String, String> {
+pub(crate) fn parse_rank_field_name(lex: &mut Lexer) -> Result<Vec<u8>, String> {
     if !lex.is_keyword(&["rank"]) {
         return Err(format!(
             "unexpected token: {}; want 'rank'",
@@ -633,7 +640,7 @@ pub(crate) fn parse_rank_field_name(lex: &mut Lexer) -> Result<String, String> {
         ));
     }
     lex.next_token();
-    let mut rank_field_name = "rank".to_string();
+    let mut rank_field_name = b"rank".to_vec();
     if lex.is_keyword(&["as"]) {
         lex.next_token();
         if lex.is_keyword(&["("]) || lex.is_query_part_trailer() {

@@ -153,9 +153,9 @@ impl fmt::Display for Field {
     }
 }
 
-pub fn get_field_value_by_name<'a>(fields: &'a [Field], name: &str) -> &'a [u8] {
+pub fn get_field_value_by_name<'a>(fields: &'a [Field], name: &[u8]) -> &'a [u8] {
     for f in fields {
-        if f.name == name.as_bytes() {
+        if f.name == name {
             return &f.value;
         }
     }
@@ -436,7 +436,7 @@ fn add_field_if_needed(
     value: &[u8],
 ) {
     let name = crate::log_rows::get_canonical_column_name_bytes(name);
-    if pf.match_string_bytes(name) {
+    if pf.match_string(name) {
         dst.push(Field {
             name: name.to_vec(),
             value: value.to_vec(),
@@ -472,10 +472,11 @@ impl Fields {
         self.fields.clear();
     }
 
-    /// Adds (name, value) field to f.
-    pub fn add(&mut self, name: &str, value: impl AsRef<[u8]>) {
+    /// Adds (name, value) field to f. Names are raw bytes (Go strings);
+    /// `&str` literals coerce via `AsRef<[u8]>`.
+    pub fn add(&mut self, name: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
         self.fields.push(Field {
-            name: name.as_bytes().to_vec(),
+            name: name.as_ref().to_vec(),
             value: value.as_ref().to_vec(),
         });
     }

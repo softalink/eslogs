@@ -44,7 +44,7 @@ pub(crate) struct FilterAnyCasePrefix {
 }
 
 pub(crate) fn new_filter_any_case_prefix(
-    field_name: &str,
+    field_name: &[u8],
     prefix: impl AsRef<[u8]>,
 ) -> FilterGeneric {
     new_filter_generic(
@@ -122,7 +122,7 @@ impl FieldFilter for FilterAnyCasePrefix {
         )
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let v = get_field_value_by_name(fields, field_name);
         match_any_case_prefix(v, self.get_prefix_lowercase())
     }
@@ -131,7 +131,7 @@ impl FieldFilter for FilterAnyCasePrefix {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let prefix_lowercase = self.get_prefix_lowercase().to_vec();
         apply_to_block_result_generic(br, bm, field_name, &prefix_lowercase, match_any_case_prefix);
@@ -141,7 +141,7 @@ impl FieldFilter for FilterAnyCasePrefix {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let prefix_lowercase = self.get_prefix_lowercase().to_vec();
 

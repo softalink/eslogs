@@ -54,7 +54,7 @@ pub(crate) struct FilterJSONArrayContainsAny {
 }
 
 pub(crate) fn new_filter_json_array_contains_any(
-    field_name: &str,
+    field_name: &[u8],
     values: Vec<Vec<u8>>,
 ) -> FilterGeneric {
     new_filter_generic(
@@ -103,7 +103,7 @@ impl FieldFilter for FilterJSONArrayContainsAny {
         format!("json_array_contains_any({args})")
     }
 
-    fn match_row_by_field(&self, fields: &[Field], field_name: &str) -> bool {
+    fn match_row_by_field(&self, fields: &[Field], field_name: &[u8]) -> bool {
         let tokenss = &self.get_tokens().0;
         let v = get_field_value_by_name(fields, field_name);
         match_json_array_contains_any(v, &self.values, tokenss)
@@ -113,7 +113,7 @@ impl FieldFilter for FilterJSONArrayContainsAny {
         &self,
         br: &mut BlockResult,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let tokenss = &self.get_tokens().0;
 
@@ -149,7 +149,7 @@ impl FieldFilter for FilterJSONArrayContainsAny {
         &self,
         bs: &mut BlockSearch<'_>,
         bm: &mut Bitmap,
-        field_name: &str,
+        field_name: &[u8],
     ) {
         let v = bs.get_const_column_value(field_name);
         if !v.is_empty() {

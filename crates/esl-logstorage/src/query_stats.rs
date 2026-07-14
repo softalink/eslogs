@@ -150,7 +150,7 @@ impl QueryStats {
 
         let mut err_global: Option<String> = None;
         let mut get_uint64_entry = |name: &str| -> u64 {
-            let Some(c) = db.get_column_by_name(name) else {
+            let Some(c) = db.get_column_by_name(name.as_bytes()) else {
                 if err_global.is_none() {
                     err_global = Some(format!(
                         "cannot find field {name:?} in query stats received from the remote storage"

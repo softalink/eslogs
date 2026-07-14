@@ -1020,13 +1020,8 @@ pub(crate) fn process_query_request(storage: &Arc<Storage>, req: &Request, w: &m
                         return;
                     }
                 };
-                // These are field NAMES (Field.name is String in the engine),
-                // so they are valid UTF-8 by construction; lossy is a no-op
-                // safeguard on a name path, not a value path.
-                let mut fields: Vec<String> = field_names
-                    .into_iter()
-                    .map(|vh| String::from_utf8_lossy(&vh.value).into_owned())
-                    .collect();
+                // Field names are raw bytes end-to-end.
+                let mut fields: Vec<Vec<u8>> = field_names.into_iter().map(|vh| vh.value).collect();
                 fields.sort();
                 ca.q.add_pipe_fields(&fields);
                 fields

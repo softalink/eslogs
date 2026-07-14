@@ -32,7 +32,7 @@ pub struct IfFilter {
     /// pipe-local `IfFilter` placeholder (which recomputes this), so the
     /// canonical copy is currently only read in tests.
     #[allow(dead_code)]
-    pub(crate) allow_filters: Vec<String>,
+    pub(crate) allow_filters: Vec<Vec<u8>>,
 }
 
 impl IfFilter {
@@ -105,7 +105,7 @@ mod tests {
     fn test_parse_if_filter_success() {
         let iff = parse("if (foo:bar)").unwrap();
         assert_eq!(iff.to_string(), "if (foo:bar)");
-        assert_eq!(iff.allow_filters, vec!["foo".to_string()]);
+        assert_eq!(iff.allow_filters, vec![b"foo".to_vec()]);
     }
 
     #[test]

@@ -90,8 +90,8 @@ pub fn request_handler<S: LogRowsStorage>(
             );
             let time_fields: Vec<&str> = cp.time_fields.iter().map(String::as_str).collect();
             let msg_fields: Vec<&str> = cp.msg_fields.iter().map(String::as_str).collect();
-            let preserve_keys: Vec<&str> =
-                cp.preserve_json_keys.iter().map(String::as_str).collect();
+            let preserve_keys: Vec<&[u8]> =
+                cp.preserve_json_keys.iter().map(|s| s.as_bytes()).collect();
 
             // Precompute the error-report context from `req` before the
             // limiter reader borrows it mutably (the reader's Drop otherwise
@@ -174,7 +174,7 @@ fn read_bulk_request<S: LogRowsStorage>(
     r: &mut dyn Read,
     time_fields: &[&str],
     msg_fields: &[&str],
-    preserve_keys: &[&str],
+    preserve_keys: &[&[u8]],
     lmp: &mut LogMessageProcessor<'_, S>,
 ) -> (usize, Result<(), String>) {
     // See https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
@@ -202,7 +202,7 @@ fn read_bulk_line<S: LogRowsStorage>(
     lr: &mut LineReader,
     time_fields: &[&str],
     msg_fields: &[&str],
-    preserve_keys: &[&str],
+    preserve_keys: &[&[u8]],
     lmp: &mut LogMessageProcessor<'_, S>,
     fields_buf: &mut Vec<Field>,
 ) -> (bool, Option<String>) {

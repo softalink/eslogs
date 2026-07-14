@@ -140,31 +140,32 @@ fn is_equal_prev_row(col_values: &[Vec<Vec<u8>>], row_idx: usize) -> bool {
     true
 }
 
-fn rank_field_name_string(name: &str) -> String {
+fn rank_field_name_string(name: &[u8]) -> String {
     let mut s = " rank".to_string();
-    if name != "rank" {
+    if name != b"rank" {
         s += " as ";
-        s += name;
+        // Go: quoteTokenIfNeeded(rankFieldName).
+        s += &crate::parser::quote_token_bytes_if_needed(name);
     }
     s
 }
 
 /// The `| top ...` pipe.
 pub struct PipeTop {
-    by_fields: Vec<String>,
+    by_fields: Vec<Vec<u8>>,
     limit: u64,
     limit_str: String,
-    hits_field_name: String,
-    rank_field_name: String,
+    hits_field_name: Vec<u8>,
+    rank_field_name: Vec<u8>,
 }
 
 /// Builds a [`PipeTop`] (Go `parsePipeTop` result).
 pub(crate) fn new_pipe_top(
-    by_fields: Vec<String>,
+    by_fields: Vec<Vec<u8>>,
     limit: u64,
     limit_str: String,
-    hits_field_name: String,
-    rank_field_name: String,
+    hits_field_name: Vec<u8>,
+    rank_field_name: Vec<u8>,
 ) -> PipeTop {
     PipeTop {
         by_fields,
@@ -179,7 +180,7 @@ impl Pipe for PipeTop {
     /// Port of Go `pipeTop.splitToRemoteAndLocal`: every node counts hits per
     /// group; the local side sums them and selects the top groups.
     fn split_to_remote_and_local(&self, timestamp: i64) -> crate::pipe::SplitPipesResult {
-        let hits_quoted = crate::stream_filter::quote_token_if_needed(&self.hits_field_name);
+        let hits_quoted = crate::parser::quote_token_bytes_if_needed(&self.hits_field_name);
         let fields_quoted = crate::stats_count::field_names_string(&self.by_fields);
 
         let mut p_local_str = format!(
@@ -192,7 +193,7 @@ impl Pipe for PipeTop {
         p_local_str += &format!(" | fields {fields_quoted}, {hits_quoted}");
         if !self.rank_field_name.is_empty() {
             p_local_str += ", ";
-            p_local_str += &crate::stream_filter::quote_token_if_needed(&self.rank_field_name);
+            p_local_str += &crate::parser::quote_token_bytes_if_needed(&self.rank_field_name);
         }
 
         let ps_local = crate::pipe::must_parse_pipes(&p_local_str, timestamp);
@@ -209,10 +210,14 @@ impl Pipe for PipeTop {
             s += " ";
             s += &self.limit_str;
         }
-        s += &format!(" by ({})", self.by_fields.join(", "));
-        if self.hits_field_name != "hits" {
+        s += &format!(
+            " by ({})",
+            crate::stats_count::field_names_string(&self.by_fields)
+        );
+        if self.hits_field_name != b"hits" {
             s += " hits as ";
-            s += &self.hits_field_name;
+            // Go: quoteTokenIfNeeded(pt.hitsFieldName).
+            s += &crate::parser::quote_token_bytes_if_needed(&self.hits_field_name);
         }
         if !self.rank_field_name.is_empty() {
             s += &rank_field_name_string(&self.rank_field_name);
@@ -261,10 +266,10 @@ impl Shard {
 }
 
 struct PipeTopProcessor {
-    by_fields: Arc<Vec<String>>,
+    by_fields: Arc<Vec<Vec<u8>>>,
     limit: u64,
-    hits_field_name: String,
-    rank_field_name: String,
+    hits_field_name: Vec<u8>,
+    rank_field_name: Vec<u8>,
     stop: Arc<AtomicBool>,
     pp_next: Arc<dyn PipeProcessor>,
     shards: Vec<Mutex<Shard>>,
@@ -310,7 +315,7 @@ impl PipeTopProcessor {
         shard.key_buf = key_buf;
     }
 
-    fn update_single_column(&self, shard: &mut Shard, br: &mut BlockResult, field_name: &str) {
+    fn update_single_column(&self, shard: &mut Shard, br: &mut BlockResult, field_name: &[u8]) {
         let c = br.get_column_by_name(field_name);
         if br.column_is_const(c) {
             let v = br.column_get_value_at_row(c, 0).to_vec();
@@ -397,17 +402,17 @@ impl PipeTopProcessor {
             .by_fields
             .iter()
             .map(|name| ResultColumn {
-                name: name.clone().into_bytes(),
+                name: name.clone(),
                 values: Vec::new(),
             })
             .collect();
         rcs.push(ResultColumn {
-            name: self.hits_field_name.clone().into_bytes(),
+            name: self.hits_field_name.clone(),
             values: Vec::new(),
         });
         if has_rank {
             rcs.push(ResultColumn {
-                name: self.rank_field_name.clone().into_bytes(),
+                name: self.rank_field_name.clone(),
                 values: Vec::new(),
             });
         }
@@ -580,11 +585,11 @@ mod tests {
     #[test]
     fn test_top_single_field_ordered_by_hits() {
         let pt = new_pipe_top(
-            vec!["x".to_string()],
+            vec![b"x".to_vec()],
             10,
             String::new(),
-            "hits".to_string(),
-            String::new(),
+            b"hits".to_vec(),
+            Vec::new(),
         );
         let out = run(
             &pt,
@@ -607,11 +612,11 @@ mod tests {
     #[test]
     fn test_top_limit_truncates() {
         let pt = new_pipe_top(
-            vec!["x".to_string()],
+            vec![b"x".to_vec()],
             1,
             "1".to_string(),
-            "hits".to_string(),
-            String::new(),
+            b"hits".to_vec(),
+            Vec::new(),
         );
         let out = run(
             &pt,
@@ -629,11 +634,11 @@ mod tests {
     #[test]
     fn test_top_rank_field() {
         let pt = new_pipe_top(
-            vec!["x".to_string()],
+            vec![b"x".to_vec()],
             10,
             String::new(),
-            "hits".to_string(),
-            "rank".to_string(),
+            b"hits".to_vec(),
+            b"rank".to_vec(),
         );
         let out = run(
             &pt,
@@ -651,11 +656,11 @@ mod tests {
     #[test]
     fn test_top_two_fields() {
         let pt = new_pipe_top(
-            vec!["a".to_string(), "b".to_string()],
+            vec![b"a".to_vec(), b"b".to_vec()],
             10,
             String::new(),
-            "hits".to_string(),
-            String::new(),
+            b"hits".to_vec(),
+            Vec::new(),
         );
         let out = run(
             &pt,
@@ -675,11 +680,11 @@ mod tests {
     #[test]
     fn test_top_to_string() {
         let pt = new_pipe_top(
-            vec!["x".to_string()],
+            vec![b"x".to_vec()],
             5,
             "5".to_string(),
-            "hits".to_string(),
-            String::new(),
+            b"hits".to_vec(),
+            Vec::new(),
         );
         assert_eq!(pt.to_string(), "top 5 by (x)");
     }
