@@ -26,15 +26,17 @@
 //! PORT NOTE (byte matching / invalid UTF-8 haystacks): matching is done with
 //! [`regex::bytes::Regex`] on raw value bytes, mirroring Go's `regexp` which
 //! matches `[]byte`/`string` payloads byte-wise. For valid-UTF-8 haystacks the
-//! two engines agree exactly. For haystacks containing invalid UTF-8 there is
-//! one narrow residual: Go decodes each invalid byte as U+FFFD
-//! (`utf8.DecodeRune`), so rune-oriented constructs (`.`, negated classes,
-//! `\p{...}`, a literal `\x{FFFD}`) match such bytes; `regex::bytes` in its
-//! default Unicode mode only lets rune-oriented constructs match well-formed
-//! UTF-8 sequences, so they simply fail to match invalid bytes. Literal and
-//! positive-class matching is byte-exact and identical, and payload bytes are
-//! never lossily transcoded. See `tests::test_bytes_regex_invalid_utf8_probe`
-//! for the pinned behavior.
+//! two engines agree exactly. For haystacks containing invalid UTF-8, Go decodes
+//! each invalid byte as U+FFFD (`utf8.DecodeRune` returns `(RuneError, 1)` per
+//! invalid byte); `regex::bytes` in Unicode mode would instead not match invalid
+//! bytes with rune-oriented constructs. [`Regex::match_bytes`] /
+//! [`PromRegex::match_bytes`] therefore run [`go_utf8_replace`] first — one
+//! U+FFFD per invalid byte via `slice::utf8_chunks` — so `.`, negated classes,
+//! `\p{...}` and a literal U+FFFD all match invalid bytes exactly like Go, while
+//! valid-UTF-8 haystacks are returned unchanged (byte-identical). See
+//! `tests::test_regex_match_bytes_invalid_utf8` (the port matchers) and
+//! `tests::test_bytes_regex_invalid_utf8_probe` (the underlying `regex::bytes`
+//! behavior the wrapper compensates for).
 
 mod goclass;
 mod gofold;
@@ -548,6 +550,10 @@ impl PromRegex {
     /// The regex is automatically anchored to the beginning and to the end
     /// of the matching string with '^' and '$'.
     pub fn match_bytes(&self, s: &[u8]) -> bool {
+        // Match over the haystack as Go's `regexp` decodes a `[]byte` (invalid
+        // bytes → U+FFFD); a no-op for valid UTF-8 (the common case).
+        let s = go_utf8_replace(s);
+        let s: &[u8] = &s;
         if self.is_only_prefix {
             return s == self.prefix.as_bytes();
         }
@@ -589,6 +595,31 @@ impl PromRegex {
         // Fall back to slow path by matching the original regexp.
         self.re_suffix.is_match(s)
     }
+}
+
+/// Rewrites `s` the way Go's `regexp` sees a `[]byte` haystack: valid UTF-8 is
+/// left as-is, and every invalid byte becomes `U+FFFD` — Go's `utf8.DecodeRune`
+/// returns `(RuneError, 1)` per invalid byte, so `slice::utf8_chunks` emitting
+/// one `U+FFFD` per byte of each invalid chunk reproduces it exactly.
+///
+/// Returns `s` unchanged when it is already valid UTF-8 (the common case), so
+/// valid haystacks still match byte-for-byte. Applied only on the regex-engine
+/// slow path, so the byte-literal fast paths (prefix/substr/or) stay byte-exact;
+/// it makes rune-oriented constructs (`.`, negated classes, `\p{…}`) match
+/// invalid bytes as Go does. `re()`/`=~`/`!~` filtering only — capture
+/// extraction still returns the raw bytes.
+fn go_utf8_replace(s: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if std::str::from_utf8(s).is_ok() {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = Vec::with_capacity(s.len());
+    for chunk in s.utf8_chunks() {
+        out.extend_from_slice(chunk.valid().as_bytes());
+        for _ in 0..chunk.invalid().len() {
+            out.extend_from_slice("\u{FFFD}".as_bytes());
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 impl std::fmt::Display for PromRegex {
@@ -694,6 +725,10 @@ impl Regex {
     /// Returns true if the raw bytes `s` match the regex (Go matches
     /// `string`/`[]byte` payloads byte-wise; this is the primary matcher).
     pub fn match_bytes(&self, s: &[u8]) -> bool {
+        // Match over the haystack as Go's `regexp` decodes a `[]byte` (invalid
+        // bytes → U+FFFD); a no-op for valid UTF-8 (the common case).
+        let s = go_utf8_replace(s);
+        let s: &[u8] = &s;
         if self.is_only_prefix {
             if self.prefix.is_empty() {
                 return true;

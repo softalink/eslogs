@@ -467,14 +467,6 @@ what remains in section (a) is confirmed-present divergence.
   (deliberate: no `expect`-panic API). (`\p{...}` classes are now accepted and
   `\b` is ASCII like Go. The simplified-regex `String()` printable-rune escaping
   now matches Go exactly — see the `strconv.IsPrint` note below.)
-- `regexutil` (invalid-UTF-8 haystacks) — regex matching runs on raw value
-  bytes via `regex::bytes::Regex` (Go `regexp` matches byte payloads too), so
-  valid-UTF-8 haystacks and literal/positive-class matching over invalid bytes
-  are byte-exact. One narrow residual: Go decodes each invalid byte as `U+FFFD`
-  (`utf8.DecodeRune`), so rune-oriented constructs (`.`, negated classes,
-  `\p{...}`) match such bytes; `regex::bytes` in its default Unicode mode only
-  matches well-formed UTF-8 there, so they don't. Irreducible without a custom
-  rune-stepping engine; pinned by `test_bytes_regex_invalid_utf8_probe`.
 - `fs/mod.rs:11` + `filestream.rs:215/:389` — file-close errors are swallowed
   (file closed on `Drop`) where Go's `MustClose` panics. (The `must_mkdir`
   0777-vs-0755 divergence is closed: `must_mkdir` now sets mode `0o755`
@@ -572,7 +564,14 @@ what remains in section (a) is confirmed-present divergence.
    civil-time math, xxhash streams, and `strconv.IsPrint`/`unicode.IsPrint`
    (`strconv_isprint.rs` — compact `isprint.go` tables cross-checked over all
    `0x0..=0x10FFFF`, so JSON key re-quoting, `go_quote`, and simplified-regex
-   `String()` escape printable runes exactly like Go).
+   `String()` escape printable runes exactly like Go). Also `regexutil` value
+   matching over **invalid-UTF-8 haystacks**: `re()`/`=~`/`!~` decode each
+   invalid byte to `U+FFFD` before matching (`go_utf8_replace`, one `U+FFFD`
+   per invalid byte via `slice::utf8_chunks`, matching Go's `utf8.DecodeRune`
+   which returns size 1 per invalid byte), so rune-oriented constructs (`.`,
+   negated classes, `\p{…}`) and literal `U+FFFD` patterns match such bytes
+   exactly like Go's `regexp` over a `[]byte`; valid-UTF-8 haystacks are a
+   no-op (byte-identical).
 7. **Byte/string ownership shims** — `[]byte` aliasing → owned
    `Vec<u8>`/`String`, unsafe string views → safe (~55).
 8. **`(n, err)`/EOF/nil-receiver idioms → `Result`/`Option`** and

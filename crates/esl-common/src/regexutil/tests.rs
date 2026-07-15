@@ -738,6 +738,24 @@ fn test_bytes_regex_invalid_utf8_probe() {
 }
 
 #[test]
+fn test_regex_match_bytes_invalid_utf8() {
+    let f = |expr: &str, s: &[u8]| Regex::new(expr).unwrap().match_bytes(s);
+    // Rune-oriented constructs now match invalid bytes decoded as U+FFFD,
+    // matching Go's `regexp` over a `[]byte` (the closed residual).
+    assert!(f("a.c", b"a\xffc"));
+    assert!(f("a[^b]c", b"a\xffc"));
+    assert!(f("a\u{FFFD}c", b"a\xffc"));
+    assert!(f("a.c", b"a\x80c"));
+    assert!(f("(?s)^a.*c$", b"a\xff\xffc"));
+    // \p{L} still does NOT match U+FFFD (a symbol), like Go.
+    assert!(!f(r"a\p{L}c", b"a\xffc"));
+    // Valid-UTF-8 matching is unchanged (byte-exact).
+    assert!(f("a.c", "abc".as_bytes()));
+    assert!(!f("a.c", b"axyc"));
+    assert!(f("a.c", "a\u{00e9}c".as_bytes())); // multi-byte codepoint
+}
+
+#[test]
 fn test_regex_match_bytes() {
     fn f(expr: &str, s: &[u8], result_expected: bool) {
         let r = Regex::new(expr).unwrap_or_else(|err| panic!("cannot parse {expr:?}: {err}"));
