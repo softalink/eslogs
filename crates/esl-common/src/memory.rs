@@ -10,12 +10,14 @@ static ALLOWED_PERCENT: Flag<f64> = Flag::new(
     "Allowed percent of system memory Softalink LLC caches may occupy. See also -memory.allowedBytes. Too low a value may increase cache miss rate usually resulting in higher CPU and disk IO usage. Too high a value may evict too much data from the OS page cache which will result in higher disk IO usage",
     || 60.0,
 );
+crate::register_flag!(ALLOWED_PERCENT);
 
 static ALLOWED_BYTES: Flag<Bytes> = Flag::new(
     "memory.allowedBytes",
     "Allowed size of system memory Softalink LLC caches may occupy. This option overrides -memory.allowedPercent if set to a non-zero value. Too low a value may increase the cache miss rate usually resulting in higher CPU and disk IO usage. Too high a value may evict too much data from the OS page cache resulting in higher disk IO usage. The process may behave unexpectedly if this flag is set too small (e.g., 1 byte).",
     || Bytes::with_default(0),
 );
+crate::register_flag!(ALLOWED_BYTES);
 
 struct MemLimits {
     allowed: usize,

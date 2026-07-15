@@ -29,6 +29,7 @@ static HTTP_LISTEN_ADDR: Flag<ArrayString> = Flag::new(
     // the fallback applied below, not a base that CLI addresses append to.
     ArrayString::default,
 );
+esl_common::register_flag!(HTTP_LISTEN_ADDR);
 
 static TMP_DATA_PATH: Flag<String> = Flag::new(
     "tmpDataPath",
@@ -37,6 +38,7 @@ static TMP_DATA_PATH: Flag<String> = Flag::new(
      and -fileCollector.checkpointsPath unless those flags are set explicitly",
     String::new,
 );
+esl_common::register_flag!(TMP_DATA_PATH);
 
 fn main() {
     // Install signal handlers before any long-running setup (see

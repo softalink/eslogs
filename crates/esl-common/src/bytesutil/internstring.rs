@@ -14,12 +14,14 @@ static INTERN_STRING_MAX_LEN: Flag<i64> = Flag::new(
      See https://en.wikipedia.org/wiki/String_interning . See also -internStringDisableCache and -internStringCacheExpireDuration",
     || 500,
 );
+crate::register_flag!(INTERN_STRING_MAX_LEN);
 static DISABLE_CACHE: Flag<bool> = Flag::new(
     "internStringDisableCache",
     "Whether to disable caches for interned strings. This may reduce memory usage at the cost of higher CPU usage. \
      See https://en.wikipedia.org/wiki/String_interning . See also -internStringCacheExpireDuration and -internStringMaxLen",
     || false,
 );
+crate::register_flag!(DISABLE_CACHE);
 // PORT NOTE: `flagutil` has no Duration flag type yet (ported in parallel);
 // the flag holds the Go duration string and is parsed by the private
 // `parse_go_duration` helper below.
@@ -29,6 +31,7 @@ static CACHE_EXPIRE_DURATION: Flag<String> = Flag::new(
      See https://en.wikipedia.org/wiki/String_interning . See also -internStringMaxLen and -internStringDisableCache",
     || "6m".to_string(),
 );
+crate::register_flag!(CACHE_EXPIRE_DURATION);
 
 pub(super) fn cache_expire_duration() -> Duration {
     static D: OnceLock<Duration> = OnceLock::new();

@@ -70,6 +70,7 @@ static RETENTION_PERIOD: Flag<RetentionDuration> = Flag::new(
      see https://docs.victoriametrics.com/victorialogs/#retention",
     || retention("7d"),
 );
+esl_common::register_flag!(RETENTION_PERIOD);
 
 static DEFAULT_PARALLEL_READERS: Flag<usize> = Flag::new(
     "defaultParallelReaders",
@@ -78,6 +79,7 @@ static DEFAULT_PARALLEL_READERS: Flag<usize> = Flag::new(
      such as NFS or S3 at the cost of higher RAM usage",
     || 2 * cgroup::available_cpus(),
 );
+esl_common::register_flag!(DEFAULT_PARALLEL_READERS);
 
 static MAX_DISK_SPACE_USAGE_BYTES: Flag<Bytes> = Flag::new(
     "retention.maxDiskSpaceUsageBytes",
@@ -85,6 +87,7 @@ static MAX_DISK_SPACE_USAGE_BYTES: Flag<Bytes> = Flag::new(
      automatically dropped; see https://docs.victoriametrics.com/victorialogs/#retention-by-disk-space-usage",
     || Bytes::with_default(0),
 );
+esl_common::register_flag!(MAX_DISK_SPACE_USAGE_BYTES);
 
 static MAX_DISK_USAGE_PERCENT: Flag<i64> = Flag::new(
     "retention.maxDiskUsagePercent",
@@ -93,6 +96,7 @@ static MAX_DISK_USAGE_PERCENT: Flag<i64> = Flag::new(
      exclusive with -retention.maxDiskSpaceUsageBytes",
     || 0,
 );
+esl_common::register_flag!(MAX_DISK_USAGE_PERCENT);
 
 static FUTURE_RETENTION: Flag<RetentionDuration> = Flag::new(
     "futureRetention",
@@ -100,6 +104,7 @@ static FUTURE_RETENTION: Flag<RetentionDuration> = Flag::new(
      ingestion; see https://docs.victoriametrics.com/victorialogs/#retention",
     || retention("2d"),
 );
+esl_common::register_flag!(FUTURE_RETENTION);
 
 static MAX_BACKFILL_AGE: Flag<RetentionDuration> = Flag::new(
     "maxBackfillAge",
@@ -107,6 +112,7 @@ static MAX_BACKFILL_AGE: Flag<RetentionDuration> = Flag::new(
      ingestion; see https://docs.victoriametrics.com/victorialogs/#backfilling",
     || retention("0"),
 );
+esl_common::register_flag!(MAX_BACKFILL_AGE);
 
 static SNAPSHOTS_MAX_AGE: Flag<RetentionDuration> = Flag::new(
     "snapshotsMaxAge",
@@ -115,6 +121,7 @@ static SNAPSHOTS_MAX_AGE: Flag<RetentionDuration> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/#how-to-remove-snapshots",
     || retention("3d"),
 );
+esl_common::register_flag!(SNAPSHOTS_MAX_AGE);
 
 static STORAGE_DATA_PATH: Flag<String> = Flag::new(
     "storageDataPath",
@@ -122,6 +129,7 @@ static STORAGE_DATA_PATH: Flag<String> = Flag::new(
      see https://docs.victoriametrics.com/victorialogs/#storage",
     || "es-logs-data".to_string(),
 );
+esl_common::register_flag!(STORAGE_DATA_PATH);
 
 static INMEMORY_DATA_FLUSH_INTERVAL: Flag<ExtendedDuration> = Flag::new(
     "inmemoryDataFlushInterval",
@@ -129,6 +137,7 @@ static INMEMORY_DATA_FLUSH_INTERVAL: Flag<ExtendedDuration> = Flag::new(
      unclean shutdowns such as OOM crash, hardware reset, SIGKILL, etc. Minimum supported value is 1s",
     || ExtendedDuration::parse_flag("5s").expect("BUG: invalid built-in flush-interval default"),
 );
+esl_common::register_flag!(INMEMORY_DATA_FLUSH_INTERVAL);
 
 static LOG_NEW_STREAMS: Flag<bool> = Flag::new(
     "logNewStreams",
@@ -136,6 +145,7 @@ static LOG_NEW_STREAMS: Flag<bool> = Flag::new(
      issues with log streams; see also -logIngestedRows",
     || false,
 );
+esl_common::register_flag!(LOG_NEW_STREAMS);
 
 static LOG_INGESTED_ROWS: Flag<bool> = Flag::new(
     "logIngestedRows",
@@ -143,12 +153,14 @@ static LOG_INGESTED_ROWS: Flag<bool> = Flag::new(
      ingestion; see also -logNewStreams",
     || false,
 );
+esl_common::register_flag!(LOG_INGESTED_ROWS);
 
 static MIN_FREE_DISK_SPACE_BYTES: Flag<Bytes> = Flag::new(
     "storage.minFreeDiskSpaceBytes",
     "The minimum free disk space at -storageDataPath after which the storage stops accepting new data",
     || Bytes::with_default(10e6 as i64),
 );
+esl_common::register_flag!(MIN_FREE_DISK_SPACE_BYTES);
 
 static LOG_NEW_STREAMS_AUTH_KEY: Flag<Password> = Flag::new(
     "logNewStreamsAuthKey",
@@ -156,6 +168,7 @@ static LOG_NEW_STREAMS_AUTH_KEY: Flag<Password> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/#logging-new-streams",
     || Password::new("logNewStreamsAuthKey"),
 );
+esl_common::register_flag!(LOG_NEW_STREAMS_AUTH_KEY);
 
 static FORCE_MERGE_AUTH_KEY: Flag<Password> = Flag::new(
     "forceMergeAuthKey",
@@ -163,6 +176,7 @@ static FORCE_MERGE_AUTH_KEY: Flag<Password> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/#forced-merge",
     || Password::new("forceMergeAuthKey"),
 );
+esl_common::register_flag!(FORCE_MERGE_AUTH_KEY);
 
 static FORCE_FLUSH_AUTH_KEY: Flag<Password> = Flag::new(
     "forceFlushAuthKey",
@@ -170,6 +184,7 @@ static FORCE_FLUSH_AUTH_KEY: Flag<Password> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/#forced-flush",
     || Password::new("forceFlushAuthKey"),
 );
+esl_common::register_flag!(FORCE_FLUSH_AUTH_KEY);
 
 static PARTITION_MANAGE_AUTH_KEY: Flag<Password> = Flag::new(
     "partitionManageAuthKey",
@@ -177,6 +192,7 @@ static PARTITION_MANAGE_AUTH_KEY: Flag<Password> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/#partitions-lifecycle",
     || Password::new("partitionManageAuthKey"),
 );
+esl_common::register_flag!(PARTITION_MANAGE_AUTH_KEY);
 
 static STORAGE_NODE_ADDRS: Flag<ArrayString> = Flag::new(
     "storageNode",
@@ -185,12 +201,14 @@ static STORAGE_NODE_ADDRS: Flag<ArrayString> = Flag::new(
      queried locally from -storageDataPath",
     ArrayString::default,
 );
+esl_common::register_flag!(STORAGE_NODE_ADDRS);
 
 static INSERT_CONCURRENCY: Flag<usize> = Flag::new(
     "insert.concurrency",
     "The average number of concurrent data ingestion requests, which can be sent to every -storageNode",
     || 2,
 );
+esl_common::register_flag!(INSERT_CONCURRENCY);
 
 static INSERT_DISABLE_COMPRESSION: Flag<bool> = Flag::new(
     "insert.disableCompression",
@@ -198,6 +216,7 @@ static INSERT_DISABLE_COMPRESSION: Flag<bool> = Flag::new(
      Disabled compression reduces CPU usage at the cost of higher network usage",
     || false,
 );
+esl_common::register_flag!(INSERT_DISABLE_COMPRESSION);
 
 static SELECT_DISABLE_COMPRESSION: Flag<bool> = Flag::new(
     "select.disableCompression",
@@ -205,12 +224,14 @@ static SELECT_DISABLE_COMPRESSION: Flag<bool> = Flag::new(
      Disabled compression reduces CPU usage at the cost of higher network usage",
     || false,
 );
+esl_common::register_flag!(SELECT_DISABLE_COMPRESSION);
 
 static STORAGE_NODE_USERNAME: Flag<ArrayString> = Flag::new(
     "storageNode.username",
     "Optional basic auth username to use for the corresponding -storageNode",
     ArrayString::default,
 );
+esl_common::register_flag!(STORAGE_NODE_USERNAME);
 
 static STORAGE_NODE_USERNAME_FILE: Flag<ArrayString> = Flag::new(
     "storageNode.usernameFile",
@@ -218,12 +239,14 @@ static STORAGE_NODE_USERNAME_FILE: Flag<ArrayString> = Flag::new(
      The file is re-read every second",
     ArrayString::default,
 );
+esl_common::register_flag!(STORAGE_NODE_USERNAME_FILE);
 
 static STORAGE_NODE_PASSWORD: Flag<ArrayString> = Flag::new(
     "storageNode.password",
     "Optional basic auth password to use for the corresponding -storageNode",
     ArrayString::default,
 );
+esl_common::register_flag!(STORAGE_NODE_PASSWORD);
 
 static STORAGE_NODE_PASSWORD_FILE: Flag<ArrayString> = Flag::new(
     "storageNode.passwordFile",
@@ -231,12 +254,14 @@ static STORAGE_NODE_PASSWORD_FILE: Flag<ArrayString> = Flag::new(
      The file is re-read every second",
     ArrayString::default,
 );
+esl_common::register_flag!(STORAGE_NODE_PASSWORD_FILE);
 
 static STORAGE_NODE_BEARER_TOKEN: Flag<ArrayString> = Flag::new(
     "storageNode.bearerToken",
     "Optional bearer auth token to use for the corresponding -storageNode",
     ArrayString::default,
 );
+esl_common::register_flag!(STORAGE_NODE_BEARER_TOKEN);
 
 static STORAGE_NODE_BEARER_TOKEN_FILE: Flag<ArrayString> = Flag::new(
     "storageNode.bearerTokenFile",
@@ -244,6 +269,7 @@ static STORAGE_NODE_BEARER_TOKEN_FILE: Flag<ArrayString> = Flag::new(
      The token is re-read from the file every second",
     ArrayString::default,
 );
+esl_common::register_flag!(STORAGE_NODE_BEARER_TOKEN_FILE);
 
 static STORAGE_NODE_TLS: Flag<ArrayBool> = Flag::new(
     "storageNode.tls",
@@ -251,6 +277,7 @@ static STORAGE_NODE_TLS: Flag<ArrayBool> = Flag::new(
      By default communication is performed via HTTP",
     ArrayBool::default,
 );
+esl_common::register_flag!(STORAGE_NODE_TLS);
 
 static STORAGE_NODE_TLS_CA_FILE: Flag<ArrayString> = Flag::new(
     "storageNode.tlsCAFile",
@@ -258,18 +285,21 @@ static STORAGE_NODE_TLS_CA_FILE: Flag<ArrayString> = Flag::new(
      By default, system CA is used",
     ArrayString::default,
 );
+esl_common::register_flag!(STORAGE_NODE_TLS_CA_FILE);
 
 static STORAGE_NODE_TLS_CERT_FILE: Flag<ArrayString> = Flag::new(
     "storageNode.tlsCertFile",
     "Optional path to client-side TLS certificate file to use when connecting to the corresponding -storageNode",
     ArrayString::default,
 );
+esl_common::register_flag!(STORAGE_NODE_TLS_CERT_FILE);
 
 static STORAGE_NODE_TLS_KEY_FILE: Flag<ArrayString> = Flag::new(
     "storageNode.tlsKeyFile",
     "Optional path to client-side TLS certificate key to use when connecting to the corresponding -storageNode",
     ArrayString::default,
 );
+esl_common::register_flag!(STORAGE_NODE_TLS_KEY_FILE);
 
 static STORAGE_NODE_TLS_SERVER_NAME: Flag<ArrayString> = Flag::new(
     "storageNode.tlsServerName",
@@ -277,12 +307,14 @@ static STORAGE_NODE_TLS_SERVER_NAME: Flag<ArrayString> = Flag::new(
      By default, the server name from -storageNode is used",
     ArrayString::default,
 );
+esl_common::register_flag!(STORAGE_NODE_TLS_SERVER_NAME);
 
 static STORAGE_NODE_TLS_INSECURE_SKIP_VERIFY: Flag<ArrayBool> = Flag::new(
     "storageNode.tlsInsecureSkipVerify",
     "Whether to skip tls verification when connecting to the corresponding -storageNode",
     ArrayBool::default,
 );
+esl_common::register_flag!(STORAGE_NODE_TLS_INSECURE_SKIP_VERIFY);
 
 /// Returns the configured `-storageDataPath`.
 pub fn storage_data_path() -> &'static str {

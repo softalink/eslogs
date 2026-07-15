@@ -33,6 +33,7 @@ The fadvise() syscall prevents from eviction of recently accessed data from OS p
 In some rare cases it is better to disable the syscall if it uses too much CPU",
     || false,
 );
+crate::register_flag!(DISABLE_FADVISE);
 
 // Only the Linux stream tracker consumes this in non-test builds.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

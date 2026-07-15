@@ -19,16 +19,19 @@ static LOGGER_LEVEL: Flag<String> = Flag::new(
     "Minimum level of errors to log. Possible values: INFO, WARN, ERROR, FATAL, PANIC",
     || "INFO".to_string(),
 );
+crate::register_flag!(LOGGER_LEVEL);
 static LOGGER_FORMAT: Flag<String> = Flag::new(
     "loggerFormat",
     "Format for logs. Possible values: default, json",
     || "default".to_string(),
 );
+crate::register_flag!(LOGGER_FORMAT);
 static LOGGER_OUTPUT: Flag<String> = Flag::new(
     "loggerOutput",
     "Output for the logs. Supported values: stderr, stdout",
     || "stderr".to_string(),
 );
+crate::register_flag!(LOGGER_OUTPUT);
 // PORT NOTE: Go loads any IANA timezone via time.LoadLocation (with embedded
 // tzdata); the port has no IANA tzdb dependency, so only "UTC" (also ""),
 // and "Local" are supported — named zones are a fatal init error like Go's
@@ -39,29 +42,34 @@ static LOGGER_TIMEZONE: Flag<String> = Flag::new(
      For example: America/New_York, Europe/Berlin, Etc/GMT+3 or Local",
     || "UTC".to_string(),
 );
+crate::register_flag!(LOGGER_TIMEZONE);
 static DISABLE_TIMESTAMPS: Flag<bool> = Flag::new(
     "loggerDisableTimestamps",
     "Whether to disable writing timestamps in logs",
     || false,
 );
+crate::register_flag!(DISABLE_TIMESTAMPS);
 static MAX_LOG_ARG_LEN: Flag<i64> = Flag::new(
     "loggerMaxArgLen",
     "The maximum length of a single logged argument. Longer arguments are replaced with 'arg_start..arg_end', \
      where 'arg_start' and 'arg_end' is prefix and suffix of the arg with the length not exceeding -loggerMaxArgLen / 2",
     || 5000,
 );
+crate::register_flag!(MAX_LOG_ARG_LEN);
 static ERRORS_PER_SECOND_LIMIT: Flag<i64> = Flag::new(
     "loggerErrorsPerSecondLimit",
     "Per-second limit on the number of ERROR messages. If more than the given number of errors are emitted per second, \
      the remaining errors are suppressed. Zero values disable the rate limit",
     || 0,
 );
+crate::register_flag!(ERRORS_PER_SECOND_LIMIT);
 static WARNS_PER_SECOND_LIMIT: Flag<i64> = Flag::new(
     "loggerWarnsPerSecondLimit",
     "Per-second limit on the number of WARN messages. If more than the given number of warns are emitted per second, \
      then the remaining warns are suppressed. Zero values disable the rate limit",
     || 0,
 );
+crate::register_flag!(WARNS_PER_SECOND_LIMIT);
 static LOGGER_JSON_FIELDS: Flag<String> = Flag::new(
     "loggerJSONFields",
     "Allows renaming fields in JSON formatted logs. \
@@ -69,6 +77,7 @@ static LOGGER_JSON_FIELDS: Flag<String> = Flag::new(
      Supported fields: ts, level, caller, msg",
     String::new,
 );
+crate::register_flag!(LOGGER_JSON_FIELDS);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Level {

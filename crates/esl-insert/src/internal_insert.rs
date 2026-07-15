@@ -28,6 +28,7 @@ static MAX_REQUEST_SIZE: Flag<Bytes> = Flag::new(
     "The maximum size in bytes of a single request, which can be accepted at /internal/insert HTTP endpoint",
     || Bytes::with_default(64 * 1024 * 1024),
 );
+esl_common::register_flag!(MAX_REQUEST_SIZE);
 
 static UNSUPPORTED_OPTIONS_LOGGER: LazyLock<&'static LogThrottler> =
     LazyLock::new(|| with_throttler("unsuppoted_options", Duration::from_secs(5)));

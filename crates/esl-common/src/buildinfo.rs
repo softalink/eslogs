@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use crate::flagutil::Flag;
 
 static SHOW_VERSION: Flag<bool> = Flag::new("version", "Show Softalink LLC version", || false);
+crate::register_flag!(SHOW_VERSION);
 
 /// PORT NOTE: Go sets `buildinfo.Version` via `-ldflags '-X'`; the Rust port
 /// sets it once from `main` via [`set_version`].

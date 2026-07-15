@@ -56,6 +56,7 @@ static MAX_CONCURRENCY: Flag<usize> = Flag::new(
 on systems with small number of CPU cores; higher values may help reducing data ingestion latency on systems with high-latency storage such as NFS or Ceph",
     get_default_concurrency,
 );
+crate::register_flag!(MAX_CONCURRENCY);
 
 fn get_default_concurrency() -> usize {
     // PORT NOTE: lib/cgroup is ported separately; std::thread::available_parallelism()

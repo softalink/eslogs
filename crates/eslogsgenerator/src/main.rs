@@ -23,97 +23,116 @@ static ADDR: Flag<String> = Flag::new(
     "HTTP address to push the generated logs to; if it is set to stdout, then logs are generated to stdout",
     || "stdout".to_string(),
 );
+esl_common::register_flag!(ADDR);
 static WORKERS: Flag<i64> = Flag::new(
     "workers",
     "The number of workers to use to push logs to -addr",
     || 1,
 );
+esl_common::register_flag!(WORKERS);
 
 static START: Flag<TimeFlag> = Flag::new(
     "start",
     "Generated logs start from this time; see https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#timestamp-formats",
     || TimeFlag::must_parse("-1d"),
 );
+esl_common::register_flag!(START);
 static END: Flag<TimeFlag> = Flag::new(
     "end",
     "Generated logs end at this time; see https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#timestamp-formats",
     || TimeFlag::must_parse("0s"),
 );
+esl_common::register_flag!(END);
 static ACTIVE_STREAMS: Flag<i64> = Flag::new(
     "activeStreams",
     "The number of active log streams to generate; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#stream-fields",
     || 100,
 );
+esl_common::register_flag!(ACTIVE_STREAMS);
 static TOTAL_STREAMS: Flag<i64> = Flag::new(
     "totalStreams",
     "The number of total log streams; if -totalStreams > -activeStreams, then some active streams are substituted with new streams during data generation",
     || 0,
 );
+esl_common::register_flag!(TOTAL_STREAMS);
 static LOGS_PER_STREAM: Flag<i64> = Flag::new(
     "logsPerStream",
     "The number of log entries to generate per each log stream. Log entries are evenly distributed between -start and -end",
     || 1_000,
 );
+esl_common::register_flag!(LOGS_PER_STREAM);
 static CONST_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "constFieldsPerLog",
     "The number of fields with constant values to generate per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 3,
 );
+esl_common::register_flag!(CONST_FIELDS_PER_LOG);
 static VAR_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "varFieldsPerLog",
     "The number of fields with variable values to generate per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 1,
 );
+esl_common::register_flag!(VAR_FIELDS_PER_LOG);
 static DICT_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "dictFieldsPerLog",
     "The number of fields with up to 8 different values to generate per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 2,
 );
+esl_common::register_flag!(DICT_FIELDS_PER_LOG);
 static U8_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "u8FieldsPerLog",
     "The number of fields with uint8 values to generate per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 1,
 );
+esl_common::register_flag!(U8_FIELDS_PER_LOG);
 static U16_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "u16FieldsPerLog",
     "The number of fields with uint16 values to generate per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 1,
 );
+esl_common::register_flag!(U16_FIELDS_PER_LOG);
 static U32_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "u32FieldsPerLog",
     "The number of fields with uint32 values to generate per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 1,
 );
+esl_common::register_flag!(U32_FIELDS_PER_LOG);
 static U64_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "u64FieldsPerLog",
     "The number of fields with uint64 values to generate per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 1,
 );
+esl_common::register_flag!(U64_FIELDS_PER_LOG);
 static I64_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "i64FieldsPerLog",
     "The number of fields with int64 values to generate per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 1,
 );
+esl_common::register_flag!(I64_FIELDS_PER_LOG);
 static FLOAT_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "floatFieldsPerLog",
     "The number of fields with float64 values to generate per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 1,
 );
+esl_common::register_flag!(FLOAT_FIELDS_PER_LOG);
 static IP_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "ipFieldsPerLog",
     "The number of fields with IPv4 values to generate per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 1,
 );
+esl_common::register_flag!(IP_FIELDS_PER_LOG);
 static TIMESTAMP_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "timestampFieldsPerLog",
     "The number of fields with ISO8601 timestamps per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 1,
 );
+esl_common::register_flag!(TIMESTAMP_FIELDS_PER_LOG);
 static JSON_FIELDS_PER_LOG: Flag<i64> = Flag::new(
     "jsonFieldsPerLog",
     "The number of JSON fields to generate per each log entry; see https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     || 1,
 );
+esl_common::register_flag!(JSON_FIELDS_PER_LOG);
 
 static STAT_INTERVAL: Flag<DurationFlag> = Flag::new(
     "statInterval",
@@ -122,6 +141,7 @@ static STAT_INTERVAL: Flag<DurationFlag> = Flag::new(
         nanos: 10_000_000_000,
     },
 );
+esl_common::register_flag!(STAT_INTERVAL);
 
 fn main() {
     // PORT NOTE: Go redirects the flag help output to stdout via

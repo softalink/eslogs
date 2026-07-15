@@ -17,6 +17,7 @@ By default, mmap() is used for 64-bit arches and pread() is used for 32-bit arch
 mmap() is usually faster for reading small data chunks than pread()",
     || IS_32BIT_PTR,
 );
+crate::register_flag!(DISABLE_MMAP);
 
 static DISABLE_MINCORE: Flag<bool> = Flag::new(
     "fs.disableMincore",
@@ -26,6 +27,7 @@ Disabling mincore() may be needed on older ZFS filesystems (below 2.1.5), since 
 See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/10327 for details.",
     || false,
 );
+crate::register_flag!(DISABLE_MINCORE);
 
 // Disable mmap for architectures with 32-bit pointers in order to be able to work with files exceeding 2^32 bytes.
 const IS_32BIT_PTR: bool = cfg!(target_pointer_width = "32");

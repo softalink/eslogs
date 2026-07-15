@@ -43,6 +43,7 @@ static HTTP_LISTEN_ADDR: Flag<ArrayString> = Flag::new(
     // addresses append to (a double-bind on :9428).
     ArrayString::default,
 );
+esl_common::register_flag!(HTTP_LISTEN_ADDR);
 
 // PORT NOTE: Windows' default system timer resolution is ~15.6ms, which
 // quantizes thread wakeups (mpsc handoff to HTTP workers, condvar waits in the

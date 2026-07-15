@@ -44,6 +44,7 @@ static MAX_QUERY_TIME_RANGE: Flag<ExtendedDuration> = Flag::new(
         d
     },
 );
+esl_common::register_flag!(MAX_QUERY_TIME_RANGE);
 
 /// Current wall-clock time in nanoseconds since the Unix epoch.
 pub(crate) fn now_nsec() -> i64 {

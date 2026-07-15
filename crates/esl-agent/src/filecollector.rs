@@ -50,12 +50,14 @@ static GLOB: Flag<ArrayString> = Flag::new(
      Example: -fileCollector.glob=\"/var/log/my_app/*.log\"",
     ArrayString::default,
 );
+esl_common::register_flag!(GLOB);
 static EXCLUDE_GLOB: Flag<ArrayString> = Flag::new(
     "fileCollector.excludeGlob",
     "Glob pattern for log files to exclude from collection. Can be specified multiple times. \
      Example: -fileCollector.excludeGlob=\"/var/log/my_app/*.gz\"",
     ArrayString::default,
 );
+esl_common::register_flag!(EXCLUDE_GLOB);
 static CHECKPOINTS_PATH: Flag<String> = Flag::new(
     "fileCollector.checkpointsPath",
     "Path to the file where eslagent stores its read position for each collected file. \
@@ -63,6 +65,7 @@ static CHECKPOINTS_PATH: Flag<String> = Flag::new(
      Example: -fileCollector.checkpointsPath=/var/lib/eslagent/file-checkpoints.json",
     String::new,
 );
+esl_common::register_flag!(CHECKPOINTS_PATH);
 
 static REFRESH_INTERVAL: Flag<DurationFlag> = Flag::new(
     "fileCollector.refreshInterval",
@@ -71,6 +74,7 @@ static REFRESH_INTERVAL: Flag<DurationFlag> = Flag::new(
         nanos: 10_000_000_000,
     },
 );
+esl_common::register_flag!(REFRESH_INTERVAL);
 
 /// Port of Go `flag.Duration`, stored as nanoseconds.
 struct DurationFlag {

@@ -153,6 +153,7 @@ static TLS_ENABLE: Flag<ArrayBool> = Flag::new(
      -tlsCertFile and -tlsKeyFile must be set if -tls is set. See also -mtls",
     ArrayBool::default,
 );
+crate::register_flag!(TLS_ENABLE);
 static USE_PROXY_PROTOCOL: Flag<ArrayBool> = Flag::new(
     "httpListenAddr.useProxyProtocol",
     "Whether to use proxy protocol for connections accepted at the given -httpListenAddr . \
@@ -161,6 +162,7 @@ static USE_PROXY_PROTOCOL: Flag<ArrayBool> = Flag::new(
      Use -pushmetrics.url for metrics pushing",
     ArrayBool::default,
 );
+crate::register_flag!(USE_PROXY_PROTOCOL);
 static TLS_CERT_FILE: Flag<ArrayString> = Flag::new(
     "tlsCertFile",
     "Path to file with TLS certificate for the corresponding -httpListenAddr if -tls is set. \
@@ -169,6 +171,7 @@ static TLS_CERT_FILE: Flag<ArrayString> = Flag::new(
      See also -tlsAutocertHosts",
     ArrayString::default,
 );
+crate::register_flag!(TLS_CERT_FILE);
 static TLS_KEY_FILE: Flag<ArrayString> = Flag::new(
     "tlsKeyFile",
     "Path to file with TLS key for the corresponding -httpListenAddr if -tls is set. \
@@ -176,18 +179,21 @@ static TLS_KEY_FILE: Flag<ArrayString> = Flag::new(
      See also -tlsAutocertHosts",
     ArrayString::default,
 );
+crate::register_flag!(TLS_KEY_FILE);
 static TLS_CIPHER_SUITES: Flag<ArrayString> = Flag::new(
     "tlsCipherSuites",
     "Optional list of TLS cipher suites for incoming requests over HTTPS if -tls is set. \
      See the list of supported cipher suites at https://pkg.go.dev/crypto/tls#pkg-constants",
     ArrayString::default,
 );
+crate::register_flag!(TLS_CIPHER_SUITES);
 static TLS_MIN_VERSION: Flag<ArrayString> = Flag::new(
     "tlsMinVersion",
     "Optional minimum TLS version to use for the corresponding -httpListenAddr if -tls is set. \
      Supported values: TLS10, TLS11, TLS12, TLS13",
     ArrayString::default,
 );
+crate::register_flag!(TLS_MIN_VERSION);
 
 // ---------------------------------------------------------------------------
 // Auth (Go lib/httpserver `-httpAuth.*` basic auth and `-*AuthKey` flags)
@@ -199,24 +205,28 @@ static HTTP_AUTH_USERNAME: Flag<String> = Flag::new(
      See also -httpAuth.password",
     String::new,
 );
+crate::register_flag!(HTTP_AUTH_USERNAME);
 static HTTP_AUTH_PASSWORD: Flag<Password> = Flag::new(
     "httpAuth.password",
     "Password for HTTP server's Basic Auth. \
      The authentication is disabled if -httpAuth.username is empty",
     || Password::new("httpAuth.password"),
 );
+crate::register_flag!(HTTP_AUTH_PASSWORD);
 static METRICS_AUTH_KEY: Flag<Password> = Flag::new(
     "metricsAuthKey",
     "Auth key for /metrics endpoint. It must be passed via authKey query arg. \
      It overrides -httpAuth.*",
     || Password::new("metricsAuthKey"),
 );
+crate::register_flag!(METRICS_AUTH_KEY);
 static FLAGS_AUTH_KEY: Flag<Password> = Flag::new(
     "flagsAuthKey",
     "Auth key for /flags endpoint. It must be passed via authKey query arg. \
      It overrides -httpAuth.*",
     || Password::new("flagsAuthKey"),
 );
+crate::register_flag!(FLAGS_AUTH_KEY);
 
 /// Port of Go `httpserver.CheckAuthFlag`: checks whether the given authKey is
 /// set and valid.

@@ -136,27 +136,81 @@ fn register_flag_value(name: &'static str, value: String) {
     flag_registry().lock().unwrap().insert(name, value);
 }
 
+/// Re-export so the [`register_flag!`] macro can reach `linkme` from crates that
+/// do not depend on it directly.
+pub use ::linkme;
+
+/// A compile-time registration of one declared flag, collected into
+/// [`ALL_FLAGS`]. The function pointers resolve the flag lazily at
+/// metrics-render time — matching Go's `flag.VisitAll`, which reports each
+/// flag's current value (its default when unset).
+pub struct FlagReg {
+    pub name: fn() -> &'static str,
+    pub value: fn() -> String,
+    pub is_set: fn() -> bool,
+}
+
+/// Every declared flag, populated at link time by [`register_flag!`] across all
+/// crates linked into the binary. Go registers flags in package `init()`;
+/// linkme's link-section collection is the life-before-main-free equivalent, so
+/// `esm_flag` can enumerate declared-but-never-resolved flags like
+/// `flag.VisitAll`.
+#[linkme::distributed_slice]
+pub static ALL_FLAGS: [FlagReg];
+
+/// Returns true if `name` was passed on the command line.
+pub fn raw_is_set(name: &str) -> bool {
+    raw_occurrences(name).is_some()
+}
+
+/// Registers a declared `Flag<T>` static into [`ALL_FLAGS`] so it appears in the
+/// `esm_flag` gauge even when never resolved or set at runtime (Go's
+/// `flag.VisitAll`). Place immediately after the `static` declaration.
+#[macro_export]
+macro_rules! register_flag {
+    ($flag:path) => {
+        const _: () = {
+            #[$crate::flagutil::linkme::distributed_slice($crate::flagutil::ALL_FLAGS)]
+            #[linkme(crate = $crate::flagutil::linkme)]
+            static REG: $crate::flagutil::FlagReg = $crate::flagutil::FlagReg {
+                name: || $flag.name(),
+                value: || $flag.get().to_string(),
+                is_set: || $crate::flagutil::raw_is_set($flag.name()),
+            };
+        };
+    };
+}
+
 /// Calls `f(name, value, is_set)` for every known flag in lexicographical
 /// order of flag names, like Go's `flag.VisitAll` (used by the `esm_flag`
 /// gauges on the `/metrics` page).
 ///
 /// PORT NOTE: Go visits every registered flag, because flags register in
-/// package `init()` before `flag.Parse()`. Rust statics are lazy and there is
-/// no life-before-main (enumerating declared-but-untouched `Flag` statics
-/// would need a distributed-slice registry, i.e. a `linkme`/`inventory`-style
-/// dependency), so the port visits the union of (a) flags resolved via
-/// `Flag::get` (canonical value strings, including default values) and
-/// (b) flags set on the command line but never resolved (raw command-line
-/// occurrences joined with `,`). Declared flags that are neither set nor read
-/// by the program are absent, so the `esm_flag` gauge series on `/metrics` is
-/// a subset of Go's `flag` series.
+/// package `init()` before `flag.Parse()`. Rust statics are lazy with no
+/// life-before-main, so the port uses a `linkme` distributed slice
+/// ([`ALL_FLAGS`], populated by [`register_flag!`]) as the equivalent
+/// link-time registry: every declared flag reports its current value (its
+/// default when unset), exactly like `flag.VisitAll`. The resolved-value
+/// registry and raw command-line occurrences are unioned on top so that a
+/// flag's canonical string (including any command-line override) wins over the
+/// bare `.to_string()` of its default.
 pub fn visit_all_flags(mut f: impl FnMut(&str, &str, bool)) {
     // Snapshot the union before invoking `f`, so `f` may resolve further
     // flags (which locks the registry) without deadlocking.
     let mut all: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    // (a) Every declared flag, via the link-time registry — this is what gives
+    // parity with Go's flag.VisitAll for flags never read or set at runtime.
+    for reg in ALL_FLAGS {
+        let name = (reg.name)();
+        all.insert(name.to_string(), ((reg.value)(), (reg.is_set)()));
+    }
+    // (b) Flags resolved via `Flag::get` carry the canonical value string
+    // (identical to (a) for registered flags, but also covers any flag that
+    // registers a value without a `register_flag!` site).
     for (name, value) in flag_registry().lock().unwrap().iter() {
         all.insert(name.to_string(), (value.clone(), raw(name).is_some()));
     }
+    // (c) Flags set on the command line but never resolved.
     if let Some(m) = RAW_FLAGS.get() {
         for (name, occurrences) in m {
             all.entry(name.clone())
@@ -475,6 +529,24 @@ mod tests {
             }
         });
         assert_eq!(seen, Some(("7".to_string(), false)));
+    }
+
+    // A flag registered via `register_flag!` but NEVER resolved via `.get()`
+    // must still appear in `visit_all_flags` (its default value), unlike a bare
+    // `Flag` static — this is the link-time registry parity with Go's
+    // `flag.VisitAll`.
+    static UNRESOLVED_REG: Flag<i64> = Flag::new("visitAllUnresolvedRegistered", "", || 99);
+    crate::register_flag!(UNRESOLVED_REG);
+
+    #[test]
+    fn test_visit_all_flags_unresolved_registered() {
+        let mut seen = None;
+        visit_all_flags(|name, value, is_set| {
+            if name == "visitAllUnresolvedRegistered" {
+                seen = Some((value.to_string(), is_set));
+            }
+        });
+        assert_eq!(seen, Some(("99".to_string(), false)));
     }
 
     #[test]

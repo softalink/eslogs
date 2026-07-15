@@ -29,6 +29,7 @@ static EXPOSE_METADATA: Flag<bool> = Flag::new(
      https://cloud.google.com/stackdriver/docs/managed-prometheus/troubleshooting#missing-metric-type",
     || false,
 );
+crate::register_flag!(EXPOSE_METADATA);
 
 static EXPOSE_METADATA_ONCE: Once = Once::new();
 

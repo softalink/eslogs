@@ -39,6 +39,7 @@ static MAX_REQUEST_SIZE: Flag<Bytes> = Flag::new(
     "The maximum size in bytes of a single OpenTelemetry request",
     || Bytes::with_default(64 * 1024 * 1024),
 );
+esl_common::register_flag!(MAX_REQUEST_SIZE);
 
 pub fn request_handler<S: LogRowsStorage>(
     storage: &Arc<S>,

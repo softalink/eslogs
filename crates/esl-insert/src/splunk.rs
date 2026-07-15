@@ -31,12 +31,14 @@ static SPLUNK_STREAM_FIELDS: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/splunk/#stream-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(SPLUNK_STREAM_FIELDS);
 static SPLUNK_IGNORE_FIELDS: Flag<ArrayString> = Flag::new(
     "splunk.ignoreFields",
     "Comma-separated list of fields to ignore for logs ingested over Splunk protocol. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/splunk/#dropping-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(SPLUNK_IGNORE_FIELDS);
 static SPLUNK_PRESERVE_JSON_KEYS: Flag<ArrayString> = Flag::new(
     "splunk.preserveJSONKeys",
     "Comma-separated list of JSON keys that should be preserved from flattening \
@@ -44,30 +46,35 @@ static SPLUNK_PRESERVE_JSON_KEYS: Flag<ArrayString> = Flag::new(
      https://docs.victoriametrics.com/victorialogs/keyconcepts/#data-model",
     ArrayString::default,
 );
+esl_common::register_flag!(SPLUNK_PRESERVE_JSON_KEYS);
 static SPLUNK_TIME_FIELD: Flag<String> = Flag::new(
     "splunk.timeField",
     "Field to use as a log timestamp for logs ingested via Splunk protocol. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/splunk/#time-field",
     || "time".to_string(),
 );
+esl_common::register_flag!(SPLUNK_TIME_FIELD);
 static SPLUNK_MSG_FIELD: Flag<ArrayString> = Flag::new(
     "splunk.msgField",
     "Field to use as a log message for logs ingested via Splunk protocol. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/splunk/#message-field",
     ArrayString::default,
 );
+esl_common::register_flag!(SPLUNK_MSG_FIELD);
 static SPLUNK_TENANT_ID: Flag<String> = Flag::new(
     "splunk.tenantID",
     "TenantID for logs ingested via the Splunk endpoint. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/splunk/#multitenancy",
     || "0:0".to_string(),
 );
+esl_common::register_flag!(SPLUNK_TENANT_ID);
 static SPLUNK_MAX_REQUEST_SIZE: Flag<Bytes> = Flag::new(
     "splunk.maxRequestSize",
     "The maximum size in bytes of a single Splunk request; \
      see https://docs.victoriametrics.com/victorialogs/data-ingestion/splunk/",
     || Bytes::with_default(64 * 1024 * 1024),
 );
+esl_common::register_flag!(SPLUNK_MAX_REQUEST_SIZE);
 
 /// MustInit initializes Splunk parser.
 ///

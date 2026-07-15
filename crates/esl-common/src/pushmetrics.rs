@@ -22,6 +22,7 @@ static PUSH_URL: Flag<ArrayString> = Flag::new(
      By default, metrics exposed at /metrics page aren't pushed to any remote storage",
     ArrayString::default,
 );
+crate::register_flag!(PUSH_URL);
 
 static PUSH_INTERVAL: Flag<ExtendedDuration> = Flag::new(
     "pushmetrics.interval",
@@ -32,6 +33,7 @@ static PUSH_INTERVAL: Flag<ExtendedDuration> = Flag::new(
         d
     },
 );
+crate::register_flag!(PUSH_INTERVAL);
 
 static PUSH_EXTRA_LABEL: Flag<ArrayString> = Flag::new(
     "pushmetrics.extraLabel",
@@ -40,6 +42,7 @@ static PUSH_EXTRA_LABEL: Flag<ArrayString> = Flag::new(
      to all the metrics pushed to every -pushmetrics.url",
     ArrayString::default,
 );
+crate::register_flag!(PUSH_EXTRA_LABEL);
 
 static PUSH_HEADER: Flag<ArrayString> = Flag::new(
     "pushmetrics.header",
@@ -48,12 +51,14 @@ static PUSH_HEADER: Flag<ArrayString> = Flag::new(
      'Authorization: Basic foobar' header to every request to every -pushmetrics.url",
     ArrayString::default,
 );
+crate::register_flag!(PUSH_HEADER);
 
 static DISABLE_COMPRESSION: Flag<bool> = Flag::new(
     "pushmetrics.disableCompression",
     "Whether to disable request body compression when pushing metrics to every -pushmetrics.url",
     || false,
 );
+crate::register_flag!(DISABLE_COMPRESSION);
 
 /// Registers `-pushmetrics.url` as a secret flag: it can contain basic auth
 /// creds, so it mustn't be visible when exposing the flags.

@@ -24,48 +24,57 @@ static DATASOURCE_URL: Flag<String> = Flag::new(
      see https://docs.victoriametrics.com/victorialogs/querying/#querying-logs . See also -tail.url",
     || "http://localhost:9428/select/logsql/query".to_string(),
 );
+esl_common::register_flag!(DATASOURCE_URL);
 static TAIL_URL: Flag<String> = Flag::new(
     "tail.url",
     "URL for live tailing queries to EsLogs; see https://docs.victoriametrics.com/victorialogs/querying/#live-tailing .\
      The url is automatically detected from -datasource.url by replacing /query with /tail at the end if -tail.url is empty",
     String::new,
 );
+esl_common::register_flag!(TAIL_URL);
 static HISTORY_FILE: Flag<String> =
     Flag::new("historyFile", "Path to file with command history", || {
         "eslogscli-history".to_string()
     });
+esl_common::register_flag!(HISTORY_FILE);
 
 static HEADER: Flag<ArrayString> = Flag::new(
     "header",
     "Optional header to pass in request -datasource.url in the form 'HeaderName: value'",
     || ArrayString(Vec::new()),
 );
+esl_common::register_flag!(HEADER);
 static ACCOUNT_ID: Flag<i64> = Flag::new(
     "accountID",
     "Account ID to query; see https://docs.victoriametrics.com/victorialogs/#multitenancy",
     || 0,
 );
+esl_common::register_flag!(ACCOUNT_ID);
 static PROJECT_ID: Flag<i64> = Flag::new(
     "projectID",
     "Project ID to query; see https://docs.victoriametrics.com/victorialogs/#multitenancy",
     || 0,
 );
+esl_common::register_flag!(PROJECT_ID);
 
 static USERNAME: Flag<String> = Flag::new(
     "username",
     "Optional basic auth username to use for the -datasource.url",
     String::new,
 );
+esl_common::register_flag!(USERNAME);
 static PASSWORD: Flag<Password> = Flag::new(
     "password",
     "Optional basic auth password to use for the -datasource.url",
     || Password::new("password"),
 );
+esl_common::register_flag!(PASSWORD);
 static BEARER_TOKEN: Flag<Password> = Flag::new(
     "bearerToken",
     "Optional bearer auth token to use for the -datasource.url",
     || Password::new("bearerToken"),
 );
+esl_common::register_flag!(BEARER_TOKEN);
 
 // PORT NOTE: Go wires these flags through lib/promauth (promauth.TLSConfig);
 // this port builds an `esl_common::tlsutil::TLSConfig` from them in
@@ -75,27 +84,32 @@ static TLS_CA_FILE: Flag<String> = Flag::new(
     "Optional path to TLS CA file to use for verifying connections to the -datasource.url. By default, system CA is used",
     String::new,
 );
+esl_common::register_flag!(TLS_CA_FILE);
 static TLS_CERT_FILE: Flag<String> = Flag::new(
     "tlsCertFile",
     "Optional path to client-side TLS certificate file to use when connecting to the -datasource.url",
     String::new,
 );
+esl_common::register_flag!(TLS_CERT_FILE);
 static TLS_KEY_FILE: Flag<String> = Flag::new(
     "tlsKeyFile",
     "Optional path to client-side TLS certificate key to use when connecting to the -datasource.url",
     String::new,
 );
+esl_common::register_flag!(TLS_KEY_FILE);
 static TLS_SERVER_NAME: Flag<String> = Flag::new(
     "tlsServerName",
     "Optional TLS server name to use for connections to the -datasource.url. \
      By default, the server name from -datasource.url is used",
     String::new,
 );
+esl_common::register_flag!(TLS_SERVER_NAME);
 static TLS_INSECURE_SKIP_VERIFY: Flag<bool> = Flag::new(
     "tlsInsecureSkipVerify",
     "Whether to skip tls verification when connecting to the -datasource.url",
     || false,
 );
+esl_common::register_flag!(TLS_INSECURE_SKIP_VERIFY);
 
 const FIRST_LINE_PROMPT: &str = ";> ";
 const NEXT_LINE_PROMPT: &str = "";

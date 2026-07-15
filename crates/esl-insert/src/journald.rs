@@ -46,34 +46,40 @@ static JOURNALD_STREAM_FIELDS: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/journald/#stream-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(JOURNALD_STREAM_FIELDS);
 static JOURNALD_IGNORE_FIELDS: Flag<ArrayString> = Flag::new(
     "journald.ignoreFields",
     "Comma-separated list of fields to ignore for logs ingested over journald protocol. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/journald/#dropping-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(JOURNALD_IGNORE_FIELDS);
 static JOURNALD_TIME_FIELD: Flag<String> = Flag::new(
     "journald.timeField",
     "Field to use as a log timestamp for logs ingested via journald protocol. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/journald/#time-field",
     || "__REALTIME_TIMESTAMP".to_string(),
 );
+esl_common::register_flag!(JOURNALD_TIME_FIELD);
 static JOURNALD_TENANT_ID: Flag<String> = Flag::new(
     "journald.tenantID",
     "TenantID for logs ingested via the Journald endpoint. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/journald/#multitenancy",
     || "0:0".to_string(),
 );
+esl_common::register_flag!(JOURNALD_TENANT_ID);
 static JOURNALD_INCLUDE_ENTRY_METADATA: Flag<bool> = Flag::new(
     "journald.includeEntryMetadata",
     "Include Journald fields with double underscore prefixes",
     || false,
 );
+esl_common::register_flag!(JOURNALD_INCLUDE_ENTRY_METADATA);
 static JOURNALD_USE_REMOTE_IP: Flag<bool> = Flag::new(
     "journald.useRemoteIP",
     "Whether to add the remote IP address as the remote_ip log field for ingested journald messages.",
     || false,
 );
+esl_common::register_flag!(JOURNALD_USE_REMOTE_IP);
 
 /// Lazily-initialized tenant id (Go `MustInit`'s `tenantID` global).
 fn tenant_id() -> TenantID {

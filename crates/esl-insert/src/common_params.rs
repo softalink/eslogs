@@ -54,6 +54,7 @@ pub static MAX_FIELDS_PER_LINE: Flag<i64> = Flag::new(
      see https://docs.victoriametrics.com/victorialogs/faq/#how-many-fields-a-single-log-entry-may-contain",
     || 1000,
 );
+esl_common::register_flag!(MAX_FIELDS_PER_LINE);
 
 /// DefaultMsgValue is the default value for `_msg` field if the ingested log
 /// entry doesn't contain it.
@@ -66,6 +67,7 @@ pub static DEFAULT_MSG_VALUE: Flag<String> = Flag::new(
             .to_string()
     },
 );
+esl_common::register_flag!(DEFAULT_MSG_VALUE);
 
 /// Returns the current unix time in nanoseconds (Go `time.Now().UnixNano()`).
 pub(crate) fn now_unix_nanos() -> i64 {

@@ -136,6 +136,7 @@ static ENABLED: Flag<bool> = Flag::new(
     "Whether to enable collecting logs from Kubernetes",
     || false,
 );
+esl_common::register_flag!(ENABLED);
 static CHECKPOINTS_PATH: Flag<String> = Flag::new(
     "kubernetesCollector.checkpointsPath",
     "Path to file with checkpoints for Kubernetes logs. \
@@ -144,6 +145,7 @@ static CHECKPOINTS_PATH: Flag<String> = Flag::new(
      if this flag isn't set, then checkpoints are saved into eslagent-kubernetes-checkpoints.json under -tmpDataPath directory",
     String::new,
 );
+esl_common::register_flag!(CHECKPOINTS_PATH);
 static LOGS_PATH: Flag<String> = Flag::new(
     "kubernetesCollector.logsPath",
     "Path to the directory with Kubernetes container logs (usually /var/log/containers). \
@@ -151,6 +153,7 @@ static LOGS_PATH: Flag<String> = Flag::new(
      eslagent must have read access to this directory and to the target log files, typically located under /var/log/pods and /var/lib on the host",
     || "/var/log/containers".to_string(),
 );
+esl_common::register_flag!(LOGS_PATH);
 static EXCLUDE_FILTER: Flag<String> = Flag::new(
     "kubernetesCollector.excludeFilter",
     "Optional LogsQL filter for excluding container logs. \
@@ -159,6 +162,7 @@ static EXCLUDE_FILTER: Flag<String> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/vlagent/#filtering-kubernetes-logs",
     String::new,
 );
+esl_common::register_flag!(EXCLUDE_FILTER);
 
 static COLLECTOR: Mutex<Option<KubernetesCollector>> = Mutex::new(None);
 
@@ -1992,22 +1996,26 @@ static TENANT_ID: Flag<String> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/vlagent/#multitenancy",
     || "0:0".to_string(),
 );
+esl_common::register_flag!(TENANT_ID);
 static IGNORE_FIELDS: Flag<ArrayString> = Flag::new(
     "kubernetesCollector.ignoreFields",
     "Fields to ignore across logs ingested from Kubernetes",
     || ArrayString(Vec::new()),
 );
+esl_common::register_flag!(IGNORE_FIELDS);
 static DECOLORIZE_FIELDS: Flag<ArrayString> = Flag::new(
     "kubernetesCollector.decolorizeFields",
     "Fields to remove ANSI color codes across logs ingested from Kubernetes",
     || ArrayString(Vec::new()),
 );
+esl_common::register_flag!(DECOLORIZE_FIELDS);
 static MSG_FIELD: Flag<ArrayString> = Flag::new(
     "kubernetesCollector.msgField",
     "Fields that may contain the _msg field. \
      Default: message,msg,log. See https://docs.victoriametrics.com/victorialogs/keyconcepts/#message-field",
     || ArrayString(Vec::new()),
 );
+esl_common::register_flag!(MSG_FIELD);
 static TIME_FIELD: Flag<ArrayString> = Flag::new(
     "kubernetesCollector.timeField",
     "Fields that may contain the _time field. \
@@ -2015,12 +2023,14 @@ static TIME_FIELD: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/keyconcepts/#time-field",
     || ArrayString(Vec::new()),
 );
+esl_common::register_flag!(TIME_FIELD);
 static EXTRA_FIELDS: Flag<String> = Flag::new(
     "kubernetesCollector.extraFields",
     "Extra fields in JSON format to add to each log line collected from Kubernetes Pods. \
      For example: -kubernetesCollector.extraFields='{\"cluster\":\"cluster-1\",\"env\":\"production\"}'",
     String::new,
 );
+esl_common::register_flag!(EXTRA_FIELDS);
 static STREAM_FIELDS: Flag<ArrayString> = Flag::new(
     "kubernetesCollector.streamFields",
     "Comma-separated list of fields to use as log stream fields for logs ingested from Kubernetes Pods. \
@@ -2028,6 +2038,7 @@ static STREAM_FIELDS: Flag<ArrayString> = Flag::new(
      See: https://docs.victoriametrics.com/victorialogs/keyconcepts/#stream-fields",
     || ArrayString(Vec::new()),
 );
+esl_common::register_flag!(STREAM_FIELDS);
 
 static INCLUDE_POD_LABELS: Flag<bool> = Flag::new(
     "kubernetesCollector.includePodLabels",
@@ -2035,36 +2046,42 @@ static INCLUDE_POD_LABELS: Flag<bool> = Flag::new(
      Even this setting is disabled, Pod labels are available for filtering via -kubernetesCollector.excludeFilter flag",
     || true,
 );
+esl_common::register_flag!(INCLUDE_POD_LABELS);
 static INCLUDE_POD_ANNOTATIONS: Flag<bool> = Flag::new(
     "kubernetesCollector.includePodAnnotations",
     "Include Pod annotations as additional fields in the log entries. \
      Even this setting is disabled, Pod annotations are available for filtering via -kubernetesCollector.excludeFilter flag",
     || false,
 );
+esl_common::register_flag!(INCLUDE_POD_ANNOTATIONS);
 static INCLUDE_NODE_LABELS: Flag<bool> = Flag::new(
     "kubernetesCollector.includeNodeLabels",
     "Include Node labels as additional fields in the log entries. \
      Even this setting is disabled, Node labels are available for filtering via -kubernetesCollector.excludeFilter flag",
     || false,
 );
+esl_common::register_flag!(INCLUDE_NODE_LABELS);
 static INCLUDE_NODE_ANNOTATIONS: Flag<bool> = Flag::new(
     "kubernetesCollector.includeNodeAnnotations",
     "Include Node annotations as additional fields in the log entries. \
      Even this setting is disabled, Node annotations are available for filtering via -kubernetesCollector.excludeFilter flag",
     || false,
 );
+esl_common::register_flag!(INCLUDE_NODE_ANNOTATIONS);
 static INCLUDE_NAMESPACE_LABELS: Flag<bool> = Flag::new(
     "kubernetesCollector.includeNamespaceLabels",
     "Include Namespace labels as additional fields in the log entries. \
      Even this setting is disabled, Namespace labels are available for filtering via -kubernetesCollector.excludeFilter flag",
     || false,
 );
+esl_common::register_flag!(INCLUDE_NAMESPACE_LABELS);
 static INCLUDE_NAMESPACE_ANNOTATIONS: Flag<bool> = Flag::new(
     "kubernetesCollector.includeNamespaceAnnotations",
     "Include Namespace annotations as additional fields in the log entries. \
      Even this setting is disabled, Namespace annotations are available for filtering via -kubernetesCollector.excludeFilter flag",
     || false,
 );
+esl_common::register_flag!(INCLUDE_NAMESPACE_ANNOTATIONS);
 
 /// The maximum log line size that EsLogs can accept.
 /// See <https://docs.victoriametrics.com/victorialogs/faq/#what-length-a-log-record-is-expected-to-have>

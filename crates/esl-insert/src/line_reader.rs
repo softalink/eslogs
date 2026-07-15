@@ -27,6 +27,7 @@ pub static MAX_LINE_SIZE_BYTES: Flag<Bytes> = Flag::new(
      see https://docs.victoriametrics.com/victorialogs/faq/#what-length-a-log-record-is-expected-to-have",
     || Bytes::with_default(256 * 1024),
 );
+esl_common::register_flag!(MAX_LINE_SIZE_BYTES);
 
 /// The resolved `-insert.maxLineSizeBytes` value (Go `MaxLineSizeBytes.IntN()`).
 fn max_line_size_bytes() -> usize {

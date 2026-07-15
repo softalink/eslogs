@@ -19,7 +19,7 @@ Status of each upstream package's port. Status values:
 | lib/memory | ported | |
 | lib/cgroup | ported | Linux-only behavior; no-op on Windows |
 | lib/logger | ported | |
-| lib/flagutil | ported | incl. flag registry for /flags + esm_flag gauges (registration at first Flag::get; PORT NOTE on coverage) |
+| lib/flagutil | ported | incl. flag registry for /flags + esm_flag gauges (full VisitAll coverage via linkme register_flag! at each Flag static) |
 | lib/envflag | ported | |
 | lib/buildinfo | ported | |
 | lib/fs | ported | cross-platform file ops |
@@ -456,11 +456,13 @@ what remains in section (a) is confirmed-present divergence.
   and `esl-select/src/logsql.rs:998`.
 - `httpserver.rs:109` — extra 10s TLS-handshake timeout Go does not have
   (imposed by the fixed worker pool).
-- `flagutil.rs:112` — flag gauges cover only read/set flags, not all declared
-  flags (Go's `VisitAll`). The metric namespace is intentionally rebranded
-  `vm_*`→`esm_*`. (The previously-missing `process_cpu_cores_available`,
+- `flagutil.rs` — the metric namespace is intentionally rebranded `vm_*`→`esm_*`.
+  (The `esm_flag` gauges now enumerate **every** declared flag like Go's
+  `flag.VisitAll`, via a `linkme` distributed-slice registry populated by the
+  `register_flag!` macro at each `Flag` static — no longer a read/set subset.
+  The previously-missing `process_cpu_cores_available`,
   `process_memory_limit_bytes`, `*_filestream_*`, and fs/nfs/mmapped series
-  are now registered.)
+  are also registered.)
 - `flagutil/password.rs:19` — `http(s)://` password sources are not fetched
   (the flag layer has no HTTP client dependency); such a source falls back to
   the stored random value. (The generated random password now uses a

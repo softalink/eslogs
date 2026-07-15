@@ -81,6 +81,7 @@ static MAX_CONCURRENT_REQUESTS: Flag<i64> = Flag::new(
      see https://docs.victoriametrics.com/victorialogs/cluster/",
     || 8,
 );
+esl_common::register_flag!(MAX_CONCURRENT_REQUESTS);
 
 /// Go `concurrencyLimitCh`: a counting gate over the request handlers, sized
 /// by `-internalselect.maxConcurrentRequests` (created lazily instead of in

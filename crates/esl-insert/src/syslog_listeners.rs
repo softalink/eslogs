@@ -80,6 +80,7 @@ static SYSLOG_TIMEZONE: Flag<String> = Flag::new(
      For example: America/New_York, Europe/Berlin, Etc/GMT+3 . See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/",
     || "Local".to_string(),
 );
+esl_common::register_flag!(SYSLOG_TIMEZONE);
 
 static LISTEN_ADDR_TCP: Flag<ArrayString> = Flag::new(
     "syslog.listenAddr.tcp",
@@ -87,12 +88,14 @@ static LISTEN_ADDR_TCP: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/",
     ArrayString::default,
 );
+esl_common::register_flag!(LISTEN_ADDR_TCP);
 static LISTEN_ADDR_UDP: Flag<ArrayString> = Flag::new(
     "syslog.listenAddr.udp",
     "Comma-separated list of UDP addresses to listen to for Syslog messages. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/",
     ArrayString::default,
 );
+esl_common::register_flag!(LISTEN_ADDR_UDP);
 static LISTEN_ADDR_UNIX: Flag<ArrayString> = Flag::new(
     "syslog.listenAddr.unix",
     "Comma-separated list of Unix socket filepaths to listen to for Syslog messages. \
@@ -100,6 +103,7 @@ static LISTEN_ADDR_UNIX: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/",
     ArrayString::default,
 );
+esl_common::register_flag!(LISTEN_ADDR_UNIX);
 
 static TLS_ENABLE: Flag<ArrayBool> = Flag::new(
     "syslog.tls",
@@ -107,6 +111,7 @@ static TLS_ENABLE: Flag<ArrayBool> = Flag::new(
      The corresponding -syslog.tlsCertFile and -syslog.tlsKeyFile must be set if -syslog.tls is set. See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#security",
     ArrayBool::default,
 );
+esl_common::register_flag!(TLS_ENABLE);
 static TLS_CERT_FILE: Flag<ArrayString> = Flag::new(
     "syslog.tlsCertFile",
     "Path to file with TLS certificate for the corresponding -syslog.listenAddr.tcp if the corresponding -syslog.tls is set. \
@@ -114,6 +119,7 @@ static TLS_CERT_FILE: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#security",
     ArrayString::default,
 );
+esl_common::register_flag!(TLS_CERT_FILE);
 static TLS_KEY_FILE: Flag<ArrayString> = Flag::new(
     "syslog.tlsKeyFile",
     "Path to file with TLS key for the corresponding -syslog.listenAddr.tcp if the corresponding -syslog.tls is set. \
@@ -121,6 +127,7 @@ static TLS_KEY_FILE: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#security",
     ArrayString::default,
 );
+esl_common::register_flag!(TLS_KEY_FILE);
 static TLS_CIPHER_SUITES: Flag<ArrayString> = Flag::new(
     "syslog.tlsCipherSuites",
     "Optional list of TLS cipher suites for -syslog.listenAddr.tcp if -syslog.tls is set. \
@@ -128,6 +135,7 @@ static TLS_CIPHER_SUITES: Flag<ArrayString> = Flag::new(
      See also https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#security",
     ArrayString::default,
 );
+esl_common::register_flag!(TLS_CIPHER_SUITES);
 static TLS_MIN_VERSION: Flag<String> = Flag::new(
     "syslog.tlsMinVersion",
     "The minimum TLS version to use for -syslog.listenAddr.tcp if -syslog.tls is set. \
@@ -135,6 +143,7 @@ static TLS_MIN_VERSION: Flag<String> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#security",
     || "TLS13".to_string(),
 );
+esl_common::register_flag!(TLS_MIN_VERSION);
 
 static STREAM_FIELDS_TCP: Flag<ArrayString> = Flag::new(
     "syslog.streamFields.tcp",
@@ -142,18 +151,21 @@ static STREAM_FIELDS_TCP: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#stream-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(STREAM_FIELDS_TCP);
 static STREAM_FIELDS_UDP: Flag<ArrayString> = Flag::new(
     "syslog.streamFields.udp",
     "Fields to use as log stream labels for logs ingested via the corresponding -syslog.listenAddr.udp. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#stream-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(STREAM_FIELDS_UDP);
 static STREAM_FIELDS_UNIX: Flag<ArrayString> = Flag::new(
     "syslog.streamFields.unix",
     "Fields to use as log stream labels for logs ingested via the corresponding -syslog.listenAddr.unix. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#stream-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(STREAM_FIELDS_UNIX);
 
 static IGNORE_FIELDS_TCP: Flag<ArrayString> = Flag::new(
     "syslog.ignoreFields.tcp",
@@ -161,18 +173,21 @@ static IGNORE_FIELDS_TCP: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#dropping-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(IGNORE_FIELDS_TCP);
 static IGNORE_FIELDS_UDP: Flag<ArrayString> = Flag::new(
     "syslog.ignoreFields.udp",
     "Fields to ignore at logs ingested via the corresponding -syslog.listenAddr.udp. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#dropping-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(IGNORE_FIELDS_UDP);
 static IGNORE_FIELDS_UNIX: Flag<ArrayString> = Flag::new(
     "syslog.ignoreFields.unix",
     "Fields to ignore at logs ingested via the corresponding -syslog.listenAddr.unix. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#dropping-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(IGNORE_FIELDS_UNIX);
 
 static DECOLORIZE_FIELDS_TCP: Flag<ArrayString> = Flag::new(
     "syslog.decolorizeFields.tcp",
@@ -180,18 +195,21 @@ static DECOLORIZE_FIELDS_TCP: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#decolorizing-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(DECOLORIZE_FIELDS_TCP);
 static DECOLORIZE_FIELDS_UDP: Flag<ArrayString> = Flag::new(
     "syslog.decolorizeFields.udp",
     "Fields to remove ANSI color codes across logs ingested via the corresponding -syslog.listenAddr.udp. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#decolorizing-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(DECOLORIZE_FIELDS_UDP);
 static DECOLORIZE_FIELDS_UNIX: Flag<ArrayString> = Flag::new(
     "syslog.decolorizeFields.unix",
     "Fields to remove ANSI color codes across logs ingested via the corresponding -syslog.listenAddr.unix. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#decolorizing-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(DECOLORIZE_FIELDS_UNIX);
 
 static EXTRA_FIELDS_TCP: Flag<ArrayString> = Flag::new(
     "syslog.extraFields.tcp",
@@ -199,18 +217,21 @@ static EXTRA_FIELDS_TCP: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#adding-extra-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(EXTRA_FIELDS_TCP);
 static EXTRA_FIELDS_UDP: Flag<ArrayString> = Flag::new(
     "syslog.extraFields.udp",
     "Fields to add to logs ingested via the corresponding -syslog.listenAddr.udp. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#adding-extra-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(EXTRA_FIELDS_UDP);
 static EXTRA_FIELDS_UNIX: Flag<ArrayString> = Flag::new(
     "syslog.extraFields.unix",
     "Fields to add to logs ingested via the corresponding -syslog.listenAddr.unix. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#adding-extra-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(EXTRA_FIELDS_UNIX);
 
 static TENANT_ID_TCP: Flag<ArrayString> = Flag::new(
     "syslog.tenantID.tcp",
@@ -218,18 +239,21 @@ static TENANT_ID_TCP: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#multitenancy",
     ArrayString::default,
 );
+esl_common::register_flag!(TENANT_ID_TCP);
 static TENANT_ID_UDP: Flag<ArrayString> = Flag::new(
     "syslog.tenantID.udp",
     "TenantID for logs ingested via the corresponding -syslog.listenAddr.udp. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#multitenancy",
     ArrayString::default,
 );
+esl_common::register_flag!(TENANT_ID_UDP);
 static TENANT_ID_UNIX: Flag<ArrayString> = Flag::new(
     "syslog.tenantID.unix",
     "TenantID for logs ingested via the corresponding -syslog.listenAddr.unix. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#multitenancy",
     ArrayString::default,
 );
+esl_common::register_flag!(TENANT_ID_UNIX);
 
 static COMPRESS_METHOD_TCP: Flag<ArrayString> = Flag::new(
     "syslog.compressMethod.tcp",
@@ -237,18 +261,21 @@ static COMPRESS_METHOD_TCP: Flag<ArrayString> = Flag::new(
      Supported values: none, gzip, deflate. See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#compression",
     ArrayString::default,
 );
+esl_common::register_flag!(COMPRESS_METHOD_TCP);
 static COMPRESS_METHOD_UDP: Flag<ArrayString> = Flag::new(
     "syslog.compressMethod.udp",
     "Compression method for syslog messages received at the corresponding -syslog.listenAddr.udp. \
      Supported values: none, gzip, deflate. See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#compression",
     ArrayString::default,
 );
+esl_common::register_flag!(COMPRESS_METHOD_UDP);
 static COMPRESS_METHOD_UNIX: Flag<ArrayString> = Flag::new(
     "syslog.compressMethod.unix",
     "Compression method for syslog messages received at the corresponding -syslog.listenAddr.unix. \
      Supported values: none, gzip, deflate. See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#compression",
     ArrayString::default,
 );
+esl_common::register_flag!(COMPRESS_METHOD_UNIX);
 
 static USE_LOCAL_TIMESTAMP_TCP: Flag<ArrayBool> = Flag::new(
     "syslog.useLocalTimestamp.tcp",
@@ -256,18 +283,21 @@ static USE_LOCAL_TIMESTAMP_TCP: Flag<ArrayBool> = Flag::new(
      at the corresponding -syslog.listenAddr.tcp. See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#log-timestamps",
     ArrayBool::default,
 );
+esl_common::register_flag!(USE_LOCAL_TIMESTAMP_TCP);
 static USE_LOCAL_TIMESTAMP_UDP: Flag<ArrayBool> = Flag::new(
     "syslog.useLocalTimestamp.udp",
     "Whether to use local timestamp instead of the original timestamp for the ingested syslog messages \
      at the corresponding -syslog.listenAddr.udp. See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#log-timestamps",
     ArrayBool::default,
 );
+esl_common::register_flag!(USE_LOCAL_TIMESTAMP_UDP);
 static USE_LOCAL_TIMESTAMP_UNIX: Flag<ArrayBool> = Flag::new(
     "syslog.useLocalTimestamp.unix",
     "Whether to use local timestamp instead of the original timestamp for the ingested syslog messages \
      at the corresponding -syslog.listenAddr.unix. See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#log-timestamps",
     ArrayBool::default,
 );
+esl_common::register_flag!(USE_LOCAL_TIMESTAMP_UNIX);
 
 static USE_REMOTE_IP_TCP: Flag<ArrayBool> = Flag::new(
     "syslog.useRemoteIP.tcp",
@@ -275,18 +305,21 @@ static USE_REMOTE_IP_TCP: Flag<ArrayBool> = Flag::new(
      via the corresponding -syslog.listenAddr.tcp. See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#capturing-remote-ip-address",
     ArrayBool::default,
 );
+esl_common::register_flag!(USE_REMOTE_IP_TCP);
 static USE_REMOTE_IP_UDP: Flag<ArrayBool> = Flag::new(
     "syslog.useRemoteIP.udp",
     "Whether to add remote ip address as 'remote_ip' log field for syslog messages ingested \
      via the corresponding -syslog.listenAddr.udp. See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#capturing-remote-ip-address",
     ArrayBool::default,
 );
+esl_common::register_flag!(USE_REMOTE_IP_UDP);
 static USE_REMOTE_IP_UNIX: Flag<ArrayBool> = Flag::new(
     "syslog.useRemoteIP.unix",
     "Whether to add remote ip address as 'remote_ip' log field for syslog messages ingested \
      via the corresponding -syslog.listenAddr.unix. See https://docs.victoriametrics.com/victorialogs/data-ingestion/syslog/#capturing-remote-ip-address",
     ArrayBool::default,
 );
+esl_common::register_flag!(USE_REMOTE_IP_UNIX);
 
 // ---------------------------------------------------------------------------
 // MustInit / MustStop

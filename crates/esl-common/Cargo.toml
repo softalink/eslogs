@@ -10,6 +10,10 @@ rust-version.workspace = true
 zstd = "0.13"
 regex = "1"
 memmap2 = "0.9"
+# Compile-time flag registry (link-section based, pure Rust, MSVC-clean) so the
+# `esm_flag` gauge can enumerate EVERY declared flag like Go's `flag.VisitAll`,
+# not just the ones resolved or set at runtime.
+linkme = "0.3"
 # httpserver request-body decompression. Pure-Rust backends so the crate
 # cross-compiles cleanly to x86_64-pc-windows-msvc (no C toolchain needed):
 #   flate2 "rust_backend" uses miniz_oxide (pure Rust) for gzip/deflate;

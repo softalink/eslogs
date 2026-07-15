@@ -37,6 +37,7 @@ static MAX_CONCURRENT_INSERTS: Flag<i64> = Flag::new(
      See also -insert.maxQueueDuration",
     || 2 * cgroup::available_cpus() as i64,
 );
+crate::register_flag!(MAX_CONCURRENT_INSERTS);
 
 static MAX_QUEUE_DURATION: Flag<DurationFlag> = Flag::new(
     "insert.maxQueueDuration",
@@ -46,6 +47,7 @@ static MAX_QUEUE_DURATION: Flag<DurationFlag> = Flag::new(
         nanos: 60_000_000_000,
     },
 );
+crate::register_flag!(MAX_QUEUE_DURATION);
 
 /// Port of Go `flag.Duration`, stored as nanoseconds.
 struct DurationFlag {

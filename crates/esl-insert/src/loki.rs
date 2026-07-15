@@ -35,6 +35,7 @@ pub(crate) static MAX_REQUEST_SIZE: Flag<Bytes> = Flag::new(
     "The maximum size in bytes of a single Loki request",
     || Bytes::with_default(64 * 1024 * 1024),
 );
+esl_common::register_flag!(MAX_REQUEST_SIZE);
 
 /// RequestHandler processes Loki insert requests. Returns true if the path was
 /// handled.

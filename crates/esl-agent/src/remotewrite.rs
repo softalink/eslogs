@@ -74,6 +74,7 @@ static REMOTE_WRITE_URLS: Flag<ArrayString> = Flag::new(
      See also -remoteWrite.maxDiskUsagePerURL and -remoteWrite.format",
     ArrayString::default,
 );
+esl_common::register_flag!(REMOTE_WRITE_URLS);
 
 static MAX_PENDING_BYTES_PER_URL: Flag<ArrayBytes> = Flag::new(
     "remoteWrite.maxDiskUsagePerURL",
@@ -83,6 +84,7 @@ static MAX_PENDING_BYTES_PER_URL: Flag<ArrayBytes> = Flag::new(
      Disk usage is unlimited if the value is set to 0",
     || ArrayBytes::with_default(0),
 );
+esl_common::register_flag!(MAX_PENDING_BYTES_PER_URL);
 
 static FORMAT: Flag<ArrayString> = Flag::new(
     "remoteWrite.format",
@@ -91,6 +93,7 @@ static FORMAT: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/vlagent/#remote-write-format",
     ArrayString::default,
 );
+esl_common::register_flag!(FORMAT);
 
 static REMOTE_WRITE_TMP_DATA_PATH: Flag<String> = Flag::new(
     "remoteWrite.tmpDataPath",
@@ -99,6 +102,7 @@ static REMOTE_WRITE_TMP_DATA_PATH: Flag<String> = Flag::new(
      see also -remoteWrite.maxDiskUsagePerURL",
     String::new,
 );
+esl_common::register_flag!(REMOTE_WRITE_TMP_DATA_PATH);
 
 static QUEUES: Flag<i64> = Flag::new(
     "remoteWrite.queues",
@@ -107,6 +111,7 @@ static QUEUES: Flag<i64> = Flag::new(
      Default value depends on the number of available CPU cores. It should work fine in most cases since it minimizes resource usage",
     || (cgroup::available_cpus() * 2) as i64,
 );
+esl_common::register_flag!(QUEUES);
 
 static SHOW_REMOTE_WRITE_URL: Flag<bool> = Flag::new(
     "remoteWrite.showURL",
@@ -114,6 +119,7 @@ static SHOW_REMOTE_WRITE_URL: Flag<bool> = Flag::new(
      It is hidden by default, since it can contain sensitive info such as auth key",
     || false,
 );
+esl_common::register_flag!(SHOW_REMOTE_WRITE_URL);
 
 // ---------------------------------------------------------------------------
 // Flags (client.go)
@@ -125,12 +131,14 @@ static RATE_LIMIT: Flag<ArrayInt> = Flag::new(
      By default, the rate limit is disabled. It can be useful for limiting load on remote storage when big amounts of buffered data ",
     || ArrayInt::with_default(0),
 );
+esl_common::register_flag!(RATE_LIMIT);
 
 static SEND_TIMEOUT: Flag<ArrayDuration> = Flag::new(
     "remoteWrite.sendTimeout",
     "Timeout for sending a single block of data to the corresponding -remoteWrite.url",
     || ArrayDuration::with_default(Duration::from_secs(60)),
 );
+esl_common::register_flag!(SEND_TIMEOUT);
 
 static RETRY_MIN_INTERVAL: Flag<ArrayDuration> = Flag::new(
     "remoteWrite.retryMinInterval",
@@ -138,6 +146,7 @@ static RETRY_MIN_INTERVAL: Flag<ArrayDuration> = Flag::new(
      Every next retry attempt will double the delay to prevent hammering of remote database. See also -remoteWrite.retryMaxTime",
     || ArrayDuration::with_default(Duration::from_secs(1)),
 );
+esl_common::register_flag!(RETRY_MIN_INTERVAL);
 
 static RETRY_MAX_TIME: Flag<ArrayDuration> = Flag::new(
     "remoteWrite.retryMaxTime",
@@ -146,6 +155,7 @@ static RETRY_MAX_TIME: Flag<ArrayDuration> = Flag::new(
      See also -remoteWrite.retryMinInterval",
     || ArrayDuration::with_default(Duration::from_secs(60)),
 );
+esl_common::register_flag!(RETRY_MAX_TIME);
 
 static PROXY_URL: Flag<ArrayString> = Flag::new(
     "remoteWrite.proxyURL",
@@ -153,6 +163,7 @@ static PROXY_URL: Flag<ArrayString> = Flag::new(
      Supported proxies: http, https, socks5. Example: -remoteWrite.proxyURL=socks5://proxy:1234",
     ArrayString::default,
 );
+esl_common::register_flag!(PROXY_URL);
 
 // PORT NOTE: -remoteWrite.tlsHandshakeTimeout is not ported as a SEPARATE
 // timeout: Go sets it on the shared keep-alive transport (default 20s), while
@@ -165,18 +176,21 @@ static TLS_INSECURE_SKIP_VERIFY: Flag<ArrayBool> = Flag::new(
     "Whether to skip tls verification when connecting to the corresponding -remoteWrite.url",
     ArrayBool::default,
 );
+esl_common::register_flag!(TLS_INSECURE_SKIP_VERIFY);
 
 static TLS_CERT_FILE: Flag<ArrayString> = Flag::new(
     "remoteWrite.tlsCertFile",
     "Optional path to client-side TLS certificate file to use when connecting to the corresponding -remoteWrite.url",
     ArrayString::default,
 );
+esl_common::register_flag!(TLS_CERT_FILE);
 
 static TLS_KEY_FILE: Flag<ArrayString> = Flag::new(
     "remoteWrite.tlsKeyFile",
     "Optional path to client-side TLS certificate key to use when connecting to the corresponding -remoteWrite.url",
     ArrayString::default,
 );
+esl_common::register_flag!(TLS_KEY_FILE);
 
 static TLS_CA_FILE: Flag<ArrayString> = Flag::new(
     "remoteWrite.tlsCAFile",
@@ -184,6 +198,7 @@ static TLS_CA_FILE: Flag<ArrayString> = Flag::new(
      By default, system CA is used",
     ArrayString::default,
 );
+esl_common::register_flag!(TLS_CA_FILE);
 
 static TLS_SERVER_NAME: Flag<ArrayString> = Flag::new(
     "remoteWrite.tlsServerName",
@@ -191,6 +206,7 @@ static TLS_SERVER_NAME: Flag<ArrayString> = Flag::new(
      By default, the server name from -remoteWrite.url is used",
     ArrayString::default,
 );
+esl_common::register_flag!(TLS_SERVER_NAME);
 
 static HEADERS: Flag<ArrayString> = Flag::new(
     "remoteWrite.headers",
@@ -199,18 +215,21 @@ static HEADERS: Flag<ArrayString> = Flag::new(
      Multiple headers must be delimited by '^^': -remoteWrite.headers='header1:value1^^header2:value2'",
     ArrayString::default,
 );
+esl_common::register_flag!(HEADERS);
 
 static BASIC_AUTH_USERNAME: Flag<ArrayString> = Flag::new(
     "remoteWrite.basicAuth.username",
     "Optional basic auth username to use for the corresponding -remoteWrite.url",
     ArrayString::default,
 );
+esl_common::register_flag!(BASIC_AUTH_USERNAME);
 
 static BASIC_AUTH_PASSWORD: Flag<ArrayString> = Flag::new(
     "remoteWrite.basicAuth.password",
     "Optional basic auth password to use for the corresponding -remoteWrite.url",
     ArrayString::default,
 );
+esl_common::register_flag!(BASIC_AUTH_PASSWORD);
 
 static BASIC_AUTH_PASSWORD_FILE: Flag<ArrayString> = Flag::new(
     "remoteWrite.basicAuth.passwordFile",
@@ -218,12 +237,14 @@ static BASIC_AUTH_PASSWORD_FILE: Flag<ArrayString> = Flag::new(
      The file is re-read every second",
     ArrayString::default,
 );
+esl_common::register_flag!(BASIC_AUTH_PASSWORD_FILE);
 
 static BEARER_TOKEN: Flag<ArrayString> = Flag::new(
     "remoteWrite.bearerToken",
     "Optional bearer auth token to use for the corresponding -remoteWrite.url",
     ArrayString::default,
 );
+esl_common::register_flag!(BEARER_TOKEN);
 
 static BEARER_TOKEN_FILE: Flag<ArrayString> = Flag::new(
     "remoteWrite.bearerTokenFile",
@@ -231,6 +252,7 @@ static BEARER_TOKEN_FILE: Flag<ArrayString> = Flag::new(
      The token is re-read from the file every second",
     ArrayString::default,
 );
+esl_common::register_flag!(BEARER_TOKEN_FILE);
 
 // PORT NOTE: the -remoteWrite.oauth2.* flags are registered for CLI
 // compatibility, but OAuth2 is not supported by this port (no OAuth2 token
@@ -240,18 +262,21 @@ static OAUTH2_CLIENT_ID: Flag<ArrayString> = Flag::new(
     "Optional OAuth2 clientID to use for the corresponding -remoteWrite.url",
     ArrayString::default,
 );
+esl_common::register_flag!(OAUTH2_CLIENT_ID);
 
 static OAUTH2_CLIENT_SECRET: Flag<ArrayString> = Flag::new(
     "remoteWrite.oauth2.clientSecret",
     "Optional OAuth2 clientSecret to use for the corresponding -remoteWrite.url",
     ArrayString::default,
 );
+esl_common::register_flag!(OAUTH2_CLIENT_SECRET);
 
 static OAUTH2_CLIENT_SECRET_FILE: Flag<ArrayString> = Flag::new(
     "remoteWrite.oauth2.clientSecretFile",
     "Optional OAuth2 clientSecretFile to use for the corresponding -remoteWrite.url",
     ArrayString::default,
 );
+esl_common::register_flag!(OAUTH2_CLIENT_SECRET_FILE);
 
 static OAUTH2_ENDPOINT_PARAMS: Flag<ArrayString> = Flag::new(
     "remoteWrite.oauth2.endpointParams",
@@ -259,18 +284,21 @@ static OAUTH2_ENDPOINT_PARAMS: Flag<ArrayString> = Flag::new(
      The endpoint parameters must be set in JSON format: {\"param1\":\"value1\",...,\"paramN\":\"valueN\"}",
     ArrayString::default,
 );
+esl_common::register_flag!(OAUTH2_ENDPOINT_PARAMS);
 
 static OAUTH2_TOKEN_URL: Flag<ArrayString> = Flag::new(
     "remoteWrite.oauth2.tokenUrl",
     "Optional OAuth2 tokenURL to use for the corresponding -remoteWrite.url",
     ArrayString::default,
 );
+esl_common::register_flag!(OAUTH2_TOKEN_URL);
 
 static OAUTH2_SCOPES: Flag<ArrayString> = Flag::new(
     "remoteWrite.oauth2.scopes",
     "Optional OAuth2 scopes to use for the corresponding -remoteWrite.url. Scopes must be delimited by ';'",
     ArrayString::default,
 );
+esl_common::register_flag!(OAUTH2_SCOPES);
 
 // ---------------------------------------------------------------------------
 // Flags (pendinglogrows.go)
@@ -281,6 +309,7 @@ static MAX_UNPACKED_BLOCK_SIZE: Flag<Bytes> = Flag::new(
     "The maximum block size to send to remote storage. Bigger blocks may improve performance at the cost of the increased memory usage.",
     || Bytes::with_default(8 * 1024 * 1024),
 );
+esl_common::register_flag!(MAX_UNPACKED_BLOCK_SIZE);
 
 static FLUSH_INTERVAL: Flag<ExtendedDuration> = Flag::new(
     "remoteWrite.flushInterval",
@@ -293,6 +322,7 @@ static FLUSH_INTERVAL: Flag<ExtendedDuration> = Flag::new(
         d
     },
 );
+esl_common::register_flag!(FLUSH_INTERVAL);
 
 // ---------------------------------------------------------------------------
 // remotewrite.go

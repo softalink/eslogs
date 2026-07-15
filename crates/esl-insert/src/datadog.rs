@@ -37,17 +37,20 @@ static DATADOG_STREAM_FIELDS: Flag<ArrayString> = Flag::new(
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/datadog-agent/#stream-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(DATADOG_STREAM_FIELDS);
 static DATADOG_IGNORE_FIELDS: Flag<ArrayString> = Flag::new(
     "datadog.ignoreFields",
     "Comma-separated list of fields to ignore for logs ingested via DataDog protocol. \
      See https://docs.victoriametrics.com/victorialogs/data-ingestion/datadog-agent/#dropping-fields",
     ArrayString::default,
 );
+esl_common::register_flag!(DATADOG_IGNORE_FIELDS);
 static MAX_REQUEST_SIZE: Flag<Bytes> = Flag::new(
     "datadog.maxRequestSize",
     "The maximum size in bytes of a single DataDog request",
     || Bytes::with_default(64 * 1024 * 1024),
 );
+esl_common::register_flag!(MAX_REQUEST_SIZE);
 
 /// RequestHandler processes Datadog insert requests. Returns true if the path
 /// was handled.
