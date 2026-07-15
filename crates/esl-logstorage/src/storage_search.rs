@@ -3210,6 +3210,16 @@ mod tests {
             &[&[("hits", "770")]],
         );
 
+        // union-subquery-with-its-own-global_filter: Go's getFinalFilter is
+        // per-(sub)query, so a subquery's own options(global_filter=...) must
+        // clamp it. Main query matches nothing; the union subquery is `*` but
+        // its own global_filter restricts it to tenant 2 (105 rows). If the
+        // subquery's global_filter were ignored the union would add all 1155.
+        f(
+            "nonexistentphrase | union (options(global_filter=(tenant.id:2)) *) | stats count() rows",
+            &[&[("rows", "105")]],
+        );
+
         // pipe-extract-if-filter-with-subquery
         f(
             r#"* | extract

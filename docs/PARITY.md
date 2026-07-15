@@ -308,10 +308,14 @@ what remains in section (a) is confirmed-present divergence.
 
 - `parser/query.rs` — `options(global_filter=...)` is now ANDed before the
   query filter (and propagated into subqueries) at parse time, matching Go's
-  `getFinalFilter`, so results are correct. Two residual differences: it
+  `getFinalFilter`, so results are correct. One residual: the top-level option
   re-renders with the filter inlined rather than as `options(global_filter=...)`
-  (Go keeps the option and ANDs it per-search), and a subquery that sets its
-  *own* `global_filter` is not composed (only the top-level option is).
+  (Go keeps the option and ANDs it per-search) — identical results, only the
+  round-trip query text differs. (A subquery that sets its *own*
+  `global_filter` **is** composed per-subquery like Go: the subquery renders
+  its `options(global_filter=...)` and re-parses through `ParseQueryAtTimestamp`,
+  which applies it — verified by a union-subquery execution test in
+  `storage_search.rs`. An earlier note here wrongly called this deferred.)
 - `parser/query.rs` `visit_subqueries` — scalar query options ARE now inherited
   into nested subqueries (Go copies the parent `queryOptions` via the lexer
   options stack): `visit_subqueries` wraps the visit closure so each subquery
@@ -487,10 +491,16 @@ what remains in section (a) is confirmed-present divergence.
   listener/reader thread pool instead). (The journald HTTP ingest now wraps its
   body with `writeconcurrencylimiter::get_reader` like its
   jsonline/elasticsearch siblings.)
-- `syslog_listeners.rs:25/:445/:539/:806` — unix-socket listeners are
-  `cfg(unix)`-only, UDP4/TCP6 network-selection flags (`-enableTCP6`) are not
-  honored (the stack is derived from the bind address), and unrecoverable
-  accept errors back off instead of `Fatalf`.
+- `syslog_listeners.rs:25/:445/:539/:806` — the `-enableTCP6` network-selection
+  flag is not honored: the socket family is derived from the bind address, so
+  the port's default (lone port → `0.0.0.0:port`) matches Go's default
+  IPv4-only listener, but Go's `-enableTCP6=true` (which makes a lone port bind
+  a dual-stack `tcp`/`udp` socket) has no effect here — a user who wants IPv6
+  must write the address explicitly. (Faithfully honoring the flag needs
+  cross-platform `IPV6_V6ONLY=0` socket options, incl. Windows Winsock, for a
+  default-off flag.) The unix-socket / accept-backoff differences moved to
+  §(b) cat 13 and §(c) — they are platform parity and port-more-robust, not
+  divergences.
 
 **Query serving, agent, tools (esl-select / esl-storage / esl-agent / CLIs)**
 
@@ -584,6 +594,10 @@ what remains in section (a) is confirmed-present divergence.
       pattern, so malformed patterns Go's `doublestar.PathMatch` would accept
       via early-segment short-circuit are rejected as `ErrBadPattern`; affects
       only malformed configs (fail-fast, arguably safer).
+    - `syslog_listeners.rs` — on an unrecoverable `accept()` error the port
+      logs and backs off, keeping the listener alive, where Go `Fatalf`s and
+      exits the process; the port is strictly more robust (no divergence in
+      the success path).
 
 ### (c) Deliberately N/A in Rust
 
@@ -604,4 +618,6 @@ what remains in section (a) is confirmed-present divergence.
   is parsed for protocol compatibility and dropped (meaningless without
   storage nodes).
 - Windows-target notes where Go has the same platform behavior (cgroups
-  no-op, unix sockets absent).
+  no-op, unix sockets absent) — including the syslog unix-socket listeners
+  (`syslog_listeners.rs`), which are `cfg(unix)`-only exactly as Go's
+  `net.Listen("unix", …)` syslog path is unix-only.

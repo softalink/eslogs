@@ -536,8 +536,11 @@ impl Query {
     /// propagation — and clears the option, so the query computes identical
     /// results but re-renders with the filter inlined rather than as
     /// `options(global_filter=...)`. A subquery that sets its *own*
-    /// `global_filter` is a niche case still deferred (only the top-level option
-    /// is composed).
+    /// `global_filter` is still composed correctly: it renders its
+    /// `options(global_filter=...)` and re-parses through `ParseQueryAtTimestamp`
+    /// at execution, which calls `apply_global_filter` on it — matching Go's
+    /// per-(sub)query `getFinalFilter` (covered by a union-subquery test in
+    /// `storage_search.rs`).
     fn apply_global_filter(&mut self) {
         if let Some(gf) = self.opts.global_filter.take() {
             self.add_extra_filters(Filter { f: Some(gf) });
