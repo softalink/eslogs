@@ -487,16 +487,17 @@ what remains in section (a) is confirmed-present divergence.
   listener/reader thread pool instead). (The journald HTTP ingest now wraps its
   body with `writeconcurrencylimiter::get_reader` like its
   jsonline/elasticsearch siblings.)
-- `syslog_listeners.rs:25/:445/:539/:806` — the `-enableTCP6` network-selection
-  flag is not honored: the socket family is derived from the bind address, so
-  the port's default (lone port → `0.0.0.0:port`) matches Go's default
-  IPv4-only listener, but Go's `-enableTCP6=true` (which makes a lone port bind
-  a dual-stack `tcp`/`udp` socket) has no effect here — a user who wants IPv6
-  must write the address explicitly. (Faithfully honoring the flag needs
-  cross-platform `IPV6_V6ONLY=0` socket options, incl. Windows Winsock, for a
-  default-off flag.) The unix-socket / accept-backoff differences moved to
-  §(b) cat 13 and §(c) — they are platform parity and port-more-robust, not
-  divergences.
+- `netutil.rs`, `syslog_listeners.rs`, `httpserver.rs` — `-enableTCP6` is
+  honored (Go `netutil.GetTCPNetwork`/`GetUDPNetwork`): a lone port binds
+  `0.0.0.0:port` (IPv4 only) by default and `[::]:port` when the flag is set,
+  across the HTTP listeners and the syslog TCP/UDP listeners. **Residual
+  (Windows only):** on Linux a `[::]` listener is dual-stack (kernel
+  `IPV6_V6ONLY=0` default), so `-enableTCP6` accepts IPv4 **and** IPv6 exactly
+  like Go; on Windows the default is `IPV6_V6ONLY=1`, so the listener is
+  IPv6-only there — matching Go's dual stack would need to set that socket
+  option before bind, which `std::net` does not expose (a `socket2`-style
+  dependency). The syslog unix-socket / accept-backoff differences are in
+  §(b) cat 13 and §(c) — platform parity and port-more-robust, not divergences.
 
 **Query serving, agent, tools (esl-select / esl-storage / esl-agent / CLIs)**
 

@@ -1415,15 +1415,10 @@ where
     H: Fn(&mut Request, &mut ResponseWriter) + Send + Sync + 'static,
 {
     // Go's net convention: an address of the form ":9428" (or "" ) means "all
-    // interfaces on that port". Rust's TcpListener::bind can't resolve a bare
-    // ":port", so normalize it to "0.0.0.0:port" (and "" to "0.0.0.0:0").
-    let bind_addr = if addr.is_empty() {
-        "0.0.0.0:0".to_string()
-    } else if let Some(port) = addr.strip_prefix(':') {
-        format!("0.0.0.0:{port}")
-    } else {
-        addr.to_string()
-    };
+    // interfaces on that port". Normalize it for std's binder, honoring
+    // -enableTCP6 (0.0.0.0 by default, [::] dual-stack when set) — see
+    // crate::netutil.
+    let bind_addr = crate::netutil::normalize_listen_addr(addr);
     // Capture the app start time for `esm_app_start_timestamp` /
     // `esm_app_uptime_seconds` (Go does it at package init).
     crate::appmetrics::init_start_time();

@@ -606,7 +606,7 @@ fn run_udp_listener<S: LogRowsStorage + 'static>(
 ) {
     // PORT NOTE: Go picks "udp"/"udp4" via netutil.GetUDPNetwork()
     // (-enableTCP6); std's UdpSocket::bind derives the stack from the address.
-    let ln = match UdpSocket::bind(normalize_listen_addr(addr)) {
+    let ln = match UdpSocket::bind(esl_common::netutil::normalize_listen_addr(addr)) {
         Ok(ln) => ln,
         Err(err) => {
             fatalf!("cannot start UDP syslog server at {addr:?}: {err}");
@@ -681,7 +681,7 @@ fn run_tcp_listener<S: LogRowsStorage + 'static>(
         }
     }
     // Go: netutil.NewTCPListener("syslog", addr, false, tlsConfig).
-    let ln = match TcpListener::bind(normalize_listen_addr(addr)) {
+    let ln = match TcpListener::bind(esl_common::netutil::normalize_listen_addr(addr)) {
         Ok(ln) => Arc::new(SyslogTcpListener { ln, tls_config }),
         Err(err) => {
             fatalf!("syslog: cannot start TCP listener at {addr}: {err}");
@@ -1779,18 +1779,6 @@ fn get_configs(
 // ---------------------------------------------------------------------------
 // Misc helpers
 // ---------------------------------------------------------------------------
-
-/// Go's net convention: an address of the form ":514" means "all interfaces on
-/// that port" (same normalization as `httpserver::serve`).
-fn normalize_listen_addr(addr: &str) -> String {
-    if addr.is_empty() {
-        "0.0.0.0:0".to_string()
-    } else if let Some(port) = addr.strip_prefix(':') {
-        format!("0.0.0.0:{port}")
-    } else {
-        addr.to_string()
-    }
-}
 
 /// Resolves `-syslog.timezone` to a fixed UTC offset in seconds.
 ///
