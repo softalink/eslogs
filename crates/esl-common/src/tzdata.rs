@@ -194,23 +194,125 @@ impl Location {
         }
     }
 
-    /// Loads the machine-local zone (Go's `time.Local`) from the system
-    /// `/etc/localtime` TZif file, so callers can resolve `Local` DST-aware
-    /// *per timestamp* instead of sampling one offset at startup. Returns `None`
-    /// when the file is absent or unparseable, or on non-Unix targets (Windows
-    /// derives Local from the registry, which the port does not read) — callers
-    /// then fall back to the fixed startup offset.
+    /// Loads the machine-local zone (Go's `time.Local`) DST-aware, so callers
+    /// resolve `Local` *per timestamp* instead of sampling one offset at
+    /// startup: from the system `/etc/localtime` TZif on Unix, and from
+    /// `GetTimeZoneInformation` (bias + SYSTEMTIME DST rules) on Windows. Returns
+    /// `None` when that source is unavailable/unparseable — callers then fall
+    /// back to the fixed startup offset.
     pub fn load_local() -> Option<Location> {
         #[cfg(unix)]
         {
             let data = std::fs::read("/etc/localtime").ok()?;
             parse_tzif(&data, "Local").ok()
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            local_from_windows()
+        }
+        #[cfg(all(not(unix), not(windows)))]
         {
             None
         }
     }
+}
+
+/// A Windows `SYSTEMTIME` DST rule reduced to the fields that matter for a
+/// recurring transition (`wYear` is 0 for these), mirroring the POSIX `Mm.w.d`
+/// form: `month` 1-12, `week` 1-5 (5 = last occurrence), `day_of_week` 0-6
+/// (Sunday=0), plus the wall-clock transition time in seconds.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy)]
+struct WinTransition {
+    month: i32,
+    week: i32,
+    day_of_week: i32,
+    seconds_of_day: i32,
+}
+
+/// Builds the machine-local `Location` from the fields of a Windows
+/// `TIME_ZONE_INFORMATION` (Go `zoneinfo_windows.go` — no IANA name mapping is
+/// needed; the zone is derived directly from the OS bias + SYSTEMTIME rules).
+/// `bias`/`std_bias`/`dl_bias` are minutes *west* of UTC; `daylight` is `None`
+/// for a zone without DST (`DaylightDate.wMonth == 0`). The recurring
+/// transitions reuse the POSIX-footer machinery ([`TzExtend`]).
+#[cfg(any(windows, test))]
+fn location_from_windows_tzi(
+    bias: i32,
+    std_bias: i32,
+    dl_bias: i32,
+    standard: WinTransition,
+    daylight: Option<WinTransition>,
+) -> Location {
+    // offset east of UTC = -(bias + seasonal bias) minutes.
+    let std_offset = -(bias + std_bias) * 60;
+    let to_rule = |t: WinTransition| TzRule {
+        kind: TzRuleKind::MonthWeekDay {
+            mon: t.month,
+            week: t.week,
+            day: t.day_of_week,
+        },
+        time: t.seconds_of_day,
+    };
+    let extend = match daylight {
+        None => TzExtend {
+            std_offset,
+            dst: None,
+        },
+        Some(dl) => TzExtend {
+            std_offset,
+            dst: Some(TzDst {
+                dst_offset: -(bias + dl_bias) * 60,
+                start: to_rule(dl),     // DaylightDate: DST begins
+                end: to_rule(standard), // StandardDate: DST ends
+            }),
+        },
+    };
+    Location {
+        name: "Local".to_string(),
+        trans: Vec::new(),
+        trans_type: Vec::new(),
+        types: vec![Ttinfo {
+            utoff: std_offset,
+            isdst: false,
+        }],
+        default_type: 0,
+        extend: Some(extend),
+    }
+}
+
+/// Reads the machine's current time zone via `GetTimeZoneInformation` and builds
+/// a DST-aware [`Location`] from it (Go's `time.Local` on Windows).
+#[cfg(windows)]
+fn local_from_windows() -> Option<Location> {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+
+    // SAFETY: `GetTimeZoneInformation` fills a caller-owned, zero-initialized
+    // struct and returns TIME_ZONE_ID_INVALID (u32::MAX) on failure.
+    let mut tzi: TIME_ZONE_INFORMATION = unsafe { core::mem::zeroed() };
+    let rc = unsafe { GetTimeZoneInformation(&mut tzi) };
+    if rc == u32::MAX {
+        return None;
+    }
+    let to_tr = |st: &SYSTEMTIME| WinTransition {
+        month: st.wMonth as i32,
+        week: st.wDay as i32,
+        day_of_week: st.wDayOfWeek as i32,
+        seconds_of_day: st.wHour as i32 * 3600 + st.wMinute as i32 * 60 + st.wSecond as i32,
+    };
+    let daylight = if tzi.DaylightDate.wMonth == 0 {
+        None
+    } else {
+        Some(to_tr(&tzi.DaylightDate))
+    };
+    Some(location_from_windows_tzi(
+        tzi.Bias,
+        tzi.StandardBias,
+        tzi.DaylightBias,
+        to_tr(&tzi.StandardDate),
+        daylight,
+    ))
 }
 
 /// Rejects names that could escape the zoneinfo directory or aren't plausible
@@ -754,6 +856,34 @@ mod tests {
                 "implausible local offset {off}"
             );
         }
+    }
+
+    // The Windows `time.Local` path builds a Location from a TIME_ZONE_INFORMATION
+    // (bias + SYSTEMTIME DST rules). Validate that conversion cross-platform with
+    // a synthetic US-Eastern and a no-DST zone, so the DST logic is exercised on
+    // the Linux CI too (the Windows FFI wrapper around it is thin).
+    #[test]
+    fn test_location_from_windows_tzi() {
+        let dl = WinTransition {
+            month: 3,
+            week: 2,
+            day_of_week: 0,
+            seconds_of_day: 2 * 3600,
+        };
+        let std = WinTransition {
+            month: 11,
+            week: 1,
+            day_of_week: 0,
+            seconds_of_day: 2 * 3600,
+        };
+        // US Eastern: Bias=300 (std UTC-5), DaylightBias=-60 (dst UTC-4).
+        let eastern = location_from_windows_tzi(300, 0, -60, std, Some(dl));
+        assert_eq!(eastern.offset_at_secs(1_610_712_000), -5 * 3600); // 2021-01 EST
+        assert_eq!(eastern.offset_at_secs(1_626_350_400), -4 * 3600); // 2021-07 EDT
+        // No-DST zone (India, UTC+05:30 → Bias=-330).
+        let india = location_from_windows_tzi(-330, 0, 0, std, None);
+        assert_eq!(india.offset_at_secs(1_610_712_000), 5 * 3600 + 30 * 60);
+        assert_eq!(india.offset_at_secs(1_626_350_400), 5 * 3600 + 30 * 60);
     }
 
     #[cfg(unix)]
