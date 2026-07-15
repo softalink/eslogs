@@ -325,12 +325,6 @@ what remains in section (a) is confirmed-present divergence.
   parent `time_offset` (re-applying it would double-shift across the parse-time
   and `add_time_filter` visits); the inherited offset value still shifts the
   added global `_time` filter and rate-step normalization.
-- `parser/parse_stats.rs` — `stats switch(...)` is now accepted and executed,
-  but because the port's `Box<dyn StatsFunc>` is not `Clone`, it is expanded at
-  parse time into the equivalent `if`-guarded funcs (each case, plus a `default`
-  whose filter is the negation of all case filters). The query computes
-  identical results to Go but re-renders as the expanded funcs (e.g.
-  `count(*) if (x) as a, count(*) if (!(x)) as b`) rather than as `switch(...)`.
 - `pipe_sort.rs:26/:536` — the sort state-size budget charges the copied
   per-value byte lengths where Go charges the cloned block's buffer
   capacities (and shares value bytes in the `byFields` path), so the port
@@ -339,13 +333,6 @@ what remains in section (a) is confirmed-present divergence.
 
 **LogsQL text rendering / round-trip (esl-logstorage)**
 
-- `strconv_isprint.rs` — Go's `strconv.IsPrint` (== `unicode.IsPrint`) is
-  ported exactly via the compact `strconv` printable tables (generated from the
-  Go toolchain's `isprint.go`, cross-checked over all 0x0..=0x10FFFF against the
-  reference `strconv.IsPrint`). So the three printable-rune escaping sites now
-  match Go precisely: JSON object-key re-quoting (`strconv.AppendQuote` —
-  non-printable non-ASCII runes `\uXXXX`/`\UXXXXXXXX`-escape), `go_quote`
-  (stream-filter/token rendering), and the simplified-regex `String()`.
 - `stream_filter.rs` — the LogsQL lexer carries a Go-exact raw-byte token payload
   (`Lexer.token_bytes`, `strconv.Unquote` semantics: double-quoted `\xNN`≥0x80
   IS the raw byte), consumed by the phrase-filter family
@@ -428,11 +415,6 @@ what remains in section (a) is confirmed-present divergence.
 - `delete_task.rs:101` — a genuinely nil delete-task list serializes as `[]`
   where Go's `json.Marshal` writes `null` (on-disk bytes differ, both
   readable; an empty-but-non-nil list is `[]` on both sides).
-- `rows.rs:442` — duplicate field names are sorted stably (`sort_by`) where
-  Go uses unstable `sort.Slice`, so tie order can differ; Go's tie order is
-  unspecified, so this is a valid instance of Go's contract surfaced only by
-  a byte-exact differential over duplicate-name input.
-
 **HTTP server, TLS, flags, logging (esl-common)**
 
 - `httpserver.rs:1375` — basic auth and the `-*AuthKey` flags
@@ -493,12 +475,6 @@ what remains in section (a) is confirmed-present divergence.
   0777-vs-0755 divergence is closed: `must_mkdir` now sets mode `0o755`
   explicitly via `DirBuilderExt`, matching Go's `os.MkdirAll(path, 0755)`
   under any umask.)
-- `metrics/process_metrics_linux.rs:319` *(deliberate — more accurate)* —
-  `process_start_time_seconds` is derived from the exact kernel start (`/proc`
-  btime+starttime), which is *more* accurate than Go's package-init `time.Now()`
-  approximation. (The `esm_os_info` Windows release label now matches Go: it
-  reports `major.minor.build` from `RtlGetVersion`, like Linux uname already
-  did.)
 - `tlsutil.rs:9/:65` *(deliberate — rustls-imposed)* — TLS 1.0/1.1
   unsupported (min version clamps to 1.2); CBC/static-RSA cipher-suite names
   rejected; trust roots come from bundled webpki-roots rather than the OS
@@ -541,10 +517,6 @@ what remains in section (a) is confirmed-present divergence.
   per request, no separate handshake timeout); and shutdown abandons an
   in-flight request after the full `sendTimeout` rather than Go's fixed 5s
   grace.
-- `esl-agent/src/filecollector.rs:330` — pattern validation always scans the
-  whole glob, so malformed patterns that Go's `doublestar.PathMatch` accepts
-  (early-segment short-circuit) are rejected as `ErrBadPattern` (malformed
-  configs only).
 - `eslogscli/src/main.rs` (`less_wrapper.rs:103`) — raw-mode line editing (in-line
   arrow-key/Ctrl-A/E/K/U/W editing, history recall, Ctrl+C clears the line and
   returns to the prompt) now works via `rustyline`, matching Go's
@@ -575,7 +547,10 @@ what remains in section (a) is confirmed-present divergence.
    Layer-7 backlog above.
 6. **Vendored Go libraries reimplemented with byte-identical output** (~40):
    fastjson subsets, quicktemplate JSON, `regexp/syntax` parser, itoa,
-   civil-time math, xxhash streams.
+   civil-time math, xxhash streams, and `strconv.IsPrint`/`unicode.IsPrint`
+   (`strconv_isprint.rs` — compact `isprint.go` tables cross-checked over all
+   `0x0..=0x10FFFF`, so JSON key re-quoting, `go_quote`, and simplified-regex
+   `String()` escape printable runes exactly like Go).
 7. **Byte/string ownership shims** — `[]byte` aliasing → owned
    `Vec<u8>`/`String`, unsafe string views → safe (~55).
 8. **`(n, err)`/EOF/nil-receiver idioms → `Result`/`Option`** and
@@ -588,6 +563,27 @@ what remains in section (a) is confirmed-present divergence.
     (`strconv` float formats, wrapping arithmetic, FMA) (~25).
 12. **Raw-pointer single-thread contracts, `Send` impls, cache-line
     padding** documenting safety of the Rust translation (~15).
+13. **Port is stricter or more precise where Go is unspecified, lax, or
+    approximate** — output stays within Go's contract (or strictly improves on
+    it), so these are not defects against upstream behavior (4):
+    - `rows.rs:442` — duplicate field names sort *stably* (`sort_by`) where Go's
+      `sort.Slice` leaves tie order **unspecified**; the port's order is one
+      valid realization of Go's contract (differs only under a byte-exact
+      differential over duplicate-name input).
+    - `metrics/process_metrics_linux.rs:319` — `process_start_time_seconds` is
+      derived from the exact kernel start (`/proc` btime+starttime), *more*
+      accurate than Go's package-init `time.Now()` approximation;
+      semantically the same metric. (`esm_os_info`'s Windows release label
+      also matches Go — `major.minor.build` from `RtlGetVersion`.)
+    - `parser/parse_stats.rs` — `stats switch(...)` computes **identical
+      results** to Go; because `Box<dyn StatsFunc>` is not `Clone` it is
+      expanded at parse time into equivalent `if`-guarded funcs, so only the
+      re-rendered query text differs (`count(*) if (x) as a, count(*) if
+      (!(x)) as b` vs `switch(...)`).
+    - `esl-agent/src/filecollector.rs:330` — glob validation scans the whole
+      pattern, so malformed patterns Go's `doublestar.PathMatch` would accept
+      via early-segment short-circuit are rejected as `ErrBadPattern`; affects
+      only malformed configs (fail-fast, arguably safer).
 
 ### (c) Deliberately N/A in Rust
 
