@@ -397,14 +397,15 @@ what remains in section (a) is confirmed-present divergence.
   follow-up (`Lexer.token` is a `String`, so a raw-byte query token is not yet
   representable there).
 - `syslog_parser.rs`, `esl-insert/src/syslog_listeners.rs` — a named IANA
-  `-syslog.timezone` (e.g. `America/New_York`) is now supported on Unix: it is
-  loaded DST-aware from the system zoneinfo database (`crate::tzdata`) and the
-  RFC3164 timestamp's offset is resolved per timestamp via
-  `Location::offset_for_wall_secs` (Go `time.Date`), so it is no longer a fatal
-  startup error. Fixed forms (UTC/`Etc/GMT±N`/`±HH:MM`/`Local`) keep the cheap
-  fixed-offset path. Residual: Windows named zones remain unsupported (no system
-  zoneinfo; the port does not bundle tzdata), and `Local` still samples a single
-  offset at startup.
+  `-syslog.timezone` (e.g. `America/New_York`) is supported DST-aware on **both**
+  platforms: `crate::tzdata` loads it from the system zoneinfo database on Unix
+  and the bundled `tzdb_data` on Windows, parses the TZif (incl. the POSIX-TZ
+  footer, Go `tzset`), and resolves the RFC3164 timestamp's offset per timestamp
+  via `Location::offset_for_wall_secs` (Go `time.Date`). Fixed forms
+  (UTC/`Etc/GMT±N`/`±HH:MM`/`Local`) keep the cheap fixed-offset path. Residuals:
+  `Local` still samples a single offset at startup (Go re-resolves it per
+  timestamp), and the Windows bundled lookup is case-insensitive where a Unix
+  file lookup is case-sensitive.
 
 **Storage engine (esl-logstorage)**
 
@@ -452,10 +453,9 @@ what remains in section (a) is confirmed-present divergence.
 - `logger.rs:311/:500/:640` — per-arg length truncation, multi-byte truncation
   (lossy `U+FFFD` vs Go's raw byte slice), and the error-writer caller location
   differ (part of the raw-byte `String`-vs-`[]byte` family). (Named IANA
-  `-loggerTimezone` values are now supported on Unix — they load from the system
-  zoneinfo database via `crate::tzdata` and the offset is looked up per log
-  timestamp, so DST is honored; only Windows named zones remain unsupported, as
-  the port does not bundle tzdata.)
+  `-loggerTimezone` values are now supported on **both** platforms via
+  `crate::tzdata` — system zoneinfo on Unix, bundled `tzdb_data` on Windows —
+  with the offset looked up per log timestamp, so DST is honored.)
 - `regexutil.rs:461/:597` — `MustCompile` returns an error instead of panicking
   (deliberate: no `expect`-panic API). (`\p{...}` classes are now accepted and
   `\b` is ASCII like Go. The simplified-regex `String()` printable-rune escaping

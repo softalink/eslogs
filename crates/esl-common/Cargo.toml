@@ -37,7 +37,20 @@ rcgen = "0.13"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(unix)'.dev-dependencies]
+# Unix has a system zoneinfo db (read directly in production), but the bundled
+# db is the Windows production source for named IANA zones — pull it in as a
+# Unix dev-dependency so the bundled-parse path is exercised by the Linux test
+# suite too (see tzdata.rs test_bundled_tzdata_offsets).
+tzdb_data = "0.2.5"
+
 [target.'cfg(windows)'.dependencies]
+# Bundled IANA time zone database (pure-Rust, #![no_std], #![forbid(unsafe_code)],
+# MSVC-clean; only transitive dep is the pure-Rust tz-rs). Windows has no system
+# zoneinfo, so named IANA zones (-syslog.timezone / -loggerTimezone, e.g.
+# America/New_York) are resolved from `tzdb_data::find_raw` and parsed with the
+# same `parse_tzif` used on Unix — identical offset computation.
+tzdb_data = "0.2.5"
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",

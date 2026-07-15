@@ -165,6 +165,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "snap",
+ "tzdb_data",
  "webpki-roots",
  "windows-sys 0.60.2",
  "zstd",
@@ -714,6 +715,21 @@ name = "time-core"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+
+[[package]]
+name = "tz-rs"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fc6c929ffa10fb34f4a3c7e9a73620a83ef2e85e47f9ec3381b8289e6762f42"
+
+[[package]]
+name = "tzdb_data"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "febaa995f6852367564e16c3369988b99d471d43ed12b1255b8d294661797f1c"
+dependencies = [
+ "tz-rs",
+]
 
 [[package]]
 name = "unicode-ident"
