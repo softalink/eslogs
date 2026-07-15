@@ -430,12 +430,6 @@ what remains in section (a) is confirmed-present divergence.
   content-type filter, `Vary`/`Content-Encoding`), and the per-connection
   timeout + jitter (`CONN_TIMEOUT`, `esm_http_conn_timeout_closed_conns_total`)
   is ported.
-- `es-logs/src/main.rs`, `esl-agent/src/main.rs` — `-httpListenAddr` accepts
-  multiple addresses (an `ArrayString`), each started via
-  `httpserver::serve_listener` with its own indexed `-tls*` config and
-  `-httpListenAddr.useProxyProtocol` (PROXY protocol v2 is read and stripped
-  before the TLS/HTTP bytes, recovering the real client address; v1 is rejected,
-  matching Go's v2-only `netutil` implementation).
 - `httpserver.rs:644` — responses are buffered and sent with Content-Length
   instead of Go's streaming/flushing writer (except `/tail`'s `flush_chunk`);
   no mid-response abort. Same pattern at `esl-select/src/internalselect.rs:31`
@@ -550,7 +544,11 @@ what remains in section (a) is confirmed-present divergence.
    `values_encoder.rs:178`, `esl-insert/src/journald.rs:248`).
 4. **Goroutines/channels/context → threads, mpsc, condvars, stop tokens,
    upfront scheduling** (~55): `storage_search.rs:42/:857`,
-   `esl-common/src/procutil.rs`, syslog/agent shutdown paths.
+   `esl-common/src/procutil.rs`, syslog/agent shutdown paths. Also
+   `-httpListenAddr` multi-address serving (`es-logs`/`esl-agent` main): each
+   `ArrayString` address gets its own `httpserver::serve_listener` thread with
+   indexed `-tls*` config and `-httpListenAddr.useProxyProtocol` (PROXY v2 read
+   and stripped, v1 rejected) — behavior-identical to Go's v2-only `netutil`.
 5. **Per-`valueType`/dict block fast paths folded into decoded per-row
    paths** (perf-only; identical results) (~25): filters and stats
    (`filter_range.rs:79`, `stats_count_uniq.rs:691`); tracked in the
