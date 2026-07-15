@@ -427,10 +427,11 @@ what remains in section (a) is confirmed-present divergence.
 - `httpserver.rs:1375` — basic auth and the `-*AuthKey` flags
   (`-metricsAuthKey`/`-flagsAuthKey`) ARE enforced (`check_basic_auth`/
   `check_auth_flag`, with the storage-side fallback at
-  `esl-storage/src/lib.rs:639`); what remains unported is `/debug/pprof` +
-  `-pprofAuthKey` (Go's runtime pprof has no clean Rust equivalent). gzip
-  **response** compression now matches Go's gzhttp wrapper (1024-byte min,
-  content-type filter, `Vary`/`Content-Encoding`), and the per-connection
+  `esl-storage/src/lib.rs:639`). (`/debug/pprof` + `-pprofAuthKey` are not a
+  behavioral divergence but a Go-runtime surface with no Rust analog — see
+  §(c).) gzip **response** compression now matches Go's gzhttp wrapper
+  (1024-byte min, content-type filter, `Vary`/`Content-Encoding`), and the
+  per-connection
   timeout + jitter (`CONN_TIMEOUT`, `esm_http_conn_timeout_closed_conns_total`)
   is ported.
 - `httpserver.rs:644` — responses are buffered and sent with Content-Length
@@ -615,7 +616,11 @@ what remains in section (a) is confirmed-present divergence.
 - Go runtime surfaces: `go_*` metrics, `prometheus_histogram.go`,
   `debug.SetGCPercent`/GOGC (no-op), GOMAXPROCS beyond CPU-count parity,
   `fasttime` synctest variant (`esl-common/src/metrics.rs:11/:16`,
-  `cgroup.rs:68`).
+  `cgroup.rs:68`). Also `/debug/pprof` + `-pprofAuthKey`: Go's `net/http/pprof`
+  exposes the Go runtime's CPU/heap/goroutine/block/mutex profilers, which
+  profile the Go scheduler and GC heap — there is nothing analogous to expose
+  for a Rust binary (native Rust profiling uses `perf`/`valgrind`/`pprof-rs`
+  out of band), so this is inherently N/A rather than an unported feature.
 - Go-only unsafe string/byte aliasing tricks made unnecessary by ownership
   (`values_encoder.rs:1291`, `pattern.rs:339`).
 - Upstream entry points with no single-node consumer: `pushmetrics.InitWith`
