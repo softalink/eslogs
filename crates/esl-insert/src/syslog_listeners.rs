@@ -383,10 +383,11 @@ pub fn must_init<S: LogRowsStorage + 'static>(storage: &Arc<S>) {
     }
 
     let tz = SYSLOG_TIMEZONE.get();
-    // "Local" is resolved DST-aware per timestamp from /etc/localtime (Go's
-    // time.Local), falling back to the fixed OS offset when unavailable (e.g.
-    // Windows).
-    if tz == "Local"
+    // "Local" — and an empty value, which Go's syslog treats as `time.Local`
+    // (syslog.go: `if tz != "" { LoadLocation } else { time.Local }`) — is
+    // resolved DST-aware per timestamp from /etc/localtime, falling back to the
+    // fixed OS offset when unavailable (e.g. Windows).
+    if (tz == "Local" || tz.is_empty())
         && let Some(loc) = Location::load_local()
     {
         let _ = GLOBAL_TIMEZONE_LOCATION.set(Arc::new(loc));
