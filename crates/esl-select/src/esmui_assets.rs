@@ -12,10 +12,12 @@
 //! files are served with the Content-Type Go's `mime.TypeByExtension` would
 //! produce, and unknown paths get Go's `http.NotFound` response. `Range`
 //! requests are served like Go's `http.ServeContent` (single-range `206`,
-//! multi-range `multipart/byteranges`, `416` for unsatisfiable). The remaining
-//! FileServer niceties that never trigger for these static assets (301
-//! canonical redirects for `.../index.html` and subdirectories, and
-//! `Last-Modified`/`ETag` conditional requests) are not ported.
+//! multi-range `multipart/byteranges`, `416` for unsatisfiable). Go serves
+//! these via `//go:embed`, whose files report a zero `ModTime`, so
+//! `ServeContent` sends no `Last-Modified` and never an `ETag` — the port
+//! matches that (it sends neither). The one unported `FileServer` nicety is the
+//! 301 canonical-path redirects (`.../index.html` → `.../`, trailing slash for
+//! directories), which never trigger for these hash-named assets.
 
 use esl_common::httpserver::{Request, ResponseWriter};
 

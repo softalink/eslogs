@@ -505,11 +505,15 @@ what remains in section (a) is confirmed-present divergence.
   `http.ServeContent` range handling in full: a single-range `Range:` request
   gives `206` + `Content-Range` (with `Accept-Ranges: bytes`), multiple ranges
   give `206` + a `multipart/byteranges` body, and an unsatisfiable range gives
-  `416`. Residual: `Last-Modified`/`ETag` conditional requests and the 301
-  canonical-path redirects (`.../index.html`, subdirectories) that
-  `http.FileServer` performs are not ported — inconsequential for these
-  immutable hash-named assets. The `/select/esmui` redirect re-encodes the query
-  like Go's `Form.Encode()` (`Request::form_encoded`: keys sorted, keys/values
+  `416`. (`Last-Modified`/`ETag` are NOT a divergence: Go serves esmui via
+  `//go:embed`, whose files report a zero `ModTime`, and `http.ServeContent`
+  omits `Last-Modified` for a zero modtime and never generates an `ETag`, so Go
+  sends neither for these assets either.) Residual: the 301 canonical-path
+  redirects `http.FileServer` performs (`.../index.html` → `.../`, a directory
+  without a trailing slash) are not ported — inconsequential for these
+  immutable hash-named assets requested at their canonical paths. The
+  `/select/esmui` redirect re-encodes the query like Go's `Form.Encode()`
+  (`Request::form_encoded`: keys sorted, keys/values
   percent-escaped).
 - `esl-agent/src/remotewrite.rs` — `-remoteWrite.oauth2.*` IS supported: a
   faithful `client_credentials` token source (`crate::oauth2`) fetches, caches
