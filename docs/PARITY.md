@@ -543,13 +543,12 @@ what remains in section (a) is confirmed-present divergence.
   whole glob, so malformed patterns that Go's `doublestar.PathMatch` accepts
   (early-segment short-circuit) are rejected as `ErrBadPattern` (malformed
   configs only).
-- `esl-agent/src/kubernetescollector.rs:18` — kubeconfig is parsed with a
-  hand-written minimal block-style YAML subset; files using flow-style,
-  anchors/aliases, or quoted/multiline scalars parse in Go but fail here
-  (plain block-style files parse identically).
-- `eslogscli/src/main.rs` (`less_wrapper.rs:103`) — no raw-mode line editing,
-  and Windows prints without paging. (Ctrl+C now cancels the in-flight query
-  and returns to the prompt instead of killing the process.)
+- `eslogscli/src/main.rs` (`less_wrapper.rs:103`) — raw-mode line editing (in-line
+  arrow-key/Ctrl-A/E/K/U/W editing, history recall, Ctrl+C clears the line and
+  returns to the prompt) now works via `rustyline`, matching Go's
+  `ergochat/readline`; piped/non-interactive input keeps the byte-identical
+  plain-line path, and the on-disk history file keeps Go's `strconv.Quote`
+  format. Residual: Windows prints without a `less` pager (no ubiquitous `less`).
 
 ### (b) Mechanism divergences (identical observable behavior)
 

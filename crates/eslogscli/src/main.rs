@@ -99,6 +99,8 @@ static TLS_INSECURE_SKIP_VERIFY: Flag<bool> = Flag::new(
 
 const FIRST_LINE_PROMPT: &str = ";> ";
 const NEXT_LINE_PROMPT: &str = "";
+/// Max entries kept in the history file and in rustyline's recall buffer.
+const HISTORY_MAX_ENTRIES: usize = 500;
 
 fn main() {
     // PORT NOTE: Go writes flags and the help message to stdout via
@@ -159,22 +161,24 @@ fn run_readline_loop(rl: &mut Readline, headers: &[HeaderEntry], auth_config: &A
     let mut s = String::new();
     loop {
         let line = match rl.read_line() {
-            Ok(Some(line)) => line,
-            Ok(None) => {
-                // EOF
+            ReadResult::Line(line) => line,
+            ReadResult::Eof => {
+                // Ctrl+D at an empty prompt, or EOF on piped stdin.
                 if !s.is_empty() {
-                    // This is non-interactive query execution.
+                    // Execute a query left in the buffer (e.g. a piped query
+                    // without a trailing empty line).
                     execute_query(rl, &s, output_mode, disable_colors, wrap_long_lines, &rctx);
                 }
                 return;
             }
-            // PORT NOTE: Go's readline surfaces ErrInterrupt for Ctrl+C here
-            // and clears a half-entered multiline query (storing it into
-            // history) instead of exiting. Without a raw-mode line editor the
-            // port cannot observe that state: the interrupt watcher (see
-            // `mod interrupt`) handles at-prompt Ctrl+C like Go's
-            // empty-prompt branch (prints "interrupted", exits 130).
-            Err(err) => fatalf(&format!("unexpected error in readline: {err}")),
+            ReadResult::Interrupted => {
+                // Ctrl+C during line editing (rustyline surfaces Go's
+                // readline ErrInterrupt): drop the half-entered multiline
+                // query and return to the primary prompt without exiting.
+                s.clear();
+                rl.set_prompt(FIRST_LINE_PROMPT);
+                continue;
+            }
         };
 
         s += &line;
@@ -287,8 +291,8 @@ fn push_to_history(rl: &mut Readline, history_lines: &mut Vec<String>, s: &str) 
     let s = s.trim();
     if history_lines.last().map(String::as_str) != Some(s) {
         history_lines.push(s.to_string());
-        if history_lines.len() > 500 {
-            history_lines.drain(..history_lines.len() - 500);
+        if history_lines.len() > HISTORY_MAX_ENTRIES {
+            history_lines.drain(..history_lines.len() - HISTORY_MAX_ENTRIES);
         }
         must_save_to_history(HISTORY_FILE.get(), history_lines);
     }
@@ -495,10 +499,17 @@ fn get_query_response(
 //
 // Go wraps each interactive query in `signal.NotifyContext(context.Background(),
 // os.Interrupt)` (runReadlineLoop): SIGINT cancels the in-flight HTTP request
-// and the CLI returns to the prompt; at an empty prompt readline surfaces
-// ErrInterrupt and the CLI prints "interrupted" and exits with 128+SIGINT;
-// readWithLess additionally ignores SIGINT while `less` runs so `less` can
-// handle Ctrl+C itself.
+// and the CLI returns to the prompt; at the prompt readline surfaces
+// ErrInterrupt and clears the current line; readWithLess additionally ignores
+// SIGINT while `less` runs so `less` can handle Ctrl+C itself.
+//
+// Ctrl+C splits cleanly across two phases, because rustyline puts the terminal
+// into raw mode (ISIG cleared) only while it reads a line:
+//  - AT THE PROMPT, rustyline reads the Ctrl+C byte itself and returns
+//    `Interrupted` (no SIGINT is generated); the loop clears the half-entered
+//    multiline query and redraws the prompt (Go's ErrInterrupt branch).
+//  - DURING QUERY EXECUTION / `less` PAGING, the terminal is back in cooked
+//    mode, so Ctrl+C is delivered as SIGINT to the watcher below.
 //
 // The port keeps ONE process-wide watcher thread (procutil::new_term_chan)
 // instead of Go's scoped registrations. On SIGINT:
@@ -506,16 +517,17 @@ fn get_query_response(
 //    aborts the blocking request/response I/O (Go: ctx cancellation);
 //  - `less` paging without an in-flight query → do nothing (`less` receives
 //    the terminal-delivered SIGINT itself, like under Go's ignoreSignals);
-//  - otherwise → print "interrupted" and exit 130, like Go's empty-prompt
-//    branch.
+//  - otherwise → print "interrupted" and exit 130. With rustyline handling
+//    at-prompt Ctrl+C this branch is now only a safety net for a stray SIGINT
+//    arriving between readline calls with no query running.
 //
-// PORT NOTE — remaining divergences from Go, all inherent to the
-// no-raw-mode/no-ctx port: (1) cancellation attaches when the TCP connection
-// is established, so a hanging dial is not abortable (Go's ctx aborts the
-// dial too); (2) the non-interactive EOF execution path is also cancellable,
-// where Go runs it with context.Background() and dies on SIGINT; (3) SIGTERM/
-// SIGHUP exit via `exit(128+sig)` instead of the default kill-by-signal
-// disposition (procutil's handlers cover them process-wide).
+// PORT NOTE — remaining divergences from Go, all inherent to the no-ctx port:
+// (1) cancellation attaches when the TCP connection is established, so a
+// hanging dial is not abortable (Go's ctx aborts the dial too); (2) the
+// non-interactive EOF execution path is also cancellable, where Go runs it
+// with context.Background() and dies on SIGINT; (3) SIGTERM/SIGHUP exit via
+// `exit(128+sig)` instead of the default kill-by-signal disposition (procutil's
+// handlers cover them process-wide).
 // ---------------------------------------------------------------------------
 
 mod interrupt {
@@ -998,28 +1010,56 @@ impl Read for ChunkedReader {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal line editor.
+// Interactive line editor.
 //
-// PORT NOTE: Go uses github.com/ergochat/readline for the interactive prompt.
-// External dependencies aren't allowed in this port, so this is a minimal
-// line reader over std stdin/stdout: prompts are printed only when stdin is a
-// terminal, history is kept in memory (and persisted via -historyFile), but
-// there is no raw-mode editing or arrow-key history recall.
+// PORT NOTE: Go uses github.com/ergochat/readline for the interactive prompt;
+// the port uses `rustyline`, the equivalent Rust readline (Unix + Windows),
+// which provides the same interactive features: in-line editing (arrow keys,
+// Ctrl+A/E/K/U/W, mid-line backspace), arrow-key history recall, and Ctrl+C
+// surfaced as `Interrupted` (Go `ErrInterrupt`) / Ctrl+D as `Eof`.
+//
+// rustyline drives the prompt only when stdin is a terminal. Piped /
+// non-interactive input is read as plain lines with NO prompt, preserving the
+// exact scripted-input behavior the tests rely on.
+//
+// History: the on-disk `-historyFile` keeps the port's strconv.Quote format
+// (see load_from_history / must_save_to_history), which round-trips multiline
+// entries and matches Go. rustyline is fed the same entries via
+// `add_history_entry` purely for in-memory recall; its own FileHistory on-disk
+// format is NOT used, so the history file stays byte-compatible with Go.
 // ---------------------------------------------------------------------------
 
 struct Readline {
-    interactive: bool,
     prompt: String,
-    /// In-memory history, mirroring readline's SaveToHistory.
-    history: Vec<String>,
+    /// `Some` when stdin is an interactive terminal (rustyline raw-mode editor
+    /// with history recall and Ctrl+C handling); `None` for piped input, which
+    /// is read as plain lines with no prompt.
+    editor: Option<rustyline::DefaultEditor>,
+}
+
+/// The outcome of reading one input line.
+enum ReadResult {
+    /// A line of input, with the trailing newline stripped.
+    Line(String),
+    /// Ctrl+C during line editing (rustyline `Interrupted` / Go `ErrInterrupt`).
+    Interrupted,
+    /// End of input: Ctrl+D at an empty prompt, or EOF on piped stdin.
+    Eof,
 }
 
 impl Readline {
     fn new() -> Readline {
+        let editor = if io::stdin().is_terminal() {
+            match new_editor() {
+                Ok(ed) => Some(ed),
+                Err(err) => fatalf(&format!("cannot initialize line editor: {err}")),
+            }
+        } else {
+            None
+        };
         Readline {
-            interactive: io::stdin().is_terminal(),
             prompt: FIRST_LINE_PROMPT.to_string(),
-            history: Vec::new(),
+            editor,
         }
     }
 
@@ -1027,25 +1067,26 @@ impl Readline {
         self.prompt = prompt.to_string();
     }
 
+    /// Adds an entry to rustyline's in-memory recall history (no-op for piped
+    /// input). The on-disk history file is written separately by
+    /// [`must_save_to_history`] in the port's strconv.Quote format.
     fn save_to_history(&mut self, line: &str) {
-        self.history.push(line.to_string());
+        if let Some(ed) = &mut self.editor {
+            let _ = ed.add_history_entry(line);
+        }
     }
 
-    /// Reads the next input line; `Ok(None)` means EOF.
-    fn read_line(&mut self) -> io::Result<Option<String>> {
-        if self.interactive {
-            let mut stdout = io::stdout();
-            stdout.write_all(self.prompt.as_bytes())?;
-            stdout.flush()?;
+    /// Reads the next input line.
+    fn read_line(&mut self) -> ReadResult {
+        if let Some(ed) = &mut self.editor {
+            return match ed.readline(&self.prompt) {
+                Ok(line) => ReadResult::Line(line),
+                Err(rustyline::error::ReadlineError::Interrupted) => ReadResult::Interrupted,
+                Err(rustyline::error::ReadlineError::Eof) => ReadResult::Eof,
+                Err(err) => fatalf(&format!("unexpected error in readline: {err}")),
+            };
         }
-        let mut line = String::new();
-        if io::stdin().lock().read_line(&mut line)? == 0 {
-            return Ok(None);
-        }
-        while line.ends_with('\n') || line.ends_with('\r') {
-            line.pop();
-        }
-        Ok(Some(line))
+        read_piped_line(&mut io::stdin().lock())
     }
 
     /// Writes `s` to the terminal (Go writes via the readline instance).
@@ -1058,6 +1099,33 @@ impl Readline {
     fn writeln(&mut self, s: &str) {
         self.write(s);
         self.write("\n");
+    }
+}
+
+/// Builds the rustyline editor, capping recall history at the same size as the
+/// on-disk history file and managing history entries manually (via
+/// [`Readline::save_to_history`]).
+fn new_editor() -> rustyline::Result<rustyline::DefaultEditor> {
+    let config = rustyline::Config::builder()
+        .max_history_size(HISTORY_MAX_ENTRIES)?
+        .auto_add_history(false)
+        .build();
+    rustyline::DefaultEditor::with_config(config)
+}
+
+/// Reads one line from a piped (non-terminal) input source, stripping the
+/// trailing newline; [`ReadResult::Eof`] marks end of input.
+fn read_piped_line<R: BufRead>(r: &mut R) -> ReadResult {
+    let mut line = String::new();
+    match r.read_line(&mut line) {
+        Ok(0) => ReadResult::Eof,
+        Ok(_) => {
+            while line.ends_with('\n') || line.ends_with('\r') {
+                line.pop();
+            }
+            ReadResult::Line(line)
+        }
+        Err(err) => fatalf(&format!("unexpected error reading input: {err}")),
     }
 }
 
@@ -1223,6 +1291,91 @@ mod tests {
         assert!(!is_incomplete_query_line("_time:5m;"));
         // Anything else continues on the next line.
         assert!(is_incomplete_query_line("_time:5m | count()"));
+    }
+
+    #[test]
+    fn read_piped_line_reads_lines_then_eof() {
+        use std::io::Cursor;
+        // A multiline query split across two physical lines, then a command.
+        let mut r = Cursor::new(&b"_time:5m\n| count();\n\\q\n"[..]);
+        assert!(matches!(read_piped_line(&mut r), ReadResult::Line(l) if l == "_time:5m"));
+        assert!(matches!(read_piped_line(&mut r), ReadResult::Line(l) if l == "| count();"));
+        assert!(matches!(read_piped_line(&mut r), ReadResult::Line(l) if l == r"\q"));
+        assert!(matches!(read_piped_line(&mut r), ReadResult::Eof));
+        // Reading past EOF keeps reporting EOF.
+        assert!(matches!(read_piped_line(&mut r), ReadResult::Eof));
+    }
+
+    #[test]
+    fn read_piped_line_without_trailing_newline() {
+        use std::io::Cursor;
+        // A final line lacking a trailing newline still yields the line, then EOF.
+        let mut r = Cursor::new(&b"error;"[..]);
+        assert!(matches!(read_piped_line(&mut r), ReadResult::Line(l) if l == "error;"));
+        assert!(matches!(read_piped_line(&mut r), ReadResult::Eof));
+    }
+
+    /// Mirrors the multiline accumulation / interrupt / EOF glue of
+    /// `run_readline_loop` (using the same [`is_incomplete_query_line`]
+    /// predicate) so it can be exercised without a terminal or network.
+    /// Returns the query strings that would be submitted for execution.
+    fn collect_submissions(results: Vec<ReadResult>) -> Vec<String> {
+        let mut s = String::new();
+        let mut submitted = Vec::new();
+        for result in results {
+            match result {
+                ReadResult::Line(line) => {
+                    if s.is_empty() && line.is_empty() {
+                        continue; // skip empty lines at the prompt
+                    }
+                    s.push_str(&line);
+                    if is_incomplete_query_line(&line) {
+                        s.push('\n');
+                    } else {
+                        submitted.push(std::mem::take(&mut s));
+                    }
+                }
+                ReadResult::Interrupted => s.clear(), // Ctrl+C drops the query
+                ReadResult::Eof => {
+                    if !s.is_empty() {
+                        submitted.push(std::mem::take(&mut s));
+                    }
+                    break;
+                }
+            }
+        }
+        submitted
+    }
+
+    #[test]
+    fn piped_multiline_query_is_assembled_and_submitted() {
+        let submitted = collect_submissions(vec![
+            ReadResult::Line("_time:5m".into()), // incomplete: accumulates with '\n'
+            ReadResult::Line("| count();".into()), // terminated: submit
+            ReadResult::Eof,
+        ]);
+        assert_eq!(submitted, vec!["_time:5m\n| count();".to_string()]);
+    }
+
+    #[test]
+    fn eof_submits_query_left_in_the_buffer() {
+        // A `;`-less final line is left in the buffer (with the continuation
+        // '\n' the loop appends) and executed on EOF — the non-interactive
+        // path Go runs with context.Background().
+        let submitted =
+            collect_submissions(vec![ReadResult::Line("error".into()), ReadResult::Eof]);
+        assert_eq!(submitted, vec!["error\n".to_string()]);
+    }
+
+    #[test]
+    fn ctrl_c_discards_in_progress_multiline_query() {
+        let submitted = collect_submissions(vec![
+            ReadResult::Line("_time:5m".into()), // starts a multiline query
+            ReadResult::Interrupted,             // Ctrl+C clears it
+            ReadResult::Line("error;".into()),   // fresh, complete query
+            ReadResult::Eof,
+        ]);
+        assert_eq!(submitted, vec!["error;".to_string()]);
     }
 
     #[test]

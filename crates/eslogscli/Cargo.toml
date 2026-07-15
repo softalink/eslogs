@@ -11,6 +11,10 @@ path = "src/main.rs"
 [dependencies]
 esl-common = { path = "../esl-common" }
 esl-logstorage = { path = "../esl-logstorage" }
+# Raw-mode line editor for the interactive prompt: in-line editing, arrow-key
+# history recall and Ctrl+C-clears-line, matching Go vlogscli's
+# github.com/ergochat/readline. Unix + Windows (MSVC) clean.
+rustyline = "18.0.1"
 
 [dev-dependencies]
 # Self-signed certificate generation for the https datasource tests

@@ -16,9 +16,10 @@
 //! request like Go's lazy `promauth` `getTLSConfigCached`.
 //!
 //! PORT NOTE (deps): Go uses `gopkg.in/yaml.v2` for kubeconfig parsing and
-//! `valyala/fastjson` for JSON. No new external dependencies are added; this
-//! module carries a minimal JSON value parser and a minimal block-style YAML
-//! subset parser sufficient for kubeconfig files.
+//! `valyala/fastjson` for JSON. The port carries a minimal JSON value parser
+//! and parses kubeconfig with the `yaml-rust2` crate (a full YAML library) —
+//! so flow style, anchors/aliases and quoted/block/folded scalars all work,
+//! matching Go's yaml.v2. Both feed the shared [`Value`] tree.
 //!
 //! PORT NOTE (siblings): `app/eslagent/tail` and `app/eslagent/remotewrite` are
 //! owned by sibling porting agents and are still stubs. This module defines
@@ -34,6 +35,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use yaml_rust2::{Yaml, YamlLoader};
 
 use esl_common::flagutil::{ArrayString, Flag};
 use esl_common::logger::{LogThrottler, with_throttler};
@@ -3068,9 +3071,10 @@ fn must_get_field_val_by_name<'a>(common_fields: &'a [Field], field_name: &[u8])
 // ===========================================================================
 //
 // PORT NOTE: these replace Go std/vendored packages that are not available in
-// the workspace: `time` civil-date math, `encoding/base64`,
-// `valyala/fastjson` (the esl-logstorage port is crate-private) and
-// `gopkg.in/yaml.v2`.
+// the workspace: `time` civil-date math, `encoding/base64` and
+// `valyala/fastjson` (the esl-logstorage port is crate-private). Kubeconfig
+// YAML is parsed with the `yaml-rust2` crate (see `yaml_parse`), the
+// `gopkg.in/yaml.v2` stand-in.
 
 fn is_leap_year(y: i64) -> bool {
     y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
@@ -3429,137 +3433,57 @@ impl JsonReader<'_> {
     }
 }
 
-/// Minimal block-style YAML parser producing a [`Value`] tree — the subset
-/// needed for kubeconfig files (nested mappings, sequences of mappings and
-/// plain/quoted scalar values; no anchors, flow syntax or multi-line scalars).
+/// Parses a kubeconfig YAML document into a [`Value`] tree using the
+/// `yaml-rust2` library — the `gopkg.in/yaml.v2` stand-in. Unlike the former
+/// minimal block-style parser, this handles the full YAML surface Go accepts:
+/// flow style (`{a: b}`, `[x, y]`), anchors/aliases (`&a`/`*a`) and quoted or
+/// block/folded (`|`, `>`, `"..."`, `'...'`) scalars.
+///
+/// Only the first document is used (a kubeconfig is a single document); an
+/// empty input yields [`Value::Null`], and malformed YAML returns an error so
+/// callers still fail clearly.
 fn yaml_parse(src: &str) -> Result<Value, String> {
-    // Preprocess into (indent, content) lines, expanding "- x" sequence
-    // entries into a "-" marker plus a virtual line indented by 2.
-    let mut lines: Vec<(usize, String)> = Vec::new();
-    for raw in src.lines() {
-        let trimmed_end = raw.trim_end();
-        let content = trimmed_end.trim_start();
-        if content.is_empty() || content.starts_with('#') || content == "---" {
-            continue;
-        }
-        let mut indent = trimmed_end.len() - content.len();
-        let mut content = content;
-        loop {
-            if content == "-" {
-                lines.push((indent, "-".to_string()));
-                break;
-            }
-            if let Some(rest) = content.strip_prefix("- ") {
-                lines.push((indent, "-".to_string()));
-                indent += 2;
-                content = rest.trim_start();
-                continue;
-            }
-            lines.push((indent, content.to_string()));
-            break;
-        }
+    let docs = YamlLoader::load_from_str(src).map_err(|err| err.to_string())?;
+    match docs.first() {
+        Some(doc) => Ok(yaml_to_value(doc)),
+        None => Ok(Value::Null),
     }
-
-    if lines.is_empty() {
-        return Ok(Value::Null);
-    }
-    let root_indent = lines[0].0;
-    let mut i = 0;
-    let v = yaml_parse_node(&lines, &mut i, root_indent)?;
-    if i != lines.len() {
-        return Err(format!("unexpected content: {:?}", lines[i].1));
-    }
-    Ok(v)
 }
 
-fn yaml_parse_node(
-    lines: &[(usize, String)],
-    i: &mut usize,
-    indent: usize,
-) -> Result<Value, String> {
-    if *i >= lines.len() {
-        return Ok(Value::Null);
+/// Converts a `yaml-rust2` [`Yaml`] node into the shared [`Value`] tree.
+///
+/// Scalar nodes that YAML resolves to a non-string type (integers, floats,
+/// booleans) are folded to their string spelling, matching Go's yaml.v2 when
+/// it decodes into the `string`-typed kubeconfig structs: the field readers
+/// only ever call [`Value::str`], so an unquoted numeric token still reads
+/// back as its text. Anchors/aliases are already expanded by the loader.
+fn yaml_to_value(y: &Yaml) -> Value {
+    match y {
+        Yaml::Null | Yaml::BadValue | Yaml::Alias(_) => Value::Null,
+        Yaml::String(s) => Value::String(s.clone()),
+        Yaml::Boolean(b) => Value::String(b.to_string()),
+        Yaml::Integer(i) => Value::String(i.to_string()),
+        Yaml::Real(s) => Value::String(s.clone()),
+        Yaml::Array(a) => Value::Array(a.iter().map(yaml_to_value).collect()),
+        Yaml::Hash(h) => Value::Object(
+            h.iter()
+                .filter_map(|(k, v)| yaml_key_to_string(k).map(|k| (k, yaml_to_value(v))))
+                .collect(),
+        ),
     }
-
-    if lines[*i].1 == "-" {
-        // Sequence.
-        let mut items = Vec::new();
-        while *i < lines.len() && lines[*i].0 == indent && lines[*i].1 == "-" {
-            *i += 1;
-            if *i < lines.len() && lines[*i].0 > indent {
-                let child_indent = lines[*i].0;
-                items.push(yaml_parse_node(lines, i, child_indent)?);
-            } else {
-                items.push(Value::Null);
-            }
-        }
-        return Ok(Value::Array(items));
-    }
-
-    // Mapping.
-    let mut map = Vec::new();
-    while *i < lines.len() && lines[*i].0 == indent && lines[*i].1 != "-" {
-        let line = &lines[*i].1;
-        let Some(colon) = find_yaml_colon(line) else {
-            return Err(format!("cannot parse yaml line {line:?}"));
-        };
-        let key = yaml_unquote(line[..colon].trim());
-        let rest = line[colon + 1..].trim();
-        *i += 1;
-        if rest.is_empty() {
-            // Sequence items may sit at the same indentation as their key.
-            let has_child = *i < lines.len()
-                && (lines[*i].0 > indent || (lines[*i].0 == indent && lines[*i].1 == "-"));
-            if has_child {
-                let child_indent = lines[*i].0;
-                map.push((key, yaml_parse_node(lines, i, child_indent)?));
-            } else {
-                map.push((key, Value::Null));
-            }
-        } else {
-            map.push((key, Value::String(yaml_unquote(rest))));
-        }
-    }
-    Ok(Value::Object(map))
 }
 
-fn find_yaml_colon(line: &str) -> Option<usize> {
-    if let Some(p) = line.find(": ") {
-        return Some(p);
+/// Renders a YAML mapping key as a string. Kubeconfig keys are always plain
+/// string scalars; non-scalar keys are dropped, matching how the struct
+/// readers would ignore anything they cannot name.
+fn yaml_key_to_string(y: &Yaml) -> Option<String> {
+    match y {
+        Yaml::String(s) => Some(s.clone()),
+        Yaml::Boolean(b) => Some(b.to_string()),
+        Yaml::Integer(i) => Some(i.to_string()),
+        Yaml::Real(s) => Some(s.clone()),
+        _ => None,
     }
-    if line.ends_with(':') {
-        return Some(line.len() - 1);
-    }
-    None
-}
-
-fn yaml_unquote(s: &str) -> String {
-    let b = s.as_bytes();
-    if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
-        let inner = &s[1..s.len() - 1];
-        let mut out = String::with_capacity(inner.len());
-        let mut esc = false;
-        for c in inner.chars() {
-            if esc {
-                out.push(match c {
-                    'n' => '\n',
-                    't' => '\t',
-                    'r' => '\r',
-                    other => other,
-                });
-                esc = false;
-            } else if c == '\\' {
-                esc = true;
-            } else {
-                out.push(c);
-            }
-        }
-        return out;
-    }
-    if b.len() >= 2 && b[0] == b'\'' && b[b.len() - 1] == b'\'' {
-        return s[1..s.len() - 1].replace("''", "'");
-    }
-    s.to_string()
 }
 
 // ===========================================================================
@@ -4204,6 +4128,101 @@ mod tests {
             panic!("expecting non-nil error");
         };
         assert!(err.contains("cannot initialize"), "unexpected error: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Kubeconfig YAML surface now parsed with the full `yaml-rust2` library.
+    // Each case below uses a YAML feature the former minimal block-style
+    // parser could NOT handle but Go's yaml.v2 accepts, and asserts the
+    // server/token fields still extract correctly.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_local_config_yaml_flow_style() {
+        // Flow-style mappings `{...}` and sequences `[...]`.
+        let yaml = "current-context: ctx\n\
+             clusters: [{name: c1, cluster: {server: \"https://127.0.0.1:6443\"}}]\n\
+             contexts: [{name: ctx, context: {cluster: c1, user: u1}}]\n\
+             users: [{name: u1, user: {token: flow-token}}]\n";
+        let cfg = local_config_from_yaml(yaml, "test-kubeconfig").unwrap();
+        assert_eq!(cfg.server, "https://127.0.0.1:6443");
+        assert_eq!(cfg.ac.bearer_token, "flow-token");
+    }
+
+    #[test]
+    fn test_local_config_yaml_anchor_alias() {
+        // The current context points at cluster c2, whose `cluster` block is
+        // the alias `*clusterdef`; if aliases were not resolved the server
+        // would come back empty.
+        let yaml = "current-context: ctx\n\
+             clusters:\n\
+             - name: c1\n\
+             \x20 cluster: &clusterdef\n\
+             \x20   server: https://10.0.0.1:6443\n\
+             - name: c2\n\
+             \x20 cluster: *clusterdef\n\
+             contexts:\n\
+             - name: ctx\n\
+             \x20 context: {cluster: c2, user: u1}\n\
+             users:\n\
+             - name: u1\n\
+             \x20 user:\n\
+             \x20   token: anchor-token\n";
+        let cfg = local_config_from_yaml(yaml, "test-kubeconfig").unwrap();
+        assert_eq!(cfg.server, "https://10.0.0.1:6443");
+        assert_eq!(cfg.ac.bearer_token, "anchor-token");
+    }
+
+    #[test]
+    fn test_local_config_yaml_double_quoted_escapes() {
+        // A double-quoted scalar with `\t` and `\"` escapes.
+        let yaml = "current-context: ctx\n\
+             clusters:\n\
+             - name: c1\n\
+             \x20 cluster:\n\
+             \x20   server: https://127.0.0.1:6443\n\
+             contexts:\n\
+             - name: ctx\n\
+             \x20 context: {cluster: c1, user: u1}\n\
+             users:\n\
+             - name: u1\n\
+             \x20 user:\n\
+             \x20   token: \"ab\\tcd\\\"ef\"\n";
+        let cfg = local_config_from_yaml(yaml, "test-kubeconfig").unwrap();
+        assert_eq!(cfg.ac.bearer_token, "ab\tcd\"ef");
+    }
+
+    #[test]
+    fn test_local_config_yaml_block_and_folded_scalars() {
+        // Folded (`>`) server and block-literal (`|`) token; both keep the
+        // trailing newline yaml.v2 produces and the old parser never could.
+        let yaml = "current-context: ctx\n\
+             clusters:\n\
+             - name: c1\n\
+             \x20 cluster:\n\
+             \x20   server: >\n\
+             \x20     https://127.0.0.1:6443\n\
+             contexts:\n\
+             - name: ctx\n\
+             \x20 context: {cluster: c1, user: u1}\n\
+             users:\n\
+             - name: u1\n\
+             \x20 user:\n\
+             \x20   token: |\n\
+             \x20     secret-token\n";
+        let cfg = local_config_from_yaml(yaml, "test-kubeconfig").unwrap();
+        assert_eq!(cfg.server, "https://127.0.0.1:6443\n");
+        assert_eq!(cfg.ac.bearer_token, "secret-token\n");
+    }
+
+    #[test]
+    fn test_local_config_yaml_malformed_errors() {
+        // An unterminated flow sequence is a YAML syntax error; the parse
+        // must fail clearly rather than silently returning an empty config.
+        let Err(err) = local_config_from_yaml("clusters: [unclosed", "test-kubeconfig") else {
+            panic!("expecting non-nil error");
+        };
+        assert!(err.contains("cannot parse yaml"), "unexpected error: {err}");
     }
 
     /// Spawns a one-shot https server that reads one request head and answers
