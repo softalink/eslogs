@@ -167,15 +167,23 @@ static TIMEZONE_LOCATION: OnceLock<crate::tzdata::Location> = OnceLock::new();
 
 // Go loads the -loggerTimezone IANA timezone via time.LoadLocation. The port
 // reads the same system zoneinfo database (see `crate::tzdata`): "UTC" (and
-// "", which LoadLocation also treats as UTC) and "Local" use a fixed offset;
-// any other name is loaded as an IANA zone whose offset is looked up per log
-// timestamp (so DST is honored). An unknown zone is a fatal init error, like
-// Go's Fatalf. ("Local" still samples the OS offset once at startup.)
+// "", which LoadLocation also treats as UTC) use a fixed zero offset; "Local"
+// and any named zone are loaded as a DST-aware `Location` whose offset is
+// looked up per log timestamp (Go `time.Local`/`LoadLocation`). "Local" loads
+// `/etc/localtime`, falling back to the fixed OS offset sampled at startup if
+// that is unavailable (e.g. on Windows). An unknown named zone is a fatal init
+// error, like Go's Fatalf.
 fn init_timezone() {
     let tz = LOGGER_TIMEZONE.get().as_str();
     let offset_secs = match tz {
         "UTC" | "" => 0,
-        "Local" => crate::timeutil::get_local_timezone_offset_nsecs() / 1_000_000_000,
+        "Local" => match crate::tzdata::Location::load_local() {
+            Some(loc) => {
+                let _ = TIMEZONE_LOCATION.set(loc);
+                0
+            }
+            None => crate::timeutil::get_local_timezone_offset_nsecs() / 1_000_000_000,
+        },
         _ => match crate::tzdata::Location::load(tz) {
             Ok(loc) => {
                 let _ = TIMEZONE_LOCATION.set(loc);

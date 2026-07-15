@@ -383,9 +383,19 @@ pub fn must_init<S: LogRowsStorage + 'static>(storage: &Arc<S>) {
     }
 
     let tz = SYSLOG_TIMEZONE.get();
+    // "Local" is resolved DST-aware per timestamp from /etc/localtime (Go's
+    // time.Local), falling back to the fixed OS offset when unavailable (e.g.
+    // Windows).
+    if tz == "Local"
+        && let Some(loc) = Location::load_local()
+    {
+        let _ = GLOBAL_TIMEZONE_LOCATION.set(Arc::new(loc));
+        *workers = Some(Workers { stop, handles });
+        return;
+    }
     match parse_timezone_offset_secs(tz) {
-        // Fixed-offset zones (UTC, Etc/GMT±N, ±HH:MM, Local) keep the cheap
-        // fixed-offset path.
+        // Fixed-offset zones (UTC, Etc/GMT±N, ±HH:MM, and Local when
+        // /etc/localtime is unavailable) keep the cheap fixed-offset path.
         Ok(offset_secs) => GLOBAL_TIMEZONE_OFFSET_SECS.store(offset_secs, Ordering::SeqCst),
         // A named IANA zone (America/New_York, ...) is loaded DST-aware from the
         // system zoneinfo database, like Go's time.LoadLocation.

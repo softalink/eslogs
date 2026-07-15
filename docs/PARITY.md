@@ -401,11 +401,13 @@ what remains in section (a) is confirmed-present divergence.
   platforms: `crate::tzdata` loads it from the system zoneinfo database on Unix
   and the bundled `tzdb_data` on Windows, parses the TZif (incl. the POSIX-TZ
   footer, Go `tzset`), and resolves the RFC3164 timestamp's offset per timestamp
-  via `Location::offset_for_wall_secs` (Go `time.Date`). Fixed forms
-  (UTC/`Etc/GMT±N`/`±HH:MM`/`Local`) keep the cheap fixed-offset path. Residuals:
-  `Local` still samples a single offset at startup (Go re-resolves it per
-  timestamp), and the Windows bundled lookup is case-insensitive where a Unix
-  file lookup is case-sensitive.
+  via `Location::offset_for_wall_secs` (Go `time.Date`). `Local` is also
+  DST-aware per timestamp on Unix (loaded from `/etc/localtime`, Go
+  `time.Local`); `UTC`/`Etc/GMT±N`/`±HH:MM` keep the cheap fixed-offset path.
+  Residuals: on Windows `Local` still samples a single startup offset (Go reads
+  it from the registry, which the port does not parse), and the Windows bundled
+  named-zone lookup is case-insensitive where a Unix file lookup is
+  case-sensitive.
 
 **Storage engine (esl-logstorage)**
 

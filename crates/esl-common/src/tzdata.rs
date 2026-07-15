@@ -193,6 +193,24 @@ impl Location {
             ))
         }
     }
+
+    /// Loads the machine-local zone (Go's `time.Local`) from the system
+    /// `/etc/localtime` TZif file, so callers can resolve `Local` DST-aware
+    /// *per timestamp* instead of sampling one offset at startup. Returns `None`
+    /// when the file is absent or unparseable, or on non-Unix targets (Windows
+    /// derives Local from the registry, which the port does not read) — callers
+    /// then fall back to the fixed startup offset.
+    pub fn load_local() -> Option<Location> {
+        #[cfg(unix)]
+        {
+            let data = std::fs::read("/etc/localtime").ok()?;
+            parse_tzif(&data, "Local").ok()
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
 }
 
 /// Rejects names that could escape the zoneinfo directory or aren't plausible
@@ -722,6 +740,19 @@ mod tests {
         {
             let via_load = Location::load("America/New_York").expect("named zone on windows");
             assert_eq!(via_load.offset_at_secs(1_610_712_000), -5 * 3600);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_local() {
+        // /etc/localtime may be absent in minimal containers; tolerate that.
+        if let Some(local) = Location::load_local() {
+            let off = local.offset_at_secs(1_700_000_000);
+            assert!(
+                (-14 * 3600..=14 * 3600).contains(&off),
+                "implausible local offset {off}"
+            );
         }
     }
 
