@@ -446,12 +446,17 @@ what remains in section (a) is confirmed-present divergence.
   The previously-missing `process_cpu_cores_available`,
   `process_memory_limit_bytes`, `*_filestream_*`, and fs/nfs/mmapped series
   are also registered.)
-- `flagutil/password.rs:19` — `http(s)://` password sources are not fetched
-  (the flag layer has no HTTP client dependency); such a source falls back to
-  the stored random value. (The generated random password now uses a
-  cryptographically secure RNG on both platforms — `/dev/urandom` on Unix,
-  `BCryptGenRandom` on Windows — and panics on read failure like Go's
-  `crypto/rand`, instead of the previous non-crypto Windows fallback.)
+- `flagutil/password.rs` — `http(s)://` password sources ARE fetched (Go
+  `Password`/`fscore.ReadFileOrHTTP`): the flag layer performs a self-contained
+  HTTP GET (no HTTP-client dependency — it reuses `crate::tlsutil` for
+  TLS-verified https), refreshing on access at most once every two seconds and
+  keeping the previous value on failure, with trailing whitespace trimmed like
+  Go. Two small residuals: the fetch is a single HTTP/1.0 request (identity
+  encoding, so no chunked-transfer decoding — universal for these endpoints),
+  and it does not follow `3xx` redirects (Go's `http.Get` follows up to 10). The
+  generated fallback random password uses a cryptographically secure RNG on both
+  platforms (`/dev/urandom` / `BCryptGenRandom`, panicking on read failure like
+  Go's `crypto/rand`).
 - `logger.rs:311/:500/:640` — per-arg length truncation, multi-byte truncation
   (lossy `U+FFFD` vs Go's raw byte slice), and the error-writer caller location
   differ (part of the raw-byte `String`-vs-`[]byte` family). (Named IANA

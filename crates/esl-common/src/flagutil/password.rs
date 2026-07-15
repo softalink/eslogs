@@ -13,13 +13,10 @@ use super::FlagValue;
 /// reasons, since the returned value can be put in logs. Call
 /// [`Password::get`] for obtaining the real password value.
 ///
-/// If the flag value is `file:///path/to/file`, then its contents are
-/// automatically re-read from the given file.
-///
-/// PORT NOTE: `http://`/`https://` sources are accepted like in Go, but
-/// re-reading over HTTP is not implemented in this port (no HTTP client
-/// dependency); such sources always fall back to the previously stored
-/// random value.
+/// If the flag value is `file:///path/to/file`, `http://host/path` or
+/// `https://host/path`, then its contents are automatically re-read from the
+/// given source (Go `Password`). The value is refreshed on access at most once
+/// every two seconds; a fetch failure keeps the previously loaded value.
 #[derive(Debug, Default)]
 pub struct Password {
     next_refresh_timestamp: AtomicU64,
@@ -147,14 +144,132 @@ fn unix_timestamp() -> u64 {
 /// file and trims trailing whitespace.
 fn read_password_from_file_or_http(path: &str) -> Result<String, String> {
     if path.starts_with("http://") || path.starts_with("https://") {
-        // PORT NOTE: HTTP fetching isn't implemented in this port.
-        return Err(format!(
-            "cannot fetch {path:?}: http fetching isn't supported in this port"
-        ));
+        // Go `fscore.ReadFileOrHTTP`: fetch over http/https and trim trailing
+        // whitespace. TLS is verified via `crate::tlsutil` (rustls + the bundled
+        // roots).
+        let data = fetch_http(path)?;
+        return Ok(String::from_utf8_lossy(&data).trim_end().to_string());
     }
     let data =
         std::fs::read_to_string(path).map_err(|err| format!("cannot read {path:?}: {err}"))?;
     Ok(data.trim_end().to_string())
+}
+
+/// Connect/read/write timeout for fetching an http(s):// password source.
+const HTTP_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Fetches the body of an `http(s)://` URL with a single HTTP/1.0 GET (Go's
+/// `http.Get`, reduced to what a password source needs). HTTP/1.0 forces an
+/// identity-encoded response the server terminates by closing the connection,
+/// so the body is simply everything after the headers — no chunked decoding.
+/// https connections are TLS-verified through `crate::tlsutil`.
+fn fetch_http(url: &str) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let (https, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return Err(format!("unsupported scheme in {url:?}"));
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = split_authority(authority, if https { 443 } else { 80 })?;
+    let addr = format!("{host}:{port}");
+
+    let sock_addr = addr
+        .to_socket_addrs()
+        .map_err(|err| format!("cannot resolve {addr:?}: {err}"))?
+        .next()
+        .ok_or_else(|| format!("cannot resolve {addr:?}: no addresses"))?;
+    let tcp = TcpStream::connect_timeout(&sock_addr, HTTP_FETCH_TIMEOUT)
+        .map_err(|err| format!("cannot connect to {addr:?}: {err}"))?;
+    let _ = tcp.set_read_timeout(Some(HTTP_FETCH_TIMEOUT));
+    let _ = tcp.set_write_timeout(Some(HTTP_FETCH_TIMEOUT));
+
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let raw = if https {
+        let tc = crate::tlsutil::TLSConfig {
+            server_name: host.clone(),
+            ..Default::default()
+        };
+        let cfg = crate::tlsutil::new_tls_client_config(&tc)?;
+        let mut s = crate::tlsutil::client_connect(&cfg, &host, tcp)?;
+        s.write_all(req.as_bytes())
+            .map_err(|err| format!("cannot send request to {url:?}: {err}"))?;
+        let mut raw = Vec::new();
+        s.read_to_end(&mut raw)
+            .map_err(|err| format!("cannot read response from {url:?}: {err}"))?;
+        raw
+    } else {
+        let mut s = tcp;
+        s.write_all(req.as_bytes())
+            .map_err(|err| format!("cannot send request to {url:?}: {err}"))?;
+        let mut raw = Vec::new();
+        s.read_to_end(&mut raw)
+            .map_err(|err| format!("cannot read response from {url:?}: {err}"))?;
+        raw
+    };
+
+    let sep = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| format!("malformed HTTP response from {url:?}"))?;
+    let status = parse_http_status(&raw[..sep])?;
+    let body = &raw[sep + 4..];
+    if status != 200 {
+        let shown = &body[..body.len().min(4 * 1024)];
+        return Err(format!(
+            "unexpected status code when fetching {url:?}: {status}, expecting 200; response: {:?}",
+            String::from_utf8_lossy(shown)
+        ));
+    }
+    Ok(body.to_vec())
+}
+
+/// Splits a URL authority into `(host, port)`, defaulting the port and handling
+/// bracketed IPv6 literals (`[::1]:8080`).
+fn split_authority(authority: &str, default_port: u16) -> Result<(String, u16), String> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: `[addr]` or `[addr]:port`.
+        let close = rest
+            .find(']')
+            .ok_or_else(|| format!("invalid IPv6 authority {authority:?}"))?;
+        let host = rest[..close].to_string();
+        let after = &rest[close + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => p
+                .parse()
+                .map_err(|_| format!("invalid port in {authority:?}"))?,
+            None => default_port,
+        };
+        return Ok((host, port));
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) => Ok((
+            h.to_string(),
+            p.parse()
+                .map_err(|_| format!("invalid port in {authority:?}"))?,
+        )),
+        None => Ok((authority.to_string(), default_port)),
+    }
+}
+
+/// Parses the HTTP status code from a response's status line.
+fn parse_http_status(head: &[u8]) -> Result<u16, String> {
+    let line = head
+        .split(|&b| b == b'\r' || b == b'\n')
+        .next()
+        .unwrap_or(&[]);
+    let line = String::from_utf8_lossy(line);
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("cannot parse HTTP status line {line:?}"))
 }
 
 /// Returns 64 cryptographically secure random bytes, like Go's `crypto/rand`.
@@ -228,6 +343,47 @@ fn random_bytes_64() -> [u8; 64] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_password_http_source() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // A one-shot HTTP/1.0 server that returns a password with a trailing
+        // newline (which Go — and the port — trim).
+        let ln = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = ln.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = ln.accept().expect("accept");
+            let mut buf = [0u8; 512];
+            let _ = conn.read(&mut buf);
+            conn.write_all(
+                b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nhttp-fetched-secret\n",
+            )
+            .unwrap();
+        });
+
+        let mut p = Password::new("apw");
+        p.set(&format!("http://127.0.0.1:{port}/secret")).unwrap();
+        // Before the fetch it holds a random value, never the URL.
+        assert_ne!(p.to_string(), "http-fetched-secret");
+        assert_eq!(p.get(), "http-fetched-secret");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_split_authority() {
+        assert_eq!(split_authority("host", 443).unwrap(), ("host".into(), 443));
+        assert_eq!(
+            split_authority("host:8443", 443).unwrap(),
+            ("host".into(), 8443)
+        );
+        assert_eq!(
+            split_authority("[::1]:9000", 80).unwrap(),
+            ("::1".into(), 9000)
+        );
+        assert_eq!(split_authority("[::1]", 80).unwrap(), ("::1".into(), 80));
+    }
 
     #[test]
     fn test_password() {
