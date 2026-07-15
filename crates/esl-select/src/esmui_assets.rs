@@ -10,10 +10,12 @@
 //! PORT NOTE — `http.FileServer` semantics are reduced to what the esmui asset
 //! tree needs: directory URLs (`/select/esmui/`) serve `index.html`, known
 //! files are served with the Content-Type Go's `mime.TypeByExtension` would
-//! produce, and unknown paths get Go's `http.NotFound` response. The
-//! FileServer niceties that never trigger for these assets (301 canonical
-//! redirects for `.../index.html` and subdirectories, Last-Modified/ETag and
-//! range requests) are not ported.
+//! produce, and unknown paths get Go's `http.NotFound` response. `Range`
+//! requests are served like Go's `http.ServeContent` (single-range `206`,
+//! multi-range `multipart/byteranges`, `416` for unsatisfiable). The remaining
+//! FileServer niceties that never trigger for these static assets (301
+//! canonical redirects for `.../index.html` and subdirectories, and
+//! `Last-Modified`/`ETag` conditional requests) are not ported.
 
 use esl_common::httpserver::{Request, ResponseWriter};
 
@@ -147,7 +149,7 @@ pub fn request_handler(req: &Request, w: &mut ResponseWriter) -> bool {
     match get_asset(rel_path) {
         Some((content_type, data)) => {
             w.set_header("Content-Type", content_type);
-            serve_asset(req, w, data);
+            serve_asset(req, w, content_type, data);
         }
         None => {
             // Go `http.NotFound` (via `http.FileServer` on a missing file).
@@ -157,35 +159,150 @@ pub fn request_handler(req: &Request, w: &mut ResponseWriter) -> bool {
     true
 }
 
-/// Serves `data`, honoring a single-range `Range: bytes=...` request with a
-/// `206 Partial Content` reply (Go's `http.ServeContent`). `Accept-Ranges:
-/// bytes` is always advertised; an unsatisfiable range yields `416`. A
-/// multi-range request (comma-separated) falls back to the full `200` body —
-/// Go emits `multipart/byteranges`, which browsers never request for these
-/// small assets (the single residual).
-fn serve_asset(req: &Request, w: &mut ResponseWriter, data: &[u8]) {
+/// Serves `data`, honoring a `Range: bytes=...` request like Go's
+/// `http.ServeContent`. `Accept-Ranges: bytes` is always advertised. A single
+/// satisfiable range gives `206 Partial Content` with `Content-Range`; multiple
+/// ranges give `206` with a `multipart/byteranges` body; an unsatisfiable range
+/// gives `416`.
+fn serve_asset(req: &Request, w: &mut ResponseWriter, content_type: &str, data: &[u8]) {
     w.set_header("Accept-Ranges", "bytes");
     let range = req.header("Range");
     if range.is_empty() {
         w.write_bytes(data);
         return;
     }
+    // A well-formed multi-range request (≥2 ranges) is served as
+    // `multipart/byteranges`; anything else falls through to the single-range
+    // path below (which returns `Full` for the comma case, unchanged).
+    if let Some(mr) = parse_multi_byte_ranges(range, data.len()) {
+        match mr {
+            // Go ignores the ranges (serves the whole body) when their total
+            // size exceeds the content — a cheap anti-abuse guard.
+            MultiRange::Full => w.write_bytes(data),
+            MultiRange::Unsatisfiable => write_unsatisfiable(w, data.len()),
+            // After dropping unsatisfiable sub-ranges, a lone survivor is a
+            // plain single-range `206` (Go does the same).
+            MultiRange::Ranges(rs) if rs.len() == 1 => write_single(w, data, rs[0]),
+            MultiRange::Ranges(rs) => write_multipart(w, content_type, data, &rs),
+        }
+        return;
+    }
     match parse_single_byte_range(range, data.len()) {
         RangeResult::Full => w.write_bytes(data),
-        RangeResult::Partial(start, end) => {
-            // end is inclusive (RFC 9110 §14.1.2 byte-range).
-            w.set_status(206);
-            w.set_header(
-                "Content-Range",
-                &format!("bytes {start}-{end}/{}", data.len()),
-            );
-            w.write_bytes(&data[start..=end]);
+        RangeResult::Partial(start, end) => write_single(w, data, (start, end)),
+        RangeResult::Unsatisfiable => write_unsatisfiable(w, data.len()),
+    }
+}
+
+/// Writes a single `206 Partial Content` reply for the inclusive `[start, end]`.
+fn write_single(w: &mut ResponseWriter, data: &[u8], (start, end): (usize, usize)) {
+    w.set_status(206);
+    w.set_header(
+        "Content-Range",
+        &format!("bytes {start}-{end}/{}", data.len()),
+    );
+    w.write_bytes(&data[start..=end]);
+}
+
+/// Writes a `416 Range Not Satisfiable` reply (Go's `errNoOverlap`).
+fn write_unsatisfiable(w: &mut ResponseWriter, size: usize) {
+    w.set_status(416);
+    w.set_header("Content-Range", &format!("bytes */{size}"));
+}
+
+/// Writes a `206` `multipart/byteranges` body for `ranges` (each inclusive),
+/// matching the format Go's `http.ServeContent` produces via `mime/multipart`.
+fn write_multipart(
+    w: &mut ResponseWriter,
+    content_type: &str,
+    data: &[u8],
+    ranges: &[(usize, usize)],
+) {
+    let size = data.len();
+    let boundary = pick_boundary(data);
+    let mut body = Vec::new();
+    for (i, &(s, e)) in ranges.iter().enumerate() {
+        // Go's mime/multipart writes no leading CRLF before the first part.
+        if i > 0 {
+            body.extend_from_slice(b"\r\n");
         }
-        RangeResult::Unsatisfiable => {
-            w.set_status(416);
-            w.set_header("Content-Range", &format!("bytes */{}", data.len()));
+        body.extend_from_slice(b"--");
+        body.extend_from_slice(boundary.as_bytes());
+        body.extend_from_slice(
+            format!(
+                "\r\nContent-Type: {content_type}\r\nContent-Range: bytes {s}-{e}/{size}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&data[s..=e]);
+    }
+    body.extend_from_slice(b"\r\n--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(b"--\r\n");
+    w.set_status(206);
+    w.set_header(
+        "Content-Type",
+        &format!("multipart/byteranges; boundary={boundary}"),
+    );
+    w.write_bytes(&body);
+}
+
+/// A fixed boundary that is not present in `data`, extended with digits until
+/// unique (Go picks a random boundary via `crypto/rand`; a collision-checked
+/// fixed base is deterministic and equally valid for these static assets).
+fn pick_boundary(data: &[u8]) -> String {
+    let mut b = String::from("eslogsbyterange3d6b6a416f9b");
+    while data.windows(b.len()).any(|w| w == b.as_bytes()) {
+        b.push('0');
+    }
+    b
+}
+
+/// Result of parsing a multi-range `Range` header.
+enum MultiRange {
+    /// Serve the whole body (`200`): the ranges' total size exceeds the content.
+    Full,
+    /// `416`: every range was out of bounds (Go's `errNoOverlap`).
+    Unsatisfiable,
+    /// The satisfiable ranges (inclusive), in request order.
+    Ranges(Vec<(usize, usize)>),
+}
+
+/// Parses a multi-range `Range: bytes=a-b,c-d,...` header (≥2 ranges) against
+/// `size`, mirroring Go's `http.parseRange` + `serveContent` for the
+/// multi-range case. Returns `None` when this is not a well-formed multi-range
+/// request, so the caller falls back to the single-range path.
+fn parse_multi_byte_ranges(header: &str, size: usize) -> Option<MultiRange> {
+    let spec = header.trim().strip_prefix("bytes=")?;
+    let parts: Vec<&str> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut ranges = Vec::new();
+    let mut total = 0usize;
+    for p in parts {
+        match parse_single_byte_range(&format!("bytes={p}"), size) {
+            RangeResult::Partial(s, e) => {
+                total = total.saturating_add(e - s + 1);
+                ranges.push((s, e));
+            }
+            // Out-of-bounds sub-range: dropped, like Go's `noOverlap` tracking.
+            RangeResult::Unsatisfiable => {}
+            // A malformed sub-range: fall back to the single-range path.
+            RangeResult::Full => return None,
         }
     }
+    if ranges.is_empty() {
+        return Some(MultiRange::Unsatisfiable);
+    }
+    if total > size {
+        return Some(MultiRange::Full);
+    }
+    Some(MultiRange::Ranges(ranges))
 }
 
 enum RangeResult {
@@ -273,6 +390,49 @@ mod tests {
         assert!(matches!(m("bytes=0-4,6-8", 10), Full));
         assert!(matches!(m("bytes=abc", 10), Full));
         assert!(matches!(m("bytes=5-2", 10), Full));
+    }
+
+    #[test]
+    fn test_parse_multi_byte_ranges() {
+        // Two satisfiable ranges.
+        match parse_multi_byte_ranges("bytes=0-4,6-8", 10) {
+            Some(MultiRange::Ranges(rs)) => assert_eq!(rs, vec![(0, 4), (6, 8)]),
+            _ => panic!("expected two ranges"),
+        }
+        // One satisfiable, one out of bounds -> the survivor (single 206).
+        match parse_multi_byte_ranges("bytes=0-4,20-30", 10) {
+            Some(MultiRange::Ranges(rs)) => assert_eq!(rs, vec![(0, 4)]),
+            _ => panic!("expected one surviving range"),
+        }
+        // All out of bounds -> 416.
+        assert!(matches!(
+            parse_multi_byte_ranges("bytes=20-30,40-50", 10),
+            Some(MultiRange::Unsatisfiable)
+        ));
+        // Total size exceeds content -> serve full 200 (Go's anti-abuse guard).
+        assert!(matches!(
+            parse_multi_byte_ranges("bytes=0-9,0-9", 10),
+            Some(MultiRange::Full)
+        ));
+        // Not a multi-range / wrong unit / malformed sub-range -> fall back.
+        assert!(parse_multi_byte_ranges("bytes=0-4", 10).is_none());
+        assert!(parse_multi_byte_ranges("items=0-4,5-6", 10).is_none());
+        assert!(parse_multi_byte_ranges("bytes=0-4,abc", 10).is_none());
+    }
+
+    #[test]
+    fn test_pick_boundary_avoids_collision() {
+        let b = pick_boundary(b"plain asset content");
+        assert!(
+            !b"plain asset content"
+                .windows(b.len())
+                .any(|w| w == b.as_bytes())
+        );
+        // When the base string appears in the data, it is extended until unique.
+        let data = b"xeslogsbyterange3d6b6a416f9bx";
+        let b2 = pick_boundary(data);
+        assert!(b2.len() > b.len());
+        assert!(!data.windows(b2.len()).any(|w| w == b2.as_bytes()));
     }
 
     /// Walks `assets/esmui` on disk and asserts the embedded table matches it
@@ -410,6 +570,57 @@ mod tests {
         assert_eq!(status, 404);
         assert!(String::from_utf8_lossy(&body).contains("not routed"));
 
+        // A single range → 206 with Content-Range.
+        let (status, headers, body) =
+            http_get_range(addr, "/select/esmui/config.json", "bytes=0-2");
+        assert_eq!(status, 206);
+        assert!(header(&headers, "content-range").starts_with("bytes 0-2/"));
+        assert_eq!(body.len(), 3);
+
+        // A multi-range request → 206 multipart/byteranges (the closed gap).
+        let (status, headers, body) =
+            http_get_range(addr, "/select/esmui/config.json", "bytes=0-2,5-7");
+        assert_eq!(status, 206);
+        assert!(header(&headers, "content-type").starts_with("multipart/byteranges; boundary="));
+        // Each part carries its own Content-Range; both requested ranges appear.
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Content-Range: bytes 0-2/"));
+        assert!(text.contains("Content-Range: bytes 5-7/"));
+
         handle.stop();
+    }
+
+    /// Like [`http_get`] but sends a `Range` header.
+    fn http_get_range(
+        addr: std::net::SocketAddr,
+        target: &str,
+        range: &str,
+    ) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        write!(
+            stream,
+            "GET {target} HTTP/1.1\r\nHost: test\r\nRange: {range}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write request");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read response");
+        let sep = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("headers/body separator");
+        let head = String::from_utf8_lossy(&raw[..sep]).into_owned();
+        let body = raw[sep + 4..].to_vec();
+        let mut lines = head.lines();
+        let status: u16 = lines
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .expect("status");
+        let headers = lines
+            .filter_map(|l| l.split_once(": "))
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
+            .collect();
+        (status, headers, body)
     }
 }
